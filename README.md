@@ -7,41 +7,129 @@
 
 **English** | [한국어](README.ko.md)
 
-**On-device LLM inference engine for ARM64 edge & mobile devices**, written in Rust.
+**Run quantized Llama / Qwen / Gemma models on a phone or edge ARM64 GPU — and swap
+the KV-cache precision format with a flag, no engine rebuild.**
 
-Argus targets Android/Linux ARM64 SoCs with a flexible backend abstraction and a
-zero-copy memory architecture. It runs Llama-family and Qwen/Gemma models from
-HuggingFace Safetensors and GGUF, with Q4_0/Q8_0 block quantization and OpenCL /
-CUDA GPU acceleration.
+Argus is an on-device LLM inference engine in Rust for Android/Linux ARM64 SoCs: NEON
+CPU and Adreno-OpenCL / CUDA GPU backends, a zero-copy UMA memory path, and a plugin
+surface for KV-cache and precision research.
 
-This repository is the **engine**. It is one of three Argus repositories:
+> **Status: early.** Adreno / ARM64 is the primary tested path. The shipped `argus_cli`
+> does **single-prompt text generation** (prompt in → continuation + a `Decode: X ms/tok`
+> line out) and can load a **KV-cache precision-format plugin** (`--kv-format`). KV-cache
+> **eviction stages** (H2O / D2O / StreamingLLM), **KIVI** KV quantization, tensor
+> partition, and runtime weight swap are implemented and tested, but in v0 they run
+> through the `argus_bench` / `argus_eval` binaries rather than `argus_cli`. Their
+> `argus_cli` wiring, an interactive **chat** binary, and `--profile` are **planned for
+> v1**. The [Roadmap](#roadmap) table says exactly where each feature runs today.
 
-| Repo | Role |
-|------|------|
-| [`argus-engine`](https://github.com/hedone21/argus-engine) | LLM inference engine (this repo) |
-| [`argus-shared`](https://github.com/hedone21/argus-shared) | IPC protocol types (manager ↔ engine) |
-| [`argus-manager`](https://github.com/hedone21/argus-manager) | System resource manager service |
+## Demo
 
-## Key features
+<!-- TODO: record an asciinema/GIF of an on-device Adreno decode showing the token
+     stream + the `Decode: X ms/tok` line, captured WITHOUT --profile (per the repo's
+     performance-measurement rule), and embed it here (export to GIF/animated SVG —
+     GitHub strips asciinema's <script> tag). -->
 
-- **ARM64 optimized** — NEON + dotprod intrinsics for Android/Linux ARM64 SoCs.
-- **Zero-copy memory** — `CL_MEM_ALLOC_HOST_PTR` / DMA-BUF maps GPU buffers to CPU
-  pointers on UMA SoCs, eliminating CPU↔GPU memcpy.
-- **Pluggable backends** — `Backend` trait over CPU (NEON) / OpenCL (Adreno) / CUDA.
-- **Quantization** — Q4_0 / Q8_0 block quant, F16/BF16. GGUF pre-quantized models
-  load directly; Safetensors F16/BF16 convert on load.
-- **KV-cache eviction** — Sliding Window / H2O / H2O+ / D2O (merge compensation) /
+_A recorded on-device decode (asciinema / GIF) will go here — token streaming plus the
+`Decode: X ms/tok` line that is the engine's headline metric._
+
+## Quickstart — what runs today
+
+```bash
+git clone https://github.com/hedone21/argus-engine.git
+cd argus-engine
+cargo build --release
+
+# 1. Single-prompt generation on CPU (default host backend)
+./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 -b cpu
+
+# 2. Same prompt on the Adreno OpenCL GPU — one flag switches the backend
+./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 -b opencl
+
+# 3. Sampling controls
+./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 \
+    --temperature 0.8 --top-p 0.9 --top-k 40 --repetition-penalty 1.1
+
+# 4. Load a KV-cache *precision format* plugin at runtime — no engine rebuild
+#    (.so is the Linux/Android name; a macOS host build produces .dylib)
+cargo build --release -p example-kv-format --features plugin-cdylib
+./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 \
+    --load-plugin target/release/libexample_kv_format.so \
+    --kv-format example_kv_format
+```
+
+Each run prints the generated continuation plus `TTFT`, `Decode: X ms/tok`, and
+`Avg TBT` lines. Point it at a `.gguf` and the dtype is auto-detected (no conversion); a
+`tokenizer.json` must sit next to the model, or pass `--tokenizer-path`. CUDA, Android
+cross-compile, and Safetensors → GGUF / AUF conversion are under
+[Install / Build from source](#install--build-from-source).
+
+Step 4 is the precision **format** plugin path — a loaded `.so` reaches the real decode
+path on `argus_cli` today. The KV-cache **eviction** plugins (`--eviction-policy
+h2o|d2o|streaming|…`) and **KIVI** precision packing run through `argus_bench` /
+`argus_eval` in v0; see the [Roadmap](#roadmap).
+
+## What you can do
+
+**On-device & fast**
+
+- **ARM64-optimized** — NEON + dotprod intrinsics for Android/Linux ARM64 SoCs; AVX2 +
+  FMA on x86_64 hosts.
+- **Zero-copy UMA memory** — `CL_MEM_ALLOC_HOST_PTR` / DMA-BUF maps GPU buffers to CPU
+  pointers on unified-memory SoCs, eliminating CPU↔GPU memcpy.
+- **GPU flash attention** — GQA-aware, strided.
+- **Quantized weights** — Q4_0 / Q8_0 block quant, F16 / BF16. GGUF loads directly
+  (dtype auto-detected); Safetensors F16/BF16 convert on load.
+
+**Memory-adaptive KV cache** *(runs via `argus_bench` / `argus_eval` in v0 — see
+[Roadmap](#roadmap))*
+
+- **Eviction stages** — Sliding Window / H2O / H2O+ / D2O (merge compensation) /
   StreamingLLM, as composable `KVCacheStage` plugins.
-- **KIVI KV-cache quantization** — dynamic Q4/Q8 KV quantization to cut memory.
-- **Flash attention** — GQA-aware GPU flash attention (strided).
-- **Tensor partition** — split FFN gate/up matmul across GPU + CPU concurrently.
-- **Adaptive resilience** — optional integration with `argus-manager` for runtime
+- **KIVI KV quantization** — dynamic Q4/Q8 KV packing to cut cache memory.
+- **Adaptive resilience** *(optional; `resilience` feature + `argus-manager`)* — runtime
   adaptation under memory/thermal pressure (eviction, backend switch, throttle).
-- **Zero-compile extension surface** — add a KV-cache stage / format / read-stage as
-  a separate crate that self-registers via `linkme`, with no engine-core edits.
-  See [`CONTEXT.md`](CONTEXT.md) for the three orthogonal axes (stage ⊥ format ⊥
-  hardware) and [`crates/technique-api/README.md`](crates/technique-api/README.md) for a
-  how-to walkthrough.
+
+**Extensible** *(zero engine-core edits)*
+
+- **Pluggable KV cache & precision** — add a KV-cache stage / format / read-stage as a
+  separate crate that self-registers via `linkme`, or load it at runtime as a `.so`.
+  Three orthogonal axes — **stage** ⊥ **format** ⊥ **hardware**. The precision **format**
+  axis (`--kv-format`) and the **read** axis (`--read-stage`) work from `argus_cli`
+  today. See [Extending Argus](#extending-argus).
+- **Pluggable backends** — `Backend` trait over CPU (NEON) / OpenCL (Adreno) / CUDA.
+
+## Why Argus / how it relates to llama.cpp
+
+Argus reuses kernels adapted from [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)
+(see [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES.md)) and is **complementary, not a
+replacement**. Where llama.cpp is portable inference across many platforms, Argus is
+tuned for **Adreno / ARM64 UMA edge devices** and adds a **zero-compile plugin surface
+for KV-cache and precision research**: swap an eviction stage or a KV precision format by
+name (**stage** ⊥ **format** ⊥ **hardware**), with no engine recompile. If you want to
+prototype KV-cache or quantization techniques on a phone-class GPU, that extension
+surface is the reason to reach for Argus.
+
+## Roadmap
+
+Where each capability runs today (v0). The **v1 plan** column marks features slated to
+reach `argus_cli` (or ship as a new binary) next.
+
+| Capability | `argus_cli` | `argus_bench` / `argus_eval` | v1 plan |
+|---|:---:|:---:|:---:|
+| Single-prompt generation (CPU / OpenCL / CUDA) | ✅ | ✅ | |
+| Sampling (temperature / top-p / top-k / rep-penalty) | ✅ | ✅ | |
+| KV-cache precision-format plugin (`--kv-format`, `--read-stage`) | ✅ | ✅ | |
+| Prefix-cache save / restore | ✅ | | |
+| KV-cache eviction stages (Sliding / H2O / H2O+ / D2O / StreamingLLM) | | ✅ | ✅ |
+| KIVI KV quantization (`--kv-mode kivi`) | | ✅ | ✅ |
+| Tensor partition (FFN split across GPU + CPU) | | ✅ | ✅ |
+| Runtime weight swap | | ✅ | ✅ |
+| Per-op profiling (`--profile`) | | | ✅ |
+| Interactive chat REPL | | | ✅ |
+
+> The chat REPL is implemented in the codebase but is not yet wired to a shipped binary;
+> it is planned to land as `argus-chat`.
 
 ## Supported models & hardware
 
@@ -79,24 +167,10 @@ Cross-compile targets: `aarch64-linux-android`, `aarch64-unknown-linux-gnu`,
 ## Install / Build from source
 
 Argus is distributed as source: it depends on
-[`argus-shared`](https://github.com/hedone21/argus-shared) as a git dependency, so it
-is not published to crates.io (`cargo install argus-engine` will not work). Build it
-from a git checkout.
-
-```bash
-git clone https://github.com/hedone21/argus-engine.git
-cd argus-engine
-cargo build --release
-
-# CPU
-./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 -b cpu
-
-# GPU (OpenCL, Adreno production path)
-./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 -b opencl
-```
-
-GGUF is the recommended model format (dtype auto-detected, no load-time conversion).
-A `tokenizer.json` must sit next to the `.gguf` file, or pass `--tokenizer-path`.
+[`argus-shared`](https://github.com/hedone21/argus-shared) as a git dependency, so it is
+not published to crates.io (`cargo install argus-engine` will not work). Build it from a
+git checkout — the [Quickstart](#quickstart--what-runs-today) covers the default
+`cargo build --release` + CPU/OpenCL run.
 
 ```bash
 # CUDA (NVIDIA discrete GPU / Jetson) — mutually exclusive with opencl
@@ -160,6 +234,111 @@ for the device-runner and evaluation tooling.
 > backend. The CUDA build above drops the default `opencl` via `--no-default-features`
 > and adds `--features cuda`. Building with **no** GPU backend at all is not currently
 > supported.
+>
+> The `profile` feature compiles the per-op instrumentation, but the shipped v0
+> `argus_cli` rejects the `--profile` flag (profiling output is read from `argus_bench`);
+> CLI profiling is planned for v1.
+
+## Extending Argus
+
+A KV-cache technique is a **separate crate** that depends only on `technique-api` +
+`linkme` and **self-registers** — adding one touches **zero engine-core code**. There are
+three orthogonal axes (**stage** ⊥ **format** ⊥ **hardware**): a **stage** adjusts which
+tokens stay resident (eviction/merge), a **format** defines the KV byte layout
+(precision), and a **read-stage** chooses what to read back.
+
+### Example: a KV-cache precision plugin
+
+This is the plugin loaded in [Quickstart](#quickstart--what-runs-today) step 4 — copy
+`crates/techniques/example-kv-format/` as a template. The whole plugin is one small crate:
+
+```
+crates/techniques/my-kv-format/
+├── Cargo.toml
+└── src/lib.rs
+```
+
+`Cargo.toml` — two dependency lines plus a `cdylib` so it can build as a loadable `.so`:
+
+```toml
+[package]
+name = "my-kv-format"
+# version / edition / license inherited from the workspace
+
+[lib]
+crate-type = ["cdylib", "rlib"]   # cdylib = the .so; rlib = static force-link
+
+[dependencies]
+technique-api = { path = "../../technique-api" }
+linkme = "0.3"
+
+[features]
+plugin-cdylib = []                # gates the .so C-ABI export
+```
+
+`src/lib.rs` — implement the trait (here `KVFormat` = a name + a byte-layout descriptor)
+and register it in one line:
+
+```rust
+use technique_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
+
+struct MyKvFormat;
+
+impl KVFormat for MyKvFormat {
+    fn name(&self) -> &str { "my_kv_format" }   // the --kv-format selector
+    fn layout(&self) -> KVLayoutDesc {          // q4_0-like: 32-elem blocks, 4-bit nibbles
+        KVLayoutDesc {
+            block_elems: 32,
+            bits: 4,
+            scale_layout: ScaleLayout::PerBlockF16,
+            packing: Packing::Nibble,
+        }
+    }
+}
+
+// One line dual-wires it: static (linkme registry) + dynamic (the `.so` C-ABI export).
+technique_api::register_kv_format!("my_kv_format", || Box::new(MyKvFormat));
+technique_api::export_plugin!();                // emits the .so entry point for --load-plugin
+```
+
+Build it as a `.so` and load it by name — no engine rebuild:
+
+```bash
+cargo build --release -p my-kv-format --features plugin-cdylib
+./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 \
+    --load-plugin target/release/libmy_kv_format.so --kv-format my_kv_format
+```
+
+At startup the engine `dlopen`s the `.so`, registers the format, and `--kv-format
+my_kv_format` routes the KV cache through your layout (the `[DecodeLoop] kv storage =
+OPAQUE` log line confirms it reached the decode path). Drop `--features plugin-cdylib`,
+add a one-line path dependency on the crate instead, and the same code is force-linked
+statically — identical `--kv-format my_kv_format`, no `.so`.
+
+### The other axes
+
+- **Stage** (eviction/merge) — implement `KVCacheStage::plan(&ctx) -> Option<KVCachePlan>`
+  returning which tokens to `keep` / `merge`, register with `register_kv_stage!`, select
+  with `--eviction-policy <name>`. Template: `example-keep-recent`. *In v0 stages run via
+  `argus_bench` / `argus_eval`, not `argus_cli`.*
+- **Read** (query-aware read) — implement `KVReadStage`, select with `--read-stage <name>`.
+  Reference: the `quest` builtin.
+
+A `KVFormat` contributes a byte-layout *descriptor*, not a compute kernel — a precision
+with no matching builtin rides a generic dequant→f32 path. See [`CONTEXT.md`](CONTEXT.md)
+for the axis vocabulary and
+[`crates/technique-api/README.md`](crates/technique-api/README.md) for the full how-to and
+the `example-*` templates (bundles, multi-format, rollback / error vehicles).
+
+## Repository map
+
+This repository is the **engine**. It is one of three Argus repositories:
+
+| Repo | Role |
+|------|------|
+| [`argus-engine`](https://github.com/hedone21/argus-engine) | LLM inference engine (this repo) |
+| [`argus-shared`](https://github.com/hedone21/argus-shared) | IPC protocol types (manager ↔ engine) |
+| [`argus-manager`](https://github.com/hedone21/argus-manager) | System resource manager service |
 
 ## Documentation
 
