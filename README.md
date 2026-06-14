@@ -326,9 +326,11 @@ statically — identical `--kv-format my_kv_format`, no `.so`.
 
 A `KVFormat` contributes a byte-layout *descriptor*, not a compute kernel — a precision
 with no matching builtin rides a generic dequant→f32 path. See [`CONTEXT.md`](CONTEXT.md)
-for the axis vocabulary and
-[`crates/technique-api/README.md`](crates/technique-api/README.md) for the full how-to and
-the `example-*` templates (bundles, multi-format, rollback / error vehicles).
+for the axis vocabulary, **[`docs/plugins.md`](docs/plugins.md)** for the full onboarding
+guide (quickstart through shipping a plugin), and
+[`crates/technique-api/README.md`](crates/technique-api/README.md) for the terse
+registration reference and the `example-*` templates (bundles, multi-format, rollback /
+error vehicles).
 
 ## Repository map
 
@@ -342,6 +344,9 @@ This repository is the **engine**. It is one of three Argus repositories:
 
 ## Documentation
 
+- [`docs/plugins.md`](docs/plugins.md) — **Writing an Argus plugin**: the developer
+  onboarding guide for adding a KV-cache technique (stage / format / read / backend-cap)
+  without forking the engine.
 - [`CONTEXT.md`](CONTEXT.md) — domain glossary: the stage ⊥ format ⊥ hardware axes and
   the cache-management vocabulary.
 - [`AGENTS.md`](AGENTS.md) — guide for AI coding agents and contributors.

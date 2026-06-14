@@ -318,7 +318,8 @@ cargo build --release -p my-kv-format --features plugin-cdylib
 
 `KVFormat`이 더하는 것은 연산 커널이 아니라 바이트 레이아웃(디스크립터)뿐입니다. 대응하는 빌트인이
 없는 정밀도는 일반 dequant→f32 경로로 처리됩니다. 축 용어는 [`CONTEXT.ko.md`](CONTEXT.ko.md)를,
-전체 how-to와 `example-*` 템플릿(번들, 멀티 포맷, rollback·에러 vehicle)은
+전체 온보딩 가이드(빠른 시작부터 플러그인 출하까지)는 **[`docs/plugins.ko.md`](docs/plugins.ko.md)**
+를, 간결한 등록 레퍼런스와 `example-*` 템플릿(번들, 멀티 포맷, rollback·에러 vehicle)은
 [`crates/technique-api/README.md`](crates/technique-api/README.md)를 보세요.
 
 ## 저장소 구성
@@ -333,6 +334,8 @@ cargo build --release -p my-kv-format --features plugin-cdylib
 
 ## 문서
 
+- [`docs/plugins.ko.md`](docs/plugins.ko.md) — **Argus 플러그인 만들기**: 엔진을 포크하지 않고
+  KV-cache 기법(stage / format / read / backend-cap)을 더하는 개발자 온보딩 가이드.
 - [`CONTEXT.ko.md`](CONTEXT.ko.md) — 도메인 용어집: stage ⊥ format ⊥ hardware 축과 캐시 관리 용어.
 - [`AGENTS.md`](AGENTS.md) — AI 코딩 에이전트와 기여자를 위한 가이드.
 
