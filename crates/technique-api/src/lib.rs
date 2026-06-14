@@ -253,7 +253,7 @@ pub struct KVCachePlan {
 /// only the [`StageCtx`] read abstraction — consistent with a C-ABI future (`cdylib` promotion), and keeping technique crates from coupling to
 /// engine internals.
 pub trait KVCacheStage: Send + Sync {
-    /// The technique name (matched against CLI `--eviction-policy <name>`, also for logging). Must be unique within the slice.
+    /// The technique name (matched against the CLI `eviction plugin --name <name>` selector, also for logging). Must be unique within the slice.
     fn name(&self) -> &str;
 
     /// Computes the retain/merge plan. `None` = not applied (no-op). Computed from ctx reads + impl state (Mutex).
@@ -285,7 +285,7 @@ pub struct StageParams {
 /// The registration entry for one stage technique. A technique crate submits it via
 /// `#[distributed_slice(KV_CACHE_STAGES)] static FOO: KVCacheStageReg = ...`.
 pub struct KVCacheStageReg {
-    /// The CLI `--eviction-policy` name. Must be unique within the slice.
+    /// The CLI selector name (`eviction plugin --name <name>`, or a built-in `eviction <policy>`). Must be unique within the slice.
     pub name: &'static str,
     /// The factory that builds a technique instance from the parameters.
     pub make: fn(StageParams) -> Box<dyn KVCacheStage>,
@@ -433,7 +433,7 @@ pub struct FromPairAbi {
 /// stages). The vtable is a `static` in the plugin `.so`, so it is valid for the entire process lifetime.
 #[repr(C)]
 pub struct PluginVTableAbi {
-    /// Null-terminated canonical name (matched against CLI `--eviction-policy`). A `'static` str in the plugin `.so`.
+    /// Null-terminated canonical name (matched against the CLI `eviction plugin --name`). A `'static` str in the plugin `.so`.
     /// (ABI gating is handled by the envelope's [`StageExportAbi::abi_version`] — no per-vtable version field.)
     pub name: *const c_char,
     /// `StageParams` → opaque plugin instance handle.

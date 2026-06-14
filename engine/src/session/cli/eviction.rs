@@ -75,14 +75,20 @@ pub enum EvictionCmd {
     /// 표면 불변). λ(redundancy/importance fusion)만 측정 조정 가능(기본 0.1).
     #[cfg(feature = "rkv")]
     Rkv(RkvArgs),
+
+    /// Plugin-supplied eviction stage, selected by registry name.
+    ///
+    /// The stage-axis analogue of `--kv-format <name>`: any technique crate registered
+    /// statically (linkme `KV_CACHE_STAGES`) or dynamically (`--load-plugin`) is selectable
+    /// by name with no engine edit. CLI form: `eviction plugin --name <stage>`.
+    Plugin(PluginArgs),
 }
 
 impl EvictionCmd {
-    /// Canonical policy name matching the legacy `--eviction-policy` string
-    /// (compatibility with existing manager IPC, lua policy DSL, and JSON
-    /// dumps). Used during the migration window so downstream code can keep
-    /// matching on the policy name.
-    pub fn policy_name(&self) -> &'static str {
+    /// Canonical policy name — the stage registry key (a built-in like "h2o", or a plugin
+    /// name from `eviction plugin --name <name>`). Also used by manager IPC, the lua policy
+    /// DSL, and JSON dumps, so downstream code can keep matching on the policy name.
+    pub fn policy_name(&self) -> &str {
         match self {
             EvictionCmd::None => "none",
             EvictionCmd::Sliding(_) => "sliding",
@@ -94,8 +100,21 @@ impl EvictionCmd {
             EvictionCmd::Caote => "caote",
             #[cfg(feature = "rkv")]
             EvictionCmd::Rkv(_) => "rkv",
+            // Plugin name is a runtime String (borrowed for &self's lifetime — this is why
+            // policy_name/eviction_policy return &str rather than &'static str).
+            EvictionCmd::Plugin(a) => a.name.as_str(),
         }
     }
+}
+
+/// Plugin eviction-stage selector (the stage-axis analogue of `--kv-format <name>`).
+/// `--name <stage>` is resolved against the static `KV_CACHE_STAGES` + dynamic
+/// (`--load-plugin`) registry via `make_stage`.
+#[derive(Args, Debug, Clone)]
+pub struct PluginArgs {
+    /// Registry name of the eviction stage to select.
+    #[arg(long = "name")]
+    pub name: String,
 }
 
 /// R-KV 측정 프로토타입 파라미터(feature `rkv`). λ 만 노출 — α/τ 는 측정 상수(rkv_stage.rs).
@@ -422,5 +441,25 @@ mod tests {
         // Other defaults preserved.
         assert_eq!(c.common.min_kv_cache, 256);
         assert!((c.common.eviction_target_ratio - 0.75).abs() < 1e-6);
+    }
+
+    /// `eviction plugin --name <stage>` parses and policy_name() returns the runtime name —
+    /// the free-string stage selector (the stage-axis analogue of `--kv-format`). This is the
+    /// seam that lets a `--load-plugin` stage be selected with no engine edit.
+    #[test]
+    fn parses_plugin_subcommand_by_name() {
+        let w = parse(&["plugin", "--name", "my_stage"]);
+        match w.ev {
+            Some(EvictionCmd::Plugin(ref a)) => assert_eq!(a.name, "my_stage"),
+            _ => panic!("expected Plugin"),
+        }
+        assert_eq!(w.ev.as_ref().unwrap().policy_name(), "my_stage");
+    }
+
+    /// `eviction plugin` without `--name` is a clap error (the name is required).
+    #[test]
+    fn plugin_requires_name() {
+        let r = Wrap::try_parse_from(["test", "plugin"]);
+        assert!(r.is_err(), "plugin subcommand requires --name");
     }
 }

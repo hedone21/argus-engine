@@ -32,7 +32,7 @@ use crate::kv::kv_cache::KVCache;
 // CAOTE production 활성화. feature `caote` ON 시 caote crate 를 force-link 한다 —
 // dep 선언만으로는 미참조 rlib 이 링크 제외돼 `#[distributed_slice]` 등록이 누락되기 때문이다.
 // 이 1줄이 production 바이너리에서 `find_stage("caote")` 를 가시화한다(session score_based
-// 경유 value-aware 동작). feature OFF = 미링크 → `--eviction-policy caote` 는 unknown 으로 graceful fail.
+// 경유 value-aware 동작). feature OFF = 미링크 + `eviction caote` 서브커맨드 부재(clap reject).
 #[cfg(feature = "caote")]
 use caote as _;
 

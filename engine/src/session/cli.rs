@@ -558,11 +558,21 @@ pub struct Args {
     #[arg(long)]
     pub kv_format: Option<String>,
 
-    /// GATE-C: 런타임 stage plugin `.so` 경로(반복 가능). startup 에 dlopen +
-    /// `register_kv_stage_v1` → `KV_CACHE_STAGES` 동적 등록. `--eviction-policy <plugin-name>` 로 선택.
-    /// 빌트인과 이름 충돌 시 fail-fast(빌트인 우선).
+    /// GATE-C: runtime plugin `.so` paths (repeatable). dlopen'd once at startup and routed
+    /// to the dynamic stage/format/backend-cap registries via the `register_kv_stages_v2` /
+    /// `register_kv_formats_v2` / `register_backend_caps_v2` entry symbols. Select a loaded
+    /// technique by name: `--kv-format <name>` (format), `eviction plugin --name <name>`
+    /// (stage), `--backend-cap <name>` (backend capability). Built-in name collisions
+    /// fail fast (built-in wins).
     #[arg(long = "load-plugin")]
     pub load_plugin: Vec<std::path::PathBuf>,
+
+    /// Select a backend-capability implementation by registry name — e.g. a KIVI fused
+    /// dequant+attention backend — static (linkme `KIVI_ATTENTION_REGS`) or `--load-plugin`
+    /// dlopen'd. The backend-capability axis's analogue of `--kv-format`. OpenCL-only;
+    /// unset = the engine's built-in OpenCL implementation.
+    #[arg(long = "backend-cap")]
+    pub backend_cap: Option<String>,
 
     // ── Eviction (S-subcmd C2): policy/h2o/d2o/sink/streaming + common
     // 7 params (kv_budget, protected_prefix, memory_threshold_mb,
@@ -1364,7 +1374,7 @@ impl Args {
         }
     }
 
-    pub fn eviction_policy(&self) -> &'static str {
+    pub fn eviction_policy(&self) -> &str {
         self.current_policy()
             .map(|e| e.policy_name())
             .unwrap_or("none")

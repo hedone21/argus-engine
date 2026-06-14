@@ -7240,6 +7240,23 @@ impl OpenCLBackend {
 // 알고 있어 사용하지 않는다(host 가 채워준 동일 핸들이라 결과 동일, byte-identical
 // 보존). `as_kivi_attention` 이 `Some(&self as &dyn KiviAttentionBackend)` 를
 // 반환하므로 caller 는 trait method 만 사용해 downcast 가 사라진다.
+impl OpenCLBackend {
+    /// Build a [`technique_api::KiviMakeArgs`] from this backend's live GPU context and
+    /// invoke `f` with it. Used by `--backend-cap <name>` to construct a named KIVI
+    /// attention capability via `resolve_kivi_capability`. The `build_opts` C string is
+    /// owned only for the duration of `f` — `KiviMakeArgs` is borrow-for-make (C7/D4) and a
+    /// Copy POD, so the pointer must not escape `f`.
+    pub fn with_kivi_make_args<R>(&self, f: impl FnOnce(&technique_api::KiviMakeArgs) -> R) -> R {
+        let opts = std::ffi::CString::new(self.cl_opts.clone()).unwrap_or_default();
+        let make_args = technique_api::KiviMakeArgs {
+            cl_ctx: <&Context as ClContextPtr>::as_ptr(&&self.context),
+            device: <Device as ClDeviceIdPtr>::as_ptr(&self.device),
+            build_opts: opts.as_ptr(),
+        };
+        f(&make_args)
+    }
+}
+
 impl crate::backend::KiviAttentionBackend for OpenCLBackend {
     fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
         Self::has_kivi_attn_kernel(self, bits)

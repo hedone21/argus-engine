@@ -9,10 +9,10 @@
 //! **Algorithm**: keep only the most recent `target_len` tokens (the prefix=0 variant of
 //! sliding). A pure computation that reads only `current_pos`/`target_len` from [`StageCtx`];
 //! the buffer mutation is performed by the engine executor running the returned plan via
-//! `compact` (plan-returning). CLI selector: `--eviction-policy example_keep_recent`.
+//! `compact` (plan-returning). CLI selector: `eviction plugin --name example_keep_recent`.
 //!
 //! GATE-C: `cargo build -p example-keep-recent --features plugin-cdylib` produces the `.so` →
-//! `argus_bench --load-plugin <.so> --eviction-policy example_keep_recent` loads it zero-compile.
+//! `argus_bench --load-plugin <.so> eviction plugin --name example_keep_recent` loads it zero-compile.
 
 use technique_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, StageParams};
 

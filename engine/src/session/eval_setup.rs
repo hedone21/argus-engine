@@ -250,10 +250,35 @@ fn build_eval_cache_manager(
                 args.h2o_keep_ratio(),
                 actual_protected_prefix,
             )),
-            other => anyhow::bail!(
-                "Unknown eviction policy: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o",
-                other
-            ),
+            name => {
+                // Plugin/registry stage (static linkme + dynamic `--load-plugin`), mirroring
+                // build_bench_loop: any registered KVCacheStage name resolves via make_stage,
+                // wrapped as an EvictionPolicy. miss = unknown (bail, builtin names listed).
+                let streaming_window = if args.streaming_window() > 0 {
+                    args.streaming_window()
+                } else if args.kv_budget() > 0 {
+                    args.kv_budget().saturating_sub(args.sink_size())
+                } else {
+                    args.eviction_window()
+                };
+                let params = technique_api::StageParams {
+                    eviction_window: args.eviction_window(),
+                    protected_prefix: actual_protected_prefix,
+                    keep_ratio: args.h2o_keep_ratio(),
+                    sink_size: args.sink_size(),
+                    streaming_window,
+                };
+                let stage = crate::kv::eviction::stage_registry::make_stage(name, &params)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "argus-eval: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o (or --load-plugin <.so>).",
+                            name
+                        )
+                    })?;
+                Box::new(crate::kv::eviction::stage_registry::StageBackedPolicy::new(
+                    stage,
+                ))
+            }
         };
         CacheManager::new(
             policy,

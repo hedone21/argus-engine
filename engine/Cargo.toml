@@ -88,7 +88,7 @@ default = ["opencl", "profile"]
 opencl = ["ocl"]
 profile = []
 # CAOTE value-aware eviction plugin install. When on, the caote crate is linked
-# and `--eviction-policy caote` becomes available.
+# and the `eviction caote` subcommand becomes available.
 caote = ["dep:caote"]
 # R-KV (cosine redundancy + importance joint eviction) measurement prototype.
 # Pure cfg gate, no external dependency. Default OFF.

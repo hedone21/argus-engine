@@ -45,7 +45,7 @@ pub struct InferencePrelude {
 pub fn build_inference_prelude(args: &Args) -> anyhow::Result<InferencePrelude> {
     // GATE-C: --load-plugin 의 `.so` 들을 .so 당 1회 dlopen 해 stage+format 양축
     // capability 를 등록한다(cross-axis open-once dispatcher — 번들/단일축 `.so` 모두 흡수). 이후
-    // make_stage(--eviction-policy)/make_format(--kv-format)가 정적(linkme)+동적(여기) 통합 조회로
+    // make_stage(eviction <policy>)/make_format(--kv-format)가 정적(linkme)+동적(여기) 통합 조회로
     // 해소한다. 봉투 abi_version mismatch / 이름 충돌 / capability-0 은 여기서 fail-fast.
     crate::session::plugin_dispatch::register_dynamic_plugins(&args.load_plugin)?;
     // fat-LTO self-test(C3 배선): 내장 KV format 4종 링크 확인 — --gc-sections silent

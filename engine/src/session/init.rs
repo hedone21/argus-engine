@@ -127,12 +127,12 @@ impl SessionInitCtx {
             }
             if matches!(args.effective_kv_mode(), KvMode::Kivi) && has_eviction {
                 anyhow::bail!(
-                    "--chat: --kivi cannot combine with --eviction-policy in v1 (pick one)"
+                    "--chat: --kivi cannot combine with eviction in v1 (pick one)"
                 );
             }
             if kv_offload_active && has_eviction {
                 anyhow::bail!(
-                    "--chat: --kv-offload cannot combine with --eviction-policy in v1 (pick one)"
+                    "--chat: --kv-offload cannot combine with eviction in v1 (pick one)"
                 );
             }
             let conflicts: &[(&str, bool)] = &[
@@ -146,7 +146,7 @@ impl SessionInitCtx {
             ];
             if let Some((flag, _)) = conflicts.iter().find(|(_, enabled)| *enabled) {
                 anyhow::bail!(
-                    "--chat is incompatible with {} (v1 supports standard / --kivi / --kv-offload / --eviction-policy paths)",
+                    "--chat is incompatible with {} (v1 supports standard / --kivi / --kv-offload / eviction paths)",
                     flag
                 );
             }
@@ -315,7 +315,32 @@ impl SessionInitCtx {
                 // 여기까지 단일 인스턴스이므로 clone 으로 두 trait object 를 파생한다.
                 // gpu_score 는 결정 #5 에 따라 register 하지 않는다(소비자 0, β 까지).
                 let mut caps = CapabilityRegistry::new();
-                caps.register::<dyn crate::backend::KiviAttentionBackend>(gpu_concrete.clone());
+                match args.backend_cap.as_deref() {
+                    Some(name) => {
+                        // --backend-cap <name>: resolve a named KIVI attention capability
+                        // (static KIVI_ATTENTION_REGS first, then dynamic --load-plugin) using
+                        // the live GPU context, and register it in place of the built-in impl.
+                        let cap = gpu_concrete
+                            .with_kivi_make_args(|make_args| {
+                                crate::capability::dynamic_backend_registry::resolve_kivi_capability(
+                                    name, make_args,
+                                )
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Unknown --backend-cap '{name}' (not found in static \
+                                     KIVI_ATTENTION_REGS or dynamic registration — check --load-plugin)"
+                                )
+                            })?;
+                        caps.register::<dyn crate::backend::KiviAttentionBackend>(cap);
+                    }
+                    // Default: the engine's built-in OpenCL KIVI attention impl (unchanged).
+                    None => {
+                        caps.register::<dyn crate::backend::KiviAttentionBackend>(
+                            gpu_concrete.clone(),
+                        );
+                    }
+                }
                 let gpu: Arc<dyn Backend> = gpu_concrete;
                 // GPU is primary; keep a ref as secondary for SwitchHw round-trip
                 (
@@ -402,6 +427,16 @@ impl SessionInitCtx {
                 args.backend
             ),
         };
+        // --backend-cap is OpenCL-only: the CPU/CUDA arms register an empty capability
+        // registry, so a named capability cannot be installed there. Warn, don't fail.
+        if args.backend_cap.is_some() && !matches!(args.backend.as_str(), "opencl" | "gpu") {
+            eprintln!(
+                "[init] --backend-cap '{}' ignored: only the OpenCL backend exposes a KIVI \
+                 attention capability (backend = {})",
+                args.backend_cap.as_deref().unwrap_or(""),
+                args.backend
+            );
+        }
         // Phase α-W-4 §3.3: registry freeze. 이후 소비자는 read-only pull 만.
         let caps = Arc::new(caps);
         // cpu_backend_arc: always available for migration and SwitchHw fallback.

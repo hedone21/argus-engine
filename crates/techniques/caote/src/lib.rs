@@ -7,7 +7,7 @@
 //!
 //! `technique-api` 에만 의존(엔진 타입 `KVCache`/`Backend` 미참조). 등록은 `#[distributed_slice]`,
 //! 활성화는 force-link 1줄. v1 은 [`KeepSpec::LayerWide`] 만 산출(head reduce 는 plugin 내부;
-//! per-head 는 단계 ⑤ executor 대기). CLI `--eviction-policy caote` 배선은 후속(host 테스트로 증명).
+//! per-head 는 단계 ⑤ executor 대기). feature `caote` 설치 시 `eviction caote` 서브커맨드로 선택.
 
 use linkme::distributed_slice;
 use technique_api::{
