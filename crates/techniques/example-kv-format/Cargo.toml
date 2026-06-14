@@ -1,0 +1,29 @@
+[package]
+name = "example-kv-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# GATE-C v2: rlib = static dep (self-registration test), cdylib = dlopen `.so`
+# (`register_kv_format_v1` C-ABI export when built with `--features plugin-cdylib`).
+crate-type = ["cdylib", "rlib"]
+
+# Example format technique crate — a format-axis extension technique depends on
+# `technique-api` (the extension API) + `linkme` (a direct plugin dep is required because the
+# static-registration macro expansion hardcodes the `linkme::` path). It depends on the engine
+# (argus_engine) and other-axis crates not at all. The format-axis counterpart of the
+# stage-axis example-keep-recent (a contributor template). **The engine does not force-link it**
+# = a vehicle demonstrating the dynamic-registration success path (make_format fallback) without
+# collision (synth_q4 is force-linked by the engine, hence builtin-collision).
+[dependencies]
+technique-api = { path = "../../technique-api" }
+linkme = "0.3"
+
+[features]
+# GATE-C v2: enables the cdylib C-ABI export (`register_kv_format_v1`). Keep it OFF for the
+# static force-link build to avoid `#[no_mangle]` symbol collisions; turn it on only when
+# producing a `.so`.
+plugin-cdylib = []

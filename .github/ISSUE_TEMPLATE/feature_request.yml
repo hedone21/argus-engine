@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest an enhancement or new capability for argus-engine
+title: "[feat]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        New KV-cache **stages / formats / read-stages** are designed to be added as
+        self-registering crates under `crates/techniques/` **without editing the engine
+        core** — see
+        [CONTRIBUTING.md](https://github.com/hedone21/argus-engine/blob/main/CONTRIBUTING.md)
+        and the `example-*` template crates. If your idea fits that model, you may be able
+        to prototype it as a separate crate.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and what is missing today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

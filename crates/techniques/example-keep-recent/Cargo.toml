@@ -1,0 +1,26 @@
+[package]
+name = "example-keep-recent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# GATE-C: rlib = static dev-dep (stage_registry visibility test), cdylib = dlopen `.so`
+# (`register_kv_stage_v1` C-ABI export when built with `--features plugin-cdylib`).
+crate-type = ["cdylib", "rlib"]
+
+# Example technique crate — depends on `technique-api` (the extension API) + `linkme`
+# (a direct plugin dep is required because the static-registration macro expansion hardcodes
+# the `linkme::` path). It depends on no other axis (format/hardware) and no engine types =
+# the additive-extension cost (2 dependency lines).
+[dependencies]
+technique-api = { path = "../../technique-api" }
+linkme = "0.3"
+
+[features]
+# GATE-C: enables the cdylib C-ABI export (`register_kv_stage_v1`). Keep it OFF for the
+# static force-link build to avoid `#[no_mangle]` symbol collisions; turn it on only when
+# producing a `.so`.
+plugin-cdylib = []

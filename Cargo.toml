@@ -1,0 +1,28 @@
+[workspace]
+# `crates/techniques/*` glob: stage-axis extension techniques are workspace members
+# just by adding a folder (zero-compile plugin extension). Linking one into the
+# binary takes a one-line dependency.
+members = [
+    "engine",
+    "crates/technique-api",
+    "crates/techniques/*",
+]
+resolver = "3"
+
+# Common package metadata inherited by every member via `field.workspace = true`.
+# Single source of truth for version / edition / MSRV / license / repository.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# MSRV tracks the latest stable toolchain we build/test with (the code uses APIs
+# stabilized after the edition-2024 floor, e.g. `is_multiple_of` in 1.87).
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hedone21/argus-engine"
+authors = ["Argus contributors"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3

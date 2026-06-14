@@ -1,0 +1,22 @@
+[package]
+name = "technique-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Additive extension API for argus-engine: KV-cache stage/format/read-stage techniques self-register via linkme, with no engine-core edits."
+
+[dependencies]
+# Static-link auto-registration — linker-section based (zero constructors, safe under
+# panic=abort/Android). The fat-LTO --gc-sections silent-drop risk is gated by a
+# startup self-test on the engine side.
+linkme = "0.3"
+
+[features]
+# Gates the dynamic `.so` path (the PLUGIN_*_VTABLES contributions of register_kv_*! and
+# the entry emit of export_plugin!). Enabled only for plugin cdylib builds. Also used when
+# technique-api's own tests verify dynamic-arm accumulation
+# (`cargo test -p technique-api --features plugin-cdylib`). The macro's
+# #[cfg(feature="plugin-cdylib")] is evaluated against the feature of the crate the macro
+# expands into (the plugin, or this crate's tests).
+plugin-cdylib = []

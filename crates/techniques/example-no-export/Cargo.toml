@@ -1,0 +1,20 @@
+[package]
+name = "example-no-export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# GATE-C v3: register_kv_format! 는 호출하되 export_plugin! 를 **고의로 누락**한
+# capability-0 vehicle. cdylib 빌드 시 PLUGIN_KV_FORMAT_VTABLES 기여는 있으나 register_kv_formats_v2
+# entry 심볼이 없어 dispatcher 가 capability-0 로 reject 함을 게이트가 검증.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+technique-api = { path = "../../technique-api" }
+linkme = "0.3"
+
+[features]
+plugin-cdylib = []

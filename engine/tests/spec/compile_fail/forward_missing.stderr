@@ -1,0 +1,7 @@
+error[E0599]: no method named `build` found for struct `DecodeLoopBuilder` in the current scope
+ --> tests/spec/compile_fail/forward_missing.rs:6:42
+  |
+6 |     let _loop = DecodeLoopBuilder::new().build();
+  |                                          ^^^^^ method not found in `DecodeLoopBuilder`
+  |
+  = note: the method was found for `DecodeLoopBuilder<HasForward>`

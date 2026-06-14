@@ -1,0 +1,77 @@
+name: Bug report
+description: Report a crash, wrong output, or performance regression in argus-engine
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. The device, backend, model/format, and the `Decode:` log
+        line are what make a report reproducible. **Do not** use this form for security
+        issues — report them privately (see
+        [SECURITY.md](https://github.com/hedone21/argus-engine/blob/main/SECURITY.md)).
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - cpu
+        - opencl
+        - cuda
+        - cuda-embedded
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device / SoC
+      placeholder: Galaxy S25 (Snapdragon 8 Elite, Adreno 830) / Jetson Orin / x86_64 desktop
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / target triple
+      placeholder: Android 15 (aarch64-linux-android) / Ubuntu 24.04 (x86_64-unknown-linux-gnu)
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model & format
+      placeholder: Qwen2.5-1.5B, GGUF Q4_0
+    validations:
+      required: true
+  - type: input
+    id: features
+    attributes:
+      label: Cargo features / build flags
+      placeholder: default (opencl, profile) / --no-default-features --features cuda
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The exact `argus_cli` command and steps to reproduce.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Decode throughput
+      description: "Relevant output. For performance issues, include the `Decode: X ms/tok` line."
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: Commit / version
+      placeholder: git commit SHA or tag (e.g. v0.1.0)
+    validations:
+      required: true

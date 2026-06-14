@@ -1,0 +1,60 @@
+# hosts.toml.example — template for per-host toolchain configuration
+#
+# Usage:
+#   cp hosts.toml.example hosts.toml   # then edit paths for your machine
+#   OR
+#   python scripts/device_registry.py bootstrap-host   # auto-probe NDK location
+#
+# hosts.toml is gitignored (each contributor keeps their own copy).
+# Only this example file is committed.
+#
+# Host detection priority:
+#   1. ARGUS_HOST env var override (e.g. export ARGUS_HOST=arch-linux)
+#   2. env_marker match + uname_match  (e.g. CI=true selects ubuntu-ci)
+#   3. uname_match only
+#   4. default_host fallback
+#   5. RuntimeError with set ARGUS_HOST=<id> hint
+
+schema_version = 1
+# default_host = "arch-linux"   # uncomment if uname detection is ambiguous
+
+# ── macOS Apple Silicon ─────────────────────────────────────────────────────
+[hosts.mac-arm]
+uname_match = { sysname = "Darwin", machine = "arm64" }
+
+  [hosts.mac-arm.toolchains.android-ndk]
+  ndk_home  = "/opt/homebrew/share/android-ndk"
+  host_tag  = "darwin-x86_64"
+  api_level = 21
+
+# ── Arch Linux / generic x86_64 Linux ───────────────────────────────────────
+[hosts.arch-linux]
+uname_match = { sysname = "Linux", machine = "x86_64" }
+
+  [hosts.arch-linux.toolchains.android-ndk]
+  ndk_home  = "/opt/android-ndk"
+  host_tag  = "linux-x86_64"
+  api_level = 21
+
+  # Future: Raspberry Pi cross-SDK (uncomment and adjust paths to enable)
+  # [hosts.arch-linux.toolchains.rpi-cross-sdk]
+  # sysroot      = "${HOME}/cross/rpi-sysroot"
+  # bin_prefix   = "/usr/bin/aarch64-linux-gnu-"
+  # cargo_target = "aarch64-unknown-linux-gnu"
+  # env          = { PKG_CONFIG_SYSROOT_DIR = "${HOME}/cross/rpi-sysroot" }
+
+  # Jetson Orin cross-compile (host → aarch64-linux-gnu)
+  # Requires: sudo pacman -S aarch64-linux-gnu-gcc  (or equivalent)
+  [hosts.arch-linux.toolchains.jetson-cross]
+  bin_prefix   = "/usr/bin/aarch64-linux-gnu-"
+  cargo_target = "aarch64-unknown-linux-gnu"
+
+# ── Ubuntu CI (GitHub Actions / self-hosted runner) ─────────────────────────
+[hosts.ubuntu-ci]
+uname_match = { sysname = "Linux", machine = "x86_64" }
+env_marker  = "CI"   # CI=true distinguishes this from arch-linux
+
+  [hosts.ubuntu-ci.toolchains.android-ndk]
+  ndk_home  = "${ANDROID_NDK_HOME}"   # set by GitHub Actions android-ndk action
+  host_tag  = "linux-x86_64"
+  api_level = 21

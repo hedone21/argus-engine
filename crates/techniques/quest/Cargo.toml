@@ -1,0 +1,15 @@
+[package]
+name = "quest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Quest read technique crate — query-aware selective KV read.
+# page 별 K channel min/max 로 query 와의 상한 내적을 추정해 top-k page 만 attention 에서 읽는다
+# (ICML'24, arXiv 2406.10774). read 축 확장(4번째 plugin 표면 = KVReadStage)의 첫 빌트인.
+# stage 축 확장은 `technique-api` 에만 의존한다(엔진/타 축 crate 미참조 = 가산 확장 비용의 증거).
+[dependencies]
+technique-api = { path = "../../technique-api" }
+linkme = "0.3"

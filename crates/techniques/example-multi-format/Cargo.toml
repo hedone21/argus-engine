@@ -1,0 +1,22 @@
+[package]
+name = "example-multi-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# GATE-C v3: 한 `.so` 에 다수 format(quant 패밀리) — register_kv_format! 다회 호출 +
+# export_plugin! 1회. cdylib = dlopen `.so`(register_kv_formats_v2 봉투에 N개 vtable).
+crate-type = ["cdylib", "rlib"]
+
+# 멀티-format 예제 — `technique-api` + `linkme` 만 의존(엔진 force-link 안 함). 한 plugin `.so` 가
+# **서로 다른 descriptor** 의 format 2종을 싣는 vehicle(인덱스-swap·이름↔vtable
+# 미스바인딩 검출용 — 동일 desc 면 못 잡음).
+[dependencies]
+technique-api = { path = "../../technique-api" }
+linkme = "0.3"
+
+[features]
+plugin-cdylib = []

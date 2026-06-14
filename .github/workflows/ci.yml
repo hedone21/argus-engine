@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Daily, so newly-published advisories surface in the cargo-deny job.
+    - cron: "0 6 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace -- -D warnings
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: default
+            args: ""
+          - label: +resilience
+            args: "--features resilience"
+          - label: +caote
+            args: "--features caote"
+          - label: +rkv
+            args: "--features rkv"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: build (${{ matrix.label }})
+        run: cargo build --release --bin argus_cli ${{ matrix.args }}
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
+      - uses: Swatinem/rust-cache@v2
+      # Host unit + integration tests. CI runners have no GPU: OpenCL-backed tests
+      # self-skip when no platform initializes, and model-fixture tests skip when
+      # the model files are absent. `--no-fail-fast` surfaces every failure at once.
+      - run: cargo test --workspace --no-fail-fast
+
+  docs-lint:
+    # Public-facing docs/comments must be English. Scope grows as the i18n burndown
+    # progresses; it currently covers the fully-translated surfaces.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No Korean under crates/technique-api (public extension API)
+        run: |
+          if grep -rnP '[\x{AC00}-\x{D7A3}]' crates/technique-api; then
+            echo "::error::Korean found under crates/technique-api — the public API surface must be English"
+            exit 1
+          fi
+      - name: CONTEXT.md is English (Korean lives in CONTEXT.ko.md)
+        run: |
+          if grep -nP '[\x{AC00}-\x{D7A3}]' CONTEXT.md | grep -vF '](CONTEXT.ko.md)'; then
+            echo "::error::Korean found in CONTEXT.md outside the language switcher — keep the canonical glossary English"
+            exit 1
+          fi
+
+  cargo-deny:
+    # Enforce deny.toml (advisories / licenses / bans / sources). Also runs on the
+    # daily schedule so new RUSTSEC advisories fail CI even without a code change.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          log-level: warn

@@ -1,0 +1,19 @@
+[package]
+name = "example-rollback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# GATE-C v3: per-`.so` 원자성 롤백 vehicle. 봉투에 [q4_0(빌트인 충돌), rollback_ok]
+# 2종 → try_register_format pass1 이 q4_0 충돌로 bail → rollback_ok 는 push 안 됨(부분 등록 롤백).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+technique-api = { path = "../../technique-api" }
+linkme = "0.3"
+
+[features]
+plugin-cdylib = []

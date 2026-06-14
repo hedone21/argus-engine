@@ -1,0 +1,108 @@
+# devices.toml.example — device registry template for scripts/run_device.py
+#
+# Usage:
+#   cp devices.toml.example devices.toml   # then edit for your devices
+#   OR
+#   python scripts/device_registry.py discover   # auto-probe attached adb devices
+#
+# devices.toml is gitignored (each contributor keeps their own). Only this
+# example is committed.
+#
+# Schema:
+#   [devices.<id>]
+#   name               = "Human-readable name"
+#   [devices.<id>.connection]
+#   type               = "local" | "adb" | "ssh"   (required)
+#   serial             = ""                          (adb only; empty = default device)
+#   host, user, port   = ...                         (ssh only)
+#   [devices.<id>.build]
+#   target             = ""                          (cargo target triple; empty = native)
+#   toolchain          = ""                          (toolchain key in hosts.toml)
+#   binary_dir         = ""                          (relative path to built binaries)
+#   features           = [...]                        (cargo features; default_features toggles --no-default-features)
+#   [devices.<id>.paths]
+#   work_dir           = ""                          (remote working directory; required)
+#   model_dir          = ""                          (model weights directory)
+#   eval_dir           = ""                          (evaluation prompt files)
+#   lib_dir            = ""                          (LD_LIBRARY_PATH on device)
+#   [devices.<id>.capabilities]
+#   arch, gpu, os, ...                                (informational metadata)
+#   [devices.<id>.manager]
+#   transport          = ""                          (manager IPC transport)
+#   thermal_zone_types = []                          (thermal zone type filters)
+
+# ── Local host (build + run natively) ───────────────────────────────────────
+[devices.host]
+name = "Local host"
+
+[devices.host.connection]
+type = "local"
+
+[devices.host.build]
+target = ""
+binary_dir = "target/release"
+
+[devices.host.paths]
+work_dir = "/tmp/argus"
+model_dir = "models/qwen2.5-1.5b"
+
+[devices.host.capabilities]
+arch = "x86_64"
+gpu = "none"
+
+# ── Android phone over adb (Adreno GPU, OpenCL production path) ──────────────
+[devices.android]
+name = "Android phone"
+
+[devices.android.connection]
+type = "adb"
+serial = ""   # leave empty for the default adb device, or set your device serial
+
+[devices.android.build]
+target = "aarch64-linux-android"
+toolchain = "android-ndk"   # defined in hosts.toml
+binary_dir = "target/aarch64-linux-android/release"
+features = ["opencl"]
+default_features = false
+
+[devices.android.paths]
+work_dir = "/data/local/tmp"
+model_dir = "/data/local/tmp/models/qwen2.5-1.5b"
+eval_dir = "/data/local/tmp/argus/eval"
+lib_dir = "/data/local/tmp"   # where libOpenCL.so is pushed
+
+[devices.android.capabilities]
+arch = "aarch64"
+gpu = "adreno"
+os = "android"
+
+[devices.android.manager]
+transport = "unix"
+thermal_zone_types = ["cpu-0-0-usr"]
+
+# ── NVIDIA Jetson over ssh (CUDA embedded UMA) ──────────────────────────────
+[devices.jetson]
+name = "NVIDIA Jetson"
+
+[devices.jetson.connection]
+type = "ssh"
+host = "jetson.local"   # hostname or IP of your device
+user = "nvidia"
+port = 22
+
+[devices.jetson.build]
+target = "aarch64-unknown-linux-gnu"
+binary_dir = "target/aarch64-unknown-linux-gnu/release"
+features = ["cuda-embedded", "resilience"]
+default_features = false
+
+[devices.jetson.paths]
+work_dir = "/home/nvidia/argus"
+model_dir = "/home/nvidia/argus/models/llama3.2-1b"
+eval_dir = "/home/nvidia/argus/eval"
+lib_dir = "/usr/local/cuda/lib64"
+
+[devices.jetson.capabilities]
+arch = "aarch64"
+gpu = "cuda"
+os = "linux"

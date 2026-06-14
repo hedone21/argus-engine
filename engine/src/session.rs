@@ -1,0 +1,41 @@
+pub mod a2sf_dump;
+pub mod assembly;
+pub mod bin_setup;
+pub mod chat;
+pub mod chat_ipc;
+pub mod chat_template;
+pub mod cli;
+pub mod command_dispatcher;
+pub mod decode_loop;
+pub mod defaults;
+pub mod dump_importance;
+pub mod eval;
+pub mod eval_setup;
+pub mod experiment;
+pub mod experiment_run;
+pub mod forward;
+pub mod head_concentration;
+pub mod init;
+pub mod local_pressure;
+pub mod pipeline_registry;
+pub mod plugin_dispatch;
+pub mod ppl;
+pub mod prefix_cache;
+pub mod qcf_runtime;
+pub mod resilience_adapter;
+pub mod resilience_init;
+pub mod samplers;
+pub mod standard_happy;
+pub mod swap_runtime;
+
+pub use crate::inference::sampling::{GreedySampler, StepCtx, TokenSampler};
+pub use assembly::{build_standard_loop, is_standard_happy_path};
+pub use bin_setup::build_inference_ctx;
+pub use command_dispatcher::{CommandDispatcher, CommandSource, EngineReport, LoopControl};
+pub use decode_loop::{
+    DecodeLoop, DecodeLoopBuilder, DecodeResult, HasForward, NoForward, StopReason,
+};
+pub use defaults::NoOpCommandSource;
+pub use experiment_run::{run_experiment_path, run_experiment_schedule_path};
+pub use forward::Forward;
+pub use samplers::RepetitionPenaltySampler;
