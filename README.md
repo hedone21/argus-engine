@@ -12,18 +12,21 @@ the KV-cache precision format with a flag, no engine rebuild.**
 
 Argus is an on-device LLM inference engine in Rust for Android/Linux ARM64 SoCs: NEON
 CPU and Adreno-OpenCL / CUDA GPU backends, a zero-copy UMA memory path, and a plugin
-surface for KV-cache and precision research.
+surface for KV-cache and precision work. Argus started as a research vehicle, but its
+main goal is to be easy to extend, flexible to configure, and simple to add new
+techniques to without touching the engine core.
 
 > **Status: early.** Adreno / ARM64 is the primary tested path. The shipped `argus-cli`
 > does single-prompt text generation (prompt in, continuation + a `Decode: X ms/tok`
 > line out), can load a KV-cache precision-format plugin (`--kv-format`), and runs
 > score-free KV-cache eviction (Sliding / StreamingLLM + `--load-plugin` stages,
 > KV-fill-triggered). Score-based eviction (H2O / D2O), KIVI KV quantization, tensor
-> partition, and runtime weight swap are implemented and tested, but in v0 they run
-> through the `argus-bench` / `argus-eval` binaries rather than `argus-cli`. A multi-turn
-> chat server (`argus-chat`, OpenAI-compatible HTTP API) ships alongside the CLI
-> (`--interactive` REPL streams tokens as they generate); `--profile` is planned for v1.
-> The [Roadmap](#roadmap) table says where each feature runs today.
+> partition, and runtime weight swap are implemented and tested, but run through the
+> `argus-bench` / `argus-eval` binaries rather than `argus-cli`. A multi-turn chat server
+> (`argus-chat`, OpenAI-compatible HTTP API) ships alongside the CLI: it serves all three
+> KV modes (Standard / KIVI / Offload) with manager-integrated resilience, and its
+> `--interactive` REPL streams tokens as they generate. `argus-cli` does not accept
+> `--profile`; per-op profiling is read from `argus-bench`.
 
 ## Demo
 
@@ -81,7 +84,7 @@ Step 4 is the precision format plugin path: a loaded `.so` reaches the real deco
 path on `argus-cli` today. Score-free KV-cache eviction stages (`eviction
 sliding|streaming`, plus `--load-plugin` stages) also run on `argus-cli`; score-based
 H2O / D2O (which need the attention-score accumulator) and KIVI precision packing run
-through `argus-bench` / `argus-eval` in v0; see the [Roadmap](#roadmap).
+through `argus-bench` / `argus-eval`.
 
 ## What you can do
 
@@ -96,7 +99,7 @@ through `argus-bench` / `argus-eval` in v0; see the [Roadmap](#roadmap).
   (dtype auto-detected); Safetensors F16/BF16 convert on load.
 
 **Memory-adaptive KV cache** *(score-free eviction runs on `argus-cli`; score-based
-H2O/D2O + KIVI via `argus-bench` / `argus-eval` in v0; see [Roadmap](#roadmap))*
+H2O/D2O + KIVI via `argus-bench` / `argus-eval`)*
 
 - **Eviction stages** — Sliding Window / H2O / H2O+ / D2O (merge compensation) /
   StreamingLLM, as composable `KVCacheStage` plugins. Sliding / StreamingLLM and
@@ -120,34 +123,11 @@ H2O/D2O + KIVI via `argus-bench` / `argus-eval` in v0; see [Roadmap](#roadmap))*
 Argus reuses kernels adapted from [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)
 (see [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES.md)) and complements it. Where llama.cpp
 is portable inference across many platforms, Argus is tuned for Adreno / ARM64 UMA edge
-devices and adds a zero-compile plugin surface for KV-cache and precision research: swap
-an eviction stage or a KV precision format by name (**stage** ⊥ **format** ⊥ **hardware**),
-with no engine recompile. To prototype KV-cache or quantization techniques on a
-phone-class GPU, that extension surface is the reason to reach for Argus.
-
-## Roadmap
-
-Where each capability runs today (v0). The **v1 plan** column marks features slated to
-reach `argus-cli` (or ship as a new binary) next.
-
-| Capability | `argus-cli` | `argus-bench` / `argus-eval` | v1 plan |
-|---|:---:|:---:|:---:|
-| Single-prompt generation (CPU / OpenCL / CUDA) | ✅ | ✅ | |
-| Sampling (temperature / top-p / top-k / rep-penalty) | ✅ | ✅ | |
-| KV-cache precision-format plugin (`--kv-format`, `--read-stage`) | ✅ | ✅ | |
-| Prefix-cache save / restore | ✅ | | |
-| KV-cache eviction — score-free (Sliding / StreamingLLM / `--load-plugin` stage) | ✅ | ✅ | |
-| KV-cache eviction — score-based (H2O / H2O+ / D2O) | | ✅ | ✅ |
-| KIVI KV quantization (`--kv-mode kivi`) | | ✅ | ✅ |
-| Tensor partition (FFN split across GPU + CPU) | | ✅ | ✅ |
-| Runtime weight swap | | ✅ | ✅ |
-| Per-op profiling (`--profile`) | | | ✅ |
-| Interactive chat REPL | | | ✅ |
-
-> Multi-turn chat now ships as `argus-chat`, an OpenAI-compatible HTTP server
-> (`POST /v1/chat/completions`, streaming + non-streaming) supporting all three KV modes
-> (Standard / KIVI / Offload) and manager-integrated resilience. `--interactive` runs a
-> local stdin REPL instead.
+devices and adds a zero-compile plugin surface built to be easy to extend and configure:
+swap an eviction stage or a KV precision format by name (**stage** ⊥ **format** ⊥
+**hardware**), or drop in a new technique as a self-registering crate, with no engine-core
+edits. That extension surface, first built for KV-cache and precision research, is the
+reason to reach for Argus.
 
 ## Supported models & hardware
 
@@ -255,9 +235,8 @@ for the device-runner and evaluation tooling.
 > and adds `--features cuda`. Building with no GPU backend at all is not currently
 > supported.
 >
-> The `profile` feature compiles the per-op instrumentation, but the shipped v0
-> `argus-cli` rejects the `--profile` flag (profiling output is read from `argus-bench`);
-> CLI profiling is planned for v1.
+> The `profile` feature compiles the per-op instrumentation, but the shipped `argus-cli`
+> rejects the `--profile` flag; profiling output is read from `argus-bench`.
 
 ## Extending Argus
 

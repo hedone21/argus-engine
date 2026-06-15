@@ -11,17 +11,19 @@
 (precision) 포맷은 엔진을 다시 빌드하지 않고 플래그 하나로 바꿉니다.**
 
 Argus는 Android·Linux ARM64 SoC를 겨냥한 Rust 온디바이스 LLM 추론 엔진입니다. NEON CPU와
-Adreno-OpenCL·CUDA GPU 백엔드, zero-copy UMA 메모리 경로, KV-cache·precision 연구를 위한
-플러그인 확장 표면을 갖췄습니다.
+Adreno-OpenCL·CUDA GPU 백엔드, zero-copy UMA 메모리 경로, KV-cache·precision 작업을 위한
+플러그인 확장 표면을 갖췄습니다. Argus는 연구용으로 시작했지만, 주된 목표는 쉽게 확장하고
+유연하게 설정하며 엔진 코어를 건드리지 않고 기능을 간단히 더하는 것입니다.
 
 > **상태: 초기 단계.** 주로 검증한 경로는 Adreno·ARM64입니다. 출하되는 `argus-cli`는 단일
-> 프롬프트 생성을 합니다. 프롬프트를 넣으면 이어지는 텍스트와 `Decode: X ms/tok` 라인을
-> 출력하고, KV-cache 정밀도 포맷 플러그인(`--kv-format`)도 여기서 로드할 수 있습니다.
-> KV-cache **eviction stage**(H2O·D2O·StreamingLLM), **KIVI** KV 양자화, tensor partition,
-> 런타임 weight swap은 이미 구현하고 검증했지만, v0에서는 `argus-cli`가 아니라 `argus-bench`·
-> `argus-eval`로 돌립니다. 멀티턴 **chat** 서버(`argus-chat`, OpenAI 호환 HTTP API)는 CLI와
-> 함께 출하됩니다. 이들을 `argus-cli`에 붙이는 작업과 `--profile`은 v1에서 제공할 예정입니다.
-> 어떤 기능이 지금 어디서 도는지는 [로드맵](#로드맵) 표에 정리해 두었습니다.
+> 프롬프트 생성을 하고(프롬프트를 넣으면 이어지는 텍스트와 `Decode: X ms/tok` 라인을 출력),
+> KV-cache 정밀도 포맷 플러그인(`--kv-format`)을 로드하며, score-free KV-cache eviction
+> (Sliding·StreamingLLM + `--load-plugin` stage, KV-fill 트리거)을 돌립니다. score-based
+> eviction(H2O·D2O), **KIVI** KV 양자화, tensor partition, 런타임 weight swap은 이미 구현·검증했지만
+> `argus-cli`가 아니라 `argus-bench`·`argus-eval`로 돌립니다. 멀티턴 chat 서버(`argus-chat`,
+> OpenAI 호환 HTTP API)도 CLI와 함께 출하됩니다. 세 가지 KV 모드(Standard·KIVI·Offload)와 manager
+> 연동 resilience를 지원하고, `--interactive` REPL은 토큰을 생성되는 대로 스트리밍합니다. `argus-cli`는
+> `--profile`을 받지 않고, 연산별 프로파일링은 `argus-bench`에서 읽습니다.
 
 ## 데모
 
@@ -73,13 +75,13 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
 GGUF·AUF 변환은 [설치 / 소스에서 빌드](#설치--소스에서-빌드)에 있습니다.
 
 4번이 정밀도 format 플러그인 경로입니다. 로드한 `.so`가 지금도 `argus-cli`의 실제 decode
-경로까지 닿습니다. KV-cache eviction 플러그인(`eviction <policy>` 서브커맨드, 예:
-`eviction h2o`; 커스텀 stage는 `eviction plugin --name <name>`)과 KIVI 정밀도 패킹은 v0에서
-`argus-bench`·`argus-eval`로 돌립니다. 자세한 내용은 [로드맵](#로드맵)을 보세요.
+경로까지 닿습니다. score-free KV-cache eviction stage(`eviction sliding|streaming`,
+그리고 `--load-plugin` stage)도 `argus-cli`에서 돌고, attention 점수 누산기가 필요한 score-based
+H2O·D2O와 KIVI 정밀도 패킹은 `argus-bench`·`argus-eval`로 돌립니다.
 
 ## 무엇을 할 수 있나
 
-**온디바이스 & 빠름**
+**온디바이스 & 최적화**
 
 - **ARM64 최적화** — Android·Linux ARM64 SoC용 NEON + dotprod 인트린식, x86_64 호스트에서는
   AVX2 + FMA.
@@ -89,11 +91,12 @@ GGUF·AUF 변환은 [설치 / 소스에서 빌드](#설치--소스에서-빌드)
 - **양자화 가중치** — Q4_0·Q8_0 블록 양자화, F16·BF16. GGUF는 바로 로드하고(dtype 자동 감지),
   Safetensors F16·BF16은 로드할 때 변환합니다.
 
-**메모리 적응형 KV cache** *(v0에서는 `argus-bench`·`argus-eval`로 동작, [로드맵](#로드맵)
-참고)*
+**메모리 적응형 KV cache** *(score-free eviction은 `argus-cli`에서, score-based H2O/D2O와
+KIVI는 `argus-bench`·`argus-eval`에서 동작)*
 
 - **Eviction stage** — Sliding Window·H2O·H2O+·D2O(merge 보상)·StreamingLLM을 조합할 수 있는
-  `KVCacheStage` 플러그인.
+  `KVCacheStage` 플러그인. Sliding·StreamingLLM과 `--load-plugin` stage는 `argus-cli`에서
+  돕니다(단일 프롬프트, KV-fill 트리거).
 - **KIVI KV 양자화** — 캐시 메모리를 줄이는 동적 Q4·Q8 KV 패킹.
 - **Adaptive resilience** *(선택, `resilience` 기능 + `argus-manager`)* — 메모리·발열 압력에
   맞춰 런타임에 적응(eviction, 백엔드 전환, throttle).
@@ -112,32 +115,10 @@ GGUF·AUF 변환은 [설치 / 소스에서 빌드](#설치--소스에서-빌드)
 Argus는 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)에서 가져온 커널을
 재사용하며([THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES.md) 참고), llama.cpp를 대체하지 않고
 보완합니다. llama.cpp가 여러 플랫폼을 폭넓게 지원하는 이식성 위주라면, Argus는 Adreno·ARM64
-UMA 엣지 기기에 맞춰 튜닝하고 그 위에 KV-cache·precision 연구용 zero-compile 플러그인
-표면을 얹습니다. eviction stage나 KV 정밀도 포맷을 이름만 바꿔 끼우면 되고(**stage** ⊥
-**format** ⊥ **hardware**) 엔진을 다시 컴파일하지 않습니다. 휴대폰급 GPU에서 KV-cache나 양자화
-기법을 빠르게 실험하고 싶을 때, 이 확장 표면이 Argus를 고를 이유입니다.
-
-## 로드맵
-
-각 기능이 지금(v0) 어디서 도는지 정리했습니다. **v1 예정** 열은 `argus-cli`에
-(또는 새 바이너리로) 들어올 기능입니다.
-
-| 기능 | `argus-cli` | `argus-bench` / `argus-eval` | v1 예정 |
-|---|:---:|:---:|:---:|
-| 단일 프롬프트 생성 (CPU / OpenCL / CUDA) | ✅ | ✅ | |
-| 샘플링 (temperature / top-p / top-k / rep-penalty) | ✅ | ✅ | |
-| KV-cache 정밀도 포맷 플러그인 (`--kv-format`, `--read-stage`) | ✅ | ✅ | |
-| Prefix-cache 저장 / 복원 | ✅ | | |
-| KV-cache eviction stage (Sliding / H2O / H2O+ / D2O / StreamingLLM) | | ✅ | ✅ |
-| KIVI KV 양자화 (`--kv-mode kivi`) | | ✅ | ✅ |
-| Tensor partition (FFN을 GPU + CPU로 분할) | | ✅ | ✅ |
-| 런타임 weight swap | | ✅ | ✅ |
-| 연산별 프로파일링 (`--profile`) | | | ✅ |
-| 대화형 chat REPL | | | ✅ |
-
-> 멀티턴 chat은 이제 `argus-chat`(OpenAI 호환 HTTP 서버, `POST /v1/chat/completions`,
-> 스트리밍 + 비스트리밍)으로 출하됩니다. 세 가지 KV 모드(Standard / KIVI / Offload)와
-> manager 연동 resilience를 지원하며, `--interactive`로 stdin REPL도 됩니다.
+UMA 엣지 기기에 맞춰 튜닝하고, 그 위에 쉽게 확장하고 설정하도록 만든 zero-compile 플러그인
+표면을 얹습니다. eviction stage나 KV 정밀도 포맷을 이름만 바꿔 끼우거나, 새 기법을 스스로
+등록하는 크레이트로 떨궈 넣으면 되고(**stage** ⊥ **format** ⊥ **hardware**) 엔진 코어는
+건드리지 않습니다. KV-cache·precision 연구에서 출발한 이 확장 표면이 Argus를 고를 이유입니다.
 
 ## 지원 모델 · 하드웨어
 
@@ -167,7 +148,9 @@ GGUF를 권장합니다(dtype 자동 감지, 로드 시 변환 없음). Safetens
 
 ## 사전 요구사항
 
-- **Rust** (stable): `rustup install stable`.
+- **Rust ≥ 1.94** (stable, edition 2024): `rustup update stable`. 첫 `cargo build`에서
+  `package ... requires rustc 1.94` 에러가 나면 stable 툴체인이 오래된 것뿐이니
+  `rustup update`로 해결됩니다.
 - **OpenCL 헤더** — 기본 빌드는 `opencl` 기능을 켭니다. Linux에서는
   `sudo apt-get install ocl-icd-opencl-dev`. macOS는 OpenCL 프레임워크를 기본 제공합니다.
   빌드에는 GPU가 *필요하지 않고*, GPU 백엔드를 실행할 때만 필요합니다.
@@ -240,8 +223,8 @@ python scripts/run_device.py -d android argus-cli \
 > 위 CUDA 빌드는 `--no-default-features`로 기본 `opencl`을 빼고 `--features cuda`를 더한
 > 것입니다. GPU 백엔드를 하나도 켜지 않는 빌드는 아직 지원하지 않습니다.
 >
-> `profile` 기능은 연산별 계측을 컴파일하지만, 출하되는 v0 `argus-cli`는 `--profile` 플래그를
-> 거부합니다(프로파일 출력은 `argus-bench`에서 봅니다). CLI 프로파일링은 v1 예정입니다.
+> `profile` 기능은 연산별 계측을 컴파일하지만, 출하되는 `argus-cli`는 `--profile` 플래그를
+> 거부합니다(프로파일 출력은 `argus-bench`에서 봅니다).
 
 ## Argus 확장
 
@@ -324,8 +307,9 @@ cargo build --release -p my-kv-format --features plugin-cdylib
 - **stage**(eviction/merge 종류) — `KVCacheStage::plan(&ctx) -> Option<KVCachePlan>`을 구현해 어떤
   토큰을 `keep`·`merge`할지 돌려주고, `register_kv_stage!`로 등록한 뒤 `eviction plugin --name
   <name>` 서브커맨드(빌트인: `eviction h2o|d2o|streaming|sliding`)로 고릅니다. 템플릿은
-  `example-keep-recent`. v0에서 stage는 `argus-cli`가 아니라
-  `argus-bench`·`argus-eval`로 돕니다.
+  `example-keep-recent`. *score-free stage는 `argus-cli`에서(`--load-plugin <.so> eviction
+  plugin --name <name>`, KV-fill 트리거), attention 점수가 필요한 score-based stage는
+  `argus-bench`·`argus-eval`로 돕니다.*
 - stage의 read 종류(쿼리 인식 읽기) — `KVReadStage`를 구현하고 `--read-stage <name>`으로 고릅니다.
   정적 링크 전용이고 `argus-cli`에서 돕니다. 참고는 `quest` 빌트인.
 
