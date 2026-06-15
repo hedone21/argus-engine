@@ -24,7 +24,7 @@ use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use super::{EvictionPolicy, H2OPolicy, SlidingWindowPolicy, StreamingLLMPolicy};
+use super::{EvictionPolicy, H2OPolicy, SlidingWindowPolicy};
 use crate::buffer::DType;
 use crate::kv::d2o_handler::{D2OConfig, D2OStage, dequantize_k, dequantize_v};
 use crate::kv::kv_cache::KVCache;
@@ -35,6 +35,11 @@ use crate::kv::kv_cache::KVCache;
 // 경유 value-aware 동작). feature OFF = 미링크 + `eviction caote` 서브커맨드 부재(clap reject).
 #[cfg(feature = "caote")]
 use caote as _;
+
+// StreamingLLM production force-link. Extracted from the engine core into the `streaming-llm`
+// technique crate; the dep declaration alone leaves the unreferenced rlib out of the link, so
+// this one line makes `find_stage("streaming")` visible (the `#[distributed_slice]` registration).
+use streaming_llm as _;
 
 /// 기존 [`EvictionPolicy`](in-place `evict*` + `plan_keep`)를 plan-returning [`KVCacheStage`] 로 노출.
 ///
@@ -395,15 +400,8 @@ static SLIDING_STAGE: KVCacheStageReg = KVCacheStageReg {
     },
 };
 
-#[distributed_slice(KV_CACHE_STAGES)]
-static STREAMING_STAGE: KVCacheStageReg = KVCacheStageReg {
-    name: "streaming",
-    make: |p: StageParams| {
-        Box::new(EvictionPolicyAsStage::new(Box::new(
-            StreamingLLMPolicy::new(p.sink_size, p.streaming_window),
-        )))
-    },
-};
+// `streaming` is registered by the out-of-tree `streaming-llm` technique crate (force-linked
+// above via `use streaming_llm as _;`), not here — extracted from the engine core.
 
 #[distributed_slice(KV_CACHE_STAGES)]
 static H2O_STAGE: KVCacheStageReg = KVCacheStageReg {

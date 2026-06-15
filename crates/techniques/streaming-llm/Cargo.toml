@@ -1,0 +1,15 @@
+[package]
+name = "streaming-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# StreamingLLM technique crate — attention-sink + recent-window KV eviction.
+# Extracted from the engine core (the caote/quest precedent): a stage-axis extension
+# depends only on `argus-extension-api` + `linkme` (no engine/other-axis crate reference =
+# proof of additive extension cost). Force-linked via one `use streaming_llm as _;`.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

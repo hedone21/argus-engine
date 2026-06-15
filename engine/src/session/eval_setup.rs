@@ -39,7 +39,6 @@ use crate::kv::eviction::h2o::H2OPolicy;
 use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
 use crate::kv::eviction::no_eviction::NoEvictionPolicy;
 use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
-use crate::kv::eviction::streaming_llm::StreamingLLMPolicy;
 use crate::kv::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor, SystemMonitor};
@@ -232,16 +231,9 @@ fn build_eval_cache_manager(
                 args.eviction_window(),
                 actual_protected_prefix,
             )),
-            "streaming" => {
-                let window = if args.streaming_window() > 0 {
-                    args.streaming_window()
-                } else if args.kv_budget() > 0 {
-                    args.kv_budget().saturating_sub(args.sink_size())
-                } else {
-                    args.eviction_window()
-                };
-                Box::new(StreamingLLMPolicy::new(args.sink_size(), window))
-            }
+            // "streaming" is no longer a built-in match arm — it falls through to the generic
+            // `name =>` path below (make_stage("streaming") → the streaming-llm plugin),
+            // which derives streaming_window identically.
             "h2o" => Box::new(H2OPolicy::new(
                 args.h2o_keep_ratio(),
                 actual_protected_prefix,

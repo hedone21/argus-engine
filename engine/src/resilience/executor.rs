@@ -487,7 +487,7 @@ impl CommandExecutor {
                 window_size,
             } => {
                 let evict = EvictPlan {
-                    target_ratio: 0.0, // StreamingLLMPolicy는 target_len 무시
+                    target_ratio: 0.0, // streaming stage ignores target_len (uses sink+window)
                     level: ResourceLevel::Critical,
                     method: EvictMethod::Streaming,
                     streaming_params: Some(StreamingParams {

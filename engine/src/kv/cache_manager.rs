@@ -1360,10 +1360,20 @@ mod tests {
 
     #[test]
     fn test_resilience_streaming_keeps_sink_plus_window() {
-        use crate::kv::eviction::StreamingLLMPolicy;
+        use crate::kv::eviction::stage_registry::{StageBackedPolicy, make_stage};
 
-        // Streaming with sink=4, window=20 should keep exactly 24 tokens.
-        let policy = StreamingLLMPolicy::new(4, 20);
+        // Streaming with sink=4, window=20 should keep exactly 24 tokens. StreamingLLM was
+        // extracted to the streaming-llm plugin, so build the stage by registry name and wrap
+        // it as an EvictionPolicy (the same StageBackedPolicy seam production uses).
+        let params = argus_extension_api::StageParams {
+            eviction_window: 0,
+            protected_prefix: 0,
+            keep_ratio: 0.0,
+            sink_size: 4,
+            streaming_window: 20,
+        };
+        let stage = make_stage("streaming", &params).expect("streaming stage registered");
+        let policy = StageBackedPolicy::new(stage);
         let cm = CacheManager::new(
             Box::new(NoEvictionPolicy::new()),
             Box::new(MockMonitor {

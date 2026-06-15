@@ -82,7 +82,8 @@ pub mod method;
 pub mod no_eviction;
 pub mod sliding_window;
 pub mod stage_registry;
-pub mod streaming_llm;
+// `streaming_llm` was extracted to the out-of-tree `streaming-llm` technique crate
+// (registers "streaming" via linkme; force-linked in stage_registry.rs).
 
 #[cfg(test)]
 mod compact_parity;
@@ -92,4 +93,3 @@ pub use h2o_plus::H2OPlusPolicy;
 pub use method::EvictMethod;
 pub use no_eviction::NoEvictionPolicy;
 pub use sliding_window::SlidingWindowPolicy;
-pub use streaming_llm::StreamingLLMPolicy;
