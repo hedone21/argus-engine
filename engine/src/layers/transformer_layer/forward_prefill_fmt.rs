@@ -1,7 +1,6 @@
 //! `forward_prefill_fmt` — `forward_prefill` 의 KVCacheFormat trait-object fork (Phase α-K substep ①-b).
 //!
-//! 설계 SSOT: `.agent/todos/design_alpha_k_1b_cut_2026_06_04.md` + roadmap `roadmap_alpha_k_bc_completion`
-//! Step 1 ①-b. (갈래 2: Generic → trait object). `forward_gen_fmt`(decode)의 prefill 짝.
+//! 갈래 2 (Generic → trait object): `forward_gen_fmt`(decode)의 prefill 짝.
 //!
 //! **branch-by-abstraction, additive**: 기존 `forward_prefill<C: KVCacheOps>`(forward.rs:41)를 1바이트도
 //! 안 건드린다. 본 fork 는 **prefill PrefillWorkspace 라이브 경로**(forward.rs:114-787 의 happy-path:

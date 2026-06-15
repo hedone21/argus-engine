@@ -400,16 +400,16 @@ fn empty_batch_ordering_invariants_hold() {
     );
 }
 
-/// synchronize と invalidate の呼び出し順序が仕様通りであることを、
-/// OrderingMockBackend のティック値で検証するシナリオ。
+/// synchronize와 invalidate의 호출 순서가 명세대로인지를
+/// OrderingMockBackend의 tick 값으로 검증하는 시나리오.
 ///
-/// このテストは "synchronize tick < invalidate tick" という不変式を
-/// コード実行パス上で確認するため、実際に swap が発生する必要がある。
-/// 現在のホスト環境では SecondaryMmap フィクスチャなしで swap を
-/// 実行できないため、このシナリオは TODO: future device fixture で実施。
+/// 이 테스트는 "synchronize tick < invalidate tick"이라는 불변식을
+/// 코드 실행 경로 상에서 확인하기 위해 실제로 swap이 발생해야 한다.
+/// 현재 호스트 환경에서는 SecondaryMmap 픽스처 없이 swap을
+/// 실행할 수 없으므로, 이 시나리오는 TODO: future device fixture에서 수행.
 ///
-/// 代替として、`execute_on_slots` がスキップパスで
-/// synchronize/invalidate を呼ばないことを確認する。
+/// 대안으로, `execute_on_slots`가 skip 경로에서
+/// synchronize/invalidate를 호출하지 않는 것을 확인한다.
 #[test]
 fn synchronize_tick_precedes_invalidate_tick_when_both_called() {
     // 현재 호스트에서 real swap path를 트리거할 수 없으므로,

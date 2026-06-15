@@ -26,6 +26,8 @@ engine/kernels/kernels
 **/HANDOFF*.md
 *.handoff.md
 .cursor/
+# Local scratch / analysis notes
+/experiments/
 
 # Python
 __pycache__/
@@ -34,3 +36,21 @@ __pycache__/
 # Local device/host config (commit only the .example templates)
 /hosts.toml
 /devices.toml
+
+# Model weights (never commit — large; fetch per the demo/quickstart instructions)
+*.gguf
+*.safetensors
+*.bin
+/models/
+
+# Profiling / debug output
+perf.data
+perf.data.*
+*.folded
+flamegraph.svg
+core
+core.*
+
+# Standalone plugin / build outputs copied outside target/
+*.so
+*.dylib

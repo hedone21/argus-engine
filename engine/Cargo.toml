@@ -9,6 +9,9 @@ repository.workspace = true
 authors.workspace = true
 keywords = ["llm", "inference", "on-device", "quantization", "opencl"]
 categories = ["science", "command-line-utilities"]
+# Not published to crates.io: depends on the `argus-shared` git dependency and on
+# path-only technique crates, which crates.io rejects. Source-only for now.
+publish = false
 # Bins are declared explicitly below so the user-facing `argus-*` family ships with
 # hyphenated names (`argus-cli`, not `argus_cli`). Disable auto-discovery to avoid
 # duplicate targets for the same `src/bin/*.rs` file.

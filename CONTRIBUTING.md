@@ -11,6 +11,9 @@ cargo fmt --all
 cargo clippy --workspace -- -D warnings
 ```
 
+Requires **Rust ≥ 1.94** (edition 2024); run `rustup update stable` if the first build
+reports a `requires rustc 1.94` version error.
+
 On Linux, building the default (OpenCL) feature needs `ocl-icd-opencl-dev`. A GPU is
 not required to build. GPU correctness and on-device benchmarks require real hardware
 and are run manually (CI builds only).

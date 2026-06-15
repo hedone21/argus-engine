@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Adapted from llama.cpp / ggml (https://github.com/ggml-org/llama.cpp), MIT licensed.
+// See THIRD-PARTY-LICENSES.md.
 // src0_q, src0_d, src1 are transposed as a preprocessing step
 // 4-bit weights are transposed in groups of 4 (unsigned short int)
 // consider weights originally "next to each other", now "on top of each other"

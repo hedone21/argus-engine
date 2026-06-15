@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Portions adapted from llama.cpp / ggml (https://github.com/ggml-org/llama.cpp), MIT licensed.
+// See THIRD-PARTY-LICENSES.md.
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 #ifdef cl_intel_subgroups

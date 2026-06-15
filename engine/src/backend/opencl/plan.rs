@@ -54,8 +54,8 @@ impl OpTag {
     /// These names match the keys produced by the non-plan path (forward_gen
     /// via `OpenCLBackend::set_op_label`), so the resulting aggregate is
     /// self-consistent whether plan execution or the generic dispatch path
-    /// was used. Must stay in sync with the label matrix in the
-    /// `.agent/research/2026-04-14_decode_microbench_plan.md` report.
+    /// was used. Must stay in sync with the label matrix used by the
+    /// decode microbench profiling path.
     pub fn profile_label(&self) -> &'static str {
         match self {
             OpTag::RmsNorm => "rms_norm",

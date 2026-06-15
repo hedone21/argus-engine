@@ -3,7 +3,7 @@
 //! 대응 spec: `spec/32-engine-algorithms.md` §3.12.19.1 (ENG-ALG-226)
 //! 대응 inv : `spec/41-invariants.md` §3.19 (INV-140)
 //! 대응 arch: `arch/weight_swap.md` §7.2
-//! Backlog : `.agent/todos/backlog.md` WSWAP-6-A
+//! Backlog : WSWAP-6-A
 //!
 //! ## 불변식 요약
 //!

@@ -1,5 +1,7 @@
-// Optimized OpenCL kernels for argus_engine using local memory reductions
-// Based on llama.cpp kernel patterns
+// SPDX-License-Identifier: MIT
+// Optimized OpenCL kernels for argus_engine using local memory reductions.
+// Portions adapted from llama.cpp / ggml (https://github.com/ggml-org/llama.cpp), MIT licensed.
+// See THIRD-PARTY-LICENSES.md.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 

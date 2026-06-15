@@ -11,8 +11,8 @@
 //! kernel override is compared against the same reference. On hosts without
 //! an OpenCL device (most dev Macs) the OpenCL test is silently skipped.
 //!
-//! See `.agent/todos/partition_fused_norm_merge.md` §1 for the design rationale
-//! (layer-boundary barrier elimination) that motivates this kernel.
+//! The design rationale is layer-boundary barrier elimination: fusing the
+//! norm into the partition kernel removes a per-layer sync barrier.
 
 use argus_engine::backend::Backend;
 use argus_engine::backend::cpu::CpuBackend;

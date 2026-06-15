@@ -2,7 +2,6 @@
 //!
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §5.4 (2-source 모델) +
 //! `arch/beta4_command_channel_mapping.md` (18-variant × 19필드 전수 매핑 = 구현 명세).
-//! 정본 명세: `.agent/todos/roadmap_beta_decode_loop_rewrite_2026_06_10.md` §β-4.
 //!
 //! [`CommandSource::poll`](super::traits::CommandSource) 가 pure 생산한 [`EngineCommand`] 들을
 //! 받아 v2 §5.4 의 3분류로 분배한다:
