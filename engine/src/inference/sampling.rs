@@ -31,6 +31,12 @@ pub trait TokenSampler {
     /// 최근 토큰을 ring buffer로 유지하기 위한 hook. Default no-op이라
     /// [`GreedySampler`] 등 stateless impl은 변경 불필요.
     fn observe_token(&mut self, _token: u32) {}
+
+    /// Clear any per-sequence state (e.g. the repetition ring buffer). Default
+    /// no-op. Stateless samplers ([`GreedySampler`]) need no override. Used by
+    /// the stateless chat server, which reuses one decode loop across requests
+    /// and must drop the previous request's token history on `reset`.
+    fn reset(&mut self) {}
 }
 
 /// Greedy sampler (argmax). Pipeline default when caller skipped `with_sampler`.

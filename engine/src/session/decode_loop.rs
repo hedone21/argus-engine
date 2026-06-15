@@ -440,6 +440,12 @@ impl DecodeLoop {
         self.prev_token = 0;
     }
 
+    /// Phase 4-5-c. Chat /reset + stateless chat 서버용. sampler 의 per-sequence
+    /// state(rep penalty ring 등)를 clear 한다. `GreedySampler` 는 default no-op.
+    pub fn reset_sampler(&mut self) {
+        self.sampler.reset();
+    }
+
     /// prefix cache restore 후 pos 를 외부에서 설정한다 (ENG-082, session::standard_happy 전용).
     ///
     /// `reset_pos`(0 고정)와 달리 임의 `pos` 를 허용한다. decode_step / prev_token 은 0 유지.

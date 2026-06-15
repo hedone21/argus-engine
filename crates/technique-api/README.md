@@ -105,7 +105,7 @@ Each `register_*!` macro wires the technique **both** ways:
   path dependency on your crate to force-link it.
 - **Dynamic** (`--features plugin-cdylib`): the crate builds as a `cdylib`; `export_plugin!()`
   emits the `.so` entry point so the host can `dlopen` it with no recompile, e.g.
-  `argus_bench --load-plugin <plugin>.so eviction plugin --name <name>` (a format uses
+  `argus-bench --load-plugin <plugin>.so eviction plugin --name <name>` (a format uses
   `--kv-format <name>`; a backend capability uses `--backend-cap <name>`).
 
 Keep `plugin-cdylib` **off** for static builds so the `#[no_mangle]` C-ABI symbols do not

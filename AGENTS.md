@@ -51,7 +51,7 @@ build).
 - **`.cl` kernels:** avoid editing by default; performance work may. Adreno lessons:
   DK=128 flash-attn register spill above 32 float4/thread; `sub_group_reduce_*` is
   slower than SLM tree-reduce on Adreno; always compare engines by wall-clock.
-- **Performance measurement:** measure *without* `--profile`. The v0 `argus_cli`
+- **Performance measurement:** measure *without* `--profile`. The v0 `argus-cli`
   intentionally rejects `--profile` (and other non-happy-path flags); production TBT is
   read from the `Decode: X ms/tok` log line. (`--profile` adds ~54 ms/token of sync
   overhead, so even when re-enabled it is valid only for *relative* per-op comparison.)

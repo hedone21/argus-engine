@@ -803,6 +803,16 @@ pub struct Args {
     #[arg(long)]
     pub chat_tcp: Option<String>,
 
+    /// argus-chat: HTTP listen address for the OpenAI-compatible API
+    /// (`POST /v1/chat/completions`). Defaults to `127.0.0.1:8080` when running
+    /// the server. Ignored by other binaries.
+    #[arg(long)]
+    pub listen: Option<String>,
+
+    /// argus-chat: run an interactive stdin chat REPL instead of the HTTP server.
+    #[arg(long, default_value_t = false)]
+    pub interactive: bool,
+
     /// Directory used by `KvOffload` directives to write out the LRU prefix
     /// of the KV cache. When set, `CacheManager::enable_swap()` registers a
     /// disk-backed `SwapHandler`; without it the `KvOffload` directive is
@@ -1524,5 +1534,12 @@ impl Args {
     }
     pub fn min_kv_cache(&self) -> usize {
         self.eviction_common.min_kv_cache
+    }
+
+    /// argus-chat HTTP listen address (`--listen`), defaulting to `127.0.0.1:8080`.
+    pub fn listen_addr(&self) -> String {
+        self.listen
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1:8080".to_string())
     }
 }

@@ -52,7 +52,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
       - uses: Swatinem/rust-cache@v2
       - name: build (${{ matrix.label }})
-        run: cargo build --release --bin argus_cli ${{ matrix.args }}
+        run: cargo build --release --bin argus-cli --bin argus-chat ${{ matrix.args }}
 
   test:
     runs-on: ubuntu-latest

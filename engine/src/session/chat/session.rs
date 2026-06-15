@@ -18,24 +18,31 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::capability::kivi_attention::KiviAttentionBackend;
+use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::d2o_handler::{D2OConfig, D2OHandler};
 use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
 use crate::kv::eviction::stage_registry::StageBackedPolicy;
 use crate::kv::kv_cache::KVCache;
+use crate::kv::standard_format::StandardFormat;
 use crate::kv::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::session::DecodeLoopBuilder;
+use crate::session::chat::sampler::{ChatSampler, SharedSamplingConfig};
 use crate::session::chat::stop_condition::{ChatStopSlot, ChatStopStage, StopCondition};
+use crate::session::chat::stream_stage::{ChatStreamSlot, ChatStreamStage};
+use crate::session::command_dispatcher::CommandDispatcher;
 use crate::session::decode_loop::DecodeLoop;
-use crate::session::decode_loop::DecodeResult;
+use crate::session::decode_loop::{DecodeResult, HasForward};
 use crate::session::forward::{
     KiviForward, ModelForward, OffloadForward, alloc_kivi_kv_caches, alloc_offload_kv_caches,
 };
 use crate::session::pipeline_registry::PipelineRegistry;
+use crate::session::resilience_adapter::ResilienceAdapter;
 
 /// `ChatKvMode::Standard` variant inner payload.
 ///
@@ -83,6 +90,13 @@ pub struct ChatSession {
     /// β-6: turn별 stop condition 을 `ChatStopStage`(DecodeEnd 구독)에 전달하는 공유 슬롯.
     /// `run_turn` 이 turn 시작 시 arm, run 후 자동 disarm(RAII guard).
     stop_slot: Arc<ChatStopSlot>,
+    /// Per-token streaming callback slot (SSE). The chat server arms it around a
+    /// turn; empty for the interactive REPL / non-streaming requests (no-op stage).
+    stream_slot: Arc<ChatStreamSlot>,
+    /// Shared sampling config handle. The chat server overwrites it per request
+    /// (OpenAI `temperature`/`top_p`); the in-loop [`ChatSampler`] reads it each
+    /// step. `None` when the decode loop uses a non-`ChatSampler` (test mocks).
+    sampling: Option<SharedSamplingConfig>,
 }
 
 impl ChatSession {
@@ -93,25 +107,81 @@ impl ChatSession {
     /// 기존 registry 는 무시되고 이 stop-registry 로 교체된다(spec 의 빈-registry decode_loop 전제).
     #[doc(hidden)]
     pub fn new_for_test(decode_loop: DecodeLoop, kv_mode: ChatKvMode, max_seq_len: usize) -> Self {
-        let (decode_loop, stop_slot) = install_stop_stage(decode_loop);
+        let (decode_loop, stop_slot, stream_slot) = install_stop_stage(decode_loop);
         Self {
             decode_loop,
             kv_mode,
             pos: 0,
             max_seq_len,
             stop_slot,
+            stream_slot,
+            sampling: None,
         }
     }
 }
 
-/// β-6: decode_loop 에 `ChatStopStage`(DecodeEnd 구독) 를 등록한 registry 를 `with_pipeline` 으로
-/// 주입한다. 반환된 슬롯에 `run_turn` 이 turn별 stop condition 을 arm 한다.
-fn install_stop_stage(decode_loop: DecodeLoop) -> (DecodeLoop, Arc<ChatStopSlot>) {
-    let slot = ChatStopSlot::new();
+/// β-6: `ChatStopStage`(DecodeEnd) + `ChatStreamStage`(DecodeEnd) 를 등록한 새 registry 와 두
+/// 공유 슬롯을 만든다. **submit 순서가 곧 dispatch 순서** — stop 을 먼저 등록해야 stop 토큰이
+/// 스트리밍되지 않는다(stop 시 dispatch break → stream stage 미발화).
+fn make_chat_registry() -> (
+    Arc<PipelineRegistry>,
+    Arc<ChatStopSlot>,
+    Arc<ChatStreamSlot>,
+) {
+    let stop_slot = ChatStopSlot::new();
+    let stream_slot = ChatStreamSlot::new();
     let registry = Arc::new(PipelineRegistry::new());
-    registry.submit(Arc::new(ChatStopStage::new(Arc::clone(&slot))));
+    registry.submit(Arc::new(ChatStopStage::new(Arc::clone(&stop_slot))));
+    registry.submit(Arc::new(ChatStreamStage::new(Arc::clone(&stream_slot))));
+    (registry, stop_slot, stream_slot)
+}
+
+/// 이미 build 된 decode_loop 에 chat registry 를 `with_pipeline_registry` 로 주입한다
+/// (test/`new_for_test` 전용 — post-build 교체). production 빌더는 build **전** `with_pipeline`
+/// 으로 동일 registry 를 주입해 `with_resilience` 의 TickStage 와 공존시킨다(`finish_chat_loop`).
+fn install_stop_stage(
+    decode_loop: DecodeLoop,
+) -> (DecodeLoop, Arc<ChatStopSlot>, Arc<ChatStreamSlot>) {
+    let (registry, stop_slot, stream_slot) = make_chat_registry();
     let decode_loop = decode_loop.with_pipeline_registry(registry);
-    (decode_loop, slot)
+    (decode_loop, stop_slot, stream_slot)
+}
+
+/// production chat 빌더 공통 마무리: 단일 registry 를 build **전** 주입하고(`with_pipeline`),
+/// resilience 가 있으면 happy/chat-minimal `CommandDispatcher` + `with_resilience` 를 배선한다.
+/// build() 가 동일 registry 에 `TickStage`(PostSample) 를 submit 하므로 stop/stream/tick stage 가
+/// 한 registry 에 공존한다. eviction directive 는 chat 자체 CacheManager(루프 밖)가 담당하므로
+/// dispatcher 의 cache_manager 는 None(inert) — [`build_standard_loop`] happy 경로와 동형.
+fn finish_chat_loop(
+    builder: DecodeLoopBuilder<HasForward>,
+    registry: Arc<PipelineRegistry>,
+    resilience: Option<ResilienceAdapter>,
+    kv_handles: Vec<Arc<StandardFormat>>,
+) -> DecodeLoop {
+    let builder = builder.with_pipeline(Arc::clone(&registry));
+    let builder = match resilience {
+        Some(adapter) => {
+            let dispatcher = CommandDispatcher::new(
+                registry,
+                kv_handles,
+                None, // cache_manager: chat evicts out-of-loop (ensure_capacity/on_turn_end)
+                Vec::new(), // layer_slots (no partition)
+                None, // hardware
+                None, // model (no weight swap)
+                None, // swap_runtime
+                None, // importance
+                Vec::new(), // kivi_handles (manager quant inert — chat-managed)
+                None, // report_tx
+                Arc::new(Mutex::new(None)), // hook_cell dummy
+                Arc::new(Mutex::new(None)), // score_cell dummy
+            );
+            builder
+                .with_resilience(adapter)
+                .with_command_dispatcher(dispatcher)
+        }
+        None => builder,
+    };
+    builder.build()
 }
 
 impl ChatSession {
@@ -159,6 +229,10 @@ impl ChatSession {
 
         // 3. decode_loop pos reset
         self.decode_loop.reset_pos();
+
+        // 3b. sampler per-sequence state reset (rep penalty ring). Stateless chat
+        //     server reuses one loop across requests — drop prior token history.
+        self.decode_loop.reset_sampler();
 
         // 4. external pos cache clear
         self.pos = 0;
@@ -369,6 +443,30 @@ impl ChatSession {
     pub fn max_seq_len(&self) -> usize {
         self.max_seq_len
     }
+
+    /// Shared per-token streaming slot — the chat server arms it (with a callback)
+    /// around a streaming turn; [`ChatStreamStage`] emits each kept token to it.
+    pub fn stream_slot(&self) -> Arc<ChatStreamSlot> {
+        Arc::clone(&self.stream_slot)
+    }
+
+    /// Overwrite the shared sampling config (OpenAI per-request `temperature`/
+    /// `top_p`). No-op if the decode loop was built without a [`ChatSampler`]
+    /// (test mocks). The change is observed by the in-loop sampler on its next step.
+    pub fn set_sampling(&self, cfg: SamplingConfig) {
+        if let Some(shared) = &self.sampling
+            && let Ok(mut g) = shared.lock()
+        {
+            *g = cfg;
+        }
+    }
+
+    /// Cancellation flag for the inner decode loop. The chat server flips it when
+    /// a streaming client disconnects, so generation stops early
+    /// (`StopReason::StopFlag`).
+    pub fn stop_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.decode_loop.stop_flag()
+    }
 }
 
 // ─── Builder 함수 인자 타입 ───────────────────────────────────────────────────
@@ -403,6 +501,11 @@ pub struct ChatStandardArgs {
     pub d2o_layer_alloc: bool,
     pub d2o_protected_layers: Vec<usize>,
     pub memory_threshold_mb: u64,
+    /// Base sampling config (CLI defaults / OpenAI request seed). Installed into a
+    /// shared handle so the server can override `temperature`/`top_p` per request.
+    pub sampling_config: SamplingConfig,
+    /// Resilience adapter (manager IPC). `None` = no manager integration.
+    pub resilience: Option<ResilienceAdapter>,
 }
 
 /// [`build_chat_kivi`]에 전달하는 args.
@@ -420,6 +523,8 @@ pub struct ChatKiviArgs {
     pub max_seq_len: usize,
     pub bits: u8,
     pub residual_size: usize,
+    pub sampling_config: SamplingConfig,
+    pub resilience: Option<ResilienceAdapter>,
 }
 
 /// [`build_chat_offload`]에 전달하는 args.
@@ -435,6 +540,8 @@ pub struct ChatOffloadArgs {
     pub offload_mode: String,
     pub disk_dir: Option<std::path::PathBuf>,
     pub max_prefetch_depth: usize,
+    pub sampling_config: SamplingConfig,
+    pub resilience: Option<ResilienceAdapter>,
 }
 
 // ─── 3 builder 함수 ──────────────────────────────────────────────────────────
@@ -443,8 +550,11 @@ pub struct ChatOffloadArgs {
 ///
 /// generate.rs `run_chat_standard` + `build_chat_eviction` (l.10317~10519) 이관.
 /// `kv_caches`는 caller가 미리 할당하여 전달한다 (alloc_standard_kv_caches 사용).
-pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
+pub fn build_chat_standard(mut args: ChatStandardArgs) -> Result<ChatSession> {
     let max_seq_len = args.max_seq_len;
+    let vocab_size = args.model.config.vocab_size;
+    let sampling_config = args.sampling_config.clone();
+    let mut resilience = args.resilience.take();
 
     // eviction setup — generate.rs build_chat_eviction 로직 이관
     let (cache_manager, score_accumulator, score_based, policy_name) =
@@ -473,11 +583,29 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
         score_cell,
     )?;
 
-    let decode_loop = DecodeLoopBuilder::new()
+    // Resilience: heartbeat KV handle (layer-0 StandardFormat) + dispatcher kv_handles.
+    // `fmt_caches()` is populated by `ModelForward::new`. Read before `mf` is moved.
+    let kv_handles = mf.fmt_caches().to_vec();
+    let kv_handle = mf
+        .fmt_caches()
+        .first()
+        .map(|f| Arc::clone(f) as Arc<dyn KVCacheFormat>);
+    if let Some(adapter) = resilience.as_mut() {
+        adapter.set_eviction_policy(&policy_name);
+        if let Some(h) = kv_handle {
+            adapter.set_kv_handle(h);
+        }
+    }
+
+    // Per-request sampling: the in-loop ChatSampler reads this shared config each
+    // step; the server overwrites it per OpenAI request.
+    let sampling: SharedSamplingConfig = Arc::new(Mutex::new(sampling_config));
+    let (registry, stop_slot, stream_slot) = make_chat_registry();
+    let builder = DecodeLoopBuilder::new()
         .with_forward(mf)
         .with_kv_capacity(max_seq_len)
-        .build();
-    let (decode_loop, stop_slot) = install_stop_stage(decode_loop);
+        .with_sampler(ChatSampler::new(Arc::clone(&sampling), vocab_size));
+    let decode_loop = finish_chat_loop(builder, registry, resilience, kv_handles);
 
     Ok(ChatSession {
         decode_loop,
@@ -492,16 +620,21 @@ pub fn build_chat_standard(args: ChatStandardArgs) -> Result<ChatSession> {
         pos: 0,
         max_seq_len,
         stop_slot,
+        stream_slot,
+        sampling: Some(sampling),
     })
 }
 
 /// KIVI 양자화 KV cache path용 ChatSession 빌더.
 ///
 /// generate.rs `run_chat_kivi` (l.10662~10756) 이관.
-pub fn build_chat_kivi(args: ChatKiviArgs) -> Result<ChatSession> {
+pub fn build_chat_kivi(mut args: ChatKiviArgs) -> Result<ChatSession> {
     let max_seq_len = args.max_seq_len;
     let bits = args.bits;
     let residual_size = args.residual_size;
+    let vocab_size = args.model.config.vocab_size;
+    let sampling_config = args.sampling_config.clone();
+    let mut resilience = args.resilience.take();
 
     eprintln!(
         "[Chat/KIVI] bits={}, residual_size={}, max_seq_len={}",
@@ -530,11 +663,24 @@ pub fn build_chat_kivi(args: ChatKiviArgs) -> Result<ChatSession> {
         max_seq_len,
     )?;
 
-    let decode_loop = DecodeLoopBuilder::new()
+    // Resilience: KIVI heartbeat handle is a KIVIFormat (not StandardFormat), so the
+    // dispatcher kv_handles stays empty (evict inert — chat-managed); only the
+    // heartbeat handle is set best-effort.
+    let kivi_handle = fwd.kivi_caches().first().cloned();
+    if let Some(adapter) = resilience.as_mut() {
+        adapter.set_eviction_policy(""); // KIVI: no in-loop eviction policy
+        if let Some(h) = kivi_handle {
+            adapter.set_kivi_handle(h);
+        }
+    }
+
+    let sampling: SharedSamplingConfig = Arc::new(Mutex::new(sampling_config));
+    let (registry, stop_slot, stream_slot) = make_chat_registry();
+    let builder = DecodeLoopBuilder::new()
         .with_forward(fwd)
         .with_kv_capacity(max_seq_len)
-        .build();
-    let (decode_loop, stop_slot) = install_stop_stage(decode_loop);
+        .with_sampler(ChatSampler::new(Arc::clone(&sampling), vocab_size));
+    let decode_loop = finish_chat_loop(builder, registry, resilience, Vec::new());
 
     Ok(ChatSession {
         decode_loop,
@@ -545,16 +691,21 @@ pub fn build_chat_kivi(args: ChatKiviArgs) -> Result<ChatSession> {
         pos: 0,
         max_seq_len,
         stop_slot,
+        stream_slot,
+        sampling: Some(sampling),
     })
 }
 
 /// KV offload path용 ChatSession 빌더.
 ///
 /// generate.rs `run_chat_offload` (l.10907~11032) 이관.
-pub fn build_chat_offload(args: ChatOffloadArgs) -> Result<ChatSession> {
+pub fn build_chat_offload(mut args: ChatOffloadArgs) -> Result<ChatSession> {
     let max_seq_len = args.max_seq_len;
     let offload_mode = args.offload_mode.clone();
     let max_prefetch_depth = args.max_prefetch_depth;
+    let vocab_size = args.model.config.vocab_size;
+    let sampling_config = args.sampling_config.clone();
+    let mut resilience = args.resilience.take();
 
     let token_bytes = args.kv_heads * args.head_dim * args.kv_dtype.size();
     let disk_dir_ref = args.disk_dir.as_deref();
@@ -589,11 +740,19 @@ pub fn build_chat_offload(args: ChatOffloadArgs) -> Result<ChatSession> {
         max_seq_len,
     )?;
 
-    let decode_loop = DecodeLoopBuilder::new()
+    // Offload has no KV-format handle accessor → heartbeat KV handle is skipped;
+    // resilience control directives (throttle/suspend) + per-token tick still wire.
+    if let Some(adapter) = resilience.as_mut() {
+        adapter.set_eviction_policy("");
+    }
+
+    let sampling: SharedSamplingConfig = Arc::new(Mutex::new(sampling_config));
+    let (registry, stop_slot, stream_slot) = make_chat_registry();
+    let builder = DecodeLoopBuilder::new()
         .with_forward(fwd)
         .with_kv_capacity(max_seq_len)
-        .build();
-    let (decode_loop, stop_slot) = install_stop_stage(decode_loop);
+        .with_sampler(ChatSampler::new(Arc::clone(&sampling), vocab_size));
+    let decode_loop = finish_chat_loop(builder, registry, resilience, Vec::new());
 
     Ok(ChatSession {
         decode_loop,
@@ -604,6 +763,8 @@ pub fn build_chat_offload(args: ChatOffloadArgs) -> Result<ChatSession> {
         pos: 0,
         max_seq_len,
         stop_slot,
+        stream_slot,
+        sampling: Some(sampling),
     })
 }
 
@@ -819,7 +980,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(max_seq_len)
             .build();
-        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
+        let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Standard(Box::new(ChatKvModeStandard {
@@ -833,6 +994,8 @@ mod tests {
             pos: 0,
             max_seq_len,
             stop_slot,
+            stream_slot,
+            sampling: None,
         }
     }
 
@@ -919,7 +1082,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(2048)
             .build();
-        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
+        let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let mut session = ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Kivi {
@@ -929,6 +1092,8 @@ mod tests {
             pos: 10,
             max_seq_len: 2048,
             stop_slot,
+            stream_slot,
+            sampling: None,
         };
 
         session.reset().unwrap();
@@ -949,7 +1114,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(10)
             .build();
-        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
+        let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let mut session = ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Kivi {
@@ -959,6 +1124,8 @@ mod tests {
             pos: 9,
             max_seq_len: 10,
             stop_slot,
+            stream_slot,
+            sampling: None,
         };
         // pos=9, additional=2 → 9+2=11 > 10 → bail
         let result = session.ensure_capacity(2);
@@ -977,7 +1144,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(10)
             .build();
-        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
+        let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let mut session = ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Offload {
@@ -987,6 +1154,8 @@ mod tests {
             pos: 9,
             max_seq_len: 10,
             stop_slot,
+            stream_slot,
+            sampling: None,
         };
         let result = session.ensure_capacity(2);
         assert!(result.is_err(), "offload overflow 시 bail 예상");
@@ -1060,7 +1229,7 @@ mod tests {
             .with_kv_capacity(10)
             .build();
 
-        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
+        let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         // cache_manager=Some → ensure_capacity overflow 시 try_evict 직접 호출 경로 진입.
         let policy = Box::new(SlidingWindowPolicy::new(4, 2));
         let cm = CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, 0.5);
@@ -1077,6 +1246,8 @@ mod tests {
             pos: 9,
             max_seq_len: 10,
             stop_slot,
+            stream_slot,
+            sampling: None,
         };
 
         // pos=9, additional=2 → 11 > 10 → overflow → try_evict 직접 호출.
@@ -1119,7 +1290,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(512)
             .build();
-        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
+        let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let session = ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Kivi {
@@ -1129,6 +1300,8 @@ mod tests {
             pos: 100,
             max_seq_len: 512,
             stop_slot,
+            stream_slot,
+            sampling: None,
         };
         let line = session.stats_line();
         assert_eq!(line, "kv_pos=100/512 mode=kivi bits=4 residual=32");
@@ -1145,7 +1318,7 @@ mod tests {
             .with_forward(fwd)
             .with_kv_capacity(512)
             .build();
-        let (decode_loop, stop_slot) = super::install_stop_stage(decode_loop);
+        let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let session = ChatSession {
             decode_loop,
             kv_mode: ChatKvMode::Offload {
@@ -1155,6 +1328,8 @@ mod tests {
             pos: 77,
             max_seq_len: 512,
             stop_slot,
+            stream_slot,
+            sampling: None,
         };
         let line = session.stats_line();
         assert_eq!(
