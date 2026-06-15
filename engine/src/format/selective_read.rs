@@ -9,7 +9,7 @@
 //! 미구현: KIVI/opaque → 엔진 폴백 = full read.
 
 use anyhow::Result;
-use technique_api::{KVReadPlan, KVReadStage, ReadGranularity};
+use argus_extension_api::{KVReadPlan, KVReadStage, ReadGranularity};
 
 use crate::backend::Backend;
 use crate::format::AttnDims;
@@ -46,7 +46,7 @@ pub trait SelectiveRead {
     /// layer `i` attention 직전에 read stage 의 `read_plan` 을 자기 캐시 위에서 호출
     /// A1.1d/A1.3).
     ///
-    /// **ctx 구성 캡슐화**: read stage 가 읽는 [`technique_api::StageCtx`](`tensor(Key)`/`tensor(QueryStats)`/
+    /// **ctx 구성 캡슐화**: read stage 가 읽는 [`argus_extension_api::StageCtx`](`tensor(Key)`/`tensor(QueryStats)`/
     /// geometry)는 concrete 캐시(예: `StandardFormat` 의 `Mutex<KVCache>`) 위에서만 만들 수 있다. 이를
     /// format 내부에 위임해 (1) 캐시 borrow/lock 이 format 안에 갇히고, (2) `attention_into_selected`(다시
     /// lock)와 충돌하지 않으며(plan 산출 후 owned `KVReadPlan` 반환 → borrow 종료), (3) `SelectiveRead`

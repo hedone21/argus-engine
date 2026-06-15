@@ -60,7 +60,7 @@ path = "src/bin/test_q4_soa_byte_equal.rs"
 # Shared IPC protocol types (manager <-> engine). Separate repo.
 argus-shared = { git = "https://github.com/hedone21/argus-shared.git", branch = "main" }
 # Extension surface: the stage-axis KVCacheStage registry + linkme auto-registration.
-technique-api = { path = "../crates/technique-api" }
+argus-extension-api = { path = "../crates/argus-extension-api" }
 linkme = "0.3"
 # CAOTE (value-aware KVCacheStage) production plugin. Opt-in via the `caote` feature.
 caote = { path = "../crates/techniques/caote", optional = true }

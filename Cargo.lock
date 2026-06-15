@@ -102,6 +102,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "argus-extension-api",
  "argus-shared",
  "caote",
  "clap",
@@ -122,12 +123,18 @@ dependencies = [
  "serde",
  "serde_json",
  "synth-q4-format",
- "technique-api",
  "tempfile",
  "tiny_http",
  "tokenizers",
  "trybuild",
  "zbus",
+]
+
+[[package]]
+name = "argus-extension-api"
+version = "0.1.0"
+dependencies = [
+ "linkme",
 ]
 
 [[package]]
@@ -329,8 +336,8 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 name = "caote"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
@@ -720,56 +727,56 @@ dependencies = [
 name = "example-backend-cap"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-bundle"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-keep-recent"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-kv-format"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-multi-format"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-no-export"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-rollback"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
@@ -1411,8 +1418,8 @@ dependencies = [
 name = "quest"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
@@ -1726,8 +1733,8 @@ dependencies = [
 name = "synth-q4-format"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
@@ -1735,13 +1742,6 @@ name = "target-triple"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
-
-[[package]]
-name = "technique-api"
-version = "0.1.0"
-dependencies = [
- "linkme",
-]
 
 [[package]]
 name = "tempfile"

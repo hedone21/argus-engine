@@ -23,7 +23,7 @@ use argus_engine::format::dynamic_format_registry::{dynamic_registered_format_na
 use argus_engine::format::{decode_via_descriptor, encode_via_descriptor};
 use argus_engine::kv::eviction::stage_registry::{dynamic_registered_stage_names, make_stage};
 use argus_engine::session::plugin_dispatch::register_dynamic_plugins;
-use technique_api::{
+use argus_extension_api::{
     KVLayoutDesc, KeepSpec, Packing, ScaleLayout, StageCtx, StageParams, TensorHandle, TensorKind,
     find_kv_format,
 };

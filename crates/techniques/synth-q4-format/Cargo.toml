@@ -11,12 +11,12 @@ publish = false
 # 가시성), cdylib = dlopen `.so`(`--features plugin-cdylib` 빌드 시 register_kv_format_v1 export).
 crate-type = ["cdylib", "rlib"]
 
-# 합성 KV format technique crate (GATE-B) — format 축 확장 기법은 `technique-api`(확장 API)
+# 합성 KV format technique crate (GATE-B) — format 축 확장 기법은 `argus-extension-api`(확장 API)
 # + `linkme`(정적 등록 매크로 확장이 `linkme::` 경로 하드코딩하므로 plugin 직접 dep 필수)에 의존한다.
 # 엔진(argus_engine) / 다른 축(stage/hardware) crate 에 의존하지 않음 = DType variant 없이 외부 crate 가
 # KV_FORMATS 에 format 을 더하는 가산 확장의 증거(.so 대역).
 [dependencies]
-technique-api = { path = "../../technique-api" }
+argus-extension-api = { path = "../../argus-extension-api" }
 linkme = "0.3"
 
 [features]

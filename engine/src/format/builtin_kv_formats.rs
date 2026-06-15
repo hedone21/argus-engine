@@ -4,7 +4,7 @@
 //! plugin = 순수 descriptor) / D6(3축 평행 linkme registry). 거울 = `pressure/eviction/
 //! stage_registry.rs`(KV_CACHE_STAGES 빌트인 등록 + `ensure_builtin_stages_registered`).
 //!
-//! format 축의 plugin 표면은 `technique_api::KVFormat`(name + layout, 버퍼 0)이다. 여기서
+//! format 축의 plugin 표면은 `argus_extension_api::KVFormat`(name + layout, 버퍼 0)이다. 여기서
 //! 그 표면의 **내장 멤버**(f32/f16/q4_0/q8_0)를 `#[distributed_slice(KV_FORMATS)]` 로 등록한다.
 //! descriptor 는 [`dtype_to_layout_desc`] 에서 도출해 단일 진실원천을 공유한다(drift 0).
 //!
@@ -14,8 +14,8 @@
 //! 정의 + 단위 테스트(round-trip + 4종 self-test)까지만 둔다.
 
 use anyhow::Result;
+use argus_extension_api::{KV_FORMATS, KVFormat, KVFormatReg, KVLayoutDesc};
 use linkme::distributed_slice;
-use technique_api::{KV_FORMATS, KVFormat, KVFormatReg, KVLayoutDesc};
 
 use crate::buffer::DType;
 use crate::format::dtype_layout::dtype_to_layout_desc;
@@ -102,7 +102,7 @@ static Q8_0_KV_FORMAT: KVFormatReg = KVFormatReg {
 /// 호출부 0(unwired)** — 후속 소비자 substep 이 startup 에 배선한다.
 pub fn ensure_builtin_kv_formats_registered() -> Result<()> {
     for name in ["f32", "f16", "q4_0", "q8_0"] {
-        if technique_api::find_kv_format(name).is_none() {
+        if argus_extension_api::find_kv_format(name).is_none() {
             anyhow::bail!(
                 "builtin KVFormat '{name}' not registered — suspected linkme fat-LTO --gc-sections silent drop\
                  . the #[distributed_slice] registration in builtin_kv_formats is \
@@ -132,7 +132,7 @@ pub fn builtin_format_dtype(name: &str) -> Option<DType> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use technique_api::{find_kv_format, registered_kv_format_names};
+    use argus_extension_api::{find_kv_format, registered_kv_format_names};
 
     /// 4종 등록 + 각 등록 descriptor 가 `dtype_to_layout_desc` 와 일치(단일 원천 round-trip).
     #[test]

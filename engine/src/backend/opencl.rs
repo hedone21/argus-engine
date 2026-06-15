@@ -7232,7 +7232,7 @@ impl OpenCLBackend {
 }
 
 // D8(2026-06-10, single-trait): KIVI native attention trait impl — canonical
-// 정의가 `technique-api` 로 이동, ABI struct(`KiviAttnArgs`/`KiviGatherArgs`,
+// 정의가 `argus-extension-api` 로 이동, ABI struct(`KiviAttnArgs`/`KiviGatherArgs`,
 // cl_mem) 시그니처. trait method 는 args 에서 raw cl_mem 을 꺼내 inherent
 // dispatch(byte-identical 로직) 로 위임하고 `Result` 를 `i32`(0=OK, 음수=err,
 // C3 panic=abort) 로 변환한다. `args.cl_queue` 는 plugin/dlopen 어댑터용 ABI
@@ -7241,14 +7241,17 @@ impl OpenCLBackend {
 // 보존). `as_kivi_attention` 이 `Some(&self as &dyn KiviAttentionBackend)` 를
 // 반환하므로 caller 는 trait method 만 사용해 downcast 가 사라진다.
 impl OpenCLBackend {
-    /// Build a [`technique_api::KiviMakeArgs`] from this backend's live GPU context and
+    /// Build a [`argus_extension_api::KiviMakeArgs`] from this backend's live GPU context and
     /// invoke `f` with it. Used by `--backend-cap <name>` to construct a named KIVI
     /// attention capability via `resolve_kivi_capability`. The `build_opts` C string is
     /// owned only for the duration of `f` — `KiviMakeArgs` is borrow-for-make (C7/D4) and a
     /// Copy POD, so the pointer must not escape `f`.
-    pub fn with_kivi_make_args<R>(&self, f: impl FnOnce(&technique_api::KiviMakeArgs) -> R) -> R {
+    pub fn with_kivi_make_args<R>(
+        &self,
+        f: impl FnOnce(&argus_extension_api::KiviMakeArgs) -> R,
+    ) -> R {
         let opts = std::ffi::CString::new(self.cl_opts.clone()).unwrap_or_default();
-        let make_args = technique_api::KiviMakeArgs {
+        let make_args = argus_extension_api::KiviMakeArgs {
             cl_ctx: <&Context as ClContextPtr>::as_ptr(&&self.context),
             device: <Device as ClDeviceIdPtr>::as_ptr(&self.device),
             build_opts: opts.as_ptr(),

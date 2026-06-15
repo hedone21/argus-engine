@@ -97,7 +97,7 @@ pub fn build_resilience_cache_manager(
             merge_e: 0.1,
             use_layer_allocation: false,
             protected_layers: Vec::new(),
-            merge_axis: technique_api::MergeAxis::Both,
+            merge_axis: argus_extension_api::MergeAxis::Both,
         });
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,
@@ -123,7 +123,7 @@ pub fn build_resilience_cache_manager(
                 } else {
                     args.eviction_window()
                 };
-                let params = technique_api::StageParams {
+                let params = argus_extension_api::StageParams {
                     eviction_window: args.eviction_window(),
                     protected_prefix: actual_protected_prefix,
                     keep_ratio: args.h2o_keep_ratio(),

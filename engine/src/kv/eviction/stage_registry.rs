@@ -1,4 +1,4 @@
-//! 빌트인 eviction 정책을 technique-api `KVCacheStage` 표면으로 노출하는 어댑터 + linkme 등록.
+//! 빌트인 eviction 정책을 argus-extension-api `KVCacheStage` 표면으로 노출하는 어댑터 + linkme 등록.
 //!
 //! stage 축 레지스트리([`KV_CACHE_STAGES`])에 빌트인 LayerWide 정책 3종
 //! (sliding/streaming/h2o)을 등록한다. 각 정책은 기존 [`EvictionPolicy::plan_keep`]
@@ -13,16 +13,16 @@
 //! d2o(`EvictionPolicy` 아님, 가중 merge)는 M4, no_eviction("none")은 happy-path 라 match 밖.
 
 use anyhow::{Context, Result};
+use argus_extension_api::{
+    KV_CACHE_STAGES, KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage,
+    KVCacheStageReg, KeepSpec, PlanAbi, PluginVTableAbi, StageCtx, StageCtxAbi, StageExportAbi,
+    StageParams, TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
+};
 use core::ffi::c_void;
 use linkme::distributed_slice;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
-use technique_api::{
-    KV_CACHE_STAGES, KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage,
-    KVCacheStageReg, KeepSpec, PlanAbi, PluginVTableAbi, StageCtx, StageCtxAbi, StageExportAbi,
-    StageParams, TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
-};
 
 use super::{EvictionPolicy, H2OPolicy, SlidingWindowPolicy, StreamingLLMPolicy};
 use crate::buffer::DType;
@@ -80,7 +80,7 @@ pub(crate) fn uniform_to_weighted(m: crate::format::Merge) -> WeightedMerge {
         into: m.into,
         into_weight: w,
         from: m.from.into_iter().map(|p| (p, w)).collect(),
-        apply_to: technique_api::MergeAxis::Both,
+        apply_to: argus_extension_api::MergeAxis::Both,
     }
 }
 
@@ -112,7 +112,7 @@ pub(crate) fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result
     }
 }
 
-/// 엔진 `DType` → technique-api `TensorDtype` 매핑(핸들 진단용; 읽기 산출은 항상 f32).
+/// 엔진 `DType` → argus-extension-api `TensorDtype` 매핑(핸들 진단용; 읽기 산출은 항상 f32).
 fn map_dtype(dt: DType) -> TensorDtype {
     match dt {
         DType::F16 => TensorDtype::F16,
@@ -295,7 +295,7 @@ impl StageCtx for KVStageCtx<'_> {
         self.cache.head_dim()
     }
     /// 단일 텐서 접근 — Key/Value 항상, Scores/AttnWeights 는 공급 시. dequant_k/v·head_score·
-    /// attn_weight 등 sugar 는 technique-api default 가 이 위에 얹힌다.
+    /// attn_weight 등 sugar 는 argus-extension-api default 가 이 위에 얹힌다.
     fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
         match kind {
             TensorKind::Key => Some(&self.key_handle),
@@ -375,7 +375,7 @@ impl EvictionPolicy for StageBackedPolicy {
 /// drop 하면 누락 기법에 대해 `Err` 로 fail-fast 한다(release 에서 정책 이름 미해석 → 조용한 폴백 방지).
 pub fn ensure_builtin_stages_registered() -> Result<()> {
     for name in ["sliding", "streaming", "h2o"] {
-        if technique_api::find_stage(name).is_none() {
+        if argus_extension_api::find_stage(name).is_none() {
             anyhow::bail!(
                 "built-in KVCacheStage '{name}' not registered — suspect linkme fat-LTO --gc-sections silent drop\
                  stage_registry's #[distributed_slice] registration was not linked."
@@ -520,7 +520,7 @@ pub(crate) fn try_register_stage(lib: &Arc<libloading::Library>, path: &Path) ->
             })?
             .to_owned();
         // 빌트인 우선 — silent override 차단(Known Bug #1/#2 류 재발 방지).
-        if technique_api::find_stage(&name).is_some() {
+        if argus_extension_api::find_stage(&name).is_some() {
             anyhow::bail!(
                 "plugin {}: stage name '{}' conflicts with a built-in (built-in takes precedence, dynamic registration rejected)",
                 path.display(),
@@ -596,7 +596,7 @@ pub fn dynamic_registered_stage_names() -> Vec<String> {
 /// 정적/동적 모두 miss 면 `None`(graceful unknown).
 pub fn make_stage(name: &str, params: &StageParams) -> Option<Box<dyn KVCacheStage>> {
     // 1) 정적(linkme) 우선.
-    if let Some(reg) = technique_api::find_stage(name) {
+    if let Some(reg) = argus_extension_api::find_stage(name) {
         return Some((reg.make)(*params));
     }
     // 2) 동적(dlopen) fallback.
@@ -723,7 +723,7 @@ unsafe fn planabi_to_plan(abi: &PlanAbi) -> Result<KVCachePlan> {
                 into: m.into,
                 into_weight: m.into_weight,
                 from,
-                apply_to: technique_api::MergeAxis::from_u32(m.apply_to),
+                apply_to: argus_extension_api::MergeAxis::from_u32(m.apply_to),
             });
         }
     }
@@ -834,8 +834,8 @@ mod tests {
     use crate::memory::host::shared::SharedBuffer;
     use crate::shape::Shape;
     use crate::tensor::Tensor;
+    use argus_extension_api::{find_stage, registered_names};
     use std::sync::Arc;
-    use technique_api::{find_stage, registered_names};
 
     /// 최소 StageCtx 스텁 — LayerWide 정책이 읽는 current_pos/target_len/importance 만 의미가 있고
     /// per-head/dequant accessor 는 trivial(이 단계 미사용).

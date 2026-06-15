@@ -6,7 +6,7 @@
 //! 정적 `q4_0` 기여는 이 cdylib 내부에만 있고 엔진 빌트인과 무관(force-link 안 함). 충돌 검사는 host 가
 //! 엔진의 `find_kv_format("q4_0")`(빌트인)로 수행한다.
 
-use technique_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
+use argus_extension_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
 
 fn q4_like() -> KVLayoutDesc {
     KVLayoutDesc {
@@ -39,6 +39,6 @@ impl KVFormat for RollbackOk {
     }
 }
 
-technique_api::register_kv_format!("q4_0", || Box::new(CollideQ4));
-technique_api::register_kv_format!("rollback_ok", || Box::new(RollbackOk));
-technique_api::export_plugin!();
+argus_extension_api::register_kv_format!("q4_0", || Box::new(CollideQ4));
+argus_extension_api::register_kv_format!("rollback_ok", || Box::new(RollbackOk));
+argus_extension_api::export_plugin!();

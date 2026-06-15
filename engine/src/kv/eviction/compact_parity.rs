@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use technique_api::{KVCachePlan, KeepSpec};
+use argus_extension_api::{KVCachePlan, KeepSpec};
 
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};

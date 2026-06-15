@@ -72,12 +72,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: No Korean under crates/technique-api (public extension API)
+      - name: No Korean under crates/argus-extension-api (public extension API)
         run: |
           # Allow the one Korean token in the README language-switcher link
           # (`[한국어](...)`), mirroring the CONTEXT.md carve-out below.
-          if grep -rnP '[\x{AC00}-\x{D7A3}]' crates/technique-api | grep -vF '한국어]('; then
-            echo "::error::Korean found under crates/technique-api — the public API surface must be English"
+          if grep -rnP '[\x{AC00}-\x{D7A3}]' crates/argus-extension-api | grep -vF '한국어]('; then
+            echo "::error::Korean found under crates/argus-extension-api — the public API surface must be English"
             exit 1
           fi
       - name: CONTEXT.md is English (Korean lives in CONTEXT.ko.md)

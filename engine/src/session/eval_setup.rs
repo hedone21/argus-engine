@@ -261,7 +261,7 @@ fn build_eval_cache_manager(
                 } else {
                     args.eviction_window()
                 };
-                let params = technique_api::StageParams {
+                let params = argus_extension_api::StageParams {
                     eviction_window: args.eviction_window(),
                     protected_prefix: actual_protected_prefix,
                     keep_ratio: args.h2o_keep_ratio(),

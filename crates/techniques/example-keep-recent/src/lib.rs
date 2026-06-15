@@ -1,7 +1,7 @@
 //! Example technique crate — proof of "add a folder = zero engine-core edits" + a
 //! contributor template.
 //!
-//! This crate depends only on [`technique_api`], implements [`KVCacheStage`], and registers
+//! This crate depends only on [`argus_extension_api`], implements [`KVCacheStage`], and registers
 //! itself via the `register_kv_stage!` macro (static linkme + cdylib C-ABI dual-wiring). It
 //! never references engine types (`KVCache`/`Backend`) — adding a member to the stage axis
 //! touches zero code on the other axes (additive extension).
@@ -14,7 +14,7 @@
 //! GATE-C: `cargo build -p example-keep-recent --features plugin-cdylib` produces the `.so` →
 //! `argus-bench --load-plugin <.so> eviction plugin --name example_keep_recent` loads it zero-compile.
 
-use technique_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, StageParams};
+use argus_extension_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, StageParams};
 
 /// Stage that keeps only the most recent `target_len` tokens.
 struct KeepRecent;
@@ -41,17 +41,17 @@ impl KVCacheStage for KeepRecent {
 // Registration (dual-wiring) — static: linkme `KV_CACHE_STAGES` (the engine discovers it via
 // `find_stage("example_keep_recent")`). Dynamic (`--features plugin-cdylib`): the
 // `register_kv_stage_v1` C-ABI export (host dlopens it). One line wires both.
-technique_api::register_kv_stage!("example_keep_recent", |_params: StageParams| Box::new(
+argus_extension_api::register_kv_stage!("example_keep_recent", |_params: StageParams| Box::new(
     KeepRecent
 ));
 // GATE-C v2: emit the `.so` entry (plugin-cdylib gate). A stage-only `.so` → stage 1 +
 // format 0 in the dispatcher = graceful wrong-type absorption + a stage plan-identity vehicle.
-technique_api::export_plugin!();
+argus_extension_api::export_plugin!();
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use technique_api::find_stage;
+    use argus_extension_api::find_stage;
 
     struct Ctx {
         cur: usize,
@@ -76,11 +76,11 @@ mod tests {
         fn head_dim(&self) -> usize {
             1
         }
-        // Only tensor() is implemented — head_score/dequant_* etc. use the technique-api default sugar (None → trivial).
+        // Only tensor() is implemented — head_score/dequant_* etc. use the argus-extension-api default sugar (None → trivial).
         fn tensor(
             &self,
-            _kind: technique_api::TensorKind,
-        ) -> Option<&dyn technique_api::TensorHandle> {
+            _kind: argus_extension_api::TensorKind,
+        ) -> Option<&dyn argus_extension_api::TensorHandle> {
             None
         }
     }

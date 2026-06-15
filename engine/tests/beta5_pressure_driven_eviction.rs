@@ -32,8 +32,8 @@ use argus_engine::session::pipeline_registry::PipelineRegistry;
 use argus_engine::shape::Shape;
 use argus_engine::stages::kv::eviction::EvictionStage;
 use argus_engine::tensor::Tensor;
+use argus_extension_api::StageParams;
 use argus_shared::Level;
-use technique_api::StageParams;
 
 const KV_HEADS: usize = 1;
 const HEAD_DIM: usize = 32;

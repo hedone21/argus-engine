@@ -25,11 +25,11 @@
 
 use std::sync::Mutex;
 
-use linkme::distributed_slice;
-use technique_api::{
+use argus_extension_api::{
     KV_READ_STAGES, KVReadPlan, KVReadStage, KVReadStageReg, ReadGranularity, ReadStageParams,
     StageCtx, TensorKind,
 };
+use linkme::distributed_slice;
 
 /// 한 page 의 채널별 K min/max (per kv_head). `min[kv_head*head_dim + d]` / `max[...]`.
 #[derive(Clone)]
@@ -264,7 +264,7 @@ static QUEST: KVReadStageReg = KVReadStageReg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use technique_api::{TensorHandle, TensorShape, find_read_stage};
+    use argus_extension_api::{TensorHandle, TensorShape, find_read_stage};
 
     /// 합성 K — `read_row(pos, head, out)` 가 page/head 결정적 값을 반환.
     /// k(pos, head, d) = base(pos) + d. base 는 pos 마다 다르게 두어 page min/max 검증.
@@ -283,8 +283,8 @@ mod tests {
                 per_head: true,
             }
         }
-        fn dtype(&self) -> technique_api::TensorDtype {
-            technique_api::TensorDtype::F32
+        fn dtype(&self) -> argus_extension_api::TensorDtype {
+            argus_extension_api::TensorDtype::F32
         }
         fn read_row(&self, row: usize, _kv_head: usize, out: &mut [f32]) {
             let base = self.bases.get(row).copied().unwrap_or(row as f32);

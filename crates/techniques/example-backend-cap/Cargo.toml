@@ -10,7 +10,7 @@ publish = false
 crate-type = ["cdylib", "rlib"] # rlib=정적 force-link 가시성, cdylib=dlopen .so
 
 [dependencies]
-technique-api = { path = "../../technique-api" }
+argus-extension-api = { path = "../../argus-extension-api" }
 linkme = "0.3" # 매크로 확장이 linkme:: 경로(재노출)를 쓰므로 plugin 직접 dep 필수
 
 [features]

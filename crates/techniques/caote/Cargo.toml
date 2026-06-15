@@ -8,7 +8,7 @@ publish = false
 
 # CAOTE technique crate — value-aware KV eviction.
 # TensorHandle 인터페이스로 V 를 읽어 plugin 이 자체 metric 을 계산하는 증명.
-# stage 축 확장은 `technique-api` 에만 의존한다(엔진/타 축 crate 미참조 = 가산 확장 비용의 증거).
+# stage 축 확장은 `argus-extension-api` 에만 의존한다(엔진/타 축 crate 미참조 = 가산 확장 비용의 증거).
 [dependencies]
-technique-api = { path = "../../technique-api" }
+argus-extension-api = { path = "../../argus-extension-api" }
 linkme = "0.3"

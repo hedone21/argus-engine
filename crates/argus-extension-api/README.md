@@ -1,4 +1,4 @@
-# technique-api
+# argus-extension-api
 
 The **additive extension surface** of argus-engine. A new KV-cache technique is a separate
 crate under [`crates/techniques/`](..) that depends only on this crate and self-registers
@@ -26,12 +26,12 @@ all buffer mutation.
 
 ## Add a KV-cache stage
 
-1. Create `crates/techniques/<name>/` with a `Cargo.toml` depending on `technique-api` and
+1. Create `crates/techniques/<name>/` with a `Cargo.toml` depending on `argus-extension-api` and
    `linkme`.
 2. Implement [`KVCacheStage`] and register it in one line:
 
 ```rust
-use technique_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, StageParams};
+use argus_extension_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, StageParams};
 
 struct KeepRecent;
 
@@ -48,8 +48,8 @@ impl KVCacheStage for KeepRecent {
     }
 }
 
-technique_api::register_kv_stage!("example_keep_recent", |_p: StageParams| Box::new(KeepRecent));
-technique_api::export_plugin!(); // only needed for the dynamic `.so` path (see below)
+argus_extension_api::register_kv_stage!("example_keep_recent", |_p: StageParams| Box::new(KeepRecent));
+argus_extension_api::export_plugin!(); // only needed for the dynamic `.so` path (see below)
 ```
 
 Working template: [`crates/techniques/example-keep-recent`](../techniques/example-keep-recent).
@@ -59,7 +59,7 @@ Working template: [`crates/techniques/example-keep-recent`](../techniques/exampl
 Implement [`KVFormat`] and register with `register_kv_format!`:
 
 ```rust
-use technique_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
+use argus_extension_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
 
 struct ExampleKvFormat;
 
@@ -71,8 +71,8 @@ impl KVFormat for ExampleKvFormat {
     }
 }
 
-technique_api::register_kv_format!("example_kv_format", || Box::new(ExampleKvFormat));
-technique_api::export_plugin!();
+argus_extension_api::register_kv_format!("example_kv_format", || Box::new(ExampleKvFormat));
+argus_extension_api::export_plugin!();
 ```
 
 Working template: [`crates/techniques/example-kv-format`](../techniques/example-kv-format).
@@ -84,7 +84,7 @@ The read axis has **no convenience macro** — submit a [`KVReadStageReg`] to th
 
 ```rust
 use linkme::distributed_slice;
-use technique_api::{KV_READ_STAGES, KVReadStageReg};
+use argus_extension_api::{KV_READ_STAGES, KVReadStageReg};
 
 #[distributed_slice(KV_READ_STAGES)]
 static MY_READ_STAGE: KVReadStageReg = KVReadStageReg {

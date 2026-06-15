@@ -814,7 +814,7 @@ fn build_chat_eviction_internal(
             merge_e: args.d2o_merge_e,
             use_layer_allocation: args.d2o_layer_alloc,
             protected_layers: args.d2o_protected_layers.clone(),
-            merge_axis: technique_api::MergeAxis::Both,
+            merge_axis: argus_extension_api::MergeAxis::Both,
         });
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,
@@ -845,7 +845,7 @@ fn build_chat_eviction_internal(
                 } else {
                     args.eviction_window
                 };
-                let params = technique_api::StageParams {
+                let params = argus_extension_api::StageParams {
                     eviction_window: args.eviction_window,
                     protected_prefix: actual_protected_prefix,
                     keep_ratio: args.h2o_keep_ratio,

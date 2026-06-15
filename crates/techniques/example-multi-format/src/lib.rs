@@ -8,7 +8,7 @@
 //! 엔진(argus_engine)·다른 축 crate 에 의존하지 않고 descriptor(데이터)만 기여. 엔진 force-link
 //! 안 함 → 동적 등록 성공 경로 vehicle.
 
-use technique_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
+use argus_extension_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
 
 /// q4_0-like(Nibble, 4-bit) — encode_via_descriptor 가 지원하는 q4_0 canonical(floor round-trip 가능).
 struct MfQ4;
@@ -43,13 +43,13 @@ impl KVFormat for MfQ8 {
 }
 
 // 한 crate(=한 `.so`)에 format 2종 — const-block 격리로 다회 호출 누적.
-technique_api::register_kv_format!("mf_q4", || Box::new(MfQ4));
-technique_api::register_kv_format!("mf_q8", || Box::new(MfQ8));
-technique_api::export_plugin!();
+argus_extension_api::register_kv_format!("mf_q4", || Box::new(MfQ4));
+argus_extension_api::register_kv_format!("mf_q8", || Box::new(MfQ8));
+argus_extension_api::export_plugin!();
 
 #[cfg(test)]
 mod tests {
-    use technique_api::{Packing, find_kv_format};
+    use argus_extension_api::{Packing, find_kv_format};
 
     #[test]
     fn both_formats_register_with_distinct_descriptors() {

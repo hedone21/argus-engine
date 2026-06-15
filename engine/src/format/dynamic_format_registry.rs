@@ -18,10 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
-use core::ffi::c_void;
-use technique_api::{
+use argus_extension_api::{
     FormatExportAbi, FormatVTableAbi, KV_FORMAT_ABI_VERSION, KVFormat, KVLayoutDesc,
 };
+use core::ffi::c_void;
 
 /// dlopen 된 한 format plugin 의 등록 항목. vtable 은 plugin `.so` 의 immutable static 을 가리킨다.
 struct RuntimeFormatReg {
@@ -92,7 +92,7 @@ pub(crate) fn try_register_format(lib: &Arc<libloading::Library>, path: &Path) -
                 )
             })?
             .to_owned();
-        if technique_api::find_kv_format(&name).is_some() {
+        if argus_extension_api::find_kv_format(&name).is_some() {
             anyhow::bail!(
                 "plugin {}: format name '{}' conflicts with a builtin (builtin takes precedence, dynamic registration rejected)",
                 path.display(),
@@ -170,7 +170,7 @@ pub fn dynamic_registered_format_names() -> Vec<String> {
 /// 정적/동적 모두 miss 면 `None`(graceful unknown). `find_kv_format` 의 source-agnostic 짝.
 pub fn make_format(name: &str) -> Option<Box<dyn KVFormat>> {
     // 1) 정적(linkme) 우선.
-    if let Some(reg) = technique_api::find_kv_format(name) {
+    if let Some(reg) = argus_extension_api::find_kv_format(name) {
         return Some((reg.make)());
     }
     // 2) 동적(dlopen) fallback.

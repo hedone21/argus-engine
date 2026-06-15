@@ -22,7 +22,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use technique_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, TensorKind};
+use argus_extension_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, TensorKind};
 
 use crate::kv::d2o_handler::cosine_similarity;
 

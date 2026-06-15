@@ -33,7 +33,7 @@ use argus_engine::session::pipeline_registry::PipelineRegistry;
 use argus_engine::shape::Shape;
 use argus_engine::stages::kv::eviction::EvictionStage;
 use argus_engine::tensor::Tensor;
-use technique_api::StageParams;
+use argus_extension_api::StageParams;
 
 const KV_HEADS: usize = 1;
 /// head_dim=32 = QK4_0 → 위치당 정확히 1 Q4_0 block (compact_parity 상수 차용).

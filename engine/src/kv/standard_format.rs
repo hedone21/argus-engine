@@ -22,7 +22,7 @@ use crate::kv::kv_cache::KVCache;
 use crate::memory::host::shared::SharedBuffer;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
-use technique_api::{KVReadPlan, KVReadStage, MergeAxis, WeightedMerge};
+use argus_extension_api::{KVReadPlan, KVReadStage, MergeAxis, WeightedMerge};
 
 /// 내부 가변 상태 — `KVCache` 와 비-F32 cast scratch 를 **단일 lock** 으로 묶는다.
 ///
@@ -771,7 +771,7 @@ fn apply_weighted_merges_opaque(cache: &mut KVCache, merges: &[WeightedMerge]) {
 #[allow(clippy::too_many_arguments)]
 fn merge_row_weighted_opaque(
     buf: &mut [u8],
-    desc: &technique_api::KVLayoutDesc,
+    desc: &argus_extension_api::KVLayoutDesc,
     into_off: usize,
     from_offs: &[usize],
     from_w: &[f32],
@@ -1484,7 +1484,7 @@ impl SelectiveRead for StandardFormat {
         out: &mut Tensor,
         dims: AttnDims,
         select: &[usize],
-        granularity: technique_api::ReadGranularity,
+        granularity: argus_extension_api::ReadGranularity,
         scores: Option<&mut [f32]>,
     ) -> Result<()> {
         use crate::memory::host::shared::SharedBuffer;
@@ -1504,8 +1504,8 @@ impl SelectiveRead for StandardFormat {
         // Page 단위라면 pos 목록으로 전개
         let expanded: Vec<usize>;
         let positions: &[usize] = match granularity {
-            technique_api::ReadGranularity::Token => select,
-            technique_api::ReadGranularity::Page { page_size } => {
+            argus_extension_api::ReadGranularity::Token => select,
+            argus_extension_api::ReadGranularity::Page { page_size } => {
                 expanded = page_indices_to_positions(select, page_size as usize, current_pos);
                 &expanded
             }
@@ -1646,7 +1646,7 @@ mod tests {
         use crate::memory::Memory;
         use crate::memory::galloc::Galloc;
         use crate::quant::{BlockQ4_0, QK4_0};
-        use technique_api::{KVLayoutDesc, Packing, ScaleLayout};
+        use argus_extension_api::{KVLayoutDesc, Packing, ScaleLayout};
 
         let kv_heads = 2usize;
         let head_dim = 64usize; // 2 blocks/head (block_elems=32)
@@ -1790,7 +1790,7 @@ mod tests {
         use crate::kv_cache_ops::KVLayout;
         use crate::memory::Memory;
         use crate::memory::galloc::Galloc;
-        use technique_api::{KVLayoutDesc, Packing, ScaleLayout};
+        use argus_extension_api::{KVLayoutDesc, Packing, ScaleLayout};
 
         let kv_heads = 1usize;
         let head_dim = 32usize; // 1 block/head
@@ -1865,7 +1865,7 @@ mod tests {
         use crate::memory::Memory;
         use crate::memory::galloc::Galloc;
         use crate::quant::{BlockQ4_0, QK4_0};
-        use technique_api::{KVLayoutDesc, Packing, ScaleLayout};
+        use argus_extension_api::{KVLayoutDesc, Packing, ScaleLayout};
 
         let kv_heads = 2usize;
         let head_dim = 64usize;
@@ -2001,7 +2001,7 @@ mod tests {
         use crate::memory::Memory;
         use crate::memory::galloc::Galloc;
         use crate::quant::{BlockQ4_0, QK4_0};
-        use technique_api::{KVLayoutDesc, MergeAxis, Packing, ScaleLayout, WeightedMerge};
+        use argus_extension_api::{KVLayoutDesc, MergeAxis, Packing, ScaleLayout, WeightedMerge};
 
         let kv_heads = 2usize;
         let head_dim = 64usize;
@@ -2686,7 +2686,7 @@ mod tests {
                 &mut out_sel,
                 dims,
                 &select_all,
-                technique_api::ReadGranularity::Token,
+                argus_extension_api::ReadGranularity::Token,
                 None,
             )
             .unwrap();
@@ -2737,7 +2737,7 @@ mod tests {
             &mut out,
             dims,
             &select_half,
-            technique_api::ReadGranularity::Token,
+            argus_extension_api::ReadGranularity::Token,
             None,
         )
         .unwrap();
@@ -2782,7 +2782,7 @@ mod tests {
             &mut out,
             dims,
             &page_select,
-            technique_api::ReadGranularity::Page { page_size: 2 },
+            argus_extension_api::ReadGranularity::Page { page_size: 2 },
             None,
         )
         .unwrap();
@@ -2794,7 +2794,7 @@ mod tests {
 
     // ── S2: read_plan seam (read stage 위임 + capability) ──
 
-    use technique_api::{KVReadPlan, KVReadStage, ReadGranularity, StageCtx};
+    use argus_extension_api::{KVReadPlan, KVReadStage, ReadGranularity, StageCtx};
 
     /// mock read stage — 생성 시 지정한 select 를 항상 반환. ctx 의 current_pos 로 "전체" plan 도 가능.
     struct MockReadStage {

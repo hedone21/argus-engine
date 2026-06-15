@@ -4,7 +4,7 @@
 # binary takes a one-line dependency.
 members = [
     "engine",
-    "crates/technique-api",
+    "crates/argus-extension-api",
     "crates/techniques/*",
 ]
 resolver = "3"

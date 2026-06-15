@@ -1,7 +1,7 @@
 //! `WeightSwapDeciderAsStage` — weight 축 빌트인 어댑터.
 //!
 //! KV 거울(`pressure::eviction::stage_registry`)의 weight 판: 엔진 내부
-//! `WeightSwapDecider` 를 technique-api 의 plan-returning `WeightStage` 표면으로
+//! `WeightSwapDecider` 를 argus-extension-api 의 plan-returning `WeightStage` 표면으로
 //! 감싸 `WEIGHT_STAGES` 슬라이스에 등록한다. 엔진 내부 등록이라 KV 빌트인과
 //! 동일하게 force-link 불요(dep 선언만으로 링크).
 //!
@@ -11,11 +11,11 @@
 //! production 호출부 배선은 Seam B/MW-D 단계의 일이라, 본 모듈은 어댑터 + 등록
 //! + self-test fn 정의 + 단위테스트까지만 둔다(호출부 배선 금지).
 
-use linkme::distributed_slice;
-use technique_api::{
+use argus_extension_api::{
     LayerDirective, LayerDispatch, TensorDtype, WEIGHT_STAGES, WeightDispatchPlan, WeightStage,
     WeightStageCtx, WeightStageParams, WeightStageReg,
 };
+use linkme::distributed_slice;
 
 use crate::weight::{SwapAlgorithm, WeightSwapDecider};
 
@@ -101,7 +101,7 @@ impl WeightStage for WeightSwapDeciderAsStage {
 /// 단위테스트만 둔다(호출부 배선 금지).
 pub fn ensure_builtin_weight_stages_registered() -> anyhow::Result<()> {
     for name in ["swap"] {
-        if technique_api::find_weight_stage(name).is_none() {
+        if argus_extension_api::find_weight_stage(name).is_none() {
             anyhow::bail!(
                 "내장 WeightStage '{name}' 미등록 — linkme fat-LTO --gc-sections silent drop 의심\
                  . weights/stage_registry 의 #[distributed_slice] 등록이 링크되지 않음."
@@ -120,7 +120,7 @@ static SWAP_STAGE: WeightStageReg = WeightStageReg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use technique_api::{LayerMetricKind, find_weight_stage};
+    use argus_extension_api::{LayerMetricKind, find_weight_stage};
 
     /// flat importance/noise/budget/current_format 를 직접 보유하는 최소 mock ctx.
     struct MockWeightCtx {

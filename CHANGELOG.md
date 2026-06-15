@@ -24,7 +24,7 @@ Initial public release.
 - GQA-aware GPU flash attention; FFN gate/up tensor partition across GPU + CPU.
 - Zero-compile extension surface: KV-cache stage / format / read-stage techniques
   self-register via `linkme` from crates under `crates/techniques/` with no engine-core
-  edits (see `crates/technique-api`).
+  edits (see `crates/argus-extension-api`).
 - Model conversion tooling (Safetensors → GGUF, and → AUF) under `scripts/`.
 
 [Unreleased]: https://github.com/hedone21/argus-engine/compare/v0.1.0...HEAD
