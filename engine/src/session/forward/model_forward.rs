@@ -78,7 +78,7 @@ pub struct ModelForward {
     // 선택적 read stage(Quest 류). `--read-stage` 지정 시 Some, 미지정(production
     // 기본)은 None. `step`(decode)이 `as_deref()` 로 forward args 에 대여 주입한다 — None 이면
     // transformer.rs seam 의 `is_some` branch 1회 → full read 직행(INV-147 byte-identical).
-    read_stage: Option<Box<dyn technique_api::KVReadStage>>,
+    read_stage: Option<Box<dyn argus_extension_api::KVReadStage>>,
 
     decode_workspace: LayerWorkspace,
     // Phase 4-4.5: paradigm equivalence requires `prefill_workspace: None`
@@ -200,7 +200,7 @@ impl ModelForward {
 
     /// 선택적 read stage 를 주입한다(decode 시 attention 직전 read_plan 호출원).
     /// `--read-stage` 미지정이면 호출되지 않아 read_stage = None(full read, INV-147 byte-identical).
-    pub fn set_read_stage(&mut self, stage: Box<dyn technique_api::KVReadStage>) {
+    pub fn set_read_stage(&mut self, stage: Box<dyn argus_extension_api::KVReadStage>) {
         self.read_stage = Some(stage);
     }
 
@@ -558,7 +558,8 @@ impl Forward for ModelForward {
 
         // read stage 대여(없으면 None). transformer.rs:1628 seam 이 layer 당 1회
         // read_plan 을 호출한다. self.model 은 Arc(별도 필드) 라 self.read_stage 동시 immutable borrow 무충돌.
-        let read_stage_slot: Option<&dyn technique_api::KVReadStage> = self.read_stage.as_deref();
+        let read_stage_slot: Option<&dyn argus_extension_api::KVReadStage> =
+            self.read_stage.as_deref();
 
         self.model.forward_into(TransformerModelForwardArgs {
             input_tokens: &self.decode_input,

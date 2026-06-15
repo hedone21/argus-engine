@@ -102,12 +102,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "argus-extension-api",
  "argus-shared",
  "caote",
  "clap",
  "cudarc",
  "env_logger",
  "example-keep-recent",
+ "h2o",
  "half",
  "libc",
  "libloading 0.8.9",
@@ -121,13 +123,20 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "streaming-llm",
  "synth-q4-format",
- "technique-api",
  "tempfile",
  "tiny_http",
  "tokenizers",
  "trybuild",
  "zbus",
+]
+
+[[package]]
+name = "argus-extension-api"
+version = "0.1.0"
+dependencies = [
+ "linkme",
 ]
 
 [[package]]
@@ -329,8 +338,8 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 name = "caote"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
@@ -720,56 +729,56 @@ dependencies = [
 name = "example-backend-cap"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-bundle"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-keep-recent"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-kv-format"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-multi-format"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-no-export"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
 name = "example-rollback"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
@@ -881,6 +890,14 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
+name = "h2o"
+version = "0.1.0"
+dependencies = [
+ "argus-extension-api",
+ "linkme",
+]
 
 [[package]]
 name = "half"
@@ -1411,8 +1428,8 @@ dependencies = [
 name = "quest"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
@@ -1706,6 +1723,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "streaming-llm"
+version = "0.1.0"
+dependencies = [
+ "argus-extension-api",
+ "linkme",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1726,8 +1751,8 @@ dependencies = [
 name = "synth-q4-format"
 version = "0.1.0"
 dependencies = [
+ "argus-extension-api",
  "linkme",
- "technique-api",
 ]
 
 [[package]]
@@ -1735,13 +1760,6 @@ name = "target-triple"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
-
-[[package]]
-name = "technique-api"
-version = "0.1.0"
-dependencies = [
- "linkme",
-]
 
 [[package]]
 name = "tempfile"

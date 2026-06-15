@@ -1491,15 +1491,15 @@ impl Args {
     }
 
     /// WeightedKV merge axis (KV 로드맵 항목 2 ablation). 미지정/타 정책 시 `Both`(구 동작).
-    pub fn d2o_merge_axis(&self) -> technique_api::MergeAxis {
+    pub fn d2o_merge_axis(&self) -> argus_extension_api::MergeAxis {
         let s = match self.current_policy() {
             Some(EvictionCmd::D2o(d)) => d.merge_axis.as_str(),
             _ => "both",
         };
         match s {
-            "key_only" => technique_api::MergeAxis::KeyOnly,
-            "value_only" => technique_api::MergeAxis::ValueOnly,
-            _ => technique_api::MergeAxis::Both,
+            "key_only" => argus_extension_api::MergeAxis::KeyOnly,
+            "value_only" => argus_extension_api::MergeAxis::ValueOnly,
+            _ => argus_extension_api::MergeAxis::Both,
         }
     }
 

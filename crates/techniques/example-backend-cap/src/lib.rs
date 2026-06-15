@@ -5,7 +5,7 @@
 //! host 게이트가 args struct 가 ABI 경계를 정확히 넘었는지(필드 정렬·값) 확인하게 한다. make 인자(cl_ctx 등)는
 //! synthetic 이라 무시. example-kv-format 의 backend 축 짝.
 
-use technique_api::{KiviAttentionBackend, KiviAttnArgs, KiviGatherArgs, KiviMakeArgs};
+use argus_extension_api::{KiviAttentionBackend, KiviAttnArgs, KiviGatherArgs, KiviMakeArgs};
 
 /// synthetic capability — 상태 없음(GPU 자원 비보유). 핸들 lifecycle(make/drop) round-trip 만 운반.
 struct SynthKivi;
@@ -48,8 +48,9 @@ impl KiviAttentionBackend for SynthKivi {
 }
 
 // 정적(linkme 이름 생존) + 동적(cdylib C-ABI vtable) 양쪽 한 줄 등록.
-technique_api::register_kivi_attention_plugin!("synth_kivi_attn", |_a: &KiviMakeArgs| -> Box<
-    dyn KiviAttentionBackend,
-> { Box::new(SynthKivi) });
+argus_extension_api::register_kivi_attention_plugin!(
+    "synth_kivi_attn",
+    |_a: &KiviMakeArgs| -> Box<dyn KiviAttentionBackend> { Box::new(SynthKivi) }
+);
 // .so 당 1회 — register_kv_stages_v2 / register_kv_formats_v2 / register_backend_caps_v2 엔트리 emit.
-technique_api::export_plugin!();
+argus_extension_api::export_plugin!();

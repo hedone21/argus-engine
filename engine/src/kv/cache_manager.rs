@@ -782,11 +782,11 @@ mod tests {
 
     #[test]
     fn test_maybe_evict_with_scores_triggers() {
-        use crate::kv::eviction::h2o::H2OPolicy;
+        use crate::kv::eviction::stage_registry::h2o_backed_policy;
 
         // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let cm = CacheManager::new(
-            Box::new(H2OPolicy::new(0.3, 0)), // prefix=4, keep_ratio=0.3
+            h2o_backed_policy(0.3, 0), // prefix=4, keep_ratio=0.3
             Box::new(MockMonitor {
                 available: 10 * 1024 * 1024,
             }),
@@ -838,10 +838,10 @@ mod tests {
     fn test_force_evict_bypasses_should_evict() {
         // H2O's should_evict() always returns false, but force_evict must still work.
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::kv::eviction::h2o::H2OPolicy;
+        use crate::kv::eviction::stage_registry::h2o_backed_policy;
 
         let cm = CacheManager::new(
-            Box::new(H2OPolicy::new(0.3, 0)),
+            h2o_backed_policy(0.3, 0),
             Box::new(MockMonitor {
                 available: 1024 * 1024 * 1024, // plenty of memory
             }),
@@ -864,10 +864,10 @@ mod tests {
     #[test]
     fn test_force_evict_with_scores_bypasses_checks() {
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::kv::eviction::h2o::H2OPolicy;
+        use crate::kv::eviction::stage_registry::h2o_backed_policy;
 
         let cm = CacheManager::new(
-            Box::new(H2OPolicy::new(0.3, 0)),
+            h2o_backed_policy(0.3, 0),
             Box::new(MockMonitor {
                 available: 1024 * 1024 * 1024,
             }),
@@ -908,10 +908,10 @@ mod tests {
     fn test_force_evict_ratio_clamping() {
         // target_ratio=0.0 clamps to 0.1 inside EvictionHandler.
         // pos=100, target_len=100*0.1=10, tokens_to_remove=90 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::kv::eviction::h2o::H2OPolicy;
+        use crate::kv::eviction::stage_registry::h2o_backed_policy;
 
         let cm = CacheManager::new(
-            Box::new(H2OPolicy::new(0.5, 0)),
+            h2o_backed_policy(0.5, 0),
             Box::new(MockMonitor { available: 0 }),
             0,
             0.75,
@@ -1054,14 +1054,14 @@ mod tests {
     #[test]
     fn test_pipeline_manager_force_evict_with_scores() {
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::kv::eviction::h2o::H2OPolicy;
+        use crate::kv::eviction::stage_registry::h2o_backed_policy;
         use crate::kv::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Emergency,
-            handler: Box::new(EvictionHandler::new(Box::new(H2OPolicy::new(0.5, 0)), 0.3)),
+            handler: Box::new(EvictionHandler::new(h2o_backed_policy(0.5, 0), 0.3)),
         }]);
 
         let cm = CacheManager::with_pipeline(
@@ -1087,14 +1087,14 @@ mod tests {
     #[test]
     fn test_pipeline_manager_with_scores() {
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-        use crate::kv::eviction::h2o::H2OPolicy;
+        use crate::kv::eviction::stage_registry::h2o_backed_policy;
         use crate::kv::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,
-            handler: Box::new(EvictionHandler::new(Box::new(H2OPolicy::new(0.5, 0)), 0.3)),
+            handler: Box::new(EvictionHandler::new(h2o_backed_policy(0.5, 0), 0.3)),
         }]);
 
         let cm = CacheManager::with_pipeline(
@@ -1360,10 +1360,20 @@ mod tests {
 
     #[test]
     fn test_resilience_streaming_keeps_sink_plus_window() {
-        use crate::kv::eviction::StreamingLLMPolicy;
+        use crate::kv::eviction::stage_registry::{StageBackedPolicy, make_stage};
 
-        // Streaming with sink=4, window=20 should keep exactly 24 tokens.
-        let policy = StreamingLLMPolicy::new(4, 20);
+        // Streaming with sink=4, window=20 should keep exactly 24 tokens. StreamingLLM was
+        // extracted to the streaming-llm plugin, so build the stage by registry name and wrap
+        // it as an EvictionPolicy (the same StageBackedPolicy seam production uses).
+        let params = argus_extension_api::StageParams {
+            eviction_window: 0,
+            protected_prefix: 0,
+            keep_ratio: 0.0,
+            sink_size: 4,
+            streaming_window: 20,
+        };
+        let stage = make_stage("streaming", &params).expect("streaming stage registered");
+        let policy = StageBackedPolicy::new(stage);
         let cm = CacheManager::new(
             Box::new(NoEvictionPolicy::new()),
             Box::new(MockMonitor {
@@ -1455,11 +1465,11 @@ mod tests {
 
     #[test]
     fn test_resilience_h2o_eviction_respects_keep_ratio() {
-        use crate::kv::eviction::h2o::H2OPolicy;
+        use crate::kv::eviction::stage_registry::h2o_backed_policy;
 
         // H2O with protected_prefix=4, keep_ratio=0.5 on 80 tokens.
         // target_ratio=0.2 → target_len=16, tokens_to_remove=64 == MIN_EVICT_TOKENS → guard does not fire.
-        let policy = H2OPolicy::new(0.5, 4);
+        let policy = h2o_backed_policy(0.5, 4);
         let mut cm = CacheManager::new(
             Box::new(NoEvictionPolicy::new()),
             Box::new(MockMonitor {
@@ -1468,7 +1478,7 @@ mod tests {
             0,
             1.0,
         );
-        cm.register_policy(crate::kv::eviction::EvictMethod::H2o, Box::new(policy));
+        cm.register_policy(crate::kv::eviction::EvictMethod::H2o, policy);
 
         let mut caches = make_caches(4, 80);
         let result = cm

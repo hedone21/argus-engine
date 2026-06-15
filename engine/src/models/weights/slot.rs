@@ -358,11 +358,11 @@ mod tests {
         LayerDispatch::Partition(vec![
             PartitionShare {
                 share: 0.5,
-                hardware: technique_api::DeviceTarget::Gpu,
+                hardware: argus_extension_api::DeviceTarget::Gpu,
             },
             PartitionShare {
                 share: 0.5,
-                hardware: technique_api::DeviceTarget::Cpu,
+                hardware: argus_extension_api::DeviceTarget::Cpu,
             },
         ])
     }

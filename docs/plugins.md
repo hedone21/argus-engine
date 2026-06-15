@@ -5,7 +5,7 @@
 A guide for adding a **KV-cache technique** to Argus without forking the engine: a new
 eviction policy, a new storage format, a query-aware read strategy. You write one trait
 impl in a small crate of your own, it registers itself, and the engine picks it up by
-name. This is the same `technique-api` surface the built-in techniques (`q4_0`, `quest`,
+name. This is the same `argus-extension-api` surface the built-in techniques (`q4_0`, `quest`,
 `caote`, …) are built on.
 
 > **New here?** Do the [Quickstart](#quickstart-your-first-plugin) (~10 minutes, runs on
@@ -86,7 +86,7 @@ are out of scope here.)
 
 > **One safety note for later.** The dynamic `.so` path loads native code into the engine
 > process with no sandbox: a panic or segfault in a plugin crashes the engine, and the
-> ABI is not stable across `technique-api` versions. None of that touches the Quickstart
+> ABI is not stable across `argus-extension-api` versions. None of that touches the Quickstart
 > (you write only safe Rust), but keep it in mind before shipping a `.so` to someone else.
 
 ---
@@ -119,7 +119,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-technique-api = { path = "../../technique-api" }
+argus-extension-api = { path = "../../argus-extension-api" }
 linkme = "0.3"
 
 [features]
@@ -135,7 +135,7 @@ only thing that matters is that the name string is unique:
 ```rust
 //! my-format — a custom KV-cache format (a q4_0-like descriptor).
 
-use technique_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
+use argus_extension_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
 
 /// A format is a *pure descriptor*: name + byte layout. No compute lives here —
 /// the engine's generic reader dequantizes through this layout to f32.
@@ -160,15 +160,15 @@ impl KVFormat for MyFormat {
 
 // One line registers MyFormat on BOTH paths: the static `KV_FORMATS` linkme slice and
 // (under `--features plugin-cdylib`) the dynamic C-ABI export.
-technique_api::register_kv_format!("my_format", || Box::new(MyFormat));
+argus_extension_api::register_kv_format!("my_format", || Box::new(MyFormat));
 
 // Emits this crate's `.so` entry symbols. Needed only for the dynamic path; a no-op for
 // static builds.
-technique_api::export_plugin!();
+argus_extension_api::export_plugin!();
 
 #[cfg(test)]
 mod tests {
-    use technique_api::find_kv_format;
+    use argus_extension_api::find_kv_format;
 
     #[test]
     fn registers_into_kv_formats() {
@@ -264,8 +264,8 @@ impl KVFormat for MyFormat {
 }
 
 // 2. REGISTER. This single line is the entire wiring — there is no central file to edit.
-technique_api::register_kv_format!("my_format", || Box::new(MyFormat));
-technique_api::export_plugin!();   // only needed for the dynamic `.so` path
+argus_extension_api::register_kv_format!("my_format", || Box::new(MyFormat));
+argus_extension_api::export_plugin!();   // only needed for the dynamic `.so` path
 ```
 
 What that registration line actually does:
@@ -343,7 +343,7 @@ Template: [`crates/techniques/example-keep-recent`](../crates/techniques/example
 (keep the most recent `target_len` tokens, the prefix-0 case of sliding-window).
 
 ```rust
-use technique_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, StageParams};
+use argus_extension_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, StageParams};
 
 struct KeepRecent;
 
@@ -368,11 +368,11 @@ impl KVCacheStage for KeepRecent {
     }
 }
 
-technique_api::register_kv_stage!(
+argus_extension_api::register_kv_stage!(
     "example_keep_recent",
     |_params: StageParams| Box::new(KeepRecent)
 );
-technique_api::export_plugin!();
+argus_extension_api::export_plugin!();
 ```
 
 ### What you can read — `StageCtx`
@@ -435,7 +435,7 @@ Two scoping notes:
   drives a CLI-selected stage (evict timing/ratio); selecting a *different* technique by name
   at runtime over the manager IPC would need a new `argus-shared` command (out of scope today).
 
-> Some `technique-api` doc-comments still call the selector `--eviction-policy <name>`, a
+> Some `argus-extension-api` doc-comments still call the selector `--eviction-policy <name>`, a
 > legacy name; the real CLI form is `eviction plugin --name <name>` (or a built-in
 > `eviction <policy>` subcommand).
 
@@ -454,7 +454,7 @@ product).
 
 ```rust
 use linkme::distributed_slice;
-use technique_api::{
+use argus_extension_api::{
     KV_READ_STAGES, KVReadPlan, KVReadStage, KVReadStageReg, ReadGranularity,
     ReadStageParams, StageCtx,
 };
@@ -569,7 +569,7 @@ active.
 | Hot-swappable | no | yes |
 | Runtime overhead | zero (direct call) | one `dlopen` + indirect C-ABI call |
 | Type richness | full Rust types | flat C-ABI structs (handled inside the macros) |
-| ABI stability | n/a (same compile) | fragile, must match `technique-api` version |
+| ABI stability | n/a (same compile) | fragile, must match `argus-extension-api` version |
 | Crash isolation | shares the process | shares the process (no sandbox) |
 | Who ships it | the engine maintainer | anyone, as a standalone `.so` |
 | Axes supported | all three | format, stage, backend-cap (read is static-only) |
@@ -613,7 +613,7 @@ What happens under the hood:
   and [`example-multi-format`](../crates/techniques/example-multi-format) (two formats).
 - **ABI handshake.** Each envelope carries an `abi_version`; the host rejects the `.so`
   fail-fast on mismatch (`KV_STAGE`/`KV_FORMAT_ABI_VERSION = 2`, `BACKEND_CAP = 1`). Rebuild
-  your plugin against the engine's `technique-api` version.
+  your plugin against the engine's `argus-extension-api` version.
 - **Name collisions.** A dynamic name that collides with a built-in (or another loaded
   plugin) is rejected; the built-in wins. Registration of one `.so` is 2-pass atomic, so a
   partial/conflicting envelope registers nothing (see
@@ -663,8 +663,8 @@ These are the system's *signature* failure modes, the ones with no obvious compi
 |---------|-------|-----|
 | Plugin compiles but the engine can't find the name | The crate isn't in the host's link graph, or its registration was dead-code-eliminated | For the static path, add the path dep **and** a `use my_crate as _;` force-link line; for the dynamic path, pass `--load-plugin <.so>` |
 | `Unknown --kv-format '…' (… check --load-plugin)` | Name typo, or `--load-plugin` points at the wrong/old `.so` | Confirm the `name()` string equals the flag value; rebuild and point at the fresh `target/<profile>/lib*.so` |
-| `.so` loads but `0 capabilities registered (… export_plugin! missing?)` | Forgot `technique_api::export_plugin!()` | Add it once per `.so` ([`example-no-export`](../crates/techniques/example-no-export)) |
-| `.so` rejected: `abi_version … != expected …` | Plugin built against a different `technique-api` version | Rebuild the plugin against the engine's version (ABI is not stable across versions) |
+| `.so` loads but `0 capabilities registered (… export_plugin! missing?)` | Forgot `argus_extension_api::export_plugin!()` | Add it once per `.so` ([`example-no-export`](../crates/techniques/example-no-export)) |
+| `.so` rejected: `abi_version … != expected …` | Plugin built against a different `argus-extension-api` version | Rebuild the plugin against the engine's version (ABI is not stable across versions) |
 | Duplicate-name rejection on load | The name collides with a built-in or another plugin | Rename your technique ([`example-rollback`](../crates/techniques/example-rollback) shows the atomic-rollback behavior) |
 | Linker `#[no_mangle]` symbol collision | A crate is force-linked **and** built with `--features plugin-cdylib` | Keep `plugin-cdylib` off for static builds; turn it on only when producing a `.so` |
 | Custom eviction stage won't select | Using `argus-cli` (no eviction in v0), or a name typo | Select on `argus-bench`/`argus-eval` with `eviction plugin --name <name>`; confirm the name matches `name()`; see [Selecting your stage](#how-to-add-an-eviction--merge-stage) |
@@ -678,10 +678,10 @@ Turning "I implemented the trait" into "I shipped a crate someone can load":
 
 - [ ] `Cargo.toml`: `crate-type = ["cdylib", "rlib"]` and a `plugin-cdylib = []` feature
       (off by default).
-- [ ] Dependencies are exactly `technique-api` (path or version) + `linkme = "0.3"`, with no
+- [ ] Dependencies are exactly `argus-extension-api` (path or version) + `linkme = "0.3"`, with no
       engine dependency.
 - [ ] A unit test that asserts registration fired (`find_kv_format(...).is_some()` etc.).
-- [ ] State the `technique-api` version your `.so` is built against; the dynamic ABI is not
+- [ ] State the `argus-extension-api` version your `.so` is built against; the dynamic ABI is not
       stable across versions.
 - [ ] License: contributions to this repo are dual `MIT OR Apache-2.0`; match it for
       in-tree crates.
@@ -693,9 +693,9 @@ Turning "I implemented the trait" into "I shipped a crate someone can load":
 ## Where to go next
 
 - **Reference:** the full trait/macro surface with doc comments:
-  [`crates/technique-api/src/lib.rs`](../crates/technique-api/src/lib.rs) (run `cargo doc
-  -p technique-api --open`) and the crate's own
-  [`README.md`](../crates/technique-api/README.md).
+  [`crates/argus-extension-api/src/lib.rs`](../crates/argus-extension-api/src/lib.rs) (run `cargo doc
+  -p argus-extension-api --open`) and the crate's own
+  [`README.md`](../crates/argus-extension-api/README.md).
 - **Concepts / vocabulary:** [`CONTEXT.md`](../CONTEXT.md): the stage ⊥ format ⊥ hardware
   model, why a *format* is never a *layer*, and why composite operations decompose into
   single-axis primitives.

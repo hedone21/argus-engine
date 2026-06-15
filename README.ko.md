@@ -231,7 +231,7 @@ python scripts/run_device.py -d android argus-cli \
 
 ## Argus 확장
 
-KV-cache 기법(technique)은 `technique-api`와 `linkme`에만 의존하는 별도 크레이트이고, 스스로
+KV-cache 기법(technique)은 `argus-extension-api`와 `linkme`에만 의존하는 별도 크레이트이고, 스스로
 등록합니다. 하나 추가해도 엔진 코어 코드는 건드리지 않습니다. 직교하는 세 축
 (**stage** ⊥ **format** ⊥ **hardware**)이 있습니다. **stage**는 어떤 토큰을 남길지(eviction/merge),
 또는 attention에서 무엇을 읽을지(read stage) 정하고, **format**은 KV 바이트 레이아웃(precision)을
@@ -260,7 +260,7 @@ name = "my-kv-format"
 crate-type = ["cdylib", "rlib"]   # cdylib = .so, rlib = 정적 force-link
 
 [dependencies]
-technique-api = { path = "../../technique-api" }
+argus-extension-api = { path = "../../argus-extension-api" }
 linkme = "0.3"
 
 [features]
@@ -271,7 +271,7 @@ plugin-cdylib = []                # .so C-ABI export를 켜는 게이트
 한 줄로 등록합니다:
 
 ```rust
-use technique_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
+use argus_extension_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
 
 struct MyKvFormat;
 
@@ -288,8 +288,8 @@ impl KVFormat for MyKvFormat {
 }
 
 // 이 한 줄이 정적(linkme 레지스트리)과 동적(`.so` C-ABI export)을 한꺼번에 등록합니다.
-technique_api::register_kv_format!("my_kv_format", || Box::new(MyKvFormat));
-technique_api::export_plugin!();                // --load-plugin이 쓸 .so 진입점을 만듭니다
+argus_extension_api::register_kv_format!("my_kv_format", || Box::new(MyKvFormat));
+argus_extension_api::export_plugin!();                // --load-plugin이 쓸 .so 진입점을 만듭니다
 ```
 
 이제 `.so`로 빌드해 이름으로 로드하면 됩니다. 엔진은 다시 빌드하지 않습니다:
@@ -320,7 +320,7 @@ cargo build --release -p my-kv-format --features plugin-cdylib
 없는 정밀도는 일반 dequant→f32 경로로 처리됩니다. 축 용어는 [`CONTEXT.ko.md`](CONTEXT.ko.md)를,
 전체 온보딩 가이드(빠른 시작부터 플러그인 출하까지)는 [`docs/plugins.ko.md`](docs/plugins.ko.md)
 를, 간결한 등록 레퍼런스와 `example-*` 템플릿(번들, 멀티 포맷, rollback·에러 vehicle)은
-[`crates/technique-api/README.md`](crates/technique-api/README.md)를 보세요.
+[`crates/argus-extension-api/README.md`](crates/argus-extension-api/README.md)를 보세요.
 
 ## 저장소 구성
 

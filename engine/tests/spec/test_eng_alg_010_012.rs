@@ -9,11 +9,13 @@
 
 use argus_engine::backend::cpu::CpuBackend;
 use argus_engine::buffer::{Buffer, DType};
-use argus_engine::kv::eviction::{EvictionPolicy, H2OPolicy, SlidingWindowPolicy};
+use argus_engine::kv::eviction::stage_registry::{StageBackedPolicy, make_stage};
+use argus_engine::kv::eviction::{EvictionPolicy, SlidingWindowPolicy};
 use argus_engine::kv::kv_cache::KVCache;
 use argus_engine::memory::host::shared::SharedBuffer;
 use argus_engine::shape::Shape;
 use argus_engine::tensor::Tensor;
+use argus_extension_api::StageParams;
 use std::sync::Arc;
 
 // ── 헬퍼 ──
@@ -53,9 +55,25 @@ fn make_cache_with_data(num_tokens: usize) -> KVCache {
 // ENG-ALG-010: H2O budget split (50:50 기본)
 // ══════════════════════════════════════════════════════════════
 
+/// H2O was extracted to the `h2o` plugin crate; build the stage by registry name and wrap it as
+/// a legacy EvictionPolicy (StageBackedPolicy) — the same seam production uses to resolve "h2o".
+fn h2o_policy(keep_ratio: f32, protected_prefix: usize) -> StageBackedPolicy {
+    StageBackedPolicy::new(
+        make_stage(
+            "h2o",
+            &StageParams {
+                keep_ratio,
+                protected_prefix,
+                ..Default::default()
+            },
+        )
+        .expect("h2o stage registered"),
+    )
+}
+
 #[test]
 fn test_eng_alg_010_h2o_no_eviction_when_below_target() {
-    let policy = H2OPolicy::new(0.5, 4);
+    let policy = h2o_policy(0.5, 4);
     let mut cache = make_cache_with_data(10);
     // target_len이 current_pos 이상이면 eviction 발생하지 않음
     policy.evict(&mut cache, 20).unwrap();
@@ -64,7 +82,7 @@ fn test_eng_alg_010_h2o_no_eviction_when_below_target() {
 
 #[test]
 fn test_eng_alg_010_h2o_evict_preserves_prefix() {
-    let policy = H2OPolicy::new(0.5, 4);
+    let policy = h2o_policy(0.5, 4);
     let mut cache = make_cache_with_data(30);
 
     // target_len=15: prefix 4개는 보호되어야 함
@@ -77,13 +95,10 @@ fn test_eng_alg_010_h2o_evict_preserves_prefix() {
     assert_eq!(k_data[0], 1.0); // position 0
 }
 
-#[test]
-fn test_eng_alg_010_h2o_should_evict_always_false() {
-    // H2O는 signal-driven: should_evict()는 항상 false
-    let policy = H2OPolicy::new(0.5, 4);
-    let cache = make_cache_with_data(50);
-    assert!(!policy.should_evict(&cache, 0));
-}
+// `test_eng_alg_010_h2o_should_evict_always_false` was removed when H2O was extracted to the
+// `h2o` plugin: the stage no longer owns the WHEN decision (StageBackedPolicy delegates the
+// trigger to the engine's MIN_EVICT/target-ratio guard), so should_evict() is no longer the
+// policy's concern. The signal-driven trigger is exercised by the cache_manager guard tests.
 
 // ══════════════════════════════════════════════════════════════
 // ENG-ALG-010/C01: H2O evict_with_scores — 중요도 기반 보존
@@ -91,7 +106,7 @@ fn test_eng_alg_010_h2o_should_evict_always_false() {
 
 #[test]
 fn test_eng_alg_010_c01_h2o_evict_with_scores_preserves_important() {
-    let policy = H2OPolicy::new(0.5, 4);
+    let policy = h2o_policy(0.5, 4);
     let mut cache = make_cache_with_data(30);
 
     // importance scores: position 10, 20에 높은 중요도

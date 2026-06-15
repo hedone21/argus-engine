@@ -1,4 +1,4 @@
-//! technique-api — the additive surface where extension techniques (stage axis) register themselves with **zero engine-core modifications**.
+//! argus-extension-api — the additive surface where extension techniques (stage axis) register themselves with **zero engine-core modifications**.
 //!
 //! extension mechanism = statically linked technique crate + linkme auto-registration. Each technique, in its own crate
 //! (`crates/techniques/<name>/`), depends only on this crate, implements [`KVCacheStage`], and
@@ -11,7 +11,7 @@
 //! via `compact` (D1). State (d2o EMA, etc.) is held by the plugin struct itself via `&self` + interior mutability
 //! (D4); it is not threaded through the ctx.
 //!
-//! Dependency direction: `engine → technique-api ← technique crate` (one-way, no cycles). Hence this crate
+//! Dependency direction: `engine → argus-extension-api ← technique crate` (one-way, no cycles). Hence this crate
 //! **does not reference** engine types (`KVCache`/`Backend`) — the cache state a technique needs to read is exposed through the read-only abstraction [`StageCtx`] that this crate
 //! defines, with the engine implementing it over `&KVCache` (D5). In the static
 //! stage this is a borrow; in a future `.so` C-ABI stage the same abstraction is swapped for C accessors / a flat snapshot — forward-compatible.
@@ -261,14 +261,14 @@ pub trait KVCacheStage: Send + Sync {
 }
 
 /// The common parameters needed to create a technique instance. The engine maps CLI args into this struct and passes it along
-/// (carrying only flat values so technique-api does not depend on the engine's args type).
+/// (carrying only flat values so argus-extension-api does not depend on the engine's args type).
 ///
 /// NOTE(open question): d2o-specific parameters (ema_beta/merge_e/use_layer_allocation, etc.) are
 /// **not carried here** because the "bloating the shared struct vs. per-technique opaque params" decision is unresolved —
 /// it will be settled upon entering the d2o migration (M4). The 4 current built-ins (sliding/streaming/h2o/no_eviction) are well served by the
 /// 5 fields below.
 #[repr(C)] // GATE-C: the `.so` C-ABI passes it by value as a POD (the make-thunk argument).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct StageParams {
     /// sliding window size (number of recent tokens to keep).
     pub eviction_window: usize,
@@ -463,7 +463,7 @@ pub struct StageExportAbi {
     pub vtables: *const PluginVTableAbi,
 }
 
-/// The slice that accumulates stage vtables inside the plugin `.so`. **Declared in exactly one place, technique-api**
+/// The slice that accumulates stage vtables inside the plugin `.so`. **Declared in exactly one place, argus-extension-api**
 /// (the linkme section name is determined by the declaring static's name — declaring it on the plugin side breaks cross-crate contribution). `register_kv_stage!`
 /// contributes via a const-block-isolated static under the plugin-cdylib gate (multiple calls = multiple stages). In a static build it stays empty and
 /// harmless (the engine reads only `KV_CACHE_STAGES`).
@@ -691,8 +691,8 @@ impl PlanArena {
 ///
 ///
 /// ```ignore
-/// technique_api::register_kv_stage!("example_keep_recent", |_p| Box::new(KeepRecent));
-/// technique_api::export_plugin!();   // once per .so
+/// argus_extension_api::register_kv_stage!("example_keep_recent", |_p| Box::new(KeepRecent));
+/// argus_extension_api::export_plugin!();   // once per .so
 /// ```
 #[macro_export]
 macro_rules! register_kv_stage {
@@ -1094,7 +1094,7 @@ pub struct FormatExportAbi {
     pub vtables: *const FormatVTableAbi,
 }
 
-/// Slice that accumulates format vtables inside a plugin `.so`. **Declared in exactly one place, technique-api**
+/// Slice that accumulates format vtables inside a plugin `.so`. **Declared in exactly one place, argus-extension-api**
 /// (the linkme section name is determined by the declaring static's name — a plugin-side declaration would break cross-crate contributions). `register_kv_format!`
 /// contributes a const-block-isolated static under the plugin-cdylib gate (multiple calls = multiple formats). In a static build it is left empty
 /// and harmless (the engine reads only `KV_FORMATS`).
@@ -1113,9 +1113,9 @@ pub static PLUGIN_KV_FORMAT_VTABLES: [FormatVTableAbi] = [..];
 /// once per `.so`, by [`export_plugin!`]. The format-axis counterpart of [`register_kv_stage!`].
 ///
 /// ```ignore
-/// technique_api::register_kv_format!("nf4",  || Box::new(Nf4));
-/// technique_api::register_kv_format!("awq4", || Box::new(Awq4));   // multiple formats in one .so
-/// technique_api::export_plugin!();   // once per .so
+/// argus_extension_api::register_kv_format!("nf4",  || Box::new(Nf4));
+/// argus_extension_api::register_kv_format!("awq4", || Box::new(Awq4));   // multiple formats in one .so
+/// argus_extension_api::export_plugin!();   // once per .so
 /// ```
 #[macro_export]
 macro_rules! register_kv_format {
@@ -1177,8 +1177,8 @@ macro_rules! register_kv_format {
 /// An axis with zero contributions yields a `count==0` envelope (an empty distributed_slice — ELF `__start==__stop`, safe).
 ///
 /// ```ignore
-/// technique_api::register_kv_format!("nf4", || Box::new(Nf4));
-/// technique_api::export_plugin!();
+/// argus_extension_api::register_kv_format!("nf4", || Box::new(Nf4));
+/// argus_extension_api::export_plugin!();
 /// ```
 #[macro_export]
 macro_rules! export_plugin {
@@ -1254,7 +1254,7 @@ pub fn registered_backend_capability_names() -> Vec<&'static str> {
 
 // ── Backend-capability axis — ATTENTION (KIVI) category dynamic C-ABI ──
 //
-// D8 (single-trait): technique-api owns the canonical [`KiviAttentionBackend`]. The engine's static OpenCL
+// D8 (single-trait): argus-extension-api owns the canonical [`KiviAttentionBackend`]. The engine's static OpenCL
 // impl, the host dlopen adapter, and the plugin `.so` **all implement this one trait** (isomorphic to the stage `KVCacheStage`). The signatures take
 // ABI structs (`KiviAttnArgs`/`KiviGatherArgs`, cl_mem `*mut c_void`) rather than `&Tensor`, so the plugin does not reference engine
 // types (independent). The static `BACKEND_CAPABILITIES` above (keyed by name) stays as-is — for the fat-LTO name-survival smoke test.
@@ -1318,7 +1318,7 @@ pub struct KiviGatherArgs {
     pub res_pos: usize,
 }
 
-/// Canonical capability trait for the ATTENTION category (D8 single-trait). Owned by technique-api → the engine's static impl,
+/// Canonical capability trait for the ATTENTION category (D8 single-trait). Owned by argus-extension-api → the engine's static impl,
 /// the host dlopen adapter, and the plugin `.so` **all implement this one trait**. It takes an ABI struct instead of `&Tensor` so the plugin is
 /// independent (does not reference engine types). Returns `i32` (C3 panic=abort: 0=OK, negative=err — vtable fn-ptrs must not panic).
 pub trait KiviAttentionBackend: Send + Sync {
@@ -1405,7 +1405,7 @@ pub struct BackendCapExportAbi {
     pub vtables: *const BackendCapVTableAbi,
 }
 
-/// Slice that accumulates backend-cap vtables inside a plugin `.so`. **Declared in exactly one place: technique-api.**
+/// Slice that accumulates backend-cap vtables inside a plugin `.so`. **Declared in exactly one place: argus-extension-api.**
 /// `register_kivi_attention_plugin!` contributes to it under the plugin-cdylib gate. Harmlessly empty in static builds.
 #[distributed_slice]
 pub static PLUGIN_BACKEND_CAP_VTABLES: [BackendCapVTableAbi] = [..];
@@ -1602,7 +1602,7 @@ mod tests {
     use super::*;
 
     /// `KVLayoutDesc` byte accounting matches the engine block struct sizes.
-    /// Zero engine dependency (technique-api is isolated), so verified against literals — the engine side
+    /// Zero engine dependency (argus-extension-api is isolated), so verified against literals — the engine side
     /// cross-checks `size_of::<Block*>()` (dtype_layout.rs).
     #[test]
     fn kv_layout_desc_byte_accounting() {

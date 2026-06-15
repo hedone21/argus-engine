@@ -241,7 +241,7 @@ for the device-runner and evaluation tooling.
 
 ## Extending Argus
 
-A KV-cache technique is a separate crate that depends only on `technique-api` +
+A KV-cache technique is a separate crate that depends only on `argus-extension-api` +
 `linkme` and self-registers, so adding one touches zero engine-core code. There are
 three orthogonal axes (**stage** ⊥ **format** ⊥ **hardware**): a stage adjusts which
 tokens stay resident (an eviction/merge stage, or a read stage that chooses what to read
@@ -269,7 +269,7 @@ name = "my-kv-format"
 crate-type = ["cdylib", "rlib"]   # cdylib = the .so; rlib = static force-link
 
 [dependencies]
-technique-api = { path = "../../technique-api" }
+argus-extension-api = { path = "../../argus-extension-api" }
 linkme = "0.3"
 
 [features]
@@ -280,7 +280,7 @@ plugin-cdylib = []                # gates the .so C-ABI export
 and register it in one line:
 
 ```rust
-use technique_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
+use argus_extension_api::{KVFormat, KVLayoutDesc, Packing, ScaleLayout};
 
 struct MyKvFormat;
 
@@ -297,8 +297,8 @@ impl KVFormat for MyKvFormat {
 }
 
 // One line dual-wires it: static (linkme registry) + dynamic (the `.so` C-ABI export).
-technique_api::register_kv_format!("my_kv_format", || Box::new(MyKvFormat));
-technique_api::export_plugin!();                // emits the .so entry point for --load-plugin
+argus_extension_api::register_kv_format!("my_kv_format", || Box::new(MyKvFormat));
+argus_extension_api::export_plugin!();                // emits the .so entry point for --load-plugin
 ```
 
 Build it as a `.so` and load it by name, no engine rebuild:
@@ -329,7 +329,7 @@ A `KVFormat` contributes a byte-layout *descriptor* rather than a compute kernel
 with no matching builtin rides a generic dequant→f32 path. See [`CONTEXT.md`](CONTEXT.md)
 for the axis vocabulary, [`docs/plugins.md`](docs/plugins.md) for the full onboarding
 guide (quickstart through shipping a plugin), and
-[`crates/technique-api/README.md`](crates/technique-api/README.md) for the terse
+[`crates/argus-extension-api/README.md`](crates/argus-extension-api/README.md) for the terse
 registration reference and the `example-*` templates (bundles, multi-format, rollback /
 error vehicles).
 

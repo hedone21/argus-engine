@@ -16,7 +16,7 @@ use quest as _;
 /// `Err` 로 fail-fast 한다(release 에서 `--read-stage quest` 미해석 → 조용한 폴백 방지).
 pub fn ensure_builtin_read_stages_registered() -> Result<()> {
     for name in ["quest"] {
-        if technique_api::find_read_stage(name).is_none() {
+        if argus_extension_api::find_read_stage(name).is_none() {
             anyhow::bail!(
                 "내장 KVReadStage '{name}' 미등록 — linkme fat-LTO --gc-sections silent drop 의심\
                  . quest crate 의 #[distributed_slice(KV_READ_STAGES)] 등록이 \
@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn quest_resolvable_by_name() {
-        let reg = technique_api::find_read_stage("quest").expect("quest 등록 검색 가능");
+        let reg = argus_extension_api::find_read_stage("quest").expect("quest 등록 검색 가능");
         assert_eq!(reg.name, "quest");
     }
 }

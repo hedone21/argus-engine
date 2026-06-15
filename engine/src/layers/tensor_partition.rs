@@ -61,7 +61,7 @@ pub fn apply_partition_dispatch(
     hw: &crate::hardware::Hardware,
 ) -> Result<usize> {
     use crate::format::weight_format::{LayerDispatch, PartitionShare, WeightFormat};
-    use technique_api::DeviceTarget;
+    use argus_extension_api::DeviceTarget;
 
     if is_gpu_only_ratio(gpu_ratio) {
         for slot in slots {

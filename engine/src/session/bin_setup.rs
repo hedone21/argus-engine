@@ -25,7 +25,7 @@ use crate::session::resilience_init::build_command_executor;
 use crate::session::standard_happy::StandardHappyCtx;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
-use technique_api::KVLayoutDesc;
+use argus_extension_api::KVLayoutDesc;
 
 /// `build_inference_ctx` / `build_kivi_bench_ctx` 공통 prelude 산출물 (AB-2 §5.7.7).
 ///

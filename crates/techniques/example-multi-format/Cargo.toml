@@ -11,11 +11,11 @@ publish = false
 # export_plugin! 1회. cdylib = dlopen `.so`(register_kv_formats_v2 봉투에 N개 vtable).
 crate-type = ["cdylib", "rlib"]
 
-# 멀티-format 예제 — `technique-api` + `linkme` 만 의존(엔진 force-link 안 함). 한 plugin `.so` 가
+# 멀티-format 예제 — `argus-extension-api` + `linkme` 만 의존(엔진 force-link 안 함). 한 plugin `.so` 가
 # **서로 다른 descriptor** 의 format 2종을 싣는 vehicle(인덱스-swap·이름↔vtable
 # 미스바인딩 검출용 — 동일 desc 면 못 잡음).
 [dependencies]
-technique-api = { path = "../../technique-api" }
+argus-extension-api = { path = "../../argus-extension-api" }
 linkme = "0.3"
 
 [features]

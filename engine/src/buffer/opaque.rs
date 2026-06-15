@@ -19,9 +19,9 @@ use std::any::Any;
 use std::sync::Arc;
 
 use anyhow::Result;
+use argus_extension_api::KVLayoutDesc;
 #[cfg(feature = "opencl")]
 use ocl::core::Mem;
-use technique_api::KVLayoutDesc;
 
 use crate::buffer::{Buffer, DType};
 
@@ -119,7 +119,7 @@ impl Buffer for OpaqueBuffer {
 mod tests {
     use super::*;
     use crate::memory::host::shared::SharedBuffer;
-    use technique_api::{Packing, ScaleLayout};
+    use argus_extension_api::{Packing, ScaleLayout};
 
     fn q4_0_desc() -> KVLayoutDesc {
         KVLayoutDesc {

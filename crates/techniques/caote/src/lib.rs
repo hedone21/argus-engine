@@ -5,15 +5,15 @@
 //! `attn_weight`(있으면) 또는 `importance` 폴백. **value(V)** 를 [`StageCtx::tensor`]`(Value)` 로 읽어
 //! plugin 안에서 계산하고, 엔진은 V/weight 노출 + 반환 plan 실행만 한다(plan-returning, D1).
 //!
-//! `technique-api` 에만 의존(엔진 타입 `KVCache`/`Backend` 미참조). 등록은 `#[distributed_slice]`,
+//! `argus-extension-api` 에만 의존(엔진 타입 `KVCache`/`Backend` 미참조). 등록은 `#[distributed_slice]`,
 //! 활성화는 force-link 1줄. v1 은 [`KeepSpec::LayerWide`] 만 산출(head reduce 는 plugin 내부;
 //! per-head 는 단계 ⑤ executor 대기). feature `caote` 설치 시 `eviction caote` 서브커맨드로 선택.
 
-use linkme::distributed_slice;
-use technique_api::{
+use argus_extension_api::{
     KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCtx, StageParams,
     TensorKind,
 };
+use linkme::distributed_slice;
 
 /// CAOTE eviction stage — value-aware criticality.
 struct Caote;
@@ -108,7 +108,7 @@ static CAOTE: KVCacheStageReg = KVCacheStageReg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use technique_api::{TensorHandle, find_stage};
+    use argus_extension_api::{TensorHandle, find_stage};
 
     /// V 미공급 mock — fallback(importance 랭킹) 경로 검증용.
     struct MockCtx {

@@ -288,7 +288,7 @@ pub struct OffloadForwardArgs<'a, C> {
     /// S6: KV read stage — decode arm 에서 layer i 완료 후 read_plan 을 산출해
     /// layer i+1 의 prefetch 우선 힌트로 공급한다.
     /// `None`(기본) = 기존 순차 preload 그대로(read_stage=None byte-identical, INV-147).
-    pub read_stage: Option<&'a dyn technique_api::KVReadStage>,
+    pub read_stage: Option<&'a dyn argus_extension_api::KVReadStage>,
 }
 
 /// `forward_into` 의 KVCacheFormat trait-object fork 인자 (Phase α-K substep 3c).
@@ -341,7 +341,7 @@ pub struct TransformerModelForwardArgs<'a> {
     /// `SelectiveRead` 를 구현하면 선택적 읽기(`attention_into_selected`)로, 아니면 plan 을 무시하고
     /// full read 폴백(D4). `None`(production 기본 / 빌트인 0개 시작)이면 layer 당 `Option::is_some`
     /// branch 1회만 추가 — INV-147 zero-overhead, α-K frozen byte-identical 게이트 대상.
-    pub read_stage: Option<&'a dyn technique_api::KVReadStage>,
+    pub read_stage: Option<&'a dyn argus_extension_api::KVReadStage>,
 }
 
 impl TransformerModel {
@@ -1417,16 +1417,16 @@ impl TransformerModel {
     /// 라 상한을 granularity 로 분기한다. 빈 select 는 그대로 통과(format 이 빈 캐시처럼 처리, D2).
     // pub(crate): offload-path forward(`models/offload_forward.rs`)가 호출하는 공유 헬퍼.
     pub(crate) fn validate_read_plan(
-        plan: &technique_api::KVReadPlan,
+        plan: &argus_extension_api::KVReadPlan,
         current_pos: usize,
     ) -> Option<&[usize]> {
         use std::sync::atomic::{AtomicBool, Ordering};
         static WARNED: AtomicBool = AtomicBool::new(false);
 
         let upper = match plan.granularity {
-            technique_api::ReadGranularity::Token => current_pos,
+            argus_extension_api::ReadGranularity::Token => current_pos,
             // page index 상한: 마지막 유효 토큰을 담는 page 까지. ceil(current_pos / page_size).
-            technique_api::ReadGranularity::Page { page_size } => {
+            argus_extension_api::ReadGranularity::Page { page_size } => {
                 if page_size == 0 {
                     current_pos // page_size=0 은 무의미 — Token 상한으로 강등(아래 violation 검출에 맡김).
                 } else {
@@ -3456,7 +3456,7 @@ mod tests {
 
     // ── S2: validate_read_plan + 미지원 format capability 폴백 ──
 
-    use technique_api::{KVReadPlan, ReadGranularity};
+    use argus_extension_api::{KVReadPlan, ReadGranularity};
 
     /// validate_read_plan: ascending + 범위 내 → Some(전체 통과).
     #[test]

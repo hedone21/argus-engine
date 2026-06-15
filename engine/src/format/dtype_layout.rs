@@ -17,9 +17,9 @@ use crate::memory::host::shared::SharedBuffer;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 use anyhow::{Result, anyhow};
+use argus_extension_api::{KVLayoutDesc, Packing, ScaleLayout};
 use half::f16;
 use std::sync::Arc;
-use technique_api::{KVLayoutDesc, Packing, ScaleLayout};
 
 /// `DType` → block-quant family descriptor 도출.
 ///
@@ -349,7 +349,7 @@ mod tests {
 
     // ── (a0) KVLayoutDesc byte-회계 == engine block 구조체 크기 ──
 
-    /// `bytes_for_elems(block_elems)` 가 `size_of::<Block*>()` 와 일치 — technique-api
+    /// `bytes_for_elems(block_elems)` 가 `size_of::<Block*>()` 와 일치 — argus-extension-api
     /// literal 검증(lib.rs)의 engine 측 cross-check(단일원천 drift 가드).
     #[test]
     fn bytes_for_elems_matches_block_struct_size() {

@@ -19,7 +19,7 @@ use argus_engine::capability::dynamic_backend_registry::{
     dynamic_registered_backend_cap_names, resolve_kivi_capability,
 };
 use argus_engine::session::plugin_dispatch::register_dynamic_plugins;
-use technique_api::{KiviAttnArgs, KiviGatherArgs, KiviMakeArgs};
+use argus_extension_api::{KiviAttnArgs, KiviGatherArgs, KiviMakeArgs};
 
 /// `cargo build -p <pkg> [--features plugin-cdylib] --message-format=json` 으로 `.so` 산출 → 경로를
 /// `CARGO_TARGET_TMPDIR` 의 고유 이름으로 복사. (`gate_c_plugin_bundle.rs` 의 헬퍼와 동일.)

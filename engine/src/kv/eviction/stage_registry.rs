@@ -1,4 +1,4 @@
-//! 빌트인 eviction 정책을 technique-api `KVCacheStage` 표면으로 노출하는 어댑터 + linkme 등록.
+//! 빌트인 eviction 정책을 argus-extension-api `KVCacheStage` 표면으로 노출하는 어댑터 + linkme 등록.
 //!
 //! stage 축 레지스트리([`KV_CACHE_STAGES`])에 빌트인 LayerWide 정책 3종
 //! (sliding/streaming/h2o)을 등록한다. 각 정책은 기존 [`EvictionPolicy::plan_keep`]
@@ -13,18 +13,18 @@
 //! d2o(`EvictionPolicy` 아님, 가중 merge)는 M4, no_eviction("none")은 happy-path 라 match 밖.
 
 use anyhow::{Context, Result};
+use argus_extension_api::{
+    KV_CACHE_STAGES, KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage,
+    KVCacheStageReg, KeepSpec, PlanAbi, PluginVTableAbi, StageCtx, StageCtxAbi, StageExportAbi,
+    StageParams, TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
+};
 use core::ffi::c_void;
 use linkme::distributed_slice;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
-use technique_api::{
-    KV_CACHE_STAGES, KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage,
-    KVCacheStageReg, KeepSpec, PlanAbi, PluginVTableAbi, StageCtx, StageCtxAbi, StageExportAbi,
-    StageParams, TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
-};
 
-use super::{EvictionPolicy, H2OPolicy, SlidingWindowPolicy, StreamingLLMPolicy};
+use super::{EvictionPolicy, SlidingWindowPolicy};
 use crate::buffer::DType;
 use crate::kv::d2o_handler::{D2OConfig, D2OStage, dequantize_k, dequantize_v};
 use crate::kv::kv_cache::KVCache;
@@ -35,6 +35,15 @@ use crate::kv::kv_cache::KVCache;
 // 경유 value-aware 동작). feature OFF = 미링크 + `eviction caote` 서브커맨드 부재(clap reject).
 #[cfg(feature = "caote")]
 use caote as _;
+
+// StreamingLLM production force-link. Extracted from the engine core into the `streaming-llm`
+// technique crate; the dep declaration alone leaves the unreferenced rlib out of the link, so
+// this one line makes `find_stage("streaming")` visible (the `#[distributed_slice]` registration).
+use streaming_llm as _;
+
+// H2O production force-link. Extracted from the engine core into the `h2o` technique crate;
+// makes `find_stage("h2o")` visible (same force-link rationale as streaming above).
+use ::h2o as _;
 
 /// 기존 [`EvictionPolicy`](in-place `evict*` + `plan_keep`)를 plan-returning [`KVCacheStage`] 로 노출.
 ///
@@ -80,7 +89,7 @@ pub(crate) fn uniform_to_weighted(m: crate::format::Merge) -> WeightedMerge {
         into: m.into,
         into_weight: w,
         from: m.from.into_iter().map(|p| (p, w)).collect(),
-        apply_to: technique_api::MergeAxis::Both,
+        apply_to: argus_extension_api::MergeAxis::Both,
     }
 }
 
@@ -112,7 +121,7 @@ pub(crate) fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result
     }
 }
 
-/// 엔진 `DType` → technique-api `TensorDtype` 매핑(핸들 진단용; 읽기 산출은 항상 f32).
+/// 엔진 `DType` → argus-extension-api `TensorDtype` 매핑(핸들 진단용; 읽기 산출은 항상 f32).
 fn map_dtype(dt: DType) -> TensorDtype {
     match dt {
         DType::F16 => TensorDtype::F16,
@@ -295,7 +304,7 @@ impl StageCtx for KVStageCtx<'_> {
         self.cache.head_dim()
     }
     /// 단일 텐서 접근 — Key/Value 항상, Scores/AttnWeights 는 공급 시. dequant_k/v·head_score·
-    /// attn_weight 등 sugar 는 technique-api default 가 이 위에 얹힌다.
+    /// attn_weight 등 sugar 는 argus-extension-api default 가 이 위에 얹힌다.
     fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
         match kind {
             TensorKind::Key => Some(&self.key_handle),
@@ -370,12 +379,30 @@ impl EvictionPolicy for StageBackedPolicy {
     }
 }
 
+/// Test helper: build the out-of-tree `h2o` stage wrapped as a legacy [`EvictionPolicy`]
+/// (`StageBackedPolicy`). Used by CacheManager / EvictionHandler tests after H2O was extracted
+/// to the `h2o` plugin crate — production resolves "h2o" the same way (make_stage → plugin).
+#[cfg(test)]
+pub(crate) fn h2o_backed_policy(
+    keep_ratio: f32,
+    protected_prefix: usize,
+) -> Box<dyn EvictionPolicy> {
+    let p = StageParams {
+        keep_ratio,
+        protected_prefix,
+        ..Default::default()
+    };
+    Box::new(StageBackedPolicy::new(
+        make_stage("h2o", &p).expect("h2o stage registered (force-linked h2o plugin)"),
+    ))
+}
+
 /// 빌트인 LayerWide 기법(sliding/streaming/h2o)이 `KV_CACHE_STAGES` 에 등록됐는지 단언한다 — eviction
 /// CacheManager build 진입 시 1회 호출. fat-LTO `--gc-sections` 가 linkme 등록을 silent
 /// drop 하면 누락 기법에 대해 `Err` 로 fail-fast 한다(release 에서 정책 이름 미해석 → 조용한 폴백 방지).
 pub fn ensure_builtin_stages_registered() -> Result<()> {
     for name in ["sliding", "streaming", "h2o"] {
-        if technique_api::find_stage(name).is_none() {
+        if argus_extension_api::find_stage(name).is_none() {
             anyhow::bail!(
                 "built-in KVCacheStage '{name}' not registered — suspect linkme fat-LTO --gc-sections silent drop\
                  stage_registry's #[distributed_slice] registration was not linked."
@@ -395,26 +422,11 @@ static SLIDING_STAGE: KVCacheStageReg = KVCacheStageReg {
     },
 };
 
-#[distributed_slice(KV_CACHE_STAGES)]
-static STREAMING_STAGE: KVCacheStageReg = KVCacheStageReg {
-    name: "streaming",
-    make: |p: StageParams| {
-        Box::new(EvictionPolicyAsStage::new(Box::new(
-            StreamingLLMPolicy::new(p.sink_size, p.streaming_window),
-        )))
-    },
-};
+// `streaming` is registered by the out-of-tree `streaming-llm` technique crate (force-linked
+// above via `use streaming_llm as _;`), not here — extracted from the engine core.
 
-#[distributed_slice(KV_CACHE_STAGES)]
-static H2O_STAGE: KVCacheStageReg = KVCacheStageReg {
-    name: "h2o",
-    make: |p: StageParams| {
-        Box::new(EvictionPolicyAsStage::new(Box::new(H2OPolicy::new(
-            p.keep_ratio,
-            p.protected_prefix,
-        ))))
-    },
-};
+// `h2o` is registered by the out-of-tree `h2o` technique crate (force-linked above via
+// `use ::h2o as _;`), not here — extracted from the engine core.
 
 /// d2o(M4-c) — `D2OStage`(plan-returning, 가중 merge + EMA). non-alloc 기본 D2OConfig: StageParams
 /// 에 d2o 전용 필드(ema_beta/merge_e/use_layer_allocation)가 없어 protected_prefix/keep_ratio 만 매핑
@@ -520,7 +532,7 @@ pub(crate) fn try_register_stage(lib: &Arc<libloading::Library>, path: &Path) ->
             })?
             .to_owned();
         // 빌트인 우선 — silent override 차단(Known Bug #1/#2 류 재발 방지).
-        if technique_api::find_stage(&name).is_some() {
+        if argus_extension_api::find_stage(&name).is_some() {
             anyhow::bail!(
                 "plugin {}: stage name '{}' conflicts with a built-in (built-in takes precedence, dynamic registration rejected)",
                 path.display(),
@@ -596,7 +608,7 @@ pub fn dynamic_registered_stage_names() -> Vec<String> {
 /// 정적/동적 모두 miss 면 `None`(graceful unknown).
 pub fn make_stage(name: &str, params: &StageParams) -> Option<Box<dyn KVCacheStage>> {
     // 1) 정적(linkme) 우선.
-    if let Some(reg) = technique_api::find_stage(name) {
+    if let Some(reg) = argus_extension_api::find_stage(name) {
         return Some((reg.make)(*params));
     }
     // 2) 동적(dlopen) fallback.
@@ -723,7 +735,7 @@ unsafe fn planabi_to_plan(abi: &PlanAbi) -> Result<KVCachePlan> {
                 into: m.into,
                 into_weight: m.into_weight,
                 from,
-                apply_to: technique_api::MergeAxis::from_u32(m.apply_to),
+                apply_to: argus_extension_api::MergeAxis::from_u32(m.apply_to),
             });
         }
     }
@@ -834,8 +846,8 @@ mod tests {
     use crate::memory::host::shared::SharedBuffer;
     use crate::shape::Shape;
     use crate::tensor::Tensor;
+    use argus_extension_api::{find_stage, registered_names};
     use std::sync::Arc;
-    use technique_api::{find_stage, registered_names};
 
     /// 최소 StageCtx 스텁 — LayerWide 정책이 읽는 current_pos/target_len/importance 만 의미가 있고
     /// per-head/dequant accessor 는 trivial(이 단계 미사용).
@@ -1032,37 +1044,9 @@ mod tests {
         assert!(plan.merges.is_empty(), "sliding 은 merge 없음");
     }
 
-    #[test]
-    fn adapter_plan_matches_plan_keep_h2o_scored() {
-        // score-based(H2O) 경로도 importance 를 ctx 로 받아 plan_keep 과 동일 keep 을 내는지.
-        let params = StageParams {
-            eviction_window: 8,
-            protected_prefix: 4,
-            keep_ratio: 0.5,
-            sink_size: 4,
-            streaming_window: 8,
-        };
-        let mut imp = vec![0.01f32; 200];
-        imp[10] = 9.0;
-        imp[20] = 8.0;
-        let reg = find_stage("h2o").expect("h2o 등록");
-        let stage = (reg.make)(params);
-        let ctx = TestCtx {
-            current_pos: 200,
-            target_len: 100,
-            importance: Some(imp.clone()),
-        };
-        let plan = stage.plan(&ctx).expect("h2o plan Some");
-        let direct = H2OPolicy::new(0.5, 4)
-            .plan_keep(200, 100, Some(&imp))
-            .expect("direct plan_keep Some");
-        match plan.keep {
-            KeepSpec::LayerWide(keep) => {
-                assert_eq!(keep, direct.0, "어댑터 keep == plan_keep keep")
-            }
-            KeepSpec::PerHead(_) => panic!("h2o 는 LayerWide 여야 한다"),
-        }
-    }
+    // The h2o adapter-vs-plan_keep test was removed when H2O was extracted to the `h2o` plugin
+    // crate: "h2o" now resolves to the plugin, whose own unit tests pin the keep-list spec
+    // (score-free + score-based). The sliding adapter test above still covers the in-tree path.
 
     // ── StageBackedPolicy parity: World B(plan→compact) ≡ in-place evict(World A) ──
     // ②a 어댑터 faithful + compact_parity(plan_keep→compact ≡ in-place) 의 합성을, 프로덕션
@@ -1140,23 +1124,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stage_backed_evict_parity_h2o_scored() {
-        let imp: Vec<f32> = (0..PMAX).map(|i| (PMAX - i) as f32).collect();
-        for dt in [DType::F32, DType::F16, DType::Q4_0] {
-            let mut a = mk(dt, 40);
-            H2OPolicy::new(0.5, 4)
-                .evict_with_scores(&mut a, 20, &imp)
-                .unwrap();
-            let mut b = mk(dt, 40);
-            let stage = (find_stage("h2o").unwrap().make)(sb_params());
-            StageBackedPolicy::new(stage)
-                .evict_with_scores(&mut b, 20, &imp)
-                .unwrap();
-            assert_eq!(a.current_pos, b.current_pos, "h2o[{dt:?}] current_pos");
-            assert_eq!(region(&a), region(&b), "h2o[{dt:?}] valid-region byte");
-        }
-    }
+    // The h2o World-A↔World-B parity test was removed with the H2O extraction: the `h2o` plugin
+    // is plan-only (no in-place evict_with_scores), so there is no World-A path to compare. The
+    // sliding parity test above still exercises the StageBackedPolicy → execute_kv_plan mechanism,
+    // and beta3_eviction_stage_equivalence.rs covers h2o end-to-end across F32/F16/Q4_0.
 
     #[test]
     fn kvstagectx_dequant_k_reads_f32() {

@@ -18,11 +18,11 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
-use core::ffi::c_void;
-use technique_api::{
+use argus_extension_api::{
     BACKEND_CAP_ABI_VERSION, BACKEND_CAP_CATEGORY_ATTENTION, BackendCapExportAbi,
     KiviAttentionBackend, KiviAttnArgs, KiviAttnVTable, KiviGatherArgs, KiviMakeArgs,
 };
+use core::ffi::c_void;
 
 /// dlopen 된 한 backend-cap 의 등록 항목. 태그드 엔트리는 plugin `.so` 의 immutable static 을 가리킨다.
 struct RuntimeBackendCapReg {
@@ -109,7 +109,7 @@ pub(crate) fn try_register_backend_cap(
                 name
             );
         }
-        if technique_api::find_kivi_attention(&name).is_some() {
+        if argus_extension_api::find_kivi_attention(&name).is_some() {
             anyhow::bail!(
                 "plugin {}: backend-cap name '{}' collides with a built-in (built-in takes priority, dynamic registration rejected)",
                 path.display(),
@@ -172,7 +172,7 @@ pub fn resolve_kivi_capability(
     make_args: &KiviMakeArgs,
 ) -> Option<Arc<dyn KiviAttentionBackend>> {
     // 1) 정적(linkme) 우선.
-    if let Some(reg) = technique_api::find_kivi_attention(name) {
+    if let Some(reg) = argus_extension_api::find_kivi_attention(name) {
         return Some(Arc::from((reg.make)(make_args)));
     }
     // 2) 동적(dlopen) fallback — category 다리.

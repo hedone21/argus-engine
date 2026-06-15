@@ -6,7 +6,7 @@
 //! 동일 `Arc<Library>` 공유로 양축 registry 에 분리 등록한다(병합 없음). "축별 `.so` 분리"
 //! 가 불필요함을 실증하는 vehicle(번들 양축 등록).
 
-use technique_api::{
+use argus_extension_api::{
     KVCachePlan, KVCacheStage, KVFormat, KVLayoutDesc, KeepSpec, Packing, ScaleLayout, StageCtx,
     StageParams,
 };
@@ -69,14 +69,16 @@ impl KVFormat for BundleFmt {
 }
 
 // 한 crate(=한 `.so`)에 stage 2종 + format 1종 — const-block 격리 다회 호출 + export 1회.
-technique_api::register_kv_stage!("bundle_keep", |_p: StageParams| Box::new(BundleKeep));
-technique_api::register_kv_stage!("bundle_perhead", |_p: StageParams| Box::new(BundlePerHead));
-technique_api::register_kv_format!("bundle_fmt", || Box::new(BundleFmt));
-technique_api::export_plugin!();
+argus_extension_api::register_kv_stage!("bundle_keep", |_p: StageParams| Box::new(BundleKeep));
+argus_extension_api::register_kv_stage!("bundle_perhead", |_p: StageParams| Box::new(
+    BundlePerHead
+));
+argus_extension_api::register_kv_format!("bundle_fmt", || Box::new(BundleFmt));
+argus_extension_api::export_plugin!();
 
 #[cfg(test)]
 mod tests {
-    use technique_api::{find_kv_format, find_stage};
+    use argus_extension_api::{find_kv_format, find_stage};
 
     #[test]
     fn bundle_registers_both_axes() {

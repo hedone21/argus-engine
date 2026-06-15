@@ -8,6 +8,19 @@ project is pre-1.0; minor releases may include breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- Renamed the extension-API crate `technique-api` → `argus-extension-api` (import
+  `argus_extension_api`); the name now states what it is (the public plugin/extension surface).
+- Extracted the **StreamingLLM** and **H2O** KV-cache eviction policies out of the engine core
+  into self-registering technique crates (`crates/techniques/streaming-llm`,
+  `crates/techniques/h2o`), following the `caote`/`quest` precedent. They depend only on
+  `argus-extension-api` + `linkme`, implement `KVCacheStage`, and are force-linked so
+  `eviction streaming` / `eviction h2o` resolve the out-of-tree plugins with no built-in copy.
+  Behaviour is unchanged: the plugin keep-lists are byte-identical to the former built-ins
+  (proven by `beta3_eviction_stage_equivalence` across F32/F16/Q4_0) and verified on-device on
+  Adreno OpenCL. (D2O and KIVI extraction to follow.)
+
 ## [0.1.0] - 2026-06-14
 
 Initial public release.
@@ -24,7 +37,7 @@ Initial public release.
 - GQA-aware GPU flash attention; FFN gate/up tensor partition across GPU + CPU.
 - Zero-compile extension surface: KV-cache stage / format / read-stage techniques
   self-register via `linkme` from crates under `crates/techniques/` with no engine-core
-  edits (see `crates/technique-api`).
+  edits (see `crates/argus-extension-api`).
 - Model conversion tooling (Safetensors → GGUF, and → AUF) under `scripts/`.
 
 [Unreleased]: https://github.com/hedone21/argus-engine/compare/v0.1.0...HEAD

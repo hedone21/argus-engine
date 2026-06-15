@@ -53,7 +53,7 @@ pub(crate) struct ForwardGenFmtArgs<'a> {
     /// KV read-plan 라우팅. `Some((select, granularity))` 면 활성 format 의
     /// `SelectiveRead::attention_into_selected` 로 선택적 읽기, `None`(production 기본)이면 기존
     /// `attention_into`(full read). 분기 1회 외 happy path 비용 0(INV-147 동형).
-    pub read_select: Option<(&'a [usize], technique_api::ReadGranularity)>,
+    pub read_select: Option<(&'a [usize], argus_extension_api::ReadGranularity)>,
 }
 
 impl TransformerLayer {

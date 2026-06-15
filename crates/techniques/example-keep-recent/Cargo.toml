@@ -11,12 +11,12 @@ publish = false
 # (`register_kv_stage_v1` C-ABI export when built with `--features plugin-cdylib`).
 crate-type = ["cdylib", "rlib"]
 
-# Example technique crate — depends on `technique-api` (the extension API) + `linkme`
+# Example technique crate — depends on `argus-extension-api` (the extension API) + `linkme`
 # (a direct plugin dep is required because the static-registration macro expansion hardcodes
 # the `linkme::` path). It depends on no other axis (format/hardware) and no engine types =
 # the additive-extension cost (2 dependency lines).
 [dependencies]
-technique-api = { path = "../../technique-api" }
+argus-extension-api = { path = "../../argus-extension-api" }
 linkme = "0.3"
 
 [features]

@@ -6,7 +6,7 @@
 //! `LayerDispatch::Partition` 의 분산 대상 backend 는 `Hardware`(§3.5)에서 resolve 하고, 슬라이스
 //! 마다 다른 (format, hardware) 좌표를 가질 수 있다 — partition = format(표현) × hardware(위치)의 곱.
 //!
-//! **dispatch 타입은 `technique-api` 거주**: `LayerDispatch`/`PartitionShare` 는
+//! **dispatch 타입은 `argus-extension-api` 거주**: `LayerDispatch`/`PartitionShare` 는
 //! plugin 결정 표면이라 api crate 에 있고 여기서 re-export 한다. 엔진 측에는 executor 변형 표면인
 //! `WeightFormat` trait 과 `DeviceTarget` mirror From 변환만 둔다. per-slice 저장 format 은 plugin
 //! 결정이 아니라 executor 가 weight dtype 에서 파생하므로 `PartitionShare` 표면에서 제외(api 정의 doc).
@@ -15,7 +15,7 @@ use anyhow::Result;
 
 use crate::hardware::Hardware;
 
-pub use technique_api::{LayerDispatch, PartitionShare};
+pub use argus_extension_api::{LayerDispatch, PartitionShare};
 
 /// weight layer 의 dispatch 모드(Full / Skip / Partition)를 적용하는 base trait.
 pub trait WeightFormat: Send + Sync {
@@ -28,11 +28,11 @@ pub trait WeightFormat: Send + Sync {
     // apply_storage(spec) 없음 — precision swap 등은 concrete-handle Stage(`Arc<LayerSlot>`) 직접 호출.
 }
 
-/// api 표면 `technique_api::DeviceTarget` ↔ 엔진 `hardware::DeviceTarget` 1:1 mirror.
+/// api 표면 `argus_extension_api::DeviceTarget` ↔ 엔진 `hardware::DeviceTarget` 1:1 mirror.
 /// 두 enum 변종이 어긋나면 round-trip 테스트(drift 게이트)가 깨진다.
-impl From<technique_api::DeviceTarget> for crate::hardware::DeviceTarget {
-    fn from(d: technique_api::DeviceTarget) -> Self {
-        use technique_api::DeviceTarget as A;
+impl From<argus_extension_api::DeviceTarget> for crate::hardware::DeviceTarget {
+    fn from(d: argus_extension_api::DeviceTarget) -> Self {
+        use argus_extension_api::DeviceTarget as A;
         match d {
             A::Cpu => crate::hardware::DeviceTarget::Cpu,
             A::Gpu => crate::hardware::DeviceTarget::Gpu,
@@ -41,13 +41,13 @@ impl From<technique_api::DeviceTarget> for crate::hardware::DeviceTarget {
     }
 }
 
-impl From<crate::hardware::DeviceTarget> for technique_api::DeviceTarget {
+impl From<crate::hardware::DeviceTarget> for argus_extension_api::DeviceTarget {
     fn from(d: crate::hardware::DeviceTarget) -> Self {
         use crate::hardware::DeviceTarget as E;
         match d {
-            E::Cpu => technique_api::DeviceTarget::Cpu,
-            E::Gpu => technique_api::DeviceTarget::Gpu,
-            E::Npu => technique_api::DeviceTarget::Npu,
+            E::Cpu => argus_extension_api::DeviceTarget::Cpu,
+            E::Gpu => argus_extension_api::DeviceTarget::Gpu,
+            E::Npu => argus_extension_api::DeviceTarget::Npu,
         }
     }
 }
@@ -59,7 +59,7 @@ mod drift_tests {
     fn device_target_mirror_roundtrip() {
         use crate::hardware::DeviceTarget as E;
         for e in [E::Cpu, E::Gpu, E::Npu] {
-            let a: technique_api::DeviceTarget = e.into();
+            let a: argus_extension_api::DeviceTarget = e.into();
             let back: E = a.into();
             assert_eq!(e, back);
         }

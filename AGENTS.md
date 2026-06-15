@@ -60,7 +60,7 @@ build).
 
 Adding a KV-cache stage / format / read-stage does **not** require editing the engine
 core. Create a crate under `crates/techniques/`, implement the trait, and self-register
-via `linkme`. See the `example-*` crates for templates and `technique-api` for the
+via `linkme`. See the `example-*` crates for templates and `argus-extension-api` for the
 registration surface.
 
 ## License

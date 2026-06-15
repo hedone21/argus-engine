@@ -1,7 +1,7 @@
 //! `WeightStageModelCtx` — weight stage 의 엔진 측 `WeightStageCtx` 구현.
 //!
 //! KV 거울(`pressure::eviction::stage_registry` 의 KV stage ctx)의 weight 판.
-//! `&TransformerModel` 의 읽기 표면을 technique-api `WeightStageCtx` plugin 표면으로
+//! `&TransformerModel` 의 읽기 표면을 argus-extension-api `WeightStageCtx` plugin 표면으로
 //! 투영한다 — plugin 은 읽고 plan 만 내며 변형은 엔진 executor 독점.
 //!
 //! 투영은 기존 호출자(`session::swap_runtime::handle_swap_weights` §3–4)가 이미
@@ -11,7 +11,7 @@
 //! production 호출부(decode loop) 배선은 Seam B(Phase β) 의 일이라, 본 모듈은 ctx 구현
 //! + 투영 + bit-identical 단위테스트까지만 둔다(호출부 배선 금지).
 
-use technique_api::{LayerMetricKind, TensorDtype, WeightStageCtx};
+use argus_extension_api::{LayerMetricKind, TensorDtype, WeightStageCtx};
 
 use crate::buffer::DType;
 use crate::models::transformer::TransformerModel;
@@ -144,7 +144,7 @@ mod tests {
     use crate::qcf_types::{ImportanceEntry, SubLayer};
     use crate::weight::stage_registry::WeightSwapDeciderAsStage;
     use crate::weight::{SwapAlgorithm, WeightSwapDecider};
-    use technique_api::{LayerDispatch, WeightStage, WeightStageParams};
+    use argus_extension_api::{LayerDispatch, WeightStage, WeightStageParams};
 
     /// `SubLayer::Full` 만 담는 최소 ImportanceLookup mock.
     struct MockImp(Vec<ImportanceEntry>);
