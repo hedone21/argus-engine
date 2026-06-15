@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use crate::format::KVCacheFormat;
 use crate::pipeline::{Pressure, PressureSource};
 use crate::resilience::sys_monitor::SystemMonitor;
 
@@ -47,6 +48,68 @@ impl PressureSource for LocalPressureSource {
             // monitor 실패 → 압력 없음(보수적 미발화). v1 determine_pressure_level 의 mem_stats Err
             // 경로(eviction skip)와 동일 시맨틱.
             Err(_) => Pressure::default(),
+        }
+    }
+}
+
+/// `Pressure::band()` 의 Warning 하한 scalar (pipeline.rs cutoff `50..=74 => Warning`).
+const KV_FILL_WARNING_SCALAR: u8 = 50;
+
+/// `pos/max_seq_len >= high_water_pct/100` 정수 비교 (float 회피). `max_seq_len==0` 이면 false.
+#[inline]
+fn at_high_water(pos: usize, max_seq_len: usize, high_water_pct: u32) -> bool {
+    max_seq_len > 0 && (pos as u64) * 100 >= (high_water_pct as u64) * (max_seq_len as u64)
+}
+
+/// KV-fill graded `PressureSource` — turn 경계가 없는 단일 프롬프트 디코드용 eviction 트리거.
+///
+/// argus-cli 처럼 manager 도 메모리 압력도 없는 happy-path 단일 프롬프트는 [`LocalPressureSource`]
+/// 가 항상 Normal 을 보고하므로 pressure-driven
+/// [`EvictionStage`](crate::stages::kv::eviction::EvictionStage)(`min_band=Warning`)가 발동하지
+/// 않는다(chat 은 turn 경계 `on_turn_end` 로 evict — 단일 프롬프트엔 그 훅이 없다). 본 source 는
+/// **메모리 대신 KV 점유율**을 압력으로 환산해, 점유율이 high-water 를 넘으면 `Warning` 밴드를
+/// 보고한다. Persistent EvictionStage(episode edge-trigger)가 이를 받아 1회 prune → pos 가
+/// high-water 밑으로 떨어지면 Normal 로 복귀 → re-arm 하는 sawtooth 로 KV 를 묶는다.
+///
+/// **천장은 동적 `capacity()` 가 아니라 고정 `max_seq_len`**: KVCache 의 `capacity()` 는 버퍼
+/// 관리 상태라 디코드 중 출렁인다 — grow 시 doubling 으로 pos 를 앞질러 키우고, prune 후엔
+/// `KVCache::shrink_to_fit` 가 ~1.5×current_pos(64-aligned)로 줄인다. `pos/capacity()` 는 이
+/// 출렁임에 묶여 진짜 overflow 천장(= 할당 cap = `max_seq_len`, decode loop `kv_capacity` 와 동일
+/// 출처)에 대한 안정적 high-water 를 주지 못한다(같은 fill ratio 도 capacity 변동에 따라 다른
+/// 절대 pos 에서 발생). 따라서 고정 `max_seq_len` 을 기준으로 삼아 트리거를 결정한다.
+///
+/// **8-step 캐시 여유**: decode loop 은 `PRESSURE_QUERY_INTERVAL`(=8) step 마다 pressure 를
+/// 샘플하므로 트리거 평가가 최대 8 토큰 지연될 수 있다. 기본 high-water 85% 는 `max_seq_len` 이
+/// 약 50 이상이면 발화~prune 사이 headroom(>15%·max)이 그 지연을 충분히 덮는다.
+pub struct KvFillPressureSource {
+    /// layer-0 KV format handle — `current_pos()` 로 라이브 점유 토큰 수를 읽는다(syscall 0).
+    handle: Arc<dyn KVCacheFormat>,
+    /// overflow 천장(= `--max-seq-len`).
+    max_seq_len: usize,
+    /// 발화 high-water (점유율 percent, 0–100).
+    high_water_pct: u32,
+}
+
+impl KvFillPressureSource {
+    pub fn new(handle: Arc<dyn KVCacheFormat>, max_seq_len: usize, high_water_pct: u32) -> Self {
+        Self {
+            handle,
+            max_seq_len,
+            high_water_pct: high_water_pct.min(100),
+        }
+    }
+}
+
+impl PressureSource for KvFillPressureSource {
+    fn pressure(&self) -> Pressure {
+        if at_high_water(
+            self.handle.current_pos(),
+            self.max_seq_len,
+            self.high_water_pct,
+        ) {
+            Pressure::new(KV_FILL_WARNING_SCALAR)
+        } else {
+            Pressure::default()
         }
     }
 }
@@ -128,5 +191,26 @@ mod tests {
             Pressure::from_mem_available(T / 3, T),
             "source 는 canonical cutoff 함수를 그대로 위임해야 함"
         );
+    }
+
+    // ─── KvFillPressureSource ─────────────────────────────────────────────
+
+    /// `pos*100 >= pct*max` 경계 검증. max=384, pct=85 → pct*max=32640 → pos>=327 발화.
+    #[test]
+    fn kv_fill_high_water_boundary() {
+        assert!(!at_high_water(0, 384, 85));
+        assert!(!at_high_water(100, 384, 85));
+        assert!(!at_high_water(326, 384, 85), "326*100=32600 < 32640");
+        assert!(at_high_water(327, 384, 85), "327*100=32700 >= 32640");
+        assert!(at_high_water(384, 384, 85), "가득 차면 발화");
+        // max_seq_len==0 → 항상 false (0 나눗셈/스퓨리어스 발화 방지).
+        assert!(!at_high_water(0, 0, 85));
+        assert!(!at_high_water(100, 0, 85));
+    }
+
+    /// KvFill 발화 scalar 가 Persistent EvictionStage 가 기대하는 Warning 밴드로 사상되는지.
+    #[test]
+    fn kv_fill_warning_scalar_is_warning_band() {
+        assert_eq!(Pressure::new(KV_FILL_WARNING_SCALAR).band(), Level::Warning);
     }
 }

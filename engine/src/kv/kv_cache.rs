@@ -489,9 +489,13 @@ impl KVCache {
         }
 
         let freed = old_buf_size.saturating_sub(buf_size) * 2; // K + V
-        eprintln!(
+        // steady-state eviction 에서 디코드 토큰마다 발화하므로 `log::debug!` 로 강등한다
+        // (RUST_LOG 로 제어 — 데모/공개 저장소 출력 청결, per-token stderr 도배 제거).
+        log::debug!(
             "[KVCache] Shrunk capacity: {} → {} tokens (freed {} bytes)",
-            self.capacity, new_cap, freed
+            self.capacity,
+            new_cap,
+            freed
         );
 
         self.k_buffer = new_k;

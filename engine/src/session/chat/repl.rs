@@ -5,7 +5,9 @@
 //!
 //! 주요 차이점:
 //! - `ChatTurnExec` trait 대신 `ChatSession` API (prefill/run_turn/ensure_capacity)
-//! - decode inner loop는 `DecodeLoop::run_until_stop`에 위임 (streaming 대신 일괄 출력)
+//! - decode inner loop는 `DecodeLoop::run_until_stop`에 위임
+//! - turn 출력은 서버 SSE 경로와 **동일하게** per-token streaming — `session.stream_slot()`
+//!   을 stdout/소켓 콜백으로 arm 하고 [`IncDetok`] 로 증분 detok 한다(byte 경계 안전).
 //! - eviction은 ChatSession::ensure_capacity + on_turn_end에 내장
 
 use std::collections::VecDeque;
@@ -18,6 +20,7 @@ use crate::inference::sampling::{self, SamplingConfig};
 use crate::model_config::ModelArch;
 use crate::session::chat::session::ChatSession;
 use crate::session::chat::stop_condition::{ChatStopCondition, build_chat_stop_ids};
+use crate::session::chat::stream_stage::IncDetok;
 use crate::session::chat_ipc::{
     ChatInput, finish_reply_stream, spawn_chat_input_sources, write_reply_bytes,
 };
@@ -44,6 +47,15 @@ pub struct ChatReplArgs<'a> {
     pub repetition_window: usize,
     /// 턴당 최대 생성 토큰 수.
     pub max_new_tokens: usize,
+}
+
+/// rep-penalty 용 recent ring 갱신 — `window` 초과 시 oldest pop.
+/// (스트림 콜백과 first_tok 경로가 공유하므로 free fn 으로 분리 — 동시 `&mut recent` 차용 회피.)
+fn push_recent(recent: &mut VecDeque<u32>, tok: u32, window: usize) {
+    recent.push_back(tok);
+    if recent.len() > window {
+        recent.pop_front();
+    }
 }
 
 /// ChatSession 기반 chat REPL 루프.
@@ -181,36 +193,62 @@ pub fn run_chat_repl_v2(args: &ChatReplArgs<'_>, session: &mut ChatSession) -> R
             Some(&mut indices_buf),
         );
 
-        // ── inner decode via run_turn ──────────────────────────────────────
+        // ── inner decode via run_turn — per-token streaming ────────────────
         // stop pos 상한: 현재 pos + max_new_tokens (overflow 안전망).
         let stop_max_pos = session.pos() + args.max_new_tokens;
         let stop_cond = ChatStopCondition::new(stop_ids.clone(), stop_max_pos);
 
-        let decode_result = session.run_turn(first_tok, &stop_cond)?;
-
-        // ── 출력 (first_tok + generated) ──────────────────────────────────
-        // first_tok가 stop_id이면 빈 출력. 아니면 first_tok + tokens_generated.
+        // 서버 SSE 경로(`server::stream_response`)와 동일: turn 직전 `stream_slot` 을
+        // stdout/소켓 콜백으로 arm 하고 `IncDetok` 로 증분 detok 한다(multi-byte/BPE 경계
+        // 안전). first_tok 은 run_turn 진입 전에 샘플되므로 콜백과 동일 경로로 한 번 직접
+        // 흘린다. is_first_stop(첫 토큰이 stop_id)이면 출력은 빈 채로 두되 run_turn 은
+        // 그대로 호출해 KV 상태 진행을 보존한다(슬롯 미arm → 생성 토큰 미스트리밍 = 기존
+        // 일괄 경로의 `all_tokens=[]` 와 동치).
         let is_first_stop = stop_ids.contains(&first_tok);
-        let all_tokens: Vec<u32> = if is_first_stop {
-            vec![]
+        let rep_window = args.repetition_window.max(1);
+        let tokenizer = args.tokenizer;
+        let reply = reply_writer.as_ref();
+        let mut detok = IncDetok::new();
+
+        if is_first_stop {
+            let _ = session.run_turn(first_tok, &stop_cond)?;
         } else {
-            let mut v = vec![first_tok];
-            v.extend_from_slice(&decode_result.tokens_generated);
-            v
-        };
+            // first_tok 을 콜백과 동일 경로로 출력 + recent(rep penalty) 갱신.
+            let piece = detok.push(first_tok, tokenizer);
+            if !piece.is_empty() {
+                write!(stdout_lock, "{}", piece).ok();
+                stdout_lock.flush().ok();
+                write_reply_bytes(reply, piece.as_bytes());
+            }
+            push_recent(&mut recent, first_tok, rep_window);
 
-        if !all_tokens.is_empty() {
-            let text = args.tokenizer.decode(&all_tokens, true).unwrap_or_default();
-            print!("{}", text);
-            stdout_lock.flush().ok();
-            write_reply_bytes(reply_writer.as_ref(), text.as_bytes());
+            {
+                // Per-token 콜백: 증분 detok → stdout + 소켓. `ChatStreamStage` 가 kept
+                // 토큰마다 발화(stop 토큰은 `ChatStopStage` 가 먼저 break → 미발화이므로
+                // 일괄 `decode(all_tokens)` 와 동일 최종 문자열).
+                let detok_ref = &mut detok;
+                let recent_ref = &mut recent;
+                let stdout_ref = &mut stdout_lock;
+                let mut cb = |tok: u32| {
+                    let piece = detok_ref.push(tok, tokenizer);
+                    if !piece.is_empty() {
+                        write!(stdout_ref, "{}", piece).ok();
+                        stdout_ref.flush().ok();
+                        write_reply_bytes(reply, piece.as_bytes());
+                    }
+                    push_recent(recent_ref, tok, rep_window);
+                };
+                let slot = session.stream_slot();
+                let _guard = slot.arm(&mut cb);
+                let _ = session.run_turn(first_tok, &stop_cond)?;
+            }
 
-            // recent 갱신 (rep penalty용)
-            for &t in &all_tokens {
-                recent.push_back(t);
-                if recent.len() > args.repetition_window.max(1) {
-                    recent.pop_front();
-                }
+            // multi-byte 경계로 보류된 잔여 바이트 flush (turn 끝 1회 — 서버 `detok.flush`).
+            let tail = detok.flush(tokenizer);
+            if !tail.is_empty() {
+                write!(stdout_lock, "{}", tail).ok();
+                stdout_lock.flush().ok();
+                write_reply_bytes(reply, tail.as_bytes());
             }
         }
 
