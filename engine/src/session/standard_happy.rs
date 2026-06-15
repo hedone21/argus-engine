@@ -179,6 +179,13 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         None
     };
 
+    // argus-cli eviction(공용 path): score-free `CacheManager`(none/sliding/streaming/
+    // `--load-plugin` stage)를 CLI `eviction <policy>` 로 구성한다. `eviction none` 이고 swap-dir
+    // 도 없으면 None → build_standard_loop 의 eviction 배선 미진입(기존 happy-path 와 byte-identical,
+    // 회귀 0). score-based(h2o/d2o)·offload(--swap-dir)·기타 미지원 모드는 argus_cli 진입부에서
+    // 이미 reject 되므로 여기 도달하는 정책은 항상 score-free.
+    let cache_manager = crate::session::assembly::build_resilience_cache_manager(&args, &backend)?;
+
     // bin_setup이 --kv-format/--kv-type dispatch로 할당한 kv_caches를
     // 그대로 소비한다(과거엔 drop 후 build_standard_loop이 typed로 재할당 →
     // --kv-format opaque 선택이 decode 경로에 도달 못 했다).
@@ -193,6 +200,8 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         !args.no_gpu_plan,
         resilience,
         args.effective_read_stage(),
+        cache_manager,
+        args.eviction_target_ratio(),
     )?;
 
     // ── prefill / restore 분기 ────────────────────────────────────────────────

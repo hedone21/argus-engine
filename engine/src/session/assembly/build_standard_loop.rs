@@ -22,18 +22,29 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use argus_shared::Level;
 
 use crate::backend::Backend;
+use crate::format::KVCacheFormat;
 use crate::inference::sampling::SamplingConfig;
+use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::KVCache;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
+use crate::pipeline::PressureSource;
 use crate::session::cli::Args;
 use crate::session::command_dispatcher::CommandDispatcher;
 use crate::session::forward::ModelForward;
+use crate::session::local_pressure::KvFillPressureSource;
 use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
+use crate::stages::kv::eviction::EvictionStage;
+
+/// argus-cli score-free eviction 의 KV-fill high-water (점유율 percent). `pos >= 85% * max_seq_len`
+/// 에서 [`KvFillPressureSource`] 가 Warning 밴드를 보고해 Persistent EvictionStage 를 1회 발화시킨다.
+/// 15% headroom 은 decode loop 의 8-step pressure 캐시 지연(`PRESSURE_QUERY_INTERVAL`)을 덮는다.
+const KV_FILL_HIGH_WATER_PCT: u32 = 85;
 
 /// Phase 4-4-a: standard generate happy path 진입 가드.
 ///
@@ -99,6 +110,11 @@ pub fn build_standard_loop(
     resilience: Option<ResilienceAdapter>,
     // 선택적 read stage 이름(`--read-stage`). None = full read(현행 byte-identical).
     read_stage_name: Option<&str>,
+    // score-free eviction `CacheManager`(sliding/streaming/`--load-plugin` stage). `None` =
+    // 순수 happy-path(eviction none) — 아래 eviction 배선 전체 미진입 = 기존과 byte-identical.
+    cache_manager: Option<CacheManager>,
+    // force_evict target ratio(CLI `--eviction-target-ratio`). `cache_manager=None` 이면 무시.
+    eviction_target_ratio: f32,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고한다.
@@ -159,27 +175,65 @@ pub fn build_standard_loop(
         }
     }
 
+    // KV format handles — eviction stage prune 대상 + resilience heartbeat + eviction 후
+    // pos-환류(with_kv_pos_handle). mf 가 with_forward 로 move 되기 전에 읽는다.
+    let kv_handles: Vec<Arc<crate::kv::standard_format::StandardFormat>> = mf.fmt_caches().to_vec();
+    let kv_pos_handle: Option<Arc<dyn KVCacheFormat>> = mf
+        .fmt_caches()
+        .first()
+        .map(|f| f.clone() as Arc<dyn KVCacheFormat>);
+
+    // eviction(CM) 또는 resilience 가 있을 때만 registry 를 만든다. 둘 다 없으면(순수 happy-path,
+    // eviction none + no-resilience) registry/dispatcher/pos-handle/pressure 미배선 = 기존과
+    // byte-identical 조립(INV: 회귀 0).
+    let needs_registry = resilience.is_some() || cache_manager.is_some();
+    let registry = needs_registry.then(|| Arc::new(PipelineRegistry::new()));
+
+    // score-free eviction(sliding/streaming/`--load-plugin` stage): KV-fill 압력 구동 Persistent
+    // EvictionStage + [`KvFillPressureSource`]. chat 의 turn-경계 evict 와 달리 단일 프롬프트는 turn
+    // 경계가 없으므로, KV 점유율이 high-water 를 넘으면 Warning 밴드를 보고하는 source 로 stage 를
+    // 구동한다(메모리 압력·manager 무관 — free-RAM 머신에서도 발화). score-based(h2o/d2o)는
+    // accumulator 가 필요해 argus-cli 진입부에서 reject — 여기 도달하는 CM 은 항상 score-free.
+    let pressure_source: Option<Arc<dyn PressureSource>> = match cache_manager {
+        Some(cm) => {
+            let registry = registry
+                .as_ref()
+                .expect("registry: cache_manager.is_some()");
+            let shared_cm = Arc::new(Mutex::new(cm));
+            registry.submit(Arc::new(EvictionStage::persistent(
+                kv_handles.clone(),
+                shared_cm,
+                eviction_target_ratio,
+                Level::Warning,
+            )));
+            kv_pos_handle.clone().map(|h| {
+                Arc::new(KvFillPressureSource::new(
+                    h,
+                    max_seq_len,
+                    KV_FILL_HIGH_WATER_PCT,
+                )) as Arc<dyn PressureSource>
+            })
+        }
+        None => None,
+    };
+
     // β-4: resilience-on 이면 dispatcher 를 구성한다 — control 디렉티브(Throttle/SetTargetTbt/
     // Suspend 등)는 CM 없이 소비 가능하고, v1 은 argus_cli resilience-on 에서 이를 적용했다
     // (dispatcher 부재 시 디렉티브 무소비 드롭 = v1 회귀, β-4 device smoke 실증 2026-06-10).
-    // evict 디렉티브는 CM=None 이라 dispatcher 내부 inert — v1 (a.5) cache_manager=None 스킵 등가.
-    // heartbeat kv snapshot 은 held-handle query(매핑 문서 4부 채택안 (가)) — layer-0 handle 주입.
-    // `--no-resilience`(None) 경로는 아래 분기 전체 미진입 = 기존과 byte-identical 조립.
-    let (resilience, dispatcher_parts) = match resilience {
+    // dispatcher 의 cache_manager 는 None(inert): argus-cli eviction 은 위 KV-fill Persistent
+    // stage 가 구동하므로 manager evict 디렉티브 경로는 사용하지 않는다(v1 (a.5) 스킵 등가).
+    // heartbeat kv snapshot 은 held-handle query — layer-0 handle 주입.
+    let (resilience, dispatcher) = match resilience {
         Some(mut adapter) => {
-            let kv_pos_handle: Option<Arc<dyn crate::format::KVCacheFormat>> = mf
-                .fmt_caches()
-                .first()
-                .map(|f| f.clone() as Arc<dyn crate::format::KVCacheFormat>);
             if let Some(h) = kv_pos_handle.clone() {
                 adapter.set_kv_handle(h);
             }
-            let registry = Arc::new(PipelineRegistry::new());
+            let registry = registry.as_ref().expect("registry: resilience.is_some()");
             // happy/chat 경로는 partition/swap/quant 미구성 (빈 slots + None hardware/model/
             // swap_runtime + 빈 kivi_handles). report_tx=None (AB-5: happy-path resilience 미배선).
             let dispatcher = CommandDispatcher::new(
-                Arc::clone(&registry),
-                mf.fmt_caches().to_vec(),
+                Arc::clone(registry),
+                kv_handles.clone(),
                 None,
                 Vec::new(),
                 None,
@@ -193,7 +247,7 @@ pub fn build_standard_loop(
                 // §5.9.1 Track A: happy 경로는 score-based eviction 미구성 → 더미 None cell.
                 Arc::new(Mutex::new(None)),
             );
-            (Some(adapter), Some((registry, dispatcher, kv_pos_handle)))
+            (Some(adapter), Some(dispatcher))
         }
         None => (None, None),
     };
@@ -204,30 +258,30 @@ pub fn build_standard_loop(
     // 내부 VecDeque ring buffer + scratch logits로 production 호출을 충실히 모사.
     let use_stateful =
         sampling_config.repetition_penalty != 1.0 || sampling_config.temperature != 0.0;
-    let builder = DecodeLoopBuilder::new().with_forward(mf);
-    let builder = if use_stateful {
+    let mut builder = DecodeLoopBuilder::new().with_forward(mf);
+    builder = if use_stateful {
         builder.with_sampler(RepetitionPenaltySampler::new(sampling_config, vocab_size))
     } else {
         builder.with_sampler(GreedySampler)
     };
     // P3.3: resilience adapter 주입 (Some → 3 slot 주입, None → NoOp default 유지)
-    let builder = match resilience {
-        Some(adapter) => builder.with_resilience(adapter),
-        None => builder,
-    };
-    // β-4: dispatcher + 공유 registry + pos-환류 handle 배선 (resilience-on 한정).
-    let builder = match dispatcher_parts {
-        Some((registry, dispatcher, kv_pos_handle)) => {
-            let b = builder
-                .with_pipeline(registry)
-                .with_command_dispatcher(dispatcher);
-            match kv_pos_handle {
-                Some(h) => b.with_kv_pos_handle(h),
-                None => b,
-            }
+    if let Some(adapter) = resilience {
+        builder = builder.with_resilience(adapter);
+    }
+    // β-4/eviction: 공유 registry + dispatcher(resilience-on) + pos-환류 handle + KV-fill pressure
+    // 배선. needs_registry 일 때만 진입 — 순수 happy-path 는 미배선(기존과 byte-identical).
+    if let Some(registry) = registry {
+        builder = builder.with_pipeline(registry);
+        if let Some(dispatcher) = dispatcher {
+            builder = builder.with_command_dispatcher(dispatcher);
         }
-        None => builder,
-    };
+        if let Some(h) = kv_pos_handle {
+            builder = builder.with_kv_pos_handle(h);
+        }
+        if let Some(src) = pressure_source {
+            builder = builder.with_pressure_source(src);
+        }
+    }
     Ok(builder.build())
 }
 
