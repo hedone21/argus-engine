@@ -1,0 +1,15 @@
+[package]
+name = "h2o"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# H2O (Heavy-Hitter Oracle) technique crate — attention-score-based KV eviction.
+# Extracted from the engine core (the caote/quest precedent): a stage-axis extension
+# depending only on `argus-extension-api` + `linkme`. Reads importance via StageCtx and
+# returns a keep-list; score-free it degrades to recency. Force-linked via `use h2o as _;`.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

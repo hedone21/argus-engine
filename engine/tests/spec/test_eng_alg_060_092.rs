@@ -513,12 +513,13 @@ fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
 fn test_eng_alg_092_eviction_handler_wraps_h2o() {
     use argus_engine::backend::cpu::CpuBackend;
     use argus_engine::buffer::DType;
-    use argus_engine::kv::eviction::H2OPolicy;
+    use argus_engine::kv::eviction::stage_registry::{StageBackedPolicy, make_stage};
     use argus_engine::kv::kv_cache::KVCache;
     use argus_engine::kv::{ActionResult, CachePressureHandler, EvictionHandler, HandlerContext};
     use argus_engine::memory::host::shared::SharedBuffer;
     use argus_engine::shape::Shape;
     use argus_engine::tensor::Tensor;
+    use argus_extension_api::StageParams;
     use std::sync::Arc;
 
     let backend = Arc::new(CpuBackend::new());
@@ -541,7 +542,16 @@ fn test_eng_alg_092_eviction_handler_wraps_h2o() {
     };
 
     // pos=100, ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-    let handler = EvictionHandler::new(Box::new(H2OPolicy::new(0.5, 0)), 0.3);
+    let h2o_stage = make_stage(
+        "h2o",
+        &StageParams {
+            keep_ratio: 0.5,
+            protected_prefix: 0,
+            ..Default::default()
+        },
+    )
+    .expect("h2o stage registered");
+    let handler = EvictionHandler::new(Box::new(StageBackedPolicy::new(h2o_stage)), 0.3);
     assert_eq!(handler.name(), "h2o");
 
     let mut caches: Vec<KVCache> = (0..4).map(|_| make_cache(100)).collect();

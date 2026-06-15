@@ -3,8 +3,9 @@
 //! **bit-identical** 임을 증명한다 (interior-mutability eviction 의 등가성).
 //!
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §9.1-EVICT (b) 등가식 + §9.1-EVICT-DECISION
-//! (γ 확정 — host unit test 가 1차 증명; device 는 sanity 한정). 범위 = Sliding · H2O ·
-//! StreamingLLM · NoEviction × {F32, F16, Q4_0} (per-head H2O+ · 가중 merge D2O 는 §9.1-EVICT-DEFER).
+//! (γ 확정 — host unit test 가 1차 증명; device 는 sanity 한정). 범위 = Sliding · NoEviction
+//! × {F32, F16, Q4_0} (per-head H2O+ · 가중 merge D2O 는 §9.1-EVICT-DEFER; StreamingLLM·H2O 는
+//! streaming-llm·h2o 플러그인으로 추출 — plan-only 라 World-A 등가 대상 아님).
 //!
 //! 왜 host 가 정식인가 (F4): `compact` → `compact_keep_positions` → `shift_positions` →
 //! `backend.buffer_shift` 는 in-place sliding `evict` 가 쓰는 바로 그 연산이라 GPU 가 새로 증명할
@@ -17,9 +18,7 @@ use argus_extension_api::{KVCachePlan, KeepSpec};
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
 use crate::kv::eviction::stage_registry::{execute_kv_plan, uniform_to_weighted};
-use crate::kv::eviction::{
-    EvictionPolicy, H2OPolicy, NoEvictionPolicy, SlidingWindowPolicy, StreamingLLMPolicy,
-};
+use crate::kv::eviction::{EvictionPolicy, NoEvictionPolicy, SlidingWindowPolicy};
 use crate::kv::kv_cache::KVCache;
 use crate::memory::host::shared::SharedBuffer;
 use crate::shape::Shape;
@@ -162,98 +161,15 @@ fn sliding_parity_noop_below_threshold() {
     }
 }
 
-#[test]
-fn h2o_fallback_parity_all_dtypes() {
-    // importance None → evict() fallback (prefix + recent).
-    let policy = H2OPolicy::new(0.5, 4);
-    for dt in DTYPES {
-        assert_parity(
-            &policy,
-            dt,
-            40,
-            20,
-            None,
-            |p, c| p.evict(c, 20).unwrap(),
-            "h2o-fallback",
-        );
-    }
-}
+// H2O parity tests were removed when H2O was extracted to the `h2o` technique crate: the plugin
+// is plan-only (no in-place evict/evict_with_scores), so there is no World-A path left to compare.
+// The plugin's keep-list spec (score-free + score-based) is pinned by its own unit tests, and
+// beta3_eviction_stage_equivalence.rs proves the two World-B application sites agree end-to-end.
 
-#[test]
-fn h2o_scores_parity_all_dtypes() {
-    // importance Some → evict_with_scores (prefix + heavy hitters + recent).
-    let policy = H2OPolicy::new(0.5, 4);
-    let n = 40;
-    // distinct descending scores over [0..n): pos 0 highest. evictable=[4..recent_start).
-    let importance: Vec<f32> = (0..MAX_SEQ).map(|i| (MAX_SEQ - i) as f32).collect();
-    for dt in DTYPES {
-        assert_parity(
-            &policy,
-            dt,
-            n,
-            20,
-            Some(&importance),
-            |p, c| p.evict_with_scores(c, 20, &importance).unwrap(),
-            "h2o-scores",
-        );
-    }
-}
-
-#[test]
-fn h2o_scores_parity_noncontiguous_hh() {
-    // 비연속 HH 위치 (여러 batch shift) — compact batching 경로 검증.
-    let policy = H2OPolicy::new(0.5, 4);
-    let n = 30;
-    let mut importance = vec![0.01f32; MAX_SEQ];
-    importance[6] = 10.0;
-    importance[12] = 9.0;
-    importance[19] = 8.0;
-    for dt in DTYPES {
-        assert_parity(
-            &policy,
-            dt,
-            n,
-            16,
-            Some(&importance),
-            |p, c| p.evict_with_scores(c, 16, &importance).unwrap(),
-            "h2o-noncontig",
-        );
-    }
-}
-
-#[test]
-fn streaming_parity_all_dtypes() {
-    // sink=4, window=6, current=40 → keep=10.
-    let policy = StreamingLLMPolicy::new(4, 6);
-    for dt in DTYPES {
-        assert_parity(
-            &policy,
-            dt,
-            40,
-            0,
-            None,
-            |p, c| p.evict(c, 0).unwrap(),
-            "streaming",
-        );
-    }
-}
-
-#[test]
-fn streaming_parity_shrunk_window() {
-    // target_len < keep_size → window 축소 경로.
-    let policy = StreamingLLMPolicy::new(4, 6);
-    for dt in DTYPES {
-        assert_parity(
-            &policy,
-            dt,
-            40,
-            7,
-            None,
-            |p, c| p.evict(c, 7).unwrap(),
-            "streaming-shrunk",
-        );
-    }
-}
+// StreamingLLM parity tests were removed when StreamingLLM was extracted to the `streaming-llm`
+// technique crate: the plugin is plan-only (no in-place `evict()`), so there is no World-A path
+// left to compare against. The plugin's keep-list spec is pinned by its own unit tests, and
+// beta3_eviction_stage_equivalence.rs proves the two World-B application sites agree end-to-end.
 
 #[test]
 fn no_eviction_parity_all_dtypes() {
