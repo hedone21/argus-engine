@@ -12,9 +12,8 @@ the KV-cache precision format with a flag, no engine rebuild.**
 
 Argus is an on-device LLM inference engine in Rust for Android/Linux ARM64 SoCs: NEON
 CPU and Adreno-OpenCL / CUDA GPU backends, a zero-copy UMA memory path, and a plugin
-surface for KV-cache and precision work. Argus started as a research vehicle, but its
-main goal is to be easy to extend, flexible to configure, and simple to add new
-techniques to without touching the engine core.
+surface for KV-cache and precision work. Its main goal is to be easy to extend, flexible
+to configure, and simple to add new techniques to without touching the engine core.
 
 > **Status: early.** Adreno / ARM64 is the primary tested path. The shipped `argus-cli`
 > does single-prompt text generation (prompt in, continuation + a `Decode: X ms/tok`
@@ -37,6 +36,9 @@ without the eviction stage the KV cache fills and overflows, so generation stops
 chat keeps going:
 
 ![Left (no plugin): the KV cache overflows at the sequence-length limit and generation stops. Right (StreamingLLM plugin): the cache is pruned each turn and the chat keeps streaming.](docs/demo/plugin.gif)
+
+Here the **StreamingLLM** plugin keeps the KV cache from filling up, using a
+sliding-window policy.
 
 <sub>Recorded on-device over OpenCL, streaming token-by-token (the right pane logs
 `[Chat/Evict] removed=…` as it prunes). Slow prefill fast-forwarded; no `--profile`. See
@@ -126,8 +128,7 @@ is portable inference across many platforms, Argus is tuned for Adreno / ARM64 U
 devices and adds a zero-compile plugin surface built to be easy to extend and configure:
 swap an eviction stage or a KV precision format by name (**stage** ⊥ **format** ⊥
 **hardware**), or drop in a new technique as a self-registering crate, with no engine-core
-edits. That extension surface, first built for KV-cache and precision research, is the
-reason to reach for Argus.
+edits. That extension surface is the reason to reach for Argus.
 
 ## Supported models & hardware
 
