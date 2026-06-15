@@ -16,13 +16,14 @@ surface for KV-cache and precision research.
 
 > **Status: early.** Adreno / ARM64 is the primary tested path. The shipped `argus-cli`
 > does **single-prompt text generation** (prompt in → continuation + a `Decode: X ms/tok`
-> line out) and can load a **KV-cache precision-format plugin** (`--kv-format`). KV-cache
-> **eviction stages** (H2O / D2O / StreamingLLM), **KIVI** KV quantization, tensor
+> line out), can load a **KV-cache precision-format plugin** (`--kv-format`), and runs
+> **score-free KV-cache eviction** (Sliding / StreamingLLM + `--load-plugin` stages,
+> KV-fill-triggered). Score-based eviction (H2O / D2O), **KIVI** KV quantization, tensor
 > partition, and runtime weight swap are implemented and tested, but in v0 they run
 > through the `argus-bench` / `argus-eval` binaries rather than `argus-cli`. A multi-turn
-> **chat** server (`argus-chat`, OpenAI-compatible HTTP API) ships alongside the CLI; their
-> `argus-cli` wiring and `--profile` are **planned for v1**. The [Roadmap](#roadmap) table
-> says exactly where each feature runs today.
+> **chat** server (`argus-chat`, OpenAI-compatible HTTP API) ships alongside the CLI
+> (`--interactive` REPL streams tokens as they generate); `--profile` is **planned for v1**.
+> The [Roadmap](#roadmap) table says exactly where each feature runs today.
 
 ## Demo
 
@@ -72,9 +73,10 @@ cross-compile, and Safetensors → GGUF / AUF conversion are under
 [Install / Build from source](#install--build-from-source).
 
 Step 4 is the precision **format** plugin path — a loaded `.so` reaches the real decode
-path on `argus-cli` today. The KV-cache **eviction** plugins (`--eviction-policy
-h2o|d2o|streaming|…`) and **KIVI** precision packing run through `argus-bench` /
-`argus-eval` in v0; see the [Roadmap](#roadmap).
+path on `argus-cli` today. Score-free KV-cache **eviction** stages (`eviction
+sliding|streaming`, plus `--load-plugin` stages) also run on `argus-cli`; score-based
+H2O / D2O (which need the attention-score accumulator) and **KIVI** precision packing run
+through `argus-bench` / `argus-eval` in v0; see the [Roadmap](#roadmap).
 
 ## What you can do
 
@@ -88,11 +90,12 @@ h2o|d2o|streaming|…`) and **KIVI** precision packing run through `argus-bench`
 - **Quantized weights** — Q4_0 / Q8_0 block quant, F16 / BF16. GGUF loads directly
   (dtype auto-detected); Safetensors F16/BF16 convert on load.
 
-**Memory-adaptive KV cache** *(runs via `argus-bench` / `argus-eval` in v0 — see
-[Roadmap](#roadmap))*
+**Memory-adaptive KV cache** *(score-free eviction runs on `argus-cli`; score-based
+H2O/D2O + KIVI via `argus-bench` / `argus-eval` in v0 — see [Roadmap](#roadmap))*
 
 - **Eviction stages** — Sliding Window / H2O / H2O+ / D2O (merge compensation) /
-  StreamingLLM, as composable `KVCacheStage` plugins.
+  StreamingLLM, as composable `KVCacheStage` plugins. Sliding / StreamingLLM and
+  `--load-plugin` stages run on `argus-cli` (single-prompt, KV-fill-triggered).
 - **KIVI KV quantization** — dynamic Q4/Q8 KV packing to cut cache memory.
 - **Adaptive resilience** *(optional; `resilience` feature + `argus-manager`)* — runtime
   adaptation under memory/thermal pressure (eviction, backend switch, throttle).
@@ -128,7 +131,8 @@ reach `argus-cli` (or ship as a new binary) next.
 | Sampling (temperature / top-p / top-k / rep-penalty) | ✅ | ✅ | |
 | KV-cache precision-format plugin (`--kv-format`, `--read-stage`) | ✅ | ✅ | |
 | Prefix-cache save / restore | ✅ | | |
-| KV-cache eviction stages (Sliding / H2O / H2O+ / D2O / StreamingLLM) | | ✅ | ✅ |
+| KV-cache eviction — score-free (Sliding / StreamingLLM / `--load-plugin` stage) | ✅ | ✅ | |
+| KV-cache eviction — score-based (H2O / H2O+ / D2O) | | ✅ | ✅ |
 | KIVI KV quantization (`--kv-mode kivi`) | | ✅ | ✅ |
 | Tensor partition (FFN split across GPU + CPU) | | ✅ | ✅ |
 | Runtime weight swap | | ✅ | ✅ |
@@ -328,8 +332,9 @@ statically — identical `--kv-format my_kv_format`, no `.so`.
 
 - **Stage** (eviction/merge) — implement `KVCacheStage::plan(&ctx) -> Option<KVCachePlan>`
   returning which tokens to `keep` / `merge`, register with `register_kv_stage!`, select
-  with `--eviction-policy <name>`. Template: `example-keep-recent`. *In v0 stages run via
-  `argus-bench` / `argus-eval`, not `argus-cli`.*
+  with `eviction plugin --name <name>`. Template: `example-keep-recent`. *Score-free stages
+  run on `argus-cli` (`--load-plugin <.so> eviction plugin --name <name>`, KV-fill-triggered);
+  score-based stages that need attention scores run via `argus-bench` / `argus-eval`.*
 - **Read** (query-aware read) — implement `KVReadStage`, select with `--read-stage <name>`.
   Reference: the `quest` builtin.
 
