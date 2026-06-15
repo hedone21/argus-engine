@@ -7,33 +7,38 @@
 
 **English** | [한국어](README.ko.md)
 
-**Run quantized Llama / Qwen / Gemma models on a phone or edge ARM64 GPU — and swap
+**Run quantized Llama / Qwen / Gemma models on a phone or edge ARM64 GPU, and swap
 the KV-cache precision format with a flag, no engine rebuild.**
 
 Argus is an on-device LLM inference engine in Rust for Android/Linux ARM64 SoCs: NEON
 CPU and Adreno-OpenCL / CUDA GPU backends, a zero-copy UMA memory path, and a plugin
-surface for KV-cache and precision research.
+surface for KV-cache and precision work. Its main goal is to be easy to extend, flexible
+to configure, and simple to add new techniques to without touching the engine core.
 
 > **Status: early.** Adreno / ARM64 is the primary tested path. The shipped `argus-cli`
-> does **single-prompt text generation** (prompt in → continuation + a `Decode: X ms/tok`
-> line out), can load a **KV-cache precision-format plugin** (`--kv-format`), and runs
-> **score-free KV-cache eviction** (Sliding / StreamingLLM + `--load-plugin` stages,
-> KV-fill-triggered). Score-based eviction (H2O / D2O), **KIVI** KV quantization, tensor
-> partition, and runtime weight swap are implemented and tested, but in v0 they run
-> through the `argus-bench` / `argus-eval` binaries rather than `argus-cli`. A multi-turn
-> **chat** server (`argus-chat`, OpenAI-compatible HTTP API) ships alongside the CLI
-> (`--interactive` REPL streams tokens as they generate); `--profile` is **planned for v1**.
-> The [Roadmap](#roadmap) table says exactly where each feature runs today.
+> does single-prompt text generation (prompt in, continuation + a `Decode: X ms/tok`
+> line out), can load a KV-cache precision-format plugin (`--kv-format`), and runs
+> score-free KV-cache eviction (Sliding / StreamingLLM + `--load-plugin` stages,
+> KV-fill-triggered). Score-based eviction (H2O / D2O), KIVI KV quantization, tensor
+> partition, and runtime weight swap are implemented and tested, but run through the
+> `argus-bench` / `argus-eval` binaries rather than `argus-cli`. A multi-turn chat server
+> (`argus-chat`, OpenAI-compatible HTTP API) ships alongside the CLI: it serves all three
+> KV modes (Standard / KIVI / Offload) with manager-integrated resilience, and its
+> `--interactive` REPL streams tokens as they generate. `argus-cli` does not accept
+> `--profile`; per-op profiling is read from `argus-bench`.
 
 ## Demo
 
-**StreamingLLM KV-cache eviction**, streaming on a phone's **Adreno GPU** (Galaxy S25,
+**StreamingLLM KV-cache eviction**, streaming on a phone's Adreno GPU (Galaxy S25,
 OpenCL). A multi-turn `argus-chat --interactive` session capped at `--max-seq-len 512`:
-without the eviction stage the KV cache fills and **overflows, so generation stops**; with
-`eviction streaming --sink 4 --recent-window 256` the cache is **pruned each turn and the
-chat keeps going**:
+without the eviction stage the KV cache fills and overflows, so generation stops. With
+`eviction streaming --sink 4 --recent-window 256` the cache is pruned each turn and the
+chat keeps going:
 
 ![Left (no plugin): the KV cache overflows at the sequence-length limit and generation stops. Right (StreamingLLM plugin): the cache is pruned each turn and the chat keeps streaming.](docs/demo/plugin.gif)
+
+Here the **StreamingLLM** plugin keeps the KV cache from filling up, using a
+sliding-window policy.
 
 <sub>Recorded on-device over OpenCL, streaming token-by-token (the right pane logs
 `[Chat/Evict] removed=…` as it prunes). Slow prefill fast-forwarded; no `--profile`. See
@@ -77,11 +82,11 @@ counts instead). Point it at a `.gguf` and the dtype is auto-detected (no conver
 cross-compile, and Safetensors → GGUF / AUF conversion are under
 [Install / Build from source](#install--build-from-source).
 
-Step 4 is the precision **format** plugin path — a loaded `.so` reaches the real decode
-path on `argus-cli` today. Score-free KV-cache **eviction** stages (`eviction
+Step 4 is the precision format plugin path: a loaded `.so` reaches the real decode
+path on `argus-cli` today. Score-free KV-cache eviction stages (`eviction
 sliding|streaming`, plus `--load-plugin` stages) also run on `argus-cli`; score-based
-H2O / D2O (which need the attention-score accumulator) and **KIVI** precision packing run
-through `argus-bench` / `argus-eval` in v0; see the [Roadmap](#roadmap).
+H2O / D2O (which need the attention-score accumulator) and KIVI precision packing run
+through `argus-bench` / `argus-eval`.
 
 ## What you can do
 
@@ -96,7 +101,7 @@ through `argus-bench` / `argus-eval` in v0; see the [Roadmap](#roadmap).
   (dtype auto-detected); Safetensors F16/BF16 convert on load.
 
 **Memory-adaptive KV cache** *(score-free eviction runs on `argus-cli`; score-based
-H2O/D2O + KIVI via `argus-bench` / `argus-eval` in v0 — see [Roadmap](#roadmap))*
+H2O/D2O + KIVI via `argus-bench` / `argus-eval`)*
 
 - **Eviction stages** — Sliding Window / H2O / H2O+ / D2O (merge compensation) /
   StreamingLLM, as composable `KVCacheStage` plugins. Sliding / StreamingLLM and
@@ -107,48 +112,23 @@ H2O/D2O + KIVI via `argus-bench` / `argus-eval` in v0 — see [Roadmap](#roadmap
 
 **Extensible** *(zero engine-core edits)*
 
-- **Pluggable KV cache & precision** — add a KV-cache stage / format / read-stage as a
-  separate crate that self-registers via `linkme`; the **stage** and **format** axes can
-  also be loaded at runtime as a `.so` (the **read** axis is static-link only).
-  Three orthogonal axes — **stage** ⊥ **format** ⊥ **hardware**. The precision **format**
-  axis (`--kv-format`) and the **read** axis (`--read-stage`) work from `argus-cli`
+- **Pluggable KV cache & precision** — add a KV-cache stage / format as a
+  separate crate that self-registers via `linkme`; the stage and format axes can
+  also be loaded at runtime as a `.so` (a read stage is static-link only).
+  Three orthogonal axes: **stage** ⊥ **format** ⊥ **hardware**. The format
+  axis (`--kv-format`) and a read stage (`--read-stage`) work from `argus-cli`
   today. See [Extending Argus](#extending-argus).
 - **Pluggable backends** — `Backend` trait over CPU (NEON) / OpenCL (Adreno) / CUDA.
 
 ## Why Argus / how it relates to llama.cpp
 
 Argus reuses kernels adapted from [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)
-(see [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES.md)) and is **complementary, not a
-replacement**. Where llama.cpp is portable inference across many platforms, Argus is
-tuned for **Adreno / ARM64 UMA edge devices** and adds a **zero-compile plugin surface
-for KV-cache and precision research**: swap an eviction stage or a KV precision format by
-name (**stage** ⊥ **format** ⊥ **hardware**), with no engine recompile. If you want to
-prototype KV-cache or quantization techniques on a phone-class GPU, that extension
-surface is the reason to reach for Argus.
-
-## Roadmap
-
-Where each capability runs today (v0). The **v1 plan** column marks features slated to
-reach `argus-cli` (or ship as a new binary) next.
-
-| Capability | `argus-cli` | `argus-bench` / `argus-eval` | v1 plan |
-|---|:---:|:---:|:---:|
-| Single-prompt generation (CPU / OpenCL / CUDA) | ✅ | ✅ | |
-| Sampling (temperature / top-p / top-k / rep-penalty) | ✅ | ✅ | |
-| KV-cache precision-format plugin (`--kv-format`, `--read-stage`) | ✅ | ✅ | |
-| Prefix-cache save / restore | ✅ | | |
-| KV-cache eviction — score-free (Sliding / StreamingLLM / `--load-plugin` stage) | ✅ | ✅ | |
-| KV-cache eviction — score-based (H2O / H2O+ / D2O) | | ✅ | ✅ |
-| KIVI KV quantization (`--kv-mode kivi`) | | ✅ | ✅ |
-| Tensor partition (FFN split across GPU + CPU) | | ✅ | ✅ |
-| Runtime weight swap | | ✅ | ✅ |
-| Per-op profiling (`--profile`) | | | ✅ |
-| Interactive chat REPL | | | ✅ |
-
-> Multi-turn chat now ships as `argus-chat` — an OpenAI-compatible HTTP server
-> (`POST /v1/chat/completions`, streaming + non-streaming) supporting all three KV modes
-> (Standard / KIVI / Offload) and manager-integrated resilience. `--interactive` runs a
-> local stdin REPL instead.
+(see [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES.md)) and complements it. Where llama.cpp
+is portable inference across many platforms, Argus is tuned for Adreno / ARM64 UMA edge
+devices and adds a zero-compile plugin surface built to be easy to extend and configure:
+swap an eviction stage or a KV precision format by name (**stage** ⊥ **format** ⊥
+**hardware**), or drop in a new technique as a self-registering crate, with no engine-core
+edits. That extension surface is the reason to reach for Argus.
 
 ## Supported models & hardware
 
@@ -180,7 +160,7 @@ Cross-compile targets: `aarch64-linux-android`, `aarch64-unknown-linux-gnu`,
 
 - **Rust ≥ 1.94** (stable, edition 2024): `rustup update stable`. A
   `package ... requires rustc 1.94` error on the first `cargo build` just means your
-  stable toolchain is stale — `rustup update` fixes it.
+  stable toolchain is stale; `rustup update` fixes it.
 - **OpenCL headers** — the default build enables the `opencl` feature. On Linux:
   `sudo apt-get install ocl-icd-opencl-dev`. macOS ships the OpenCL framework. A GPU
   is *not* required to build (only to run GPU backends).
@@ -190,7 +170,7 @@ Cross-compile targets: `aarch64-linux-android`, `aarch64-unknown-linux-gnu`,
 Argus is distributed as source: it depends on
 [`argus-shared`](https://github.com/hedone21/argus-shared) as a git dependency, so it is
 not published to crates.io (`cargo install argus-engine` will not work). Build it from a
-git checkout — the [Quickstart](#quickstart--what-runs-today) covers the default
+git checkout; the [Quickstart](#quickstart--what-runs-today) covers the default
 `cargo build --release` + CPU/OpenCL run.
 
 ```bash
@@ -200,8 +180,8 @@ cargo build --release --no-default-features --features cuda
 
 ### Model conversion
 
-Argus loads GGUF directly. To produce a GGUF from a HuggingFace Safetensors model — or
-to build an AUF (Argus Unified Format) asset — use the tools in [`scripts/`](scripts/):
+Argus loads GGUF directly. To produce a GGUF from a HuggingFace Safetensors model, or
+to build an AUF (Argus Unified Format) asset, use the tools in [`scripts/`](scripts/):
 
 ```bash
 pip install -r scripts/requirements.txt
@@ -218,7 +198,7 @@ See [`scripts/README.md`](scripts/README.md) for the full conversion guide.
 ### Android (cross-compile + deploy)
 
 Build for `aarch64-linux-android` with the Android NDK. The Adreno production path is
-`-b opencl`; the device needs a vendor `libOpenCL.so` (not distributed here — pull it
+`-b opencl`; the device needs a vendor `libOpenCL.so` (not distributed here; pull it
 from the device's `/vendor/lib64`).
 
 `scripts/run_device.py` automates build → push → run over adb (and ssh for Jetson),
@@ -251,26 +231,25 @@ for the device-runner and evaluation tooling.
 | `caote` | | CAOTE value-aware eviction plugin |
 | `rkv` | | R-KV joint eviction measurement prototype (experimental, default-off) |
 
-> `opencl` and `cuda`/`cuda-embedded` are mutually exclusive — select exactly one GPU
+> `opencl` and `cuda`/`cuda-embedded` are mutually exclusive: select exactly one GPU
 > backend. The CUDA build above drops the default `opencl` via `--no-default-features`
-> and adds `--features cuda`. Building with **no** GPU backend at all is not currently
+> and adds `--features cuda`. Building with no GPU backend at all is not currently
 > supported.
 >
-> The `profile` feature compiles the per-op instrumentation, but the shipped v0
-> `argus-cli` rejects the `--profile` flag (profiling output is read from `argus-bench`);
-> CLI profiling is planned for v1.
+> The `profile` feature compiles the per-op instrumentation, but the shipped `argus-cli`
+> rejects the `--profile` flag; profiling output is read from `argus-bench`.
 
 ## Extending Argus
 
-A KV-cache technique is a **separate crate** that depends only on `technique-api` +
-`linkme` and **self-registers** — adding one touches **zero engine-core code**. There are
-three orthogonal axes (**stage** ⊥ **format** ⊥ **hardware**): a **stage** adjusts which
-tokens stay resident (eviction/merge), a **format** defines the KV byte layout
-(precision), and a **read-stage** chooses what to read back.
+A KV-cache technique is a separate crate that depends only on `technique-api` +
+`linkme` and self-registers, so adding one touches zero engine-core code. There are
+three orthogonal axes (**stage** ⊥ **format** ⊥ **hardware**): a stage adjusts which
+tokens stay resident (an eviction/merge stage, or a read stage that chooses what to read
+back), and a format defines the KV byte layout (precision).
 
 ### Example: a KV-cache precision plugin
 
-This is the plugin loaded in [Quickstart](#quickstart--what-runs-today) step 4 — copy
+This is the plugin loaded in [Quickstart](#quickstart--what-runs-today) step 4; copy
 `crates/techniques/example-kv-format/` as a template. The whole plugin is one small crate:
 
 ```
@@ -279,7 +258,7 @@ crates/techniques/my-kv-format/
 └── src/lib.rs
 ```
 
-`Cargo.toml` — two dependency lines plus a `cdylib` so it can build as a loadable `.so`:
+`Cargo.toml`: two dependency lines plus a `cdylib` so it can build as a loadable `.so`:
 
 ```toml
 [package]
@@ -297,7 +276,7 @@ linkme = "0.3"
 plugin-cdylib = []                # gates the .so C-ABI export
 ```
 
-`src/lib.rs` — implement the trait (here `KVFormat` = a name + a byte-layout descriptor)
+`src/lib.rs`: implement the trait (here `KVFormat` = a name + a byte-layout descriptor)
 and register it in one line:
 
 ```rust
@@ -322,7 +301,7 @@ technique_api::register_kv_format!("my_kv_format", || Box::new(MyKvFormat));
 technique_api::export_plugin!();                // emits the .so entry point for --load-plugin
 ```
 
-Build it as a `.so` and load it by name — no engine rebuild:
+Build it as a `.so` and load it by name, no engine rebuild:
 
 ```bash
 cargo build --release -p my-kv-format --features plugin-cdylib
@@ -334,21 +313,21 @@ At startup the engine `dlopen`s the `.so`, registers the format, and `--kv-forma
 my_kv_format` routes the KV cache through your layout (the `[DecodeLoop] kv storage =
 OPAQUE` log line confirms it reached the decode path). Drop `--features plugin-cdylib`,
 add a one-line path dependency on the crate instead, and the same code is force-linked
-statically — identical `--kv-format my_kv_format`, no `.so`.
+statically: identical `--kv-format my_kv_format`, no `.so`.
 
 ### The other axes
 
-- **Stage** (eviction/merge) — implement `KVCacheStage::plan(&ctx) -> Option<KVCachePlan>`
+- **Stage**, eviction/merge kind — implement `KVCacheStage::plan(&ctx) -> Option<KVCachePlan>`
   returning which tokens to `keep` / `merge`, register with `register_kv_stage!`, select
   with `eviction plugin --name <name>`. Template: `example-keep-recent`. *Score-free stages
   run on `argus-cli` (`--load-plugin <.so> eviction plugin --name <name>`, KV-fill-triggered);
   score-based stages that need attention scores run via `argus-bench` / `argus-eval`.*
-- **Read** (query-aware read) — implement `KVReadStage`, select with `--read-stage <name>`.
-  Reference: the `quest` builtin.
+- **Stage**, read kind (query-aware read) — implement `KVReadStage`, select with `--read-stage <name>`.
+  Static-link only, runs on `argus-cli`; reference the `quest` builtin.
 
-A `KVFormat` contributes a byte-layout *descriptor*, not a compute kernel — a precision
+A `KVFormat` contributes a byte-layout *descriptor* rather than a compute kernel: a precision
 with no matching builtin rides a generic dequant→f32 path. See [`CONTEXT.md`](CONTEXT.md)
-for the axis vocabulary, **[`docs/plugins.md`](docs/plugins.md)** for the full onboarding
+for the axis vocabulary, [`docs/plugins.md`](docs/plugins.md) for the full onboarding
 guide (quickstart through shipping a plugin), and
 [`crates/technique-api/README.md`](crates/technique-api/README.md) for the terse
 registration reference and the `example-*` templates (bundles, multi-format, rollback /
@@ -356,7 +335,7 @@ error vehicles).
 
 ## Repository map
 
-This repository is the **engine**. It is one of three Argus repositories:
+This repository is the engine. It is one of three Argus repositories:
 
 | Repo | Role |
 |------|------|
@@ -367,7 +346,7 @@ This repository is the **engine**. It is one of three Argus repositories:
 ## Documentation
 
 - [`docs/plugins.md`](docs/plugins.md) — **Writing an Argus plugin**: the developer
-  onboarding guide for adding a KV-cache technique (stage / format / read / backend-cap)
+  onboarding guide for adding a KV-cache technique (stage / format / backend-capability)
   without forking the engine.
 - [`CONTEXT.md`](CONTEXT.md) — domain glossary: the stage ⊥ format ⊥ hardware axes and
   the cache-management vocabulary.
