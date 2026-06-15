@@ -109,6 +109,7 @@ dependencies = [
  "cudarc",
  "env_logger",
  "example-keep-recent",
+ "h2o",
  "half",
  "libc",
  "libloading 0.8.9",
@@ -889,6 +890,14 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
+name = "h2o"
+version = "0.1.0"
+dependencies = [
+ "argus-extension-api",
+ "linkme",
+]
 
 [[package]]
 name = "half"

@@ -35,7 +35,6 @@ use crate::kv::cache_manager::CacheManager;
 use crate::kv::d2o_handler::{D2OConfig, D2OHandler};
 use crate::kv::eviction::EvictMethod;
 use crate::kv::eviction::EvictionPolicy;
-use crate::kv::eviction::h2o::H2OPolicy;
 use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
 use crate::kv::eviction::no_eviction::NoEvictionPolicy;
 use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
@@ -231,13 +230,9 @@ fn build_eval_cache_manager(
                 args.eviction_window(),
                 actual_protected_prefix,
             )),
-            // "streaming" is no longer a built-in match arm — it falls through to the generic
-            // `name =>` path below (make_stage("streaming") → the streaming-llm plugin),
-            // which derives streaming_window identically.
-            "h2o" => Box::new(H2OPolicy::new(
-                args.h2o_keep_ratio(),
-                actual_protected_prefix,
-            )),
+            // "streaming" and "h2o" are no longer built-in match arms — they fall through to the
+            // generic `name =>` path below (make_stage(name) → the streaming-llm / h2o plugin),
+            // which builds StageParams (keep_ratio/protected_prefix/streaming_window) identically.
             "h2o_plus" => Box::new(H2OPlusPolicy::new(
                 args.h2o_keep_ratio(),
                 actual_protected_prefix,
@@ -288,13 +283,25 @@ fn build_eval_cache_manager(
     // Manager-directed eviction 용 policy 등록 (legacy generate.rs:944-958).
     // attention sinks(4)만 보호 — Manager 가 언제/얼마나 evict 할지 결정한다.
     let resilience_protected_prefix = 4usize;
-    cache_manager.register_policy(
-        EvictMethod::H2o,
-        Box::new(H2OPolicy::new(
-            args.h2o_keep_ratio(),
-            resilience_protected_prefix,
-        )),
-    );
+    // H2O was extracted to the `h2o` plugin crate; build the stage by registry name and wrap it
+    // as an EvictionPolicy (StageBackedPolicy) for the Manager-directed register_policy path.
+    {
+        let h2o_params = argus_extension_api::StageParams {
+            eviction_window: args.eviction_window(),
+            protected_prefix: resilience_protected_prefix,
+            keep_ratio: args.h2o_keep_ratio(),
+            sink_size: args.sink_size(),
+            streaming_window: 0,
+        };
+        if let Some(stage) = crate::kv::eviction::stage_registry::make_stage("h2o", &h2o_params) {
+            cache_manager.register_policy(
+                EvictMethod::H2o,
+                Box::new(crate::kv::eviction::stage_registry::StageBackedPolicy::new(
+                    stage,
+                )),
+            );
+        }
+    }
     cache_manager.register_policy(
         EvictMethod::Sliding,
         Box::new(SlidingWindowPolicy::new(

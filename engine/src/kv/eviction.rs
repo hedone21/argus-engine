@@ -76,7 +76,8 @@ pub trait EvictionPolicy: Send + Sync {
     }
 }
 
-pub mod h2o;
+// `h2o` was extracted to the out-of-tree `h2o` technique crate (registers "h2o" via linkme;
+// force-linked in stage_registry.rs).
 pub mod h2o_plus;
 pub mod method;
 pub mod no_eviction;
@@ -88,7 +89,6 @@ pub mod stage_registry;
 #[cfg(test)]
 mod compact_parity;
 
-pub use h2o::H2OPolicy;
 pub use h2o_plus::H2OPlusPolicy;
 pub use method::EvictMethod;
 pub use no_eviction::NoEvictionPolicy;

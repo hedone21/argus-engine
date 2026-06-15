@@ -73,6 +73,9 @@ quest = { path = "../crates/techniques/quest" }
 # StreamingLLM (attention-sink + recent-window KVCacheStage). Extracted from the engine
 # core; non-optional, force-linked so `eviction streaming` resolves the out-of-tree plugin.
 streaming-llm = { path = "../crates/techniques/streaming-llm" }
+# H2O (Heavy-Hitter Oracle, score-based KVCacheStage). Extracted from the engine core;
+# non-optional, force-linked so `eviction h2o` resolves the out-of-tree plugin.
+h2o = { path = "../crates/techniques/h2o" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

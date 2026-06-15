@@ -268,7 +268,7 @@ pub trait KVCacheStage: Send + Sync {
 /// it will be settled upon entering the d2o migration (M4). The 4 current built-ins (sliding/streaming/h2o/no_eviction) are well served by the
 /// 5 fields below.
 #[repr(C)] // GATE-C: the `.so` C-ABI passes it by value as a POD (the make-thunk argument).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct StageParams {
     /// sliding window size (number of recent tokens to keep).
     pub eviction_window: usize,
