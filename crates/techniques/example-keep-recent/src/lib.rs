@@ -12,7 +12,7 @@
 //! `compact` (plan-returning). CLI selector: `eviction plugin --name example_keep_recent`.
 //!
 //! GATE-C: `cargo build -p example-keep-recent --features plugin-cdylib` produces the `.so` →
-//! `argus_bench --load-plugin <.so> eviction plugin --name example_keep_recent` loads it zero-compile.
+//! `argus-bench --load-plugin <.so> eviction plugin --name example_keep_recent` loads it zero-compile.
 
 use technique_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, StageParams};
 

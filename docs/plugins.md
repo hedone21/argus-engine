@@ -9,7 +9,7 @@ up by name. This is the same `technique-api` surface the built-in techniques (`q
 `quest`, `caote`, …) are built on.
 
 > **New here?** Do the [Quickstart](#quickstart-your-first-plugin) (~10 minutes, runs on
-> the shipped `argus_cli`), then stop. Everything after it is reference and how-to you can
+> the shipped `argus-cli`), then stop. Everything after it is reference and how-to you can
 > come back to one section at a time.
 
 By the end of the Quickstart you will have a **custom KV-cache format** compiled into its
@@ -96,7 +96,7 @@ specifics are out of scope here.)
 ## Quickstart: your first plugin
 
 We will add a KV-cache **format** — the axis that runs end-to-end on the shipped
-`argus_cli` and needs no engine rebuild. The starting point is a maintained template crate,
+`argus-cli` and needs no engine rebuild. The starting point is a maintained template crate,
 `example-kv-format`, which you copy and rename.
 
 ### Step 1 — copy the template
@@ -222,7 +222,7 @@ by `find_kv_format("my_format")`.
 ### Step 4 — run it in the real engine
 
 ```bash
-cargo run --release -p argus-engine --bin argus_cli -- \
+cargo run --release -p argus-engine --bin argus-cli -- \
   -m models/llama3.2-1b \
   -p "Hello, world! I am a" \
   -n 20 \
@@ -310,21 +310,21 @@ you have.
 
 | Axis | Trait | Returns | Register with | CLI selector | Selector kind | Dynamic `.so`? | Runs on | Maturity |
 |------|-------|---------|---------------|--------------|---------------|----------------|---------|-----------|
-| **format** | `KVFormat` | layout descriptor | `register_kv_format!` | `--kv-format <name>` | free string | **yes** | `argus_cli`, `argus_bench` | production |
-| **read** | `KVReadStage` | `Option<KVReadPlan>` | raw `#[distributed_slice(KV_READ_STAGES)]` | `--read-stage <name>` | free string | no (static only) | `argus_cli` | production (`quest`) |
-| **stage** (eviction/merge) | `KVCacheStage` | `Option<KVCachePlan>` | `register_kv_stage!` | `eviction plugin --name <n>` | free string | **yes** | `argus_bench`, `argus_eval` | production |
-| **backend-cap** (KIVI attn) | `KiviAttentionBackend` | kernel result code | `register_kivi_attention_plugin!` | `--backend-cap <name>` | free string | **yes** (OpenCL) | `argus_bench`, `argus_eval` | production (OpenCL) |
+| **format** | `KVFormat` | layout descriptor | `register_kv_format!` | `--kv-format <name>` | free string | **yes** | `argus-cli`, `argus-bench` | production |
+| **read** | `KVReadStage` | `Option<KVReadPlan>` | raw `#[distributed_slice(KV_READ_STAGES)]` | `--read-stage <name>` | free string | no (static only) | `argus-cli` | production (`quest`) |
+| **stage** (eviction/merge) | `KVCacheStage` | `Option<KVCachePlan>` | `register_kv_stage!` | `eviction plugin --name <n>` | free string | **yes** | `argus-bench`, `argus-eval` | production |
+| **backend-cap** (KIVI attn) | `KiviAttentionBackend` | kernel result code | `register_kivi_attention_plugin!` | `--backend-cap <name>` | free string | **yes** (OpenCL) | `argus-bench`, `argus-eval` | production (OpenCL) |
 
 All four axes select a registered technique **by name with zero engine edits** — they only
 differ in *which binary* runs them and the exact flag spelling:
 
-1. **`--kv-format` and `--read-stage` are free string flags on the shipped `argus_cli`.** This
+1. **`--kv-format` and `--read-stage` are free string flags on the shipped `argus-cli`.** This
    is the cleanest "add a folder, select by name" story — and why the Quickstart uses format.
 
-2. **Stage and backend-capability are selected by name on `argus_bench` / `argus_eval`.** A
+2. **Stage and backend-capability are selected by name on `argus-bench` / `argus-eval`.** A
    plugin eviction stage uses `eviction plugin --name <n>` (the `eviction` subcommand's
    free-string escape hatch); a backend capability uses `--backend-cap <name>` (OpenCL). Both
-   resolve through the same static→dynamic registry lookup as format. `argus_cli` doesn't run
+   resolve through the same static→dynamic registry lookup as format. `argus-cli` doesn't run
    eviction or KIVI in v0, so those two axes live on the bench/eval binaries. The resilience
    **manager** then drives a CLI-selected stage (evict timing/ratio); switching the technique
    *by name at runtime* over the manager IPC is not yet supported (it needs an `argus-shared`
@@ -421,9 +421,9 @@ A plugin stage is selected **by name**, on the eviction-capable binaries:
 
 ```bash
 # build the stage .so (see the dynamic path), then load + select it by name:
-argus_bench ... --load-plugin target/release/libmy_stage.so eviction plugin --name my_stage
+argus-bench ... --load-plugin target/release/libmy_stage.so eviction plugin --name my_stage
 # or, if you force-linked it statically, just name it:
-argus_eval  ... eviction plugin --name my_stage
+argus-eval  ... eviction plugin --name my_stage
 ```
 
 `eviction plugin --name <name>` is the `eviction` subcommand's free-string escape hatch —
@@ -434,8 +434,8 @@ subcommands: `eviction sliding`, `eviction h2o`, ….)
 
 Two scoping notes:
 
-- **Bench/eval, not `argus_cli`.** Eviction needs a cache manager, which only `argus_bench`
-  and `argus_eval` build; `argus_cli` (the single-prompt happy path) rejects eviction in v0.
+- **Bench/eval, not `argus-cli`.** Eviction needs a cache manager, which only `argus-bench`
+  and `argus-eval` build; `argus-cli` (the single-prompt happy path) rejects eviction in v0.
 - **The manager honors it; runtime by-name switch doesn't exist yet.** The resilience manager
   drives a CLI-selected stage (evict timing/ratio); selecting a *different* technique by name
   at runtime over the manager IPC would need a new `argus-shared` command (out of scope today).
@@ -489,7 +489,7 @@ static MY_READ: KVReadStageReg = KVReadStageReg {
 Two things to know:
 
 - **Selected with a free string flag**, `--read-stage my_read`, and it reaches decode on
-  the shipped `argus_cli`. (Default unset = full read = byte-identical to no plugin.)
+  the shipped `argus-cli`. (Default unset = full read = byte-identical to no plugin.)
 - **Static only.** There is no dynamic `.so` entry symbol for the read axis, so a read
   stage must be **force-linked** (see [the static path](#the-static-force-link-path)); it
   cannot be added via `--load-plugin`. `quest` is wired this way as a non-optional
@@ -504,7 +504,7 @@ Two things to know:
 ## How-to: add a backend capability (KIVI)
 
 > **Advanced / experimental.** This axis is GPU-specialized and not reachable from the
-> shipped `argus_cli`.
+> shipped `argus-cli`.
 
 The **backend-capability** axis layers a specialized fused kernel onto a backend — the
 in-tree instance is KIVI fused dequant+attention. You implement `KiviAttentionBackend`
@@ -516,7 +516,7 @@ exercises the full ABI round-trip with no real GPU math.
 Select a capability by name with `--backend-cap <name>`:
 
 ```bash
-argus_bench ... --kv-mode kivi --load-plugin target/release/libmy_kivi.so --backend-cap my_kivi
+argus-bench ... --kv-mode kivi --load-plugin target/release/libmy_kivi.so --backend-cap my_kivi
 ```
 
 `--backend-cap <name>` resolves a `KiviAttentionBackend` by registry name (static
@@ -528,7 +528,7 @@ Scoping notes:
 
 - **OpenCL-only, bench/eval-only.** The capability is registered only on the OpenCL backend
   (the CPU/CUDA arms have none, so `--backend-cap` there warns and is ignored); `--kv-mode
-  kivi` is rejected by `argus_cli` in v0.
+  kivi` is rejected by `argus-cli` in v0.
 - **Real kernels need a device.** A plugin `KiviAttentionBackend` runs actual GPU code, so
   on-host CI verifies only compilation + the synthetic gate test
   (`engine/tests/gate_c_backend_cap_dlopen.rs`); real correctness is on-device (Adreno/Mali).
@@ -603,7 +603,7 @@ cargo build --release -p my-format --features plugin-cdylib
 
 # Load at startup (repeatable; each .so is dlopen'd once and routed to every axis it
 # exports) and select:
-argus_cli ... --load-plugin target/release/libmy_format.so --kv-format my_format
+argus-cli ... --load-plugin target/release/libmy_format.so --kv-format my_format
 ```
 
 What happens under the hood:
@@ -672,7 +672,7 @@ These are the system's *signature* failure modes — the ones with no obvious co
 | `.so` rejected: `abi_version … != expected …` | Plugin built against a different `technique-api` version | Rebuild the plugin against the engine's version (ABI is not stable across versions) |
 | Duplicate-name rejection on load | The name collides with a built-in or another plugin | Rename your technique ([`example-rollback`](../crates/techniques/example-rollback) shows the atomic-rollback behavior) |
 | Linker `#[no_mangle]` symbol collision | A crate is force-linked **and** built with `--features plugin-cdylib` | Keep `plugin-cdylib` off for static builds; turn it on only when producing a `.so` |
-| Custom eviction stage won't select | Using `argus_cli` (no eviction in v0), or a name typo | Select on `argus_bench`/`argus_eval` with `eviction plugin --name <name>`; confirm the name matches `name()` — see [Selecting your stage](#how-to-add-an-eviction--merge-stage) |
+| Custom eviction stage won't select | Using `argus-cli` (no eviction in v0), or a name typo | Select on `argus-bench`/`argus-eval` with `eviction plugin --name <name>`; confirm the name matches `name()` — see [Selecting your stage](#how-to-add-an-eviction--merge-stage) |
 | Decode got slower after adding a stage/read plugin | Allocating/locking/logging on the hot path | Move setup into the factory; hold state on `&self`; measure with `Decode: X ms/tok`, not `--profile` |
 
 ---

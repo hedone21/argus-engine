@@ -74,11 +74,11 @@ Then:
 
 ```bash
 python scripts/run_device.py --list-devices
-python scripts/run_device.py -d android argus_cli \
+python scripts/run_device.py -d android argus-cli \
     --model-path /data/local/tmp/models/model.gguf -b opencl --prompt "Hello"
 
 # Deploy without executing (e.g. extra binaries):
-python scripts/run_device.py -d android --skip-exec argus_cli --extra-bin test_backend
+python scripts/run_device.py -d android --skip-exec argus-cli --extra-bin test_backend
 ```
 
 `hosts.toml` and `devices.toml` are gitignored; only the `.example` templates are
@@ -86,13 +86,13 @@ committed.
 
 ## Evaluation — `eval_ll_batched.py`
 
-Run `argus_eval --eval-ll` over a batch of questions in fixed-size chunks,
+Run `argus-eval --eval-ll` over a batch of questions in fixed-size chunks,
 restarting the process between chunks so the GPU/OpenCL driver releases its state
 (works around drivers that accumulate deferred allocations over a long run).
 
 ```bash
 python3 scripts/eval_ll_batched.py \
-    --binary ./target/release/argus_eval \
+    --binary ./target/release/argus-eval \
     --model-path models/model.gguf \
     --eval-batch questions.json \
     --output eval_out.json \
@@ -100,4 +100,4 @@ python3 scripts/eval_ll_batched.py \
     -- --backend opencl --kv-type f32 --greedy
 ```
 
-Args after `--` are forwarded to `argus_eval` verbatim.
+Args after `--` are forwarded to `argus-eval` verbatim.

@@ -2,13 +2,13 @@
 """Unified device runner — build, deploy, and execute binaries on any registered device.
 
 Usage:
-    python scripts/run_device.py -d android argus_cli --prompt "Hello" -n 128
+    python scripts/run_device.py -d android argus-cli --prompt "Hello" -n 128
     python scripts/run_device.py -d host test_backend
-    python scripts/run_device.py -d android --skip-build argus_cli -b opencl
+    python scripts/run_device.py -d android --skip-build argus-cli -b opencl
     python scripts/run_device.py --list-devices
 
     # Build + deploy multiple binaries without executing (deploy-only):
-    python scripts/run_device.py -d android --skip-exec argus_cli --extra-bin test_backend
+    python scripts/run_device.py -d android --skip-exec argus-cli --extra-bin test_backend
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from device_registry.connection import create_connection
 from device_registry.deployer import deploy_binary, deploy_eval_files, verify_model
 
 # Binaries that consume `--model-path` and benefit from model verification.
-_INFERENCE_BINARIES = ("argus_cli", "argus_eval")
+_INFERENCE_BINARIES = ("argus-cli", "argus-eval")
 
 
 def _list_devices() -> int:
@@ -67,7 +67,7 @@ def main() -> int:
 
     if not remaining:
         parser.print_help()
-        print("\nError: BINARY name required (e.g., argus_cli, test_backend)")
+        print("\nError: BINARY name required (e.g., argus-cli, test_backend)")
         return 1
 
     binary_name = remaining[0]

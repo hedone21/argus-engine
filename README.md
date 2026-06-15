@@ -14,14 +14,15 @@ Argus is an on-device LLM inference engine in Rust for Android/Linux ARM64 SoCs:
 CPU and Adreno-OpenCL / CUDA GPU backends, a zero-copy UMA memory path, and a plugin
 surface for KV-cache and precision research.
 
-> **Status: early.** Adreno / ARM64 is the primary tested path. The shipped `argus_cli`
+> **Status: early.** Adreno / ARM64 is the primary tested path. The shipped `argus-cli`
 > does **single-prompt text generation** (prompt in → continuation + a `Decode: X ms/tok`
 > line out) and can load a **KV-cache precision-format plugin** (`--kv-format`). KV-cache
 > **eviction stages** (H2O / D2O / StreamingLLM), **KIVI** KV quantization, tensor
 > partition, and runtime weight swap are implemented and tested, but in v0 they run
-> through the `argus_bench` / `argus_eval` binaries rather than `argus_cli`. Their
-> `argus_cli` wiring, an interactive **chat** binary, and `--profile` are **planned for
-> v1**. The [Roadmap](#roadmap) table says exactly where each feature runs today.
+> through the `argus-bench` / `argus-eval` binaries rather than `argus-cli`. A multi-turn
+> **chat** server (`argus-chat`, OpenAI-compatible HTTP API) ships alongside the CLI; their
+> `argus-cli` wiring and `--profile` are **planned for v1**. The [Roadmap](#roadmap) table
+> says exactly where each feature runs today.
 
 ## Demo
 
@@ -41,21 +42,27 @@ cd argus-engine
 cargo build --release
 
 # 1. Single-prompt generation on CPU (default host backend)
-./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 -b cpu
+./target/release/argus-cli -m model.gguf --prompt "Hello" -n 50 -b cpu
 
 # 2. Same prompt on the Adreno OpenCL GPU — one flag switches the backend
-./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 -b opencl
+./target/release/argus-cli -m model.gguf --prompt "Hello" -n 50 -b opencl
 
 # 3. Sampling controls
-./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 \
+./target/release/argus-cli -m model.gguf --prompt "Hello" -n 50 \
     --temperature 0.8 --top-p 0.9 --top-k 40 --repetition-penalty 1.1
 
 # 4. Load a KV-cache *precision format* plugin at runtime — no engine rebuild
 #    (.so is the Linux/Android name; a macOS host build produces .dylib)
 cargo build --release -p example-kv-format --features plugin-cdylib
-./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 \
+./target/release/argus-cli -m model.gguf --prompt "Hello" -n 50 \
     --load-plugin target/release/libexample_kv_format.so \
     --kv-format example_kv_format
+
+# 5. Multi-turn chat — OpenAI-compatible HTTP server (POST /v1/chat/completions)
+./target/release/argus-chat -m model.gguf --listen 127.0.0.1:8080
+#    then, from another shell (streaming SSE shown; drop "stream" for one JSON reply):
+curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
+    -d '{"model":"argus","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
 Each run prints the generated continuation plus `TTFT`, `Decode: X ms/tok`, and
@@ -65,9 +72,9 @@ cross-compile, and Safetensors → GGUF / AUF conversion are under
 [Install / Build from source](#install--build-from-source).
 
 Step 4 is the precision **format** plugin path — a loaded `.so` reaches the real decode
-path on `argus_cli` today. The KV-cache **eviction** plugins (`--eviction-policy
-h2o|d2o|streaming|…`) and **KIVI** precision packing run through `argus_bench` /
-`argus_eval` in v0; see the [Roadmap](#roadmap).
+path on `argus-cli` today. The KV-cache **eviction** plugins (`--eviction-policy
+h2o|d2o|streaming|…`) and **KIVI** precision packing run through `argus-bench` /
+`argus-eval` in v0; see the [Roadmap](#roadmap).
 
 ## What you can do
 
@@ -81,7 +88,7 @@ h2o|d2o|streaming|…`) and **KIVI** precision packing run through `argus_bench`
 - **Quantized weights** — Q4_0 / Q8_0 block quant, F16 / BF16. GGUF loads directly
   (dtype auto-detected); Safetensors F16/BF16 convert on load.
 
-**Memory-adaptive KV cache** *(runs via `argus_bench` / `argus_eval` in v0 — see
+**Memory-adaptive KV cache** *(runs via `argus-bench` / `argus-eval` in v0 — see
 [Roadmap](#roadmap))*
 
 - **Eviction stages** — Sliding Window / H2O / H2O+ / D2O (merge compensation) /
@@ -95,7 +102,7 @@ h2o|d2o|streaming|…`) and **KIVI** precision packing run through `argus_bench`
 - **Pluggable KV cache & precision** — add a KV-cache stage / format / read-stage as a
   separate crate that self-registers via `linkme`, or load it at runtime as a `.so`.
   Three orthogonal axes — **stage** ⊥ **format** ⊥ **hardware**. The precision **format**
-  axis (`--kv-format`) and the **read** axis (`--read-stage`) work from `argus_cli`
+  axis (`--kv-format`) and the **read** axis (`--read-stage`) work from `argus-cli`
   today. See [Extending Argus](#extending-argus).
 - **Pluggable backends** — `Backend` trait over CPU (NEON) / OpenCL (Adreno) / CUDA.
 
@@ -113,9 +120,9 @@ surface is the reason to reach for Argus.
 ## Roadmap
 
 Where each capability runs today (v0). The **v1 plan** column marks features slated to
-reach `argus_cli` (or ship as a new binary) next.
+reach `argus-cli` (or ship as a new binary) next.
 
-| Capability | `argus_cli` | `argus_bench` / `argus_eval` | v1 plan |
+| Capability | `argus-cli` | `argus-bench` / `argus-eval` | v1 plan |
 |---|:---:|:---:|:---:|
 | Single-prompt generation (CPU / OpenCL / CUDA) | ✅ | ✅ | |
 | Sampling (temperature / top-p / top-k / rep-penalty) | ✅ | ✅ | |
@@ -128,8 +135,10 @@ reach `argus_cli` (or ship as a new binary) next.
 | Per-op profiling (`--profile`) | | | ✅ |
 | Interactive chat REPL | | | ✅ |
 
-> The chat REPL is implemented in the codebase but is not yet wired to a shipped binary;
-> it is planned to land as `argus-chat`.
+> Multi-turn chat now ships as `argus-chat` — an OpenAI-compatible HTTP server
+> (`POST /v1/chat/completions`, streaming + non-streaming) supporting all three KV modes
+> (Standard / KIVI / Offload) and manager-integrated resilience. `--interactive` runs a
+> local stdin REPL instead.
 
 ## Supported models & hardware
 
@@ -211,7 +220,7 @@ cp devices.toml.example devices.toml    # register your device(s)
 # or: python scripts/device_registry.py discover         # auto-probe attached adb devices
 
 python scripts/run_device.py --list-devices
-python scripts/run_device.py -d android argus_cli \
+python scripts/run_device.py -d android argus-cli \
     --model-path /data/local/tmp/models/model.gguf -b opencl --prompt "Hello"
 ```
 
@@ -236,7 +245,7 @@ for the device-runner and evaluation tooling.
 > supported.
 >
 > The `profile` feature compiles the per-op instrumentation, but the shipped v0
-> `argus_cli` rejects the `--profile` flag (profiling output is read from `argus_bench`);
+> `argus-cli` rejects the `--profile` flag (profiling output is read from `argus-bench`);
 > CLI profiling is planned for v1.
 
 ## Extending Argus
@@ -305,7 +314,7 @@ Build it as a `.so` and load it by name — no engine rebuild:
 
 ```bash
 cargo build --release -p my-kv-format --features plugin-cdylib
-./target/release/argus_cli -m model.gguf --prompt "Hello" -n 50 \
+./target/release/argus-cli -m model.gguf --prompt "Hello" -n 50 \
     --load-plugin target/release/libmy_kv_format.so --kv-format my_kv_format
 ```
 
@@ -320,7 +329,7 @@ statically — identical `--kv-format my_kv_format`, no `.so`.
 - **Stage** (eviction/merge) — implement `KVCacheStage::plan(&ctx) -> Option<KVCachePlan>`
   returning which tokens to `keep` / `merge`, register with `register_kv_stage!`, select
   with `--eviction-policy <name>`. Template: `example-keep-recent`. *In v0 stages run via
-  `argus_bench` / `argus_eval`, not `argus_cli`.*
+  `argus-bench` / `argus-eval`, not `argus-cli`.*
 - **Read** (query-aware read) — implement `KVReadStage`, select with `--read-stage <name>`.
   Reference: the `quest` builtin.
 

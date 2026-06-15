@@ -126,14 +126,10 @@ impl SessionInitCtx {
                 anyhow::bail!("--chat: --kivi and --kv-offload are mutually exclusive");
             }
             if matches!(args.effective_kv_mode(), KvMode::Kivi) && has_eviction {
-                anyhow::bail!(
-                    "--chat: --kivi cannot combine with eviction in v1 (pick one)"
-                );
+                anyhow::bail!("--chat: --kivi cannot combine with eviction in v1 (pick one)");
             }
             if kv_offload_active && has_eviction {
-                anyhow::bail!(
-                    "--chat: --kv-offload cannot combine with eviction in v1 (pick one)"
-                );
+                anyhow::bail!("--chat: --kv-offload cannot combine with eviction in v1 (pick one)");
             }
             let conflicts: &[(&str, bool)] = &[
                 ("--eval-ll", args.eval_ll),

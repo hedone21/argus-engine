@@ -9,6 +9,49 @@ repository.workspace = true
 authors.workspace = true
 keywords = ["llm", "inference", "on-device", "quantization", "opencl"]
 categories = ["science", "command-line-utilities"]
+# Bins are declared explicitly below so the user-facing `argus-*` family ships with
+# hyphenated names (`argus-cli`, not `argus_cli`). Disable auto-discovery to avoid
+# duplicate targets for the same `src/bin/*.rs` file.
+autobins = false
+
+# ── Binaries ────────────────────────────────────────────────────────────────
+# argus-* family: hyphenated user-facing names mapped to underscore source files.
+[[bin]]
+name = "argus-cli"
+path = "src/bin/argus_cli.rs"
+
+[[bin]]
+name = "argus-chat"
+path = "src/bin/argus_chat.rs"
+
+[[bin]]
+name = "argus-bench"
+path = "src/bin/argus_bench.rs"
+
+[[bin]]
+name = "argus-eval"
+path = "src/bin/argus_eval.rs"
+
+# Internal dev / test tools keep their underscore names.
+[[bin]]
+name = "auf_tool"
+path = "src/bin/auf_tool.rs"
+
+[[bin]]
+name = "signal_injector"
+path = "src/bin/signal_injector.rs"
+
+[[bin]]
+name = "test_backend"
+path = "src/bin/test_backend.rs"
+
+[[bin]]
+name = "test_model"
+path = "src/bin/test_model.rs"
+
+[[bin]]
+name = "test_q4_soa_byte_equal"
+path = "src/bin/test_q4_soa_byte_equal.rs"
 
 [dependencies]
 # Shared IPC protocol types (manager <-> engine). Separate repo.
@@ -47,6 +90,10 @@ rand = "0.9"
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
+
+# HTTP server for argus-chat (OpenAI-compatible API). Blocking, no async runtime —
+# the engine decode loop is single-threaded and serialized on one thread.
+tiny_http = "0.12"
 
 # Parallelism
 rayon = "1.11"

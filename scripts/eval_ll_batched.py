@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run `argus_eval --eval-ll` in fixed-size chunks, restarting the process
+"""Run `argus-eval --eval-ll` in fixed-size chunks, restarting the process
 between chunks so the GPU/OpenCL driver releases its state.
 
 Some host OpenCL drivers (e.g. NVIDIA) accumulate deferred allocations across
@@ -9,7 +9,7 @@ threshold while keeping the GPU prefill path active.
 
 Usage:
     python3 scripts/eval_ll_batched.py \\
-        --binary ./target/release/argus_eval \\
+        --binary ./target/release/argus-eval \\
         --model-path models/gemma3-4b \\
         --eval-batch /tmp/eval_batch_10q.json \\
         --output /tmp/eval_out.json \\
@@ -17,7 +17,7 @@ Usage:
         -- --backend opencl --kv-type f32 --max-seq-len 4096 \\
            --qcf-mode both --greedy
 
-Positional args after `--` are forwarded to the argus_eval binary verbatim.
+Positional args after `--` are forwarded to the argus-eval binary verbatim.
 Env vars (OCL_PLATFORM, RUST_LOG, ...) are inherited from the caller.
 """
 from __future__ import annotations
@@ -130,7 +130,7 @@ def merge_outputs(chunk_outputs: list[dict]) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--binary", type=Path, default=Path("./target/release/argus_eval"))
+    parser.add_argument("--binary", type=Path, default=Path("./target/release/argus-eval"))
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--eval-batch", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
