@@ -1,9 +1,22 @@
 //! argus-cli — single-prompt inference.
 //!
-//! ARGUS CLI 패밀리의 단일 추론 엔트리. legacy `generate` 의 standard happy
-//! path + production resilience 를 지원한다. chat / experiment / ppl / eval /
-//! dump / prompt-batch / weight swap / KIVI / offload / profile /
-//! tensor-partition 는 아직 미구현이며 명시적으로 reject 한다.
+//! ARGUS CLI 패밀리의 단일 추론 엔트리. legacy `generate` 의 standard happy path +
+//! production resilience + score-free eviction(`eviction none|sliding|streaming` 및
+//! `--load-plugin` stage)을 지원한다. 단일 프롬프트는 turn 경계가 없으므로 eviction 은 KV
+//! 점유율 high-water 구동(`KvFillPressureSource`)으로 발동한다(`standard_happy` →
+//! `build_standard_loop`).
+//!
+//! 미구현이라 명시적으로 reject 하는 모드(각각 argus-chat·argus-bench·argus-eval 로 안내):
+//! chat, experiment, ppl, eval, dump, prompt-batch, weight swap, KIVI, offload,
+//! KV-offload(`--swap-dir`), profile, tensor-partition, score-based eviction(h2o·d2o —
+//! attention-score accumulator 필요).
+//!
+//! Note(streaming/sliding window 크기): eviction 의 retain window(streaming 은
+//! `--sink` + `--recent-window`, sliding 은 `--window`)는 high-water(85% × `--max-seq-len`)
+//! 보다 **작아야** 한다. window 가 high-water 이상이면 prune 후에도 pos 가 high-water 밑으로
+//! 내려가지 못해 재발화(re-arm)가 끊기고, KV 가 다시 차 `KV Cache overflow` 로 종료된다. 예:
+//! `eviction streaming --sink 4 --recent-window 128` 은 `--max-seq-len` 을 ~512 이상으로 둔다
+//! (128 ≪ 0.85×512=435).
 //!
 //! 공용 셋업(SessionInitCtx → tokenizer → KV alloc → resilience)은
 //! [`build_inference_ctx`](argus_engine::session::bin_setup) 로 argus_bench 와 공유한다.
@@ -12,7 +25,6 @@
 use anyhow::bail;
 use argus_engine::session::bin_setup::build_inference_ctx;
 use argus_engine::session::cli::{Args, KvMode};
-use argus_engine::session::is_standard_happy_path;
 use argus_engine::session::standard_happy::run_standard_happy_path;
 use clap::Parser;
 
@@ -26,18 +38,13 @@ fn main() -> anyhow::Result<()> {
     // v1-1: resilience default-on. `--no-resilience` 가 명시되면 effective=false.
     args.enable_resilience = !args.no_resilience;
 
+    // 미지원 모드 reject. score-free eviction(none/sliding/streaming/`--load-plugin` stage)은
+    // 통과하고 standard happy path 의 공용 디코드 경로가 처리한다. 미지원(qcf/skip/d2o-layer-alloc/
+    // profile/partition/swap/KIVI/offload/score-based eviction)은 reject 유지.
     reject_unsupported_modes_v0(&args)?;
 
-    if !is_standard_happy_path(&args) {
-        bail!(
-            "argus-cli v0: this combination of args is not yet supported. \
-             happy path requires: qcf_dump=none, skip_ratio=0, d2o_layer_alloc=off, \
-             profile=off, profile_events=off, eviction_policy=none, tensor_partition=0, \
-             swap_intra_forward=off, swap_layer_immediate=off, swap_phase_aware=off."
-        );
-    }
     if args.num_tokens < 1 {
-        bail!("argus-cli v0: --num-tokens must be >= 1");
+        bail!("argus-cli: --num-tokens must be >= 1");
     }
 
     let ctx = build_inference_ctx(args)?;
@@ -92,6 +99,33 @@ fn reject_unsupported_modes_v0(args: &Args) -> anyhow::Result<()> {
     }
     if args.tensor_partition > 0.0 {
         bail!("argus-cli v0: --tensor-partition not yet supported (planned for v1)");
+    }
+    // is_standard_happy_path 가 막던 나머지 가드를 명시 reject 로 이전 (eviction 만 해제).
+    if args.skip_ratio.unwrap_or(0.0) > 0.0 {
+        bail!("argus-cli v0: --skip-ratio not yet supported (planned for v1)");
+    }
+    if args.d2o_layer_alloc() {
+        bail!(
+            "argus-cli: --d2o-layer-alloc (variance measurement) belongs to argus-eval / argus-bench"
+        );
+    }
+    // KV offload(`--swap-dir`)는 OffloadStage 배선이 필요 → argus-bench.
+    if args.swap_dir.is_some() {
+        bail!("argus-cli: --swap-dir (KV offload) belongs to argus-bench");
+    }
+    // score-based eviction(importance/score accumulator 의존: h2o/h2o_plus/d2o/caote/rkv)은
+    // AttentionScoreAccumulator 배선이 필요(argus-bench 가 score_cell 을 ModelForward+EvictionStage
+    // 에 연결). argus-cli 는 score-free 만 지원: none / sliding / streaming + `--load-plugin <.so>
+    // eviction plugin --name <stage>`. (caote/rkv 는 feature-gate 시에만 도달 — 문자열 비교는 무해.)
+    if matches!(
+        args.eviction_policy(),
+        "h2o" | "h2o_plus" | "d2o" | "caote" | "rkv"
+    ) {
+        bail!(
+            "argus-cli: score-based eviction '{}' belongs to argus-bench (needs attention-score \
+             accumulator); argus-cli supports none / sliding / streaming and --load-plugin stages",
+            args.eviction_policy()
+        );
     }
     Ok(())
 }
