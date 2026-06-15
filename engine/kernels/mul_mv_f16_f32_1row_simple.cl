@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Portions adapted from llama.cpp / ggml (https://github.com/ggml-org/llama.cpp), MIT licensed.
+// See THIRD-PARTY-LICENSES.md.
 // F16 GEMV single-token decode variant (N_DST=1, 64 threads/WG).
 // Uses the same argument signature as mul_mv_f16_f32.cl so dispatch code
 // can swap in this kernel via kernel handle without changing args.

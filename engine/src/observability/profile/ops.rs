@@ -201,8 +201,8 @@ impl OpProfiler {
     /// Merge event-based per-label GPU ns into the microsecond accumulators.
     ///
     /// Called once per decode step by the `--profile-events` code path.
-    /// Input map uses the labels defined in
-    /// `.agent/research/2026-04-14_decode_microbench_plan.md` (C-2 table).
+    /// Input map uses the labels defined by the decode microbench
+    /// profiling path (C-2 label matrix).
     /// Unknown labels fall into the `other` bucket so no dispatch is dropped.
     pub fn merge_from_events(&mut self, events: &std::collections::HashMap<String, u64>) {
         for (label, ns) in events {

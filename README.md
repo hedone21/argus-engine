@@ -26,13 +26,17 @@ surface for KV-cache and precision research.
 
 ## Demo
 
-<!-- TODO: record an asciinema/GIF of an on-device Adreno decode showing the token
-     stream + the `Decode: X ms/tok` line, captured WITHOUT --profile (per the repo's
-     performance-measurement rule), and embed it here (export to GIF/animated SVG —
-     GitHub strips asciinema's <script> tag). -->
+**StreamingLLM KV-cache eviction**, streaming on a phone's **Adreno GPU** (Galaxy S25,
+OpenCL). A multi-turn `argus-chat --interactive` session capped at `--max-seq-len 512`:
+without the eviction stage the KV cache fills and **overflows, so generation stops**; with
+`eviction streaming --sink 4 --recent-window 256` the cache is **pruned each turn and the
+chat keeps going**:
 
-_A recorded on-device decode (asciinema / GIF) will go here — token streaming plus the
-`Decode: X ms/tok` line that is the engine's headline metric._
+![Left (no plugin): the KV cache overflows at the sequence-length limit and generation stops. Right (StreamingLLM plugin): the cache is pruned each turn and the chat keeps streaming.](docs/demo/plugin.gif)
+
+<sub>Recorded on-device over OpenCL, streaming token-by-token (the right pane logs
+`[Chat/Evict] removed=…` as it prunes). Slow prefill fast-forwarded; no `--profile`. See
+[`docs/demo/`](docs/demo/) to reproduce.</sub>
 
 ## Quickstart — what runs today
 
@@ -65,16 +69,18 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
     -d '{"model":"argus","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-Each run prints the generated continuation plus `TTFT`, `Decode: X ms/tok`, and
-`Avg TBT` lines. Point it at a `.gguf` and the dtype is auto-detected (no conversion); a
+Each `argus-cli` run prints the generated continuation plus `TTFT`, `Decode: X ms/tok`,
+and `Avg TBT` lines (`argus-chat` streams tokens and returns OpenAI-style token `usage`
+counts instead). Point it at a `.gguf` and the dtype is auto-detected (no conversion); a
 `tokenizer.json` must sit next to the model, or pass `--tokenizer-path`. CUDA, Android
 cross-compile, and Safetensors → GGUF / AUF conversion are under
 [Install / Build from source](#install--build-from-source).
 
 Step 4 is the precision **format** plugin path — a loaded `.so` reaches the real decode
-path on `argus-cli` today. The KV-cache **eviction** plugins (`--eviction-policy
-h2o|d2o|streaming|…`) and **KIVI** precision packing run through `argus-bench` /
-`argus-eval` in v0; see the [Roadmap](#roadmap).
+path on `argus-cli` today. The KV-cache **eviction** plugins (the `eviction <policy>`
+subcommand, e.g. `eviction h2o`; custom stages via `eviction plugin --name <name>`) and
+**KIVI** precision packing run through `argus-bench` / `argus-eval` in v0; see the
+[Roadmap](#roadmap).
 
 ## What you can do
 
@@ -100,7 +106,8 @@ h2o|d2o|streaming|…`) and **KIVI** precision packing run through `argus-bench`
 **Extensible** *(zero engine-core edits)*
 
 - **Pluggable KV cache & precision** — add a KV-cache stage / format / read-stage as a
-  separate crate that self-registers via `linkme`, or load it at runtime as a `.so`.
+  separate crate that self-registers via `linkme`; the **stage** and **format** axes can
+  also be loaded at runtime as a `.so` (the **read** axis is static-link only).
   Three orthogonal axes — **stage** ⊥ **format** ⊥ **hardware**. The precision **format**
   axis (`--kv-format`) and the **read** axis (`--read-stage`) work from `argus-cli`
   today. See [Extending Argus](#extending-argus).
@@ -168,7 +175,9 @@ Cross-compile targets: `aarch64-linux-android`, `aarch64-unknown-linux-gnu`,
 
 ## Prerequisites
 
-- **Rust** (stable): `rustup install stable`.
+- **Rust ≥ 1.94** (stable, edition 2024): `rustup update stable`. A
+  `package ... requires rustc 1.94` error on the first `cargo build` just means your
+  stable toolchain is stale — `rustup update` fixes it.
 - **OpenCL headers** — the default build enables the `opencl` feature. On Linux:
   `sudo apt-get install ocl-icd-opencl-dev`. macOS ships the OpenCL framework. A GPU
   is *not* required to build (only to run GPU backends).
@@ -328,7 +337,8 @@ statically — identical `--kv-format my_kv_format`, no `.so`.
 
 - **Stage** (eviction/merge) — implement `KVCacheStage::plan(&ctx) -> Option<KVCachePlan>`
   returning which tokens to `keep` / `merge`, register with `register_kv_stage!`, select
-  with `--eviction-policy <name>`. Template: `example-keep-recent`. *In v0 stages run via
+  with the `eviction plugin --name <name>` subcommand (built-ins: `eviction
+  h2o|d2o|streaming|sliding`). Template: `example-keep-recent`. *In v0 stages run via
   `argus-bench` / `argus-eval`, not `argus-cli`.*
 - **Read** (query-aware read) — implement `KVReadStage`, select with `--read-stage <name>`.
   Reference: the `quest` builtin.

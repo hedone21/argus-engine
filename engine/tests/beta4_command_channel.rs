@@ -2,7 +2,6 @@
 //! 의 구==신 등가 + heartbeat 송출 연속성.
 //!
 //! 설계 SSOT: `arch/beta4_command_channel_mapping.md` 5부 (host 게이트 명세 5종).
-//! 정본 명세: `.agent/todos/roadmap_beta_decode_loop_rewrite_2026_06_10.md` §β-4 게이트.
 //!
 //! 본 파일이 커버하는 게이트:
 //! 1. **매핑표 행별 등가** — mock directive 시퀀스로 v1 `ExecutionPlan` 산출 ↔ 신 `LoopControl`

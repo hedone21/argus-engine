@@ -291,8 +291,8 @@ fn test_async_path_skips_synchronize_on_empty_batch() {
 // ── Test C: use_async flag gates on supports_async_transfer ──────────────────
 
 /// `async_dispatcher=Some`이어도 `supports_async_transfer()=false`이면
-/// sync fallback — synchronize가 호출됨 (実際のswapがないので0).
-/// この테스트는 use_async=false 경로를 확인.
+/// sync fallback — synchronize가 호출됨 (실제 swap이 없으므로 0).
+/// 이 테스트는 use_async=false 경로를 확인.
 #[test]
 fn test_supports_async_transfer_false_uses_sync_fallback() {
     let mock = Arc::new(AsyncMockBackend::new(false)); // async NOT supported
@@ -363,7 +363,7 @@ fn test_async_path_empty_target_layers() {
 
 // ── Test E: dispatcher pending remains 0 when secondary absent ───────────────
 
-/// secondary=None の場合 dispatcher にジョブは submit されない.
+/// secondary=None인 경우 dispatcher에 job이 submit되지 않는다.
 /// dispatcher.pending_count() == 0 after execute_on_slots.
 #[test]
 fn test_async_path_no_secondary_no_pending_jobs() {

@@ -94,8 +94,8 @@ impl SyncPolicy {
     /// Bisection result (2026-04-19): smallest category set that
     /// preserves correctness on Jetson UMA is `ElemAdd` (residual
     /// `add_assign`, fires 32x per token at 16 layers) plus
-    /// `FallbackPre` for safety on CPU-fallback paths. Raw logs at
-    /// `.agent/research/2026-04-19_sync_bisect/`.
+    /// `FallbackPre` for safety on CPU-fallback paths (established by a
+    /// sync-category bisection on Jetson UMA).
     pub const MINIMAL: SyncPolicy =
         SyncPolicy((1u32 << (SyncCat::ElemAdd as u32)) | (1u32 << (SyncCat::FallbackPre as u32)));
 

@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Additive extension API for argus-engine: KV-cache stage/format/read-stage techniques self-register via linkme, with no engine-core edits."
+# Not yet published to crates.io. Remove this line (and add repository/authors/readme
+# metadata) when promoting the extension API as a standalone published crate.
+publish = false
 
 [dependencies]
 # Static-link auto-registration — linker-section based (zero constructors, safe under

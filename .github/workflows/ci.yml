@@ -74,7 +74,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: No Korean under crates/technique-api (public extension API)
         run: |
-          if grep -rnP '[\x{AC00}-\x{D7A3}]' crates/technique-api; then
+          # Allow the one Korean token in the README language-switcher link
+          # (`[한국어](...)`), mirroring the CONTEXT.md carve-out below.
+          if grep -rnP '[\x{AC00}-\x{D7A3}]' crates/technique-api | grep -vF '한국어]('; then
             echo "::error::Korean found under crates/technique-api — the public API surface must be English"
             exit 1
           fi

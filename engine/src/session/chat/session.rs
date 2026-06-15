@@ -337,8 +337,8 @@ impl ChatSession {
 
     /// turn 종료 후 opportunistic eviction (Standard 모드만).
     ///
-    /// pos が KV capacity の 90% 以上なら force_evict, 未満なら maybe_evict.
-    /// generate.rs::StandardTurnExec::on_turn_end (l.10288~10303) 同等.
+    /// pos가 KV capacity의 90% 이상이면 force_evict, 미만이면 maybe_evict.
+    /// generate.rs::StandardTurnExec::on_turn_end (l.10288~10303)과 동등.
     pub fn on_turn_end(&mut self) -> Result<()> {
         let has_cm = matches!(
             &self.kv_mode,
@@ -348,7 +348,7 @@ impl ChatSession {
             return Ok(());
         }
 
-        // KV capacity는 pos で近似する (ModelForward 내부 cache.capacity()를
+        // KV capacity는 pos로 근사한다 (ModelForward 내부 cache.capacity()를
         // 직접 읽는 대신 max_seq_len을 proxy로 사용 — 할당 크기와 동일).
         let at_pressure = self.pos >= self.max_seq_len.saturating_mul(9) / 10;
 

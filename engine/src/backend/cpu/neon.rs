@@ -1,6 +1,8 @@
-// Hand-written ARM NEON SIMD: intrinsic-dense, perf-shaped, with helper routines kept
-// for completeness. The lints below are noise in this style, so they are allowed
-// module-wide rather than scattered across the intrinsic sites.
+// ARM NEON SIMD: intrinsic-dense, perf-shaped, with helper routines kept for
+// completeness. Some routines (e.g. the f16 vector-dot / exp paths and the Q4_0/Q8_0
+// block layouts) are adapted from llama.cpp / ggml (MIT) — see THIRD-PARTY-LICENSES.md.
+// The lints below are noise in this style, so they are allowed module-wide rather than
+// scattered across the intrinsic sites.
 #![allow(
     unused_unsafe,
     dead_code,

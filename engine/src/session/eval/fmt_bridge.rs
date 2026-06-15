@@ -1,7 +1,6 @@
 //! Phase α-K BC ①-c: eval transient fmt-wrap bridge.
 //!
-//! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §9.1-BC1'(line 794) + cut
-//! `.agent/todos/design_alpha_k_1c_cut_2026_06_04.md`(workflow `wdrcgtqwz`, Strategy A).
+//! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §9.1-BC1' (line 794), Strategy A.
 //!
 //! eval 은 concrete `Vec<KVCache>`(EvictionHook) / `Vec<KiviCache>`(KiviHook) 를 **계속 소유**하되,
 //! forward 1회 동안만 `Arc<dyn KVCacheFormat>` 로 wrap 하여 `forward_into` 에 위임한다(round-trip).

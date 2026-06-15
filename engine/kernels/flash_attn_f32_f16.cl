@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Portions adapted from llama.cpp / ggml (https://github.com/ggml-org/llama.cpp), MIT licensed.
+// See THIRD-PARTY-LICENSES.md.
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 // Adreno-specific sub-group size hint (A-3 B-1).
@@ -466,7 +469,7 @@ __kernel void flash_attn_f32_f16(
 // Decode Q1 kernel — SLM tree-reduce 패턴 (llama.cpp 유래, 2026-04-14 cross-run
 // 검증 후 B-4 sub_group_reduce 버전에서 revert). Adreno 830 측정 결과
 // `sub_group_reduce_*` + `REQD_SUBGROUP_SIZE_64` 조합이 SLM tree-reduce보다
-// 33-55% 느렸음 (.agent/research/microbench_flash_attn/cross_run_verdict.md).
+// 33-55% 느렸음 (cross-run flash-attn microbench).
 __kernel void flash_attn_f32_f16_q1(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,

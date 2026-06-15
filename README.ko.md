@@ -25,12 +25,15 @@ Adreno-OpenCL·CUDA GPU 백엔드, zero-copy UMA 메모리 경로, KV-cache·pre
 
 ## 데모
 
-<!-- TODO: 온디바이스 Adreno decode를 asciinema·GIF로 녹화해(토큰 스트리밍 + `Decode: X ms/tok`
-     라인, --profile 없이 — repo의 성능 측정 규칙) 여기에 넣기. GitHub는 asciinema의 <script>
-     태그를 지우므로 GIF나 애니메이션 SVG로 내보낼 것. -->
+폰의 **Adreno GPU**(Galaxy S25, OpenCL)에서 스트리밍으로 도는 **StreamingLLM KV-cache eviction**.
+`--max-seq-len 512`로 제한한 멀티턴 `argus-chat --interactive` 세션 — eviction stage가 없으면 KV cache가
+차서 **오버플로로 생성이 멈추고**, `eviction streaming --sink 4 --recent-window 256`을 주면
+**매 턴 캐시를 프루닝하며 계속**됩니다:
 
-_실제 온디바이스 decode 녹화(asciinema·GIF)가 들어갈 자리입니다. 토큰 스트리밍과 엔진의 대표
-지표인 `Decode: X ms/tok` 라인을 함께 보여줄 예정입니다._
+![좌(no plugin): KV cache가 seq-len 한계에서 오버플로해 생성 중단. 우(StreamingLLM plugin): 매 턴 캐시를 프루닝하며 계속 스트리밍.](docs/demo/plugin.gif)
+
+<sub>온디바이스 OpenCL에서 토큰 단위 스트리밍으로 녹화(오른쪽 패널은 프루닝 시 `[Chat/Evict] removed=…` 출력).
+느린 프리필은 빨리감기, `--profile` 없이 녹화. 재현은 [`docs/demo/`](docs/demo/) 참고.</sub>
 
 ## 빠른 시작 — 지금 되는 것
 
@@ -63,15 +66,16 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
     -d '{"model":"argus","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-실행할 때마다 이어지는 텍스트와 함께 `TTFT`, `Decode: X ms/tok`, `Avg TBT` 라인이 출력됩니다.
+`argus-cli`는 실행할 때마다 이어지는 텍스트와 함께 `TTFT`, `Decode: X ms/tok`, `Avg TBT`
+라인을 출력합니다(`argus-chat`은 토큰을 스트리밍하고 OpenAI 형식의 토큰 `usage` 카운트를 돌려줍니다).
 `.gguf`만 가리키면 dtype은 자동으로 감지되어 따로 변환할 필요가 없습니다. `tokenizer.json`은 모델
 파일 옆에 두거나 `--tokenizer-path`로 지정하세요. CUDA, Android 크로스 컴파일, Safetensors →
 GGUF·AUF 변환은 [설치 / 소스에서 빌드](#설치--소스에서-빌드)에 있습니다.
 
 4번이 정밀도 **format** 플러그인 경로입니다. 로드한 `.so`가 지금도 `argus-cli`의 실제 decode
-경로까지 닿습니다. KV-cache **eviction** 플러그인(`--eviction-policy h2o|d2o|streaming|…`)과
-**KIVI** 정밀도 패킹은 v0에서 `argus-bench`·`argus-eval`로 돌립니다. 자세한 내용은
-[로드맵](#로드맵)을 보세요.
+경로까지 닿습니다. KV-cache **eviction** 플러그인(`eviction <policy>` 서브커맨드, 예:
+`eviction h2o`; 커스텀 stage는 `eviction plugin --name <name>`)과 **KIVI** 정밀도 패킹은 v0에서
+`argus-bench`·`argus-eval`로 돌립니다. 자세한 내용은 [로드맵](#로드맵)을 보세요.
 
 ## 무엇을 할 수 있나
 
@@ -97,9 +101,10 @@ GGUF·AUF 변환은 [설치 / 소스에서 빌드](#설치--소스에서-빌드)
 **확장성** *(엔진 코어 수정 없음)*
 
 - **플러그형 KV cache·precision** — KV-cache stage·format·read-stage를 별도 크레이트로 추가해
-  `linkme`로 스스로 등록하거나, 런타임에 `.so`로 로드합니다. 직교하는 세 축
-  (**stage** ⊥ **format** ⊥ **hardware**). 정밀도 **format** 축(`--kv-format`)과 **read**
-  축(`--read-stage`)은 지금 `argus-cli`에서 바로 됩니다. [Argus 확장](#argus-확장) 참고.
+  `linkme`로 스스로 등록합니다. **stage**·**format** 축은 런타임에 `.so`로도 로드할 수 있습니다
+  (**read** 축은 정적 링크 전용). 직교하는 세 축 (**stage** ⊥ **format** ⊥ **hardware**). 정밀도
+  **format** 축(`--kv-format`)과 **read** 축(`--read-stage`)은 지금 `argus-cli`에서 바로 됩니다.
+  [Argus 확장](#argus-확장) 참고.
 - **플러그형 백엔드** — CPU(NEON)·OpenCL(Adreno)·CUDA를 아우르는 `Backend` 트레이트.
 
 ## Argus는 llama.cpp와 어떻게 다른가
@@ -317,8 +322,9 @@ cargo build --release -p my-kv-format --features plugin-cdylib
 ### 다른 축
 
 - **Stage**(eviction/merge) — `KVCacheStage::plan(&ctx) -> Option<KVCachePlan>`을 구현해 어떤
-  토큰을 `keep`·`merge`할지 돌려주고, `register_kv_stage!`로 등록한 뒤 `--eviction-policy
-  <name>`으로 고릅니다. 템플릿은 `example-keep-recent`. *v0에서 stage는 `argus-cli`가 아니라
+  토큰을 `keep`·`merge`할지 돌려주고, `register_kv_stage!`로 등록한 뒤 `eviction plugin --name
+  <name>` 서브커맨드(빌트인: `eviction h2o|d2o|streaming|sliding`)로 고릅니다. 템플릿은
+  `example-keep-recent`. *v0에서 stage는 `argus-cli`가 아니라
   `argus-bench`·`argus-eval`로 돕니다.*
 - **Read**(쿼리 인식 읽기) — `KVReadStage`를 구현하고 `--read-stage <name>`으로 고릅니다.
   참고는 `quest` 빌트인.
