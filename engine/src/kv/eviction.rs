@@ -51,6 +51,26 @@ pub trait EvictionPolicy: Send + Sync {
         self.evict_with_scores(cache, target_len, flat_importance)
     }
 
+    /// Per-layer eviction entry. The engine's per-cache loop calls this with the real
+    /// `(layer_idx, n_layers)` so per-layer techniques (d2o `protected_layers` / last-layer
+    /// protection) know which layer they handle. `importance` is the flat per-token score (or
+    /// `None`, score-free). Default ignores the layer info and dispatches by score presence — only
+    /// layer-aware adapters (`StageBackedPolicy`) override it to thread layer info into the ctx.
+    fn evict_layer(
+        &self,
+        cache: &mut KVCache,
+        target_len: usize,
+        importance: Option<&[f32]>,
+        layer_idx: usize,
+        n_layers: usize,
+    ) -> Result<()> {
+        let _ = (layer_idx, n_layers);
+        match importance {
+            Some(imp) => self.evict_with_scores(cache, target_len, imp),
+            None => self.evict(cache, target_len),
+        }
+    }
+
     /// (Phase α-K substep 3c-evict) keep-list 산출 — in-place `evict*` 와 **동일 의미**의
     /// 보존 토큰 목록(+merges)을 산출하되 버퍼는 건드리지 않는다. 호출자가
     /// [`crate::format::KVCacheFormat::compact`]`(keep, merges)` 로 적용한다 (

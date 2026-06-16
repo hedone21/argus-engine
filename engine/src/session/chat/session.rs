@@ -22,12 +22,10 @@ use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
-use crate::kv::d2o_handler::{D2OConfig, D2OHandler};
 use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
 use crate::kv::eviction::stage_registry::StageBackedPolicy;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
-use crate::kv::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
@@ -806,7 +804,10 @@ fn build_chat_eviction_internal(
     crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
 
     let cache_manager = if args.eviction_policy == "d2o" {
-        let d2o_handler = D2OHandler::new(D2OConfig {
+        // D2O extracted to the out-of-tree `d2o` plugin. Build `D2OStage` with the chat CLI config
+        // and wrap as an EvictionPolicy (StageBackedPolicy → execute_kv_plan applies its Eq.11
+        // WeightedMerges). Constructed directly because StageParams can't carry ema_beta/merge_e.
+        let stage = d2o::D2OStage::new(d2o::D2OConfig {
             keep_ratio: args.d2o_keep_ratio,
             protected_prefix: actual_protected_prefix,
             target_ratio: args.eviction_target_ratio,
@@ -816,11 +817,9 @@ fn build_chat_eviction_internal(
             protected_layers: args.d2o_protected_layers.clone(),
             merge_axis: argus_extension_api::MergeAxis::Both,
         });
-        let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
-            min_level: PressureLevel::Warning,
-            handler: Box::new(d2o_handler),
-        }]);
-        CacheManager::with_pipeline(pipeline, monitor, threshold_bytes)
+        let policy: Box<dyn crate::kv::eviction::EvictionPolicy> =
+            Box::new(StageBackedPolicy::new(Box::new(stage)));
+        CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
     } else {
         let policy: Box<dyn crate::kv::eviction::EvictionPolicy> = match args
             .eviction_policy

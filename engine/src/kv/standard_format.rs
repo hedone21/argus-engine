@@ -529,8 +529,8 @@ impl KVCacheFormat for StandardFormat {
 
 /// (M4-b) [`WeightedMerge`](가중치 baked) 를 `&mut KVCache` 에 in-place 적용한다.
 ///
-/// d2o 의 `scatter_reduce_merge_layer_wide`(d2o_handler.rs)와 **bit-identical** 산술이다 — per
-/// `WeightedMerge` per head `acc = into_weight·into[d] + Σ w·from[d]`(`into` 먼저, `from` 은 list
+/// d2o 의 former in-place layer-wide scatter-reduce(이제 `d2o` 플러그인의 Eq.11 가중 merge 가 산출)와
+/// **bit-identical** 산술이다 — per `WeightedMerge` per head `acc = into_weight·into[d] + Σ w·from[d]`(`into` 먼저, `from` 은 list
 /// 순서). K 는 `k_buffer.dtype()`, V 는 `v_buffer.dtype()` 로 독립 디스패치(F32/F16/Q4_0). 위치는
 /// compact 적용 직전(pre-compact) 논리 좌표. Q4_0 merge 활성.
 ///

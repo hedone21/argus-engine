@@ -19,7 +19,16 @@ project is pre-1.0; minor releases may include breaking changes.
   `eviction streaming` / `eviction h2o` resolve the out-of-tree plugins with no built-in copy.
   Behaviour is unchanged: the plugin keep-lists are byte-identical to the former built-ins
   (proven by `beta3_eviction_stage_equivalence` across F32/F16/Q4_0) and verified on-device on
-  Adreno OpenCL. (D2O and KIVI extraction to follow.)
+  Adreno OpenCL.
+- Extracted **D2O** (Dynamic Discriminative Operations) into `crates/techniques/d2o`. Unlike
+  StreamingLLM/H2O it produces `WeightedMerge`s (cosine-nearest + Eq.11 weights, EMA threshold);
+  the engine executor `apply_weighted_merges` applies them (already proven bit-identical to the
+  former in-place scatter-reduce). The in-place `D2OHandler` is gone — production now resolves
+  `d2o` through the same `StageBackedPolicy` path as the other techniques. `StageCtx` gained
+  `layer_idx`/`n_layers` (so the plugin honours `protected_layers` / last-layer protection) and
+  `kv_on_device` (device-only buffers degrade to a keep-only plan, preserving the former GPU
+  fallback). Shared dequant helpers (`dequantize_k`/`dequantize_v`/`cosine_similarity`) moved to
+  an engine-core `kv::dequant` module. (KIVI extraction to follow.)
 
 ## [0.1.0] - 2026-06-14
 

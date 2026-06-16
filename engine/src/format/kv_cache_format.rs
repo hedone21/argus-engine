@@ -34,9 +34,9 @@ pub struct AttnDims {
 
 /// D2O merge 의미 기반의 compact merge 명세 (§4.1 `compact(keep, merges)`).
 ///
-/// "evicted 토큰들(`from`)을 retained(kept) 토큰(`into`)에 가중 병합" — 현
-/// `pressure/d2o_handler.rs::evict_and_merge` (`Match{retain_pos, sim}` + `scatter_reduce_*`)의
-/// 의미를 trait 표면으로 표현한다. 가중치(Eq.11 `w_c`/`w_e`, EMA threshold)는 impl 의 config
+/// "evicted 토큰들(`from`)을 retained(kept) 토큰(`into`)에 가중 병합" — `d2o` 플러그인의 cosine-nearest
+/// 와 Eq.11 가중 merge(엔진 executor `apply_weighted_merges` 가 적용)의 의미를 trait 표면으로 표현한다.
+/// 가중치(Eq.11 `w_c`/`w_e`, EMA threshold)는 impl 의 config
 /// 책임이라 여기 담지 않는다 — `from` 의 코사인 유사도·필터링·정규화는 D2O impl 이 자체 수행한다.
 ///
 /// `into`/`from` 은 **compact 적용 직전(pre-compact)의 논리 위치**다 — compact 가 keep 을 앞으로

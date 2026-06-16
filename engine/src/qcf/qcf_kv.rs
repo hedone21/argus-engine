@@ -9,19 +9,18 @@
 //!
 //! ## D2O merge (paper arXiv 2406.13035 Eq.10/11)
 //!
-//! The D2O simulation is kept in lockstep with the actuator
-//! (`crate::kv::d2o_handler`). For the same retained set $R$ and the
-//! evicted set $E$:
+//! The D2O simulation is kept in lockstep with the actuator (the out-of-tree `d2o` plugin crate).
+//! For the same retained set $R$ and the evicted set $E$:
 //!   * **Nearest mapping** uses **K** (per head, cosine similarity). When the
 //!     caller supplies `k_source`, K vectors of head `h` drive the matching.
 //!     Without `k_source`, the simulator falls back to V (legacy behaviour) and
 //!     emits a one-time `eprintln!` warning.
-//!   * **Group normalisation** matches handler's `compute_eq11_weights`:
+//!   * **Group normalisation** matches the `d2o` plugin's `compute_eq11_weights`:
 //!     $D_j = \sum_i e^{u_{ij}} + e$, $w_{c_j} = e/D_j$,
 //!     $w_{e_i} = e^{u_{ij}}/D_j$, with `u` clamped to `[-10, 10]` before
 //!     `exp`. Weights sum to 1 by construction.
 //!   * **Constant `e`** is `MERGE_E = 0.1`, the default of
-//!     `D2OConfig::merge_e`.
+//!     `d2o::D2OConfig::merge_e`.
 //!   * Only **V is augmented** in the simulator: $O_\text{after} =
 //!     \sum_{c\in R} \alpha_c\,V_c^\text{merged}$, so re-augmenting K is a
 //!     no-op for the QCF measurement. The handler still merges both K and V
@@ -568,7 +567,7 @@ fn compute_o_d2o_merge(
     }
 
     // 5. Per-group Eq.11 weight application: V_c <- w_c · V_c + Σ w_ei · V_ei
-    //    (matches `crate::kv::d2o_handler::compute_eq11_weights`).
+    //    (matches the `d2o` plugin's `compute_eq11_weights`).
     for (&retained_idx, group) in &groups {
         let exps: Vec<f32> = group
             .iter()

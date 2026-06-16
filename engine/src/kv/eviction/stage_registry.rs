@@ -26,7 +26,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use super::{EvictionPolicy, SlidingWindowPolicy};
 use crate::buffer::DType;
-use crate::kv::d2o_handler::{D2OConfig, D2OStage, dequantize_k, dequantize_v};
+use crate::kv::dequant::{dequantize_k, dequantize_v};
 use crate::kv::kv_cache::KVCache;
 
 // CAOTE production 활성화. feature `caote` ON 시 caote crate 를 force-link 한다 —
@@ -44,6 +44,12 @@ use streaming_llm as _;
 // H2O production force-link. Extracted from the engine core into the `h2o` technique crate;
 // makes `find_stage("h2o")` visible (same force-link rationale as streaming above).
 use ::h2o as _;
+
+// D2O production force-link. Extracted from the engine core into the `d2o` technique crate
+// (registers "d2o", a WeightedMerge-producing stage); makes `find_stage("d2o")` visible. Production
+// constructs `d2o::D2OStage` directly with the full CLI config (eval_setup/build_bench_loop/chat),
+// but the registration must survive fat-LTO for `make_stage("d2o")` + the registry self-test.
+use d2o as _;
 
 /// 기존 [`EvictionPolicy`](in-place `evict*` + `plan_keep`)를 plan-returning [`KVCacheStage`] 로 노출.
 ///
@@ -100,7 +106,8 @@ pub(crate) fn uniform_to_weighted(m: crate::format::Merge) -> WeightedMerge {
 /// `set_current_pos(keep.len())`. compact_parity 가 이 경로 ≡ in-place `evict*` 를 4정책×3dtype 에서
 /// 증명하므로, plan keep 이 `plan_keep` keep 과 같으면(②a 어댑터 faithful) 버퍼 bit-identical 무회귀.
 ///
-/// pub(crate): M4-c d2o 동등성 테스트가 D2OStage plan 을 실행해 D2OHandler 와 비교하는 데 쓴다.
+/// pub(crate): the `d2o` plugin's WeightedMerge plan flows through here (apply_weighted_merges +
+/// compact) — the production merge-application path.
 pub(crate) fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result<()> {
     match &plan.keep {
         KeepSpec::LayerWide(keep) => {
@@ -240,6 +247,13 @@ pub(crate) struct KVStageCtx<'a> {
     cache: &'a KVCache,
     target_len: usize,
     importance: Option<&'a [f32]>,
+    /// Which layer this single-cache view represents + the total layer count, for per-layer
+    /// techniques (d2o `protected_layers` / last-layer protection). Default `(0, 1)`; the engine
+    /// eviction loop sets the real values via [`with_layer`](Self::with_layer).
+    layer_idx: usize,
+    n_layers: usize,
+    /// Whether the KV buffers are device-only (no CPU pointer) → no raw read / no merge.
+    on_device: bool,
     key_handle: KeyHandle<'a>,
     value_handle: ValueHandle<'a>,
     scores_handle: Option<ScalarHandle<'a>>,
@@ -267,6 +281,10 @@ impl<'a> KVStageCtx<'a> {
             cache,
             target_len,
             importance,
+            layer_idx: 0,
+            n_layers: 1,
+            // Device-only KV (discrete GPU) returns a null host pointer → CPU read/merge unsafe.
+            on_device: cache.k_buffer.as_ptr().is_null(),
             key_handle: KeyHandle { cache },
             value_handle: ValueHandle { cache },
             scores_handle: head_scores.map(|data| ScalarHandle {
@@ -282,6 +300,14 @@ impl<'a> KVStageCtx<'a> {
             query_stats_handle: query_stats.map(|data| QueryStatsHandle { data, head_dim }),
         }
     }
+
+    /// Set the real layer index + total layer count (the engine eviction loop injects these while
+    /// iterating caches). Enables per-layer techniques (d2o protected_layers / last-layer protect).
+    pub(crate) fn with_layer(mut self, layer_idx: usize, n_layers: usize) -> Self {
+        self.layer_idx = layer_idx;
+        self.n_layers = n_layers;
+        self
+    }
 }
 
 impl StageCtx for KVStageCtx<'_> {
@@ -292,7 +318,13 @@ impl StageCtx for KVStageCtx<'_> {
         self.target_len
     }
     fn layer_idx(&self) -> usize {
-        0 // per-layer(d2o) = M4
+        self.layer_idx
+    }
+    fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+    fn kv_on_device(&self) -> bool {
+        self.on_device
     }
     fn importance(&self) -> Option<&[f32]> {
         self.importance
@@ -335,16 +367,21 @@ impl StageBackedPolicy {
     }
 
     /// 읽기 ctx 로 plan 산출(immutable borrow) → borrow 종료 후 executor 가 `&mut` 로 실행.
+    /// `layer_idx`/`n_layers` 는 per-layer 기법(d2o protected_layers/last-layer protect)용 — 비-layer
+    /// 인지 호출자(직접 evict)는 `(0, 1)` 단일-layer 뷰를 쓴다.
     fn run(
         &self,
         cache: &mut KVCache,
         target_len: usize,
         importance: Option<&[f32]>,
+        layer_idx: usize,
+        n_layers: usize,
     ) -> Result<()> {
         let plan = {
             // QueryStats(MQ-4 e2e seam)는 production eviction 경로에서 미공급(None) — score-active
             // 측정 하네스가 별도로 공급한다(dump_importance.rs).
-            let ctx = KVStageCtx::new(cache, target_len, importance, None, None, None);
+            let ctx = KVStageCtx::new(cache, target_len, importance, None, None, None)
+                .with_layer(layer_idx, n_layers);
             self.stage.plan(&ctx)
         };
         if let Some(plan) = plan {
@@ -362,7 +399,7 @@ impl EvictionPolicy for StageBackedPolicy {
     }
 
     fn evict(&self, cache: &mut KVCache, target_len: usize) -> Result<()> {
-        self.run(cache, target_len, None)
+        self.run(cache, target_len, None, 0, 1)
     }
 
     fn evict_with_scores(
@@ -371,7 +408,20 @@ impl EvictionPolicy for StageBackedPolicy {
         target_len: usize,
         importance: &[f32],
     ) -> Result<()> {
-        self.run(cache, target_len, Some(importance))
+        self.run(cache, target_len, Some(importance), 0, 1)
+    }
+
+    /// Per-layer eviction: thread the real `(layer_idx, n_layers)` into the stage ctx so per-layer
+    /// techniques (d2o `protected_layers` / last-layer protection) see which layer they handle.
+    fn evict_layer(
+        &self,
+        cache: &mut KVCache,
+        target_len: usize,
+        importance: Option<&[f32]>,
+        layer_idx: usize,
+        n_layers: usize,
+    ) -> Result<()> {
+        self.run(cache, target_len, importance, layer_idx, n_layers)
     }
 
     fn name(&self) -> &str {
@@ -401,7 +451,7 @@ pub(crate) fn h2o_backed_policy(
 /// CacheManager build 진입 시 1회 호출. fat-LTO `--gc-sections` 가 linkme 등록을 silent
 /// drop 하면 누락 기법에 대해 `Err` 로 fail-fast 한다(release 에서 정책 이름 미해석 → 조용한 폴백 방지).
 pub fn ensure_builtin_stages_registered() -> Result<()> {
-    for name in ["sliding", "streaming", "h2o"] {
+    for name in ["sliding", "streaming", "h2o", "d2o"] {
         if argus_extension_api::find_stage(name).is_none() {
             anyhow::bail!(
                 "built-in KVCacheStage '{name}' not registered — suspect linkme fat-LTO --gc-sections silent drop\
@@ -428,22 +478,10 @@ static SLIDING_STAGE: KVCacheStageReg = KVCacheStageReg {
 // `h2o` is registered by the out-of-tree `h2o` technique crate (force-linked above via
 // `use ::h2o as _;`), not here — extracted from the engine core.
 
-/// d2o(M4-c) — `D2OStage`(plan-returning, 가중 merge + EMA). non-alloc 기본 D2OConfig: StageParams
-/// 에 d2o 전용 필드(ema_beta/merge_e/use_layer_allocation)가 없어 protected_prefix/keep_ratio 만 매핑
-/// 하고 나머지는 D2OConfig::default()(non-alloc, ema_beta=0.7, merge_e=0.1). **production d2o 는
-/// 여전히 if-branch(session.rs:604·build_bench_loop.rs:72)=D2OHandler 가 처리**(layer-alloc 지원 +
-/// 비권장 정책) — 본 등록은 proven-equivalent(non-alloc) available 표면.
-#[distributed_slice(KV_CACHE_STAGES)]
-static D2O_STAGE: KVCacheStageReg = KVCacheStageReg {
-    name: "d2o",
-    make: |p: StageParams| {
-        Box::new(D2OStage::new(D2OConfig {
-            protected_prefix: p.protected_prefix,
-            keep_ratio: p.keep_ratio,
-            ..D2OConfig::default()
-        }))
-    },
-};
+// `d2o` is registered by the out-of-tree `d2o` technique crate (force-linked above via
+// `use d2o as _;`), not here — extracted from the engine core. It emits WeightedMerge (Eq.11);
+// the engine executor `apply_weighted_merges` applies them. Production builds `d2o::D2OStage`
+// directly with the full CLI config (StageParams carries only protected_prefix/keep_ratio).
 
 /// R-KV(KV roadmap 항목 0 측정, P2a) — `RkvStage`(cosine redundancy + importance joint eviction).
 /// `StageParams` 에 R-KV 전용 필드(λ)가 없어 기본 `RkvConfig`(λ=0.1, α=8, τ=0.5)로 등록한다 — CLI
@@ -1131,7 +1169,7 @@ mod tests {
 
     #[test]
     fn kvstagectx_dequant_k_reads_f32() {
-        // (M-D) dequant_k sugar(→ tensor(Key) → KeyHandle → d2o_handler::dequantize_k)로 raw K(F32) 읽기.
+        // (M-D) dequant_k sugar(→ tensor(Key) → KeyHandle → kv::dequant::dequantize_k)로 raw K(F32) 읽기.
         // 완전 통합 후에도 기존 dequant_k 시그니처·결과가 보존됨을 확인.
         let mut c = mk(DType::F32, 8);
         let off = c.offset(5, 0);
@@ -1247,5 +1285,48 @@ mod tests {
         assert_eq!(tensor_kind_from_u32(3), Some(TensorKind::Scores));
         assert_eq!(tensor_kind_from_u32(4), Some(TensorKind::QueryStats));
         assert_eq!(tensor_kind_from_u32(5), None);
+    }
+
+    #[test]
+    fn d2o_stage_executes_full_mechanism_all_dtypes() {
+        // End-to-end production path for the extracted `d2o` plugin: real KVStageCtx (raw K via the
+        // KeyHandle → dequantize_k) → D2OStage::plan (cosine-nearest + Eq.11 WeightedMerges) →
+        // execute_kv_plan (apply_weighted_merges + compact). Proves the plan flows through the
+        // engine merge executor + compaction on real F32/F16/Q4_0 buffers without panic, and
+        // compacts to the partition keep size (prefix + HH + recent = target_len).
+        for dt in [DType::F32, DType::F16, DType::Q4_0] {
+            let mut c = mk(dt, 20); // kv_heads=1, head_dim=PHD, current_pos=20, distinct per pos.
+            let imp: Vec<f32> = (0..20).map(|i| i as f32).collect();
+            let stage = d2o::D2OStage::new(d2o::D2OConfig {
+                keep_ratio: 0.75,
+                protected_prefix: 4,
+                ..d2o::D2OConfig::default()
+            });
+            let plan = {
+                // target_len=12 → keep = 4(prefix) + 6(HH) + 2(recent) = 12.
+                let ctx = KVStageCtx::new(&c, 12, Some(&imp), None, None, None);
+                assert!(!ctx.kv_on_device(), "CPU buffers → merge enabled");
+                stage
+                    .plan(&ctx)
+                    .expect("d2o plan Some (current 20 > keep 12)")
+            };
+            match &plan.keep {
+                KeepSpec::LayerWide(k) => {
+                    assert_eq!(k.len(), 12, "d2o[{dt:?}] keeps prefix+HH+recent = target");
+                    assert!(k.windows(2).all(|w| w[0] < w[1]), "ascending keep");
+                }
+                KeepSpec::PerHead(_) => panic!("d2o is layer-wide"),
+            }
+            assert!(
+                !plan.merges.is_empty(),
+                "d2o[{dt:?}] merge enabled → WeightedMerges present"
+            );
+            execute_kv_plan(&mut c, &plan).unwrap();
+            assert_eq!(
+                c.current_pos(),
+                12,
+                "d2o[{dt:?}] executor compacts to keep.len()"
+            );
+        }
     }
 }
