@@ -25,7 +25,7 @@ fn test_seq_095_dispatcher_sends_qcf_estimate_on_request_qcf() {
     use argus_engine::backend::cpu::CpuBackend;
     use argus_engine::buffer::DType;
     use argus_engine::kv::cache_manager::CacheManager;
-    use argus_engine::kv::eviction::sliding_window::SlidingWindowPolicy;
+    use argus_engine::kv::eviction::stage_registry::sliding_backed_policy;
     use argus_engine::kv::kv_cache::KVCache;
     use argus_engine::kv::standard_format::StandardFormat;
     use argus_engine::memory::host::shared::SharedBuffer;
@@ -51,7 +51,7 @@ fn test_seq_095_dispatcher_sends_qcf_estimate_on_request_qcf() {
     cache.current_pos = 60; // 충분히 채워서 compute 가능.
     let handle = Arc::new(StandardFormat::new(0, cache));
 
-    let policy = Box::new(SlidingWindowPolicy::new(10, 4));
+    let policy = sliding_backed_policy(10, 4);
     let cm = Arc::new(Mutex::new(CacheManager::new(
         policy,
         Box::new(NoOpMonitor),

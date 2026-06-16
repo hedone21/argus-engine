@@ -138,7 +138,7 @@ mod tests {
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
     use crate::format::KVCacheFormat;
-    use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
+    use crate::kv::eviction::stage_registry::sliding_backed_policy;
     use crate::memory::host::shared::SharedBuffer;
     use crate::observability::profile::OpProfiler;
     use crate::pipeline::{Pressure, StepInfo};
@@ -166,7 +166,7 @@ mod tests {
 
     /// swap 미활성 CacheManager (swap_handler=None).
     fn make_cm_no_swap() -> Arc<Mutex<CacheManager>> {
-        let policy = Box::new(SlidingWindowPolicy::new(10, 4));
+        let policy = sliding_backed_policy(10, 4);
         Arc::new(Mutex::new(CacheManager::new(
             policy,
             Box::new(NoOpMonitor),

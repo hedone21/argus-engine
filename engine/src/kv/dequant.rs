@@ -1,36 +1,16 @@
-//! Shared KV dequantization + similarity helpers.
+//! Shared KV dequantization helpers.
 //!
 //! These were formerly defined inside `d2o_handler.rs`, but they are not D2O-specific: the
 //! [`StageCtx`](argus_extension_api::StageCtx) `tensor(Key)`/`tensor(Value)` handles (in
 //! `eviction/stage_registry.rs`) delegate to [`dequantize_k`]/[`dequantize_v`] so every stage reads
-//! raw K/V identically, and the R-KV measurement stage reuses [`cosine_similarity`]. When D2O was
-//! extracted to the out-of-tree `d2o` plugin crate, these stayed in the engine core (the plugin
-//! reads K via `ctx.dequant_k`, and carries its own `cosine_similarity`).
+//! raw K/V identically. When D2O / R-KV were extracted to out-of-tree plugin crates, these
+//! dequant helpers stayed in the engine core (the plugins read K via `ctx.dequant_k`, and carry
+//! their own `cosine_similarity`).
 
 use crate::buffer::DType;
 use crate::kv::kv_cache::KVCache;
 use crate::quant::{BlockQ4_0, QK4_0};
 use half::f16;
-
-/// Cosine similarity between two slices.
-///
-/// `pub(crate)`: the R-KV measurement prototype (`rkv_stage.rs`) reuses this as the building block
-/// of its N×N pairwise redundancy row-mean. Gated on feature `rkv` — its sole engine consumer
-/// (the D2O algorithm that also used it moved to the out-of-tree `d2o` plugin, which carries its own).
-#[cfg(feature = "rkv")]
-pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
-    }
-    let denom = (norm_a * norm_b).sqrt();
-    if denom < 1e-10 { 0.0 } else { dot / denom }
-}
 
 /// Dequantize a K vector at (pos, head) into the output buffer.
 /// Works for F32, F16, and Q4_0 dtypes.

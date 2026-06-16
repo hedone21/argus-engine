@@ -117,13 +117,16 @@ dependencies = [
  "linkme",
  "log",
  "memmap2",
+ "no-eviction",
  "ocl",
  "quest",
  "rand",
  "rayon",
+ "rkv",
  "safetensors",
  "serde",
  "serde_json",
+ "sliding-window",
  "streaming-llm",
  "synth-q4-format",
  "tempfile",
@@ -1206,6 +1209,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "no-eviction"
+version = "0.1.0"
+dependencies = [
+ "argus-extension-api",
+ "linkme",
+]
+
+[[package]]
 name = "nodrop"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1572,6 +1583,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rkv"
+version = "0.1.0"
+dependencies = [
+ "argus-extension-api",
+ "linkme",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1706,6 +1725,14 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "sliding-window"
+version = "0.1.0"
+dependencies = [
+ "argus-extension-api",
+ "linkme",
+]
 
 [[package]]
 name = "smallvec"

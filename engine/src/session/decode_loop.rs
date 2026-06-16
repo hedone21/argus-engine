@@ -1279,7 +1279,7 @@ mod tests {
         use crate::buffer::DType;
         use crate::format::KVCacheFormat;
         use crate::kv::cache_manager::CacheManager;
-        use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
+        use crate::kv::eviction::stage_registry::sliding_backed_policy;
         use crate::kv::kv_cache::KVCache;
         use crate::kv::standard_format::StandardFormat;
         use crate::memory::host::shared::SharedBuffer;
@@ -1306,7 +1306,7 @@ mod tests {
         let handle = Arc::new(StandardFormat::new(0, cache));
 
         // OneShot EvictionStage: sliding(window=10, prefix=4) → prune.
-        let policy = Box::new(SlidingWindowPolicy::new(10, 4));
+        let policy = sliding_backed_policy(10, 4);
         let cm = CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, 0.3);
         // β-4: EvictionStage::one_shot 은 Arc<Mutex<CacheManager>> 를 받는다 (시그니처만 적응 — 검증 무변).
         let stage = EvictionStage::one_shot(vec![handle.clone()], Arc::new(Mutex::new(cm)), 0.3);

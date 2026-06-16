@@ -27,9 +27,8 @@ pub(crate) mod dequant;
 // Pressure pipeline handlers (구 core/pressure/ 내용 flat 병합)
 pub mod eviction_handler;
 pub mod quantize_handler;
-// R-KV 측정 프로토타입(KV roadmap 항목 0, P2a). feature `rkv` OFF = 미컴파일(production 표면 불변).
-#[cfg(feature = "rkv")]
-pub mod rkv_stage;
+// R-KV (rkv_stage) was extracted to the out-of-tree `rkv` technique crate (feature `rkv`,
+// force-linked in eviction/stage_registry.rs) — like streaming/h2o/d2o/sliding/no-eviction.
 pub mod swap_handler;
 use crate::kv::kv_cache::KVCache;
 use anyhow::Result;

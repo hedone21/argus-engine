@@ -1188,7 +1188,7 @@ mod tests {
     #[test]
     fn turn_boundary_try_evict_called_directly_on_overflow() {
         use crate::kv::cache_manager::CacheManager;
-        use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
+        use crate::kv::eviction::stage_registry::sliding_backed_policy;
         use crate::resilience::sys_monitor::NoOpMonitor;
         use crate::session::forward::Forward as ForwardTrait;
         use std::cell::Cell;
@@ -1231,7 +1231,7 @@ mod tests {
 
         let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         // cache_manager=Some → ensure_capacity overflow 시 try_evict 직접 호출 경로 진입.
-        let policy = Box::new(SlidingWindowPolicy::new(4, 2));
+        let policy = sliding_backed_policy(4, 2);
         let cm = CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, 0.5);
         let mut session = ChatSession {
             decode_loop,

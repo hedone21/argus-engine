@@ -447,7 +447,7 @@ fn test_eng_alg_092_swap_emergency_offloads() {
 fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
     use argus_engine::backend::cpu::CpuBackend;
     use argus_engine::buffer::DType;
-    use argus_engine::kv::eviction::SlidingWindowPolicy;
+    use argus_engine::kv::eviction::stage_registry::sliding_backed_policy;
     use argus_engine::kv::kv_cache::KVCache;
     use argus_engine::kv::{ActionResult, CachePressureHandler, EvictionHandler, HandlerContext};
     use argus_engine::memory::host::shared::SharedBuffer;
@@ -475,7 +475,7 @@ fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
     };
 
     // pos=100, ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
-    let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(10, 0)), 0.3);
+    let handler = EvictionHandler::new(sliding_backed_policy(10, 0), 0.3);
 
     let mut caches: Vec<KVCache> = (0..4).map(|_| make_cache(100)).collect();
     let mut ctx = HandlerContext {

@@ -1541,7 +1541,8 @@ impl Args {
     pub fn rkv_lambda(&self) -> f32 {
         match self.current_policy() {
             Some(EvictionCmd::Rkv(r)) => r.lambda,
-            _ => crate::kv::rkv_stage::RKV_DEFAULT_LAMBDA,
+            // R-KV default λ (the `rkv` plugin's RKV_DEFAULT_LAMBDA; redundancy-dominant).
+            _ => 0.1,
         }
     }
 

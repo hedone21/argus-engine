@@ -23,7 +23,7 @@ use argus_engine::backend::cpu::CpuBackend;
 use argus_engine::buffer::DType;
 use argus_engine::format::KVCacheFormat;
 use argus_engine::kv::cache_manager::CacheManager;
-use argus_engine::kv::eviction::sliding_window::SlidingWindowPolicy;
+use argus_engine::kv::eviction::stage_registry::sliding_backed_policy;
 use argus_engine::kv::kv_cache::KVCache;
 use argus_engine::kv::standard_format::StandardFormat;
 use argus_engine::memory::host::shared::SharedBuffer;
@@ -54,7 +54,7 @@ fn make_handle(n_tokens: usize) -> Arc<StandardFormat> {
 }
 
 fn make_cm() -> Arc<Mutex<CacheManager>> {
-    let policy = Box::new(SlidingWindowPolicy::new(10, 4));
+    let policy = sliding_backed_policy(10, 4);
     Arc::new(Mutex::new(CacheManager::new(
         policy,
         Box::new(NoOpMonitor),

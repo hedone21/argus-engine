@@ -35,8 +35,7 @@ use crate::kv::cache_manager::CacheManager;
 use crate::kv::eviction::EvictMethod;
 use crate::kv::eviction::EvictionPolicy;
 use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
-use crate::kv::eviction::no_eviction::NoEvictionPolicy;
-use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
+use crate::kv::eviction::stage_registry::{StageBackedPolicy, make_stage, make_stage_with_args};
 use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor, SystemMonitor};
 use crate::session::bin_setup::{
@@ -188,13 +187,23 @@ fn build_eval_cache_manager(
         // force_evict_with_scores 로 흘려보낸다(아래 score_based_eviction 포함).
         #[cfg(feature = "rkv")]
         {
-            use crate::kv::eviction::stage_registry::StageBackedPolicy;
-            use crate::kv::rkv_stage::{RkvConfig, RkvStage};
-            let stage = RkvStage::new(RkvConfig {
-                lambda: args.rkv_lambda(),
-                ..RkvConfig::default()
-            });
-            let policy: Box<dyn EvictionPolicy> = Box::new(StageBackedPolicy::new(Box::new(stage)));
+            // R-KV is an out-of-tree KVCacheStage plugin now; λ rides the opaque StageArgs blob
+            // (the plugin parses `lambda` in RkvConfig::from_args). α/τ are measurement constants.
+            let lambda = args.rkv_lambda().to_string();
+            let params = argus_extension_api::StageParams {
+                protected_prefix: actual_protected_prefix,
+                ..Default::default()
+            };
+            let stage = make_stage_with_args(
+                "rkv",
+                &params,
+                &[argus_extension_api::PluginArg {
+                    key: "lambda",
+                    val: &lambda,
+                }],
+            )
+            .expect("rkv stage registered (force-linked rkv plugin under feature rkv)");
+            let policy: Box<dyn EvictionPolicy> = Box::new(StageBackedPolicy::new(stage));
             CacheManager::new(
                 policy,
                 monitor,
@@ -207,22 +216,15 @@ fn build_eval_cache_manager(
         unreachable!("rkv branch gated by cfg!(feature = \"rkv\")")
     } else {
         let policy: Box<dyn EvictionPolicy> = match args.eviction_policy() {
-            "none" => Box::new(NoEvictionPolicy::new()),
-            "sliding" => Box::new(SlidingWindowPolicy::new(
-                args.eviction_window(),
-                actual_protected_prefix,
-            )),
-            // "streaming" and "h2o" are no longer built-in match arms — they fall through to the
-            // generic `name =>` path below (make_stage(name) → the streaming-llm / h2o plugin),
-            // which builds StageParams (keep_ratio/protected_prefix/streaming_window) identically.
+            // h2o_plus(per-head) stays an in-engine policy until stage ⑤ (per-head executor + F5).
             "h2o_plus" => Box::new(H2OPlusPolicy::new(
                 args.h2o_keep_ratio(),
                 actual_protected_prefix,
             )),
+            // none/sliding/streaming/h2o/d2o are all out-of-tree KVCacheStage plugins now — any
+            // registered name (static linkme + dynamic `--load-plugin`) resolves via make_stage,
+            // wrapped as an EvictionPolicy. miss = unknown (bail, builtin names listed).
             name => {
-                // Plugin/registry stage (static linkme + dynamic `--load-plugin`), mirroring
-                // build_bench_loop: any registered KVCacheStage name resolves via make_stage,
-                // wrapped as an EvictionPolicy. miss = unknown (bail, builtin names listed).
                 let streaming_window = if args.streaming_window() > 0 {
                     args.streaming_window()
                 } else if args.kv_budget() > 0 {
@@ -254,18 +256,13 @@ fn build_eval_cache_manager(
                     .iter()
                     .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
                     .collect();
-                let stage = crate::kv::eviction::stage_registry::make_stage_with_args(
-                    name, &params, &extra,
-                )
-                .ok_or_else(|| {
+                let stage = make_stage_with_args(name, &params, &extra).ok_or_else(|| {
                     anyhow::anyhow!(
                         "argus-eval: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o (or --load-plugin <.so>).",
                         name
                     )
                 })?;
-                Box::new(crate::kv::eviction::stage_registry::StageBackedPolicy::new(
-                    stage,
-                ))
+                Box::new(StageBackedPolicy::new(stage))
             }
         };
         CacheManager::new(
@@ -294,22 +291,26 @@ fn build_eval_cache_manager(
             sink_size: args.sink_size(),
             streaming_window: 0,
         };
-        if let Some(stage) = crate::kv::eviction::stage_registry::make_stage("h2o", &h2o_params) {
+        if let Some(stage) = make_stage("h2o", &h2o_params) {
+            cache_manager
+                .register_policy(EvictMethod::H2o, Box::new(StageBackedPolicy::new(stage)));
+        }
+    }
+    // Sliding was extracted to the `sliding-window` plugin; build the stage by registry name and
+    // wrap it as an EvictionPolicy for the Manager-directed register_policy path.
+    {
+        let sliding_params = argus_extension_api::StageParams {
+            eviction_window: args.eviction_window(),
+            protected_prefix: resilience_protected_prefix,
+            ..Default::default()
+        };
+        if let Some(stage) = make_stage("sliding", &sliding_params) {
             cache_manager.register_policy(
-                EvictMethod::H2o,
-                Box::new(crate::kv::eviction::stage_registry::StageBackedPolicy::new(
-                    stage,
-                )),
+                EvictMethod::Sliding,
+                Box::new(StageBackedPolicy::new(stage)),
             );
         }
     }
-    cache_manager.register_policy(
-        EvictMethod::Sliding,
-        Box::new(SlidingWindowPolicy::new(
-            args.eviction_window(),
-            resilience_protected_prefix,
-        )),
-    );
 
     Ok(cache_manager)
 }

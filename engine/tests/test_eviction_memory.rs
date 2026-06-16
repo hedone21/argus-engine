@@ -15,7 +15,7 @@ mod eviction_memory_test {
     use argus_engine::backend::cpu::CpuBackend;
     use argus_engine::buffer::{Buffer, DType};
     use argus_engine::kv::cache_manager::CacheManager;
-    use argus_engine::kv::eviction::sliding_window::SlidingWindowPolicy;
+    use argus_engine::kv::eviction::stage_registry::sliding_backed_policy;
     use argus_engine::kv::kv_cache::KVCache;
     use argus_engine::memory::host::shared::SharedBuffer;
     use argus_engine::shape::Shape;
@@ -106,12 +106,12 @@ mod eviction_memory_test {
     fn apply_eviction(caches: &mut [KVCache], target_ratio: f32) {
         // Use sliding window policy with large window (so CacheManager target_ratio controls eviction)
         let window_size = MAX_SEQ_LEN;
-        let policy = SlidingWindowPolicy::new(window_size, 0);
+        let policy = sliding_backed_policy(window_size, 0);
 
         let monitor = MockMonitor;
 
         let cm = CacheManager::new(
-            Box::new(policy),
+            policy,
             Box::new(monitor),
             usize::MAX, // threshold: always triggers
             target_ratio,

@@ -14,17 +14,16 @@
 
 use anyhow::{Context, Result};
 use argus_extension_api::{
-    KV_CACHE_STAGES, KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage,
-    KVCacheStageReg, KeepSpec, PlanAbi, PluginVTableAbi, StageCaps, StageCtx, StageCtxAbi,
-    StageExportAbi, StageParams, TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
+    KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage, KeepSpec, PlanAbi,
+    PluginVTableAbi, StageCtx, StageCtxAbi, StageExportAbi, StageParams, TensorDtype, TensorHandle,
+    TensorKind, TensorShape, WeightedMerge,
 };
 use core::ffi::c_void;
-use linkme::distributed_slice;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use super::{EvictionPolicy, SlidingWindowPolicy};
+use super::EvictionPolicy;
 use crate::buffer::DType;
 use crate::kv::dequant::{dequantize_k, dequantize_v};
 use crate::kv::kv_cache::KVCache;
@@ -51,55 +50,19 @@ use ::h2o as _;
 // with the d2o-private knobs in the StageArgs blob; the registration must survive fat-LTO.
 use d2o as _;
 
-/// 기존 [`EvictionPolicy`](in-place `evict*` + `plan_keep`)를 plan-returning [`KVCacheStage`] 로 노출.
-///
-/// [`KVCacheStage::plan`] 은 [`EvictionPolicy::plan_keep`](layer-wide keep + 균등 merge)을
-/// [`KVCachePlan`](`KeepSpec::LayerWide` + [`WeightedMerge`])으로 매핑한다. `plan_keep` 이 `None`
-/// (per-head 등 단일 layer-wide keep 으로 표현 불가)이면 `None` 을 전파한다. 버퍼 변형은 엔진
-/// executor 가 실행한다.
-pub struct EvictionPolicyAsStage {
-    inner: Box<dyn EvictionPolicy>,
-}
+// Sliding-window + no-eviction production force-link. Extracted from the engine core into the
+// `sliding-window` (registers "sliding") and `no-eviction` (registers "none") technique crates; the
+// dep declaration alone leaves the unreferenced rlib out of the link, so these lines make
+// `find_stage("sliding")` / `find_stage("none")` visible (same rationale as streaming/h2o above).
+use no_eviction as _;
+use sliding_window as _;
 
-impl EvictionPolicyAsStage {
-    /// 주어진 정책을 stage 표면으로 감싼다.
-    pub fn new(inner: Box<dyn EvictionPolicy>) -> Self {
-        Self { inner }
-    }
-}
+// R-KV measurement force-link (feature `rkv`). Extracted from the engine core into the `rkv`
+// technique crate (registers "rkv"); feature OFF = unlinked + `eviction rkv` subcommand absent.
+#[cfg(feature = "rkv")]
+use rkv as _;
 
-impl KVCacheStage for EvictionPolicyAsStage {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-        let (keep, merges) =
-            self.inner
-                .plan_keep(ctx.current_pos(), ctx.target_len(), ctx.importance())?;
-        Some(KVCachePlan {
-            keep: KeepSpec::LayerWide(keep),
-            merges: merges.into_iter().map(uniform_to_weighted).collect(),
-        })
-    }
-}
-
-/// 균등 `format::Merge` → [`WeightedMerge`] 매핑. 현 빌트인 3정책은 모두 빈 merge 를 내므로 실질적으로
-/// 빈 Vec→빈 Vec 이나, 균등 가중치 의미(`into` 포함 N개 동일 가중, Σ=1)를 보존한다. d2o 의 Eq.11 가중
-/// merge 는 이 경로가 아니라 M4 에서 직접 산출한다.
-/// `pub(crate)`: `compact_parity` 가 Path B retarget에서 재사용한다.
-pub(crate) fn uniform_to_weighted(m: crate::format::Merge) -> WeightedMerge {
-    let n = (1 + m.from.len()) as f32; // into + from 토큰 수
-    let w = 1.0 / n;
-    WeightedMerge {
-        into: m.into,
-        into_weight: w,
-        from: m.from.into_iter().map(|p| (p, w)).collect(),
-        apply_to: argus_extension_api::MergeAxis::Both,
-    }
-}
-
-// ── ②b: KVCachePlan executor + StageBackedPolicy 역어댑터 (World B) ──────────────
+// ── KVCachePlan executor + StageBackedPolicy 역어댑터 (World B) ──────────────
 
 /// [`KVCacheStage`] 가 산출한 [`KVCachePlan`] 을 `&mut KVCache` 에 적용한다(변형은
 /// 엔진 독점). `StandardFormat::compact` 의 빈-merge 경로와 동일: `compact_keep_positions(keep, 0)` +
@@ -447,6 +410,31 @@ pub(crate) fn h2o_backed_policy(
     ))
 }
 
+/// Build the out-of-tree `sliding` stage wrapped as a legacy [`EvictionPolicy`]
+/// (`StageBackedPolicy`). Convenience constructor used by CacheManager / EvictionHandler tests (and
+/// engine integration tests) after SlidingWindowPolicy was extracted to the `sliding-window` plugin
+/// crate — production resolves "sliding" the same way (`make_stage` → plugin → StageBackedPolicy).
+pub fn sliding_backed_policy(window: usize, protected_prefix: usize) -> Box<dyn EvictionPolicy> {
+    let p = StageParams {
+        eviction_window: window,
+        protected_prefix,
+        ..Default::default()
+    };
+    Box::new(StageBackedPolicy::new(make_stage("sliding", &p).expect(
+        "sliding stage registered (force-linked sliding-window plugin)",
+    )))
+}
+
+/// Build the out-of-tree `none` stage wrapped as a legacy [`EvictionPolicy`] (`StageBackedPolicy`)
+/// — a no-op policy. Convenience constructor used by tests after NoEvictionPolicy was extracted to
+/// the `no-eviction` plugin crate; production resolves "none" the same way.
+pub fn none_backed_policy() -> Box<dyn EvictionPolicy> {
+    Box::new(StageBackedPolicy::new(
+        make_stage("none", &StageParams::default())
+            .expect("none stage registered (force-linked no-eviction plugin)"),
+    ))
+}
+
 /// 빌트인 LayerWide 기법(sliding/streaming/h2o)이 `KV_CACHE_STAGES` 에 등록됐는지 단언한다 — eviction
 /// CacheManager build 진입 시 1회 호출. fat-LTO `--gc-sections` 가 linkme 등록을 silent
 /// drop 하면 누락 기법에 대해 `Err` 로 fail-fast 한다(release 에서 정책 이름 미해석 → 조용한 폴백 방지).
@@ -479,57 +467,17 @@ pub fn ensure_builtin_stages_registered() -> Result<()> {
     Ok(())
 }
 
-#[distributed_slice(KV_CACHE_STAGES)]
-static SLIDING_STAGE: KVCacheStageReg = KVCacheStageReg {
-    name: "sliding",
-    make: |p: StageParams| {
-        Box::new(EvictionPolicyAsStage::new(Box::new(
-            SlidingWindowPolicy::new(p.eviction_window, p.protected_prefix),
-        )))
-    },
-    // sliding takes no technique-private args — drop the blob, build from StageParams.
-    make_with_args: |p: StageParams, _args| {
-        Box::new(EvictionPolicyAsStage::new(Box::new(
-            SlidingWindowPolicy::new(p.eviction_window, p.protected_prefix),
-        )))
-    },
-    // Sliding is score-free (recency only); the engine picks the protected-prefix fallback (the
-    // SlidingWindowPolicy itself clamps to a 4-sink minimum), so declare no stage default.
-    caps: StageCaps::SCORE_FREE,
-};
-
-// `streaming` is registered by the out-of-tree `streaming-llm` technique crate (force-linked
-// above via `use streaming_llm as _;`), not here — extracted from the engine core.
-
-// `h2o` is registered by the out-of-tree `h2o` technique crate (force-linked above via
-// `use ::h2o as _;`), not here — extracted from the engine core.
-
-// `d2o` is registered by the out-of-tree `d2o` technique crate (force-linked above via
-// `use d2o as _;`), not here — extracted from the engine core. It emits WeightedMerge (Eq.11);
-// the engine executor `apply_weighted_merges` applies them. Production resolves it via
-// `make_stage_with_args("d2o", &params, &blob)`: StageParams carries keep_ratio/protected_prefix,
-// and the d2o-private knobs ride the StageArgs blob (parsed by `d2o::D2OConfig::from_args`).
-
-/// R-KV(KV roadmap 항목 0 측정, P2a) — `RkvStage`(cosine redundancy + importance joint eviction).
-/// `StageParams` 에 R-KV 전용 필드(λ)가 없어 기본 `RkvConfig`(λ=0.1, α=8, τ=0.5)로 등록한다 — CLI
-/// λ override 는 측정 schedule 의 stage 직접 생성 경로(d2o 의 if-branch 와 동형). feature `rkv` OFF =
-/// 이 등록 미컴파일 → `find_stage("rkv")` None → production 정책 카탈로그 불변(arch §6 Spec Triage).
-#[cfg(feature = "rkv")]
-#[distributed_slice(KV_CACHE_STAGES)]
-static RKV_STAGE: KVCacheStageReg = KVCacheStageReg {
-    name: "rkv",
-    make: |_p: StageParams| Box::new(crate::kv::rkv_stage::RkvStage::new(Default::default())),
-    // rkv's λ override rides the eval stage-direct path, not StageParams — no private blob here.
-    make_with_args: |_p: StageParams, _args| {
-        Box::new(crate::kv::rkv_stage::RkvStage::new(Default::default()))
-    },
-    // R-KV's fusion Z = λ·I − (1−λ)·R includes the importance term, so it is score-based; protect 4
-    // attention sinks by default (same as the other score-based stages).
-    caps: StageCaps {
-        is_score_based: true,
-        default_protected_prefix: 4,
-    },
-};
+// All built-in LayerWide/score stages are now out-of-tree technique crates, force-linked above:
+//   "sliding"   → `sliding-window`   (use sliding_window as _)
+//   "none"      → `no-eviction`      (use no_eviction as _)
+//   "streaming" → `streaming-llm`    (use streaming_llm as _)
+//   "h2o"       → `h2o`              (use ::h2o as _)
+//   "d2o"       → `d2o`              (use d2o as _; WeightedMerge via apply_weighted_merges)
+//   "rkv"       → `rkv`              (#[cfg(feature = "rkv")] use rkv as _; λ rides the StageArgs blob)
+//   "caote"     → `caote`           (#[cfg(feature = "caote")] use caote as _)
+// The engine names none of them here — each registers itself into KV_CACHE_STAGES via linkme, and
+// production resolves them by name through `make_stage(_with_args)`. The force-link references above
+// are the only place the engine spells a stage crate (so its #[distributed_slice] survives fat-LTO).
 
 // ════════════════════════════════════════════════════════════════════════════
 // GATE-C — 런타임 `.so` dlopen 레지스트리
@@ -938,38 +886,6 @@ mod tests {
     use argus_extension_api::{find_stage, registered_names};
     use std::sync::Arc;
 
-    /// 최소 StageCtx 스텁 — LayerWide 정책이 읽는 current_pos/target_len/importance 만 의미가 있고
-    /// per-head/dequant accessor 는 trivial(이 단계 미사용).
-    struct TestCtx {
-        current_pos: usize,
-        target_len: usize,
-        importance: Option<Vec<f32>>,
-    }
-    impl StageCtx for TestCtx {
-        fn current_pos(&self) -> usize {
-            self.current_pos
-        }
-        fn target_len(&self) -> usize {
-            self.target_len
-        }
-        fn layer_idx(&self) -> usize {
-            0
-        }
-        fn importance(&self) -> Option<&[f32]> {
-            self.importance.as_deref()
-        }
-        fn n_kv_heads(&self) -> usize {
-            1
-        }
-        fn head_dim(&self) -> usize {
-            1
-        }
-        // LayerWide 정책만 구동 → 텐서 미공급(None). head_score/dequant_* 는 default sugar(None→trivial).
-        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
-            None
-        }
-    }
-
     #[test]
     fn builtins_registered() {
         // linkme 가 엔진의 등록을 슬라이스로 모으는지 (fat-LTO 생존은 ②b release self-test).
@@ -1056,90 +972,13 @@ mod tests {
         assert_eq!(c.current_pos(), 4, "executor 가 keep.len() 로 compact");
     }
 
-    /// R-KV 측정 프로토타입(P2a, feature `rkv`) — 등록 가시성 + sliding 하네스(KVStageCtx→plan→
-    /// execute_kv_plan) 실행 + redundant fraction 덤프(last_stats). 설계서 §4.1 완료 게이트 (3)(4).
-    #[cfg(feature = "rkv")]
-    #[test]
-    fn rkv_stage_visible_executes_and_dumps_redundancy() {
-        use crate::kv::rkv_stage::RkvStage;
+    // The rkv visibility/execute test moved to the `rkv` technique crate (it owns RkvStage now); the
+    // adapter-vs-plan_keep and World-A↔B sliding parity tests were removed when SlidingWindowPolicy
+    // was extracted to the `sliding-window` plugin crate — the plugin is plan-only (no in-place
+    // evict/plan_keep), so there is no World-A path left to compare. The plugin's keep-list spec is
+    // pinned by its own unit tests, and beta3_eviction_stage_equivalence.rs proves the World-B
+    // application end-to-end. (Streaming/h2o were retired the same way.)
 
-        // (게이트 4) find_stage("rkv") 가시 + sliding/h2o 와 동일 registry 표면.
-        let reg = find_stage("rkv").expect("feature rkv ON 시 rkv 등록이 보여야 한다");
-        assert_eq!(reg.name, "rkv");
-
-        // (게이트 3) 동일 하네스 실행: KVStageCtx(Key 핸들 공급) → plan → execute_kv_plan.
-        // 직접 생성한 RkvStage 로 last_stats(1단 덤프)도 검증한다(registry make 는 last_stats 미노출).
-        let mut c = mk(DType::F32, 8); // kv_heads=1, head_dim=PHD, K distinct per pos
-        let imp = vec![1.0f32; 8];
-        let stage = RkvStage::new(Default::default());
-        let plan = {
-            let ctx = KVStageCtx::new(&c, 4, Some(&imp), None, None, None);
-            assert!(
-                ctx.tensor(TensorKind::Key).is_some(),
-                "KVStageCtx 는 Key 핸들 항상 공급(redundancy 입력)"
-            );
-            stage.plan(&ctx).expect("rkv plan Some (target<n)")
-        };
-        match &plan.keep {
-            KeepSpec::LayerWide(k) => {
-                assert_eq!(k.len(), 4, "target_len=4 만큼 보존");
-                assert!(k.windows(2).all(|w| w[0] < w[1]), "ascending keep");
-                assert!(k.iter().all(|&p| p < 8), "유효 위치");
-            }
-            KeepSpec::PerHead(_) => panic!("R-KV 프로토타입은 LayerWide"),
-        }
-
-        // (게이트 4) 1단 측정 hook: per-kv_head redundancy stats 덤프(MPC, redundant fraction).
-        let stats = stage.last_stats();
-        assert_eq!(stats.len(), 1, "kv_heads=1 → stats 1개");
-        assert!(
-            (0.0..=1.0).contains(&stats[0].redundant_fraction),
-            "redundant_fraction 은 [0,1]: {}",
-            stats[0].redundant_fraction
-        );
-        assert!(stats[0].mpc.is_finite(), "MPC 유한: {}", stats[0].mpc);
-
-        execute_kv_plan(&mut c, &plan).unwrap();
-        assert_eq!(c.current_pos(), 4, "executor 가 keep.len() 로 compact");
-    }
-
-    #[test]
-    fn adapter_plan_matches_plan_keep_sliding() {
-        // 어댑터 plan() 의 LayerWide keep 이 원본 plan_keep keep 과 동일한지 (faithful, score-free).
-        let params = StageParams {
-            eviction_window: 8,
-            protected_prefix: 4,
-            keep_ratio: 0.5,
-            sink_size: 4,
-            streaming_window: 8,
-        };
-        let reg = find_stage("sliding").expect("sliding 등록");
-        let stage = (reg.make)(params);
-        let ctx = TestCtx {
-            current_pos: 200,
-            target_len: 100,
-            importance: None,
-        };
-        let plan = stage.plan(&ctx).expect("sliding plan Some");
-        let direct = SlidingWindowPolicy::new(8, 4)
-            .plan_keep(200, 100, None)
-            .expect("direct plan_keep Some");
-        match plan.keep {
-            KeepSpec::LayerWide(keep) => {
-                assert_eq!(keep, direct.0, "어댑터 keep == plan_keep keep")
-            }
-            KeepSpec::PerHead(_) => panic!("sliding 은 LayerWide 여야 한다"),
-        }
-        assert!(plan.merges.is_empty(), "sliding 은 merge 없음");
-    }
-
-    // The h2o adapter-vs-plan_keep test was removed when H2O was extracted to the `h2o` plugin
-    // crate: "h2o" now resolves to the plugin, whose own unit tests pin the keep-list spec
-    // (score-free + score-based). The sliding adapter test above still covers the in-tree path.
-
-    // ── StageBackedPolicy parity: World B(plan→compact) ≡ in-place evict(World A) ──
-    // ②a 어댑터 faithful + compact_parity(plan_keep→compact ≡ in-place) 의 합성을, 프로덕션
-    // 메커니즘 전체(find_stage→make→StageBackedPolicy→KVStageCtx→plan→execute_kv_plan)로 직접 확인.
     const PHD: usize = 32; // head_dim = QK4_0 → Q4_0 위치당 1 block
     const PMAX: usize = 128;
 
@@ -1180,43 +1019,12 @@ mod tests {
         c
     }
 
-    fn region(c: &KVCache) -> (Vec<u8>, Vec<u8>) {
-        let nb = c.current_pos * pbytes(c.k_buffer.dtype());
-        unsafe {
-            (
-                std::slice::from_raw_parts(c.k_buffer.as_mut_ptr() as *const u8, nb).to_vec(),
-                std::slice::from_raw_parts(c.v_buffer.as_mut_ptr() as *const u8, nb).to_vec(),
-            )
-        }
-    }
-
-    fn sb_params() -> StageParams {
-        StageParams {
-            eviction_window: 10,
-            protected_prefix: 4,
-            keep_ratio: 0.5,
-            sink_size: 4,
-            streaming_window: 6,
-        }
-    }
-
-    #[test]
-    fn stage_backed_evict_parity_sliding() {
-        for dt in [DType::F32, DType::F16, DType::Q4_0] {
-            let mut a = mk(dt, 40);
-            SlidingWindowPolicy::new(10, 4).evict(&mut a, 20).unwrap();
-            let mut b = mk(dt, 40);
-            let stage = (find_stage("sliding").unwrap().make)(sb_params());
-            StageBackedPolicy::new(stage).evict(&mut b, 20).unwrap();
-            assert_eq!(a.current_pos, b.current_pos, "sliding[{dt:?}] current_pos");
-            assert_eq!(region(&a), region(&b), "sliding[{dt:?}] valid-region byte");
-        }
-    }
-
-    // The h2o World-A↔World-B parity test was removed with the H2O extraction: the `h2o` plugin
-    // is plan-only (no in-place evict_with_scores), so there is no World-A path to compare. The
-    // sliding parity test above still exercises the StageBackedPolicy → execute_kv_plan mechanism,
-    // and beta3_eviction_stage_equivalence.rs covers h2o end-to-end across F32/F16/Q4_0.
+    // The World-A↔World-B sliding parity test (and its `region`/`sb_params` helpers) were removed
+    // when SlidingWindowPolicy was extracted to the `sliding-window` plugin crate: the plugin is
+    // plan-only, so there is no in-place World-A path left to compare. The plugin's keep-list spec is
+    // pinned by its own unit tests; beta3_eviction_stage_equivalence.rs proves the World-B path
+    // end-to-end across F32/F16/Q4_0; and d2o_stage_executes_full_mechanism_all_dtypes below still
+    // exercises the full find_stage → make → StageBackedPolicy → KVStageCtx → execute_kv_plan chain.
 
     #[test]
     fn kvstagectx_dequant_k_reads_f32() {

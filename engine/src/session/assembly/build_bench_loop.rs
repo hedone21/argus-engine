@@ -18,7 +18,6 @@ use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::eviction::EvictionPolicy;
 use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
-use crate::kv::eviction::no_eviction::NoEvictionPolicy;
 use crate::kv::eviction::stage_registry::StageBackedPolicy;
 use crate::kv::kv_cache::KVCache;
 use crate::memory::Memory;
@@ -88,9 +87,9 @@ pub fn build_resilience_cache_manager(
 
     let mut cm = {
         let policy: Box<dyn EvictionPolicy> = match policy_name {
-            // eviction=none + swap-dir 전용(AB-3): eviction 은 안 하고 offload 만.
-            "none" => Box::new(NoEvictionPolicy::new()),
-            // h2o_plus(per-head, plan_keep→None) → 레거시 직생성 잔류(단계 ⑤).
+            // h2o_plus(per-head) → 레거시 직생성 잔류(단계 ⑤). none/sliding/streaming/h2o/d2o 는
+            // 모두 out-of-tree 플러그인 → 아래 generic make_stage 경로(eviction=none + swap-dir 전용
+            // AB-3 도 make_stage("none") = no-op stage 로 흐른다).
             "h2o_plus" => Box::new(H2OPlusPolicy::new(
                 args.h2o_keep_ratio(),
                 actual_protected_prefix,

@@ -599,8 +599,8 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
-    use crate::kv::eviction::no_eviction::NoEvictionPolicy;
-    use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
+    use crate::kv::eviction::stage_registry::none_backed_policy;
+    use crate::kv::eviction::stage_registry::sliding_backed_policy;
     use crate::memory::host::shared::SharedBuffer;
     use crate::resilience::sys_monitor::MemoryStats;
     use crate::shape::Shape;
@@ -648,7 +648,7 @@ mod tests {
     #[test]
     fn test_no_eviction_with_plenty_memory() {
         let cm = CacheManager::new(
-            Box::new(NoEvictionPolicy::new()),
+            none_backed_policy(),
             Box::new(MockMonitor {
                 available: 1024 * 1024 * 1024,
             }), // 1GB
@@ -665,7 +665,7 @@ mod tests {
     fn test_sliding_window_with_memory_pressure() {
         // target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
         let cm = CacheManager::new(
-            Box::new(SlidingWindowPolicy::new(30, 0)),
+            sliding_backed_policy(30, 0),
             Box::new(MockMonitor {
                 available: 100 * 1024 * 1024,
             }), // 100MB (below threshold)
@@ -684,7 +684,7 @@ mod tests {
     fn test_eviction_across_all_layers() {
         // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let cm = CacheManager::new(
-            Box::new(SlidingWindowPolicy::new(20, 0)),
+            sliding_backed_policy(20, 0),
             Box::new(MockMonitor {
                 available: 10 * 1024 * 1024,
             }), // Very low
@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn test_empty_caches() {
         let cm = CacheManager::new(
-            Box::new(NoEvictionPolicy::new()),
+            none_backed_policy(),
             Box::new(MockMonitor { available: 0 }),
             256 * 1024 * 1024,
             0.75,
@@ -717,7 +717,7 @@ mod tests {
     #[test]
     fn test_policy_name() {
         let cm = CacheManager::new(
-            Box::new(SlidingWindowPolicy::new(10, 0)),
+            sliding_backed_policy(10, 0),
             Box::new(MockMonitor { available: 0 }),
             0,
             0.75,
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn test_monitor_error_skips_eviction() {
         let cm = CacheManager::new(
-            Box::new(SlidingWindowPolicy::new(10, 0)),
+            sliding_backed_policy(10, 0),
             Box::new(ErrorMonitor),
             256 * 1024 * 1024,
             0.75,
@@ -784,7 +784,7 @@ mod tests {
     #[test]
     fn test_maybe_evict_with_scores_no_eviction_needed() {
         let cm = CacheManager::new(
-            Box::new(NoEvictionPolicy::new()),
+            none_backed_policy(),
             Box::new(MockMonitor {
                 available: 1024 * 1024 * 1024,
             }),
@@ -863,7 +863,7 @@ mod tests {
     #[test]
     fn test_force_evict_empty_caches() {
         let cm = CacheManager::new(
-            Box::new(NoEvictionPolicy::new()),
+            none_backed_policy(),
             Box::new(MockMonitor { available: 0 }),
             256 * 1024 * 1024,
             0.75,
@@ -898,7 +898,7 @@ mod tests {
         // target_ratio below 0.1 should be clamped to 0.1.
         // pos=100, clamped target_len=10, tokens_to_remove=90 >= MIN_EVICT_TOKENS(64) → guard passes.
         let cm = CacheManager::new(
-            Box::new(SlidingWindowPolicy::new(10, 0)),
+            sliding_backed_policy(10, 0),
             Box::new(MockMonitor { available: 10 }),
             256 * 1024 * 1024,
             0.01, // should clamp to 0.1
@@ -912,7 +912,7 @@ mod tests {
         // pos=100, clamped target_len=99, tokens_to_remove=1 < MIN_EVICT_TOKENS(64).
         // Guard fires → NoOp (eviction skipped to avoid useless compaction).
         let cm2 = CacheManager::new(
-            Box::new(SlidingWindowPolicy::new(10, 0)),
+            sliding_backed_policy(10, 0),
             Box::new(MockMonitor { available: 10 }),
             256 * 1024 * 1024,
             5.0, // should clamp to 0.99
@@ -935,10 +935,7 @@ mod tests {
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,
-            handler: Box::new(EvictionHandler::new(
-                Box::new(SlidingWindowPolicy::new(10, 0)),
-                0.3,
-            )),
+            handler: Box::new(EvictionHandler::new(sliding_backed_policy(10, 0), 0.3)),
         }]);
 
         let cm = CacheManager::with_pipeline(
@@ -966,10 +963,7 @@ mod tests {
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,
-            handler: Box::new(EvictionHandler::new(
-                Box::new(SlidingWindowPolicy::new(10, 0)),
-                0.5,
-            )),
+            handler: Box::new(EvictionHandler::new(sliding_backed_policy(10, 0), 0.5)),
         }]);
 
         let cm = CacheManager::with_pipeline(
@@ -995,10 +989,7 @@ mod tests {
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Emergency,
-            handler: Box::new(EvictionHandler::new(
-                Box::new(SlidingWindowPolicy::new(10, 0)),
-                0.3,
-            )),
+            handler: Box::new(EvictionHandler::new(sliding_backed_policy(10, 0), 0.3)),
         }]);
 
         let cm = CacheManager::with_pipeline(
@@ -1103,17 +1094,11 @@ mod tests {
         let pipeline = CachePressurePipeline::new(vec![
             PressureStageConfig {
                 min_level: PressureLevel::Warning,
-                handler: Box::new(EvictionHandler::new(
-                    Box::new(SlidingWindowPolicy::new(10, 0)),
-                    0.8,
-                )),
+                handler: Box::new(EvictionHandler::new(sliding_backed_policy(10, 0), 0.8)),
             },
             PressureStageConfig {
                 min_level: PressureLevel::Critical,
-                handler: Box::new(EvictionHandler::new(
-                    Box::new(SlidingWindowPolicy::new(10, 0)),
-                    0.5,
-                )),
+                handler: Box::new(EvictionHandler::new(sliding_backed_policy(10, 0), 0.5)),
             },
         ]);
 
@@ -1142,14 +1127,14 @@ mod tests {
             PressureStageConfig {
                 min_level: PressureLevel::Warning,
                 handler: Box::new(EvictionHandler::new(
-                    Box::new(SlidingWindowPolicy::new(50, 0)),
+                    sliding_backed_policy(50, 0),
                     0.3, // keep 30% → tokens_to_remove=70 on pos=100
                 )),
             },
             PressureStageConfig {
                 min_level: PressureLevel::Critical,
                 handler: Box::new(EvictionHandler::new(
-                    Box::new(SlidingWindowPolicy::new(10, 0)),
+                    sliding_backed_policy(10, 0),
                     0.1, // keep 10%
                 )),
             },
@@ -1173,17 +1158,11 @@ mod tests {
         let pipeline2 = CachePressurePipeline::new(vec![
             PressureStageConfig {
                 min_level: PressureLevel::Warning,
-                handler: Box::new(EvictionHandler::new(
-                    Box::new(SlidingWindowPolicy::new(50, 0)),
-                    0.3,
-                )),
+                handler: Box::new(EvictionHandler::new(sliding_backed_policy(50, 0), 0.3)),
             },
             PressureStageConfig {
                 min_level: PressureLevel::Critical,
-                handler: Box::new(EvictionHandler::new(
-                    Box::new(SlidingWindowPolicy::new(10, 0)),
-                    0.1,
-                )),
+                handler: Box::new(EvictionHandler::new(sliding_backed_policy(10, 0), 0.1)),
             },
         ]);
 
@@ -1234,10 +1213,7 @@ mod tests {
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,
-            handler: Box::new(EvictionHandler::new(
-                Box::new(SlidingWindowPolicy::new(10, 0)),
-                0.5,
-            )),
+            handler: Box::new(EvictionHandler::new(sliding_backed_policy(10, 0), 0.5)),
         }]);
 
         let cm = CacheManager::with_pipeline(pipeline, Box::new(ErrorMonitor), 256 * 1024 * 1024);
@@ -1258,16 +1234,16 @@ mod tests {
         // Simulate Manager-directed sliding eviction with small protected_prefix.
         // Keep ratio = 0.2: should reduce 90 tokens to ~18.
         // tokens_to_remove = 90 - 18 = 72 >= MIN_EVICT_TOKENS(64) → guard does not fire.
-        let policy = SlidingWindowPolicy::new(50, 4); // protected_prefix=4, NOT prompt length
+        let policy = sliding_backed_policy(50, 4); // protected_prefix=4, NOT prompt length
         let mut cm = CacheManager::new(
-            Box::new(NoEvictionPolicy::new()),
+            none_backed_policy(),
             Box::new(MockMonitor {
                 available: usize::MAX,
             }),
             0,
             1.0,
         );
-        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, Box::new(policy));
+        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, policy);
 
         let mut caches = make_caches(4, 90);
         let result = cm
@@ -1297,16 +1273,16 @@ mod tests {
     fn test_resilience_sliding_large_protected_prefix_limits_eviction() {
         // If protected_prefix is too large (e.g. entire prompt), eviction is limited.
         // This documents the behavior the undershoot warning catches.
-        let policy = SlidingWindowPolicy::new(50, 70); // protected_prefix=70 out of 80 tokens
+        let policy = sliding_backed_policy(50, 70); // protected_prefix=70 out of 80 tokens
         let mut cm = CacheManager::new(
-            Box::new(NoEvictionPolicy::new()),
+            none_backed_policy(),
             Box::new(MockMonitor {
                 available: usize::MAX,
             }),
             0,
             1.0,
         );
-        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, Box::new(policy));
+        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, policy);
 
         let mut caches = make_caches(4, 80);
         let result = cm
@@ -1344,7 +1320,7 @@ mod tests {
         let stage = make_stage("streaming", &params).expect("streaming stage registered");
         let policy = StageBackedPolicy::new(stage);
         let cm = CacheManager::new(
-            Box::new(NoEvictionPolicy::new()),
+            none_backed_policy(),
             Box::new(MockMonitor {
                 available: usize::MAX,
             }),
@@ -1370,16 +1346,16 @@ mod tests {
     fn test_run_policy_eviction_skips_small_request() {
         // current_pos=100, target_ratio=0.98 → target_len=98, tokens_to_remove=2 < MIN_EVICT_TOKENS=64
         // Expected: evicted=false (guard fires).
-        let policy = SlidingWindowPolicy::new(200, 0);
+        let policy = sliding_backed_policy(200, 0);
         let mut cm = CacheManager::new(
-            Box::new(NoEvictionPolicy::new()),
+            none_backed_policy(),
             Box::new(MockMonitor {
                 available: usize::MAX,
             }),
             0,
             1.0,
         );
-        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, Box::new(policy));
+        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, policy);
 
         let mut caches = make_caches(2, 100);
         let result = cm
@@ -1404,16 +1380,16 @@ mod tests {
     fn test_run_policy_eviction_proceeds_when_above_threshold() {
         // current_pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS=64
         // Expected: evicted=true (guard does not fire).
-        let policy = SlidingWindowPolicy::new(200, 0);
+        let policy = sliding_backed_policy(200, 0);
         let mut cm = CacheManager::new(
-            Box::new(NoEvictionPolicy::new()),
+            none_backed_policy(),
             Box::new(MockMonitor {
                 available: usize::MAX,
             }),
             0,
             1.0,
         );
-        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, Box::new(policy));
+        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, policy);
 
         let mut caches = make_caches(2, 100);
         let result = cm
@@ -1440,7 +1416,7 @@ mod tests {
         // target_ratio=0.2 → target_len=16, tokens_to_remove=64 == MIN_EVICT_TOKENS → guard does not fire.
         let policy = h2o_backed_policy(0.5, 4);
         let mut cm = CacheManager::new(
-            Box::new(NoEvictionPolicy::new()),
+            none_backed_policy(),
             Box::new(MockMonitor {
                 available: usize::MAX,
             }),
