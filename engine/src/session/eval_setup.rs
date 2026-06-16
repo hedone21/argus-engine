@@ -34,7 +34,6 @@ use crate::inference::skip_config::SkipConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::eviction::EvictMethod;
 use crate::kv::eviction::EvictionPolicy;
-use crate::kv::eviction::internal_policy::engine_internal_policy;
 use crate::kv::eviction::stage_registry::{
     StageBackedPolicy, make_stage, make_stage_with_args, stage_default_protected_prefix,
     stage_is_score_based,
@@ -185,15 +184,10 @@ fn build_eval_cache_manager(
 
     let mut cache_manager = {
         let name = args.eviction_policy();
-        // h2o_plus is the only remaining engine-internal (non-plugin) policy — built generically via
-        // the internal-policy helper so this site never names it. Every other policy
-        // (none/sliding/streaming/h2o/d2o/rkv) resolves through the plugin registry by name (static
-        // linkme + dynamic `--load-plugin`), with its private knobs riding the opaque StageArgs blob.
-        let policy: Box<dyn EvictionPolicy> = if let Some(p) =
-            engine_internal_policy(name, args.keep_ratio(), actual_protected_prefix)
-        {
-            p
-        } else {
+        // Every policy (none/sliding/streaming/h2o/h2o_plus/d2o/rkv) resolves through the plugin
+        // registry by name (static linkme + dynamic `--load-plugin`), with its private knobs riding
+        // the opaque StageArgs blob — this site names no plugin.
+        let policy: Box<dyn EvictionPolicy> = {
             let streaming_window = if args.streaming_window() > 0 {
                 args.streaming_window()
             } else if args.kv_budget() > 0 {

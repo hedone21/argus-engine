@@ -83,6 +83,9 @@ rkv = { path = "../crates/techniques/rkv", optional = true }
 # H2O (Heavy-Hitter Oracle, score-based KVCacheStage). Extracted from the engine core;
 # non-optional, force-linked so `eviction h2o` resolves the out-of-tree plugin.
 h2o = { path = "../crates/techniques/h2o" }
+# H2O+ (GQA-aware per-head heavy-hitter KVCacheStage — the first PerHead-plan plugin). Extracted
+# from the engine core; non-optional, force-linked so `eviction h2o_plus` resolves the plugin.
+h2o-plus = { path = "../crates/techniques/h2o-plus" }
 # D2O (Dynamic Discriminative Operations, WeightedMerge-producing KVCacheStage). Extracted from
 # the engine core; non-optional, force-linked. Production builds `d2o::D2OStage` directly with the
 # full CLI config; the linkme registration backs `make_stage("d2o")` + the registry self-test.

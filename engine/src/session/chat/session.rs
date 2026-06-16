@@ -809,18 +809,10 @@ fn build_chat_eviction_internal(
 
     let cache_manager = {
         let name = args.eviction_policy.as_str();
-        // h2o_plus is the only remaining engine-internal (non-plugin) policy — built generically via
-        // the internal-policy helper so this site never names it. Everything else resolves through
-        // the plugin registry by name (static linkme + dynamic --load-plugin), with its private knobs
-        // riding the opaque StageArgs blob (built generically in chat/build.rs by `Args::stage_args`).
-        let policy: Box<dyn crate::kv::eviction::EvictionPolicy> = if let Some(p) =
-            crate::kv::eviction::internal_policy::engine_internal_policy(
-                name,
-                args.keep_ratio,
-                actual_protected_prefix,
-            ) {
-            p
-        } else {
+        // Every policy (none/sliding/streaming/h2o/h2o_plus/d2o) resolves through the plugin registry
+        // by name (static linkme + dynamic --load-plugin), with its private knobs riding the opaque
+        // StageArgs blob (built generically in chat/build.rs by `Args::stage_args`). Names no plugin.
+        let policy: Box<dyn crate::kv::eviction::EvictionPolicy> = {
             // streaming window 유도는 StageParams 5필드 밖이라 caller(여기)에서 해소해 baked.
             // 비-streaming 정책의 make 는 이 필드를 무시한다.
             let streaming_window = if args.streaming_window > 0 {

@@ -111,6 +111,7 @@ dependencies = [
  "env_logger",
  "example-keep-recent",
  "h2o",
+ "h2o-plus",
  "half",
  "libc",
  "libloading 0.8.9",
@@ -905,6 +906,14 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "h2o"
+version = "0.1.0"
+dependencies = [
+ "argus-extension-api",
+ "linkme",
+]
+
+[[package]]
+name = "h2o-plus"
 version = "0.1.0"
 dependencies = [
  "argus-extension-api",

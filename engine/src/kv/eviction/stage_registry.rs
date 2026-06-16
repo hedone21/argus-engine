@@ -44,6 +44,10 @@ use streaming_llm as _;
 // makes `find_stage("h2o")` visible (same force-link rationale as streaming above).
 use ::h2o as _;
 
+// H2O+ production force-link. Extracted from the engine core into the `h2o-plus` technique crate
+// (the first PerHead-plan stage); makes `find_stage("h2o_plus")` visible.
+use h2o_plus as _;
+
 // D2O production force-link. Extracted from the engine core into the `d2o` technique crate
 // (registers "d2o", a WeightedMerge-producing stage); makes `find_stage("d2o")` visible. Production
 // resolves it via `make_stage_with_args("d2o", &params, &blob)` (eval_setup/build_bench_loop/chat),
@@ -83,10 +87,38 @@ pub(crate) fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result
             cache.set_current_pos(keep.len());
             Ok(())
         }
-        KeepSpec::PerHead(_) => {
-            // per-head executor = 단계 ⑤(h2o_plus, head_score source 미완) deferred.
-            // 현 빌트인 3정책은 PerHead 미생산이라 도달 불가.
-            anyhow::bail!("per-head executor not implemented (stage ⑤ deferred)")
+        KeepSpec::PerHead(heads) => {
+            // Per-head executor (stage ⑤): each KV head keeps a different token set (h2o_plus). The
+            // plugin emits prefix-inclusive ascending keep-lists of equal length per head; the engine
+            // compacts each head independently and sets the single shared current_pos.
+            //
+            // Per-head compaction requires HeadMajor layout (so a head's tokens are contiguous and
+            // shiftable in isolation); on the default SeqMajor cache it is undefined, so bail cleanly
+            // rather than panic. Production never reaches this arm — only the score-free/flat fallback
+            // (LayerWide) fires there — so this gate is for the head-score-driven (HeadMajor) path.
+            if cache.layout() != crate::kv_cache_ops::KVLayout::HeadMajor {
+                anyhow::bail!(
+                    "per-head (KeepSpec::PerHead) eviction requires HeadMajor KV layout, got {:?}",
+                    cache.layout()
+                );
+            }
+            // Per-head + weighted merge has no producer; reject rather than silently drop merges.
+            if !plan.merges.is_empty() {
+                anyhow::bail!("per-head plan with weighted merges is unsupported");
+            }
+            // All heads keep the same NUMBER of tokens (the engine's single-current_pos invariant);
+            // the new position is that shared length.
+            let new_pos = heads.first().map_or(0, |h| h.len());
+            for (kv_head, keep) in heads.iter().enumerate() {
+                debug_assert_eq!(
+                    keep.len(),
+                    new_pos,
+                    "PerHead keep-lists must be equal length (head {kv_head})"
+                );
+                cache.compact_keep_positions_for_head(kv_head, keep, 0)?;
+            }
+            cache.set_current_pos(new_pos);
+            Ok(())
         }
     }
 }
@@ -387,6 +419,36 @@ impl EvictionPolicy for StageBackedPolicy {
         self.run(cache, target_len, importance, layer_idx, n_layers)
     }
 
+    /// Per-KV-head eviction (stage ⑤ / F5): route the per-head accumulated importance
+    /// (`[n_kv_heads * max_seq]`, row-major) into the stage ctx as `tensor(Scores)` so a per-head
+    /// stage (h2o_plus) sees `ctx.head_score(kv_head, pos)` and emits a [`KeepSpec::PerHead`] plan;
+    /// the engine then compacts each head independently in [`execute_kv_plan`]. `flat_importance`
+    /// remains available via `ctx.importance()` for the stage's score-free / flat fallback.
+    fn evict_with_head_scores(
+        &self,
+        cache: &mut KVCache,
+        target_len: usize,
+        flat_importance: &[f32],
+        head_importance: &[f32],
+        _n_kv_heads: usize,
+    ) -> Result<()> {
+        let plan = {
+            let ctx = KVStageCtx::new(
+                cache,
+                target_len,
+                Some(flat_importance),
+                Some(head_importance),
+                None,
+                None,
+            );
+            self.stage.plan(&ctx)
+        };
+        if let Some(plan) = plan {
+            execute_kv_plan(cache, &plan)?;
+        }
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         self.stage.name()
     }
@@ -437,21 +499,19 @@ pub fn none_backed_policy() -> Box<dyn EvictionPolicy> {
 
 /// Whether the named stage is score-based (consumes importance) — the generic capability lookup the
 /// CLI/chat/eval/bench paths use instead of `matches!(name, "h2o" | "d2o" | "caote" | "rkv" | ...)`.
-/// Consults the plugin registry's [`stage_caps`](argus_extension_api::stage_caps) first, then the
-/// engine-internal table (h2o_plus, pending stage ⑤). Unknown / unregistered → `false`.
+/// Reads the plugin's declared [`StageCaps`](argus_extension_api::stage_caps). Unknown /
+/// unregistered (incl. dynamic `.so` stages whose caps don't cross the ABI yet) → `false`.
 pub fn stage_is_score_based(name: &str) -> bool {
     argus_extension_api::stage_caps(name)
-        .or_else(|| super::internal_policy::engine_internal_caps(name))
         .map(|c| c.is_score_based)
         .unwrap_or(false)
 }
 
 /// The default `--protected-prefix` the named stage declares (`4` for score-based, `0` = "engine
 /// picks its own fallback"). The generic lookup that replaces the `match name { ... => 4 }` prefix
-/// tables. Consults the plugin registry then the engine-internal table. Unknown → `0`.
+/// tables. Reads the plugin's declared [`StageCaps`]. Unknown → `0`.
 pub fn stage_default_protected_prefix(name: &str) -> usize {
     argus_extension_api::stage_caps(name)
-        .or_else(|| super::internal_policy::engine_internal_caps(name))
         .map(|c| c.default_protected_prefix)
         .unwrap_or(0)
 }
@@ -468,6 +528,7 @@ pub fn ensure_builtin_stages_registered() -> Result<()> {
         ("sliding", false),
         ("streaming", false),
         ("h2o", true),
+        ("h2o_plus", true),
         ("d2o", true),
     ] {
         let Some(caps) = argus_extension_api::stage_caps(name) else {
@@ -1207,6 +1268,109 @@ mod tests {
                 12,
                 "d2o[{dt:?}] executor compacts to keep.len()"
             );
+        }
+    }
+
+    /// (stage ⑤) End-to-end per-head path: the out-of-tree `h2o_plus` plugin emits a
+    /// `KeepSpec::PerHead` plan from per-(kv_head, pos) scores, and the engine's per-head executor
+    /// compacts each KV head independently — **without bailing**. Proves the F5 score source
+    /// (`StageBackedPolicy::evict_with_head_scores` → `tensor(Scores)`) + the per-head executor work
+    /// end to end, and that heads diverge (head 0 keeps different heavy hitters than head 1).
+    #[test]
+    fn h2o_plus_per_head_executor_runs_without_bail() {
+        use crate::kv_cache_ops::KVLayout;
+
+        const MAX_SEQ: usize = 64;
+        const HD: usize = 4;
+        let n_kv_heads = 2;
+
+        // HeadMajor cache (per-head compaction requires it) with a distinct f32 marker per (head, pos).
+        let backend = Arc::new(CpuBackend::new());
+        let buf = || {
+            Arc::new(SharedBuffer::new(
+                n_kv_heads * MAX_SEQ * HD * std::mem::size_of::<f32>(),
+                DType::F32,
+            ))
+        };
+        let shape = Shape::new(vec![1, MAX_SEQ, n_kv_heads, HD]);
+        let mut c = KVCache::new(
+            Tensor::new(shape.clone(), buf(), backend.clone()),
+            Tensor::new(shape, buf(), backend),
+            MAX_SEQ,
+        )
+        .with_layout(KVLayout::HeadMajor);
+        c.current_pos = 20;
+        // marker(head, pos) = (pos+1) + head*1000 — distinct so a wrong keep shows up immediately.
+        let marker = |head: usize, pos: usize| (pos + 1) as f32 + head as f32 * 1000.0;
+        for head in 0..n_kv_heads {
+            for pos in 0..20 {
+                let off = c.offset(pos, head);
+                let k = c.k_buffer.as_mut_slice::<f32>();
+                for d in 0..HD {
+                    k[off + d] = marker(head, pos);
+                }
+            }
+        }
+
+        // Per-(kv_head, pos) importance, stride = MAX_SEQ: head 0 prefers tokens 5,6,7; head 1 → 10,11,12.
+        let mut head_imp = vec![0.0f32; n_kv_heads * MAX_SEQ];
+        for (rank, &pos) in [5usize, 6, 7].iter().enumerate() {
+            head_imp[pos] = 10.0 - rank as f32;
+        }
+        for (rank, &pos) in [10usize, 11, 12].iter().enumerate() {
+            head_imp[MAX_SEQ + pos] = 10.0 - rank as f32;
+        }
+        let flat = vec![1.0f32; MAX_SEQ];
+
+        // Resolve h2o_plus through the registry (force-linked plugin) and run the per-head path.
+        let stage = make_stage(
+            "h2o_plus",
+            &StageParams {
+                keep_ratio: 0.5,
+                protected_prefix: 4,
+                ..Default::default()
+            },
+        )
+        .expect("h2o_plus stage registered (force-linked h2o-plus plugin)");
+        let policy = StageBackedPolicy::new(stage);
+        // target=10, prefix=4, keep_ratio=0.5 → keep=10, hh_budget=3, recent_start=17.
+        policy
+            .evict_with_head_scores(&mut c, 10, &flat, &head_imp, n_kv_heads)
+            .expect("per-head executor runs without bail");
+
+        // All heads compacted to the same count (prefix 4 + HH 3 + recent 3 = 10).
+        assert_eq!(c.current_pos(), 10, "uniform per-head current_pos");
+
+        // Head 0 kept its own HH (5,6,7); head 1 kept (10,11,12). After compaction the slots after
+        // the 4-token prefix hold each head's heavy hitters, then the recent window (17,18,19).
+        let at = |head: usize, slot: usize| c.k_buffer.as_slice::<f32>()[c.offset(slot, head)];
+        // prefix preserved for both heads.
+        for head in 0..n_kv_heads {
+            for slot in 0..4 {
+                assert_eq!(
+                    at(head, slot),
+                    marker(head, slot),
+                    "head {head} prefix slot {slot}"
+                );
+            }
+        }
+        // head 0: slots 4,5,6 = tokens 5,6,7.
+        assert_eq!(at(0, 4), marker(0, 5));
+        assert_eq!(at(0, 5), marker(0, 6));
+        assert_eq!(at(0, 6), marker(0, 7));
+        // head 1: slots 4,5,6 = tokens 10,11,12 (DIFFERENT tokens than head 0 → per-head divergence).
+        assert_eq!(at(1, 4), marker(1, 10));
+        assert_eq!(at(1, 5), marker(1, 11));
+        assert_eq!(at(1, 6), marker(1, 12));
+        // recent window (17,18,19) tail, same positions for both heads.
+        for head in 0..n_kv_heads {
+            for (i, &pos) in [17usize, 18, 19].iter().enumerate() {
+                assert_eq!(
+                    at(head, 7 + i),
+                    marker(head, pos),
+                    "head {head} recent {pos}"
+                );
+            }
         }
     }
 }
