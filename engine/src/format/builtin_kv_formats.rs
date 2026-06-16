@@ -8,10 +8,10 @@
 //! 그 표면의 **내장 멤버**(f32/f16/q4_0/q8_0)를 `#[distributed_slice(KV_FORMATS)]` 로 등록한다.
 //! descriptor 는 [`dtype_to_layout_desc`] 에서 도출해 단일 진실원천을 공유한다(drift 0).
 //!
-//! **purely additive·unwired (S4-1)** — 등록만 하고 production 소비자는 아직 없다(compute→
-//! backend descriptor dispatch 는 후속 substep). 따라서 production force-link 호출
-//! (`ensure_builtin_kv_formats_registered`)은 소비자 substep 에서 배선한다. 본 단계에선
-//! 정의 + 단위 테스트(round-trip + 4종 self-test)까지만 둔다.
+//! **purely additive (S4-1), now wired** — force-link 호출 `ensure_builtin_kv_formats_registered`
+//! 이 startup 에 배선됨(`session/bin_setup`/`eval_setup`); `builtin_format_dtype` 는 `--kv-format`
+//! typed 라우터(`session/bin_setup`)가 사용한다. (compute→backend descriptor dispatch 소비는
+//! 후속 substep.)
 
 use anyhow::Result;
 use argus_extension_api::{KV_FORMATS, KVFormat, KVFormatReg, KVLayoutDesc};
@@ -98,8 +98,8 @@ static Q8_0_KV_FORMAT: KVFormatReg = KVFormatReg {
 /// 진입 시 1회 호출(`ensure_builtin_stages_registered` 거울).
 ///
 /// fat-LTO `--gc-sections` 가 linkme 등록을 silent drop 하면 누락 format 에 대해 `Err` 로
-/// fail-fast 한다(release 에서 format 이름 미해석 → 조용한 폴백 방지). **S4-1 에선 production
-/// 호출부 0(unwired)** — 후속 소비자 substep 이 startup 에 배선한다.
+/// fail-fast 한다(release 에서 format 이름 미해석 → 조용한 폴백 방지). startup 에서 호출됨
+/// (`session/bin_setup`/`eval_setup`).
 pub fn ensure_builtin_kv_formats_registered() -> Result<()> {
     for name in ["f32", "f16", "q4_0", "q8_0"] {
         if argus_extension_api::find_kv_format(name).is_none() {

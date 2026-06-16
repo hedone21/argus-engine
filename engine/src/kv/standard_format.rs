@@ -3,10 +3,11 @@
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §4.1 / §2.1 (guard rail: format impl 은 `kv/`
 //! (현 `pressure/`)에, base trait 은 `format/` 에).
 //!
-//! **purely additive, host-only, unwired** — 기존 `KVCache` 와 `KVCacheOps` 경로를 1바이트도
-//! 건드리지 않고, 신규 wrapper 로 공존한다. production 에서 `StandardFormat` 를 생성하는 코드는
-//! 0(unit test 에서만 생성). 내부 가변성 = `std::sync::Mutex`(trait `Send+Sync` 요구로 `RefCell`
-//! 불가; §4.1 R4 상 cold-path 라 lock 비용 무관).
+//! **purely additive wrapper, now LIVE** — 기존 `KVCache`/`KVCacheOps` 를 1바이트도 건드리지
+//! 않는 신규 wrapper 로 출발했으나, 표준 forward 경로가 이제 이 wrapper 로 KV 를 래핑한다
+//! (`session/standard_happy.rs`, `session/forward/model_forward::wrap_kv_caches`, `qcf_runtime`).
+//! 내부 가변성 = `std::sync::Mutex`(trait `Send+Sync` 요구로 `RefCell` 불가; §4.1 R4 상 cold-path
+//! 라 lock 비용 무관).
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -46,7 +47,7 @@ pub struct StandardFormat {
 }
 
 impl StandardFormat {
-    /// `KVCache` 를 layer 인덱스와 함께 wrapping. (현재 unit test 전용 — unwired.)
+    /// `KVCache` 를 layer 인덱스와 함께 wrapping. (표준 forward 경로가 생성 — live.)
     pub fn new(idx: usize, inner: KVCache) -> Self {
         Self {
             idx,
@@ -158,7 +159,7 @@ impl StandardFormat {
     /// device round(substep (3c))에서 검증한다. **비-F32(F16/Q4_0) cast 경로**(forward_gen 의
     /// `memory.alloc` + `ws.k_cast` scratch)는 inner `KVCache` 의 allocator 로 scratch 를 lazy 할당해
     /// 흡수한다 — write_kv signature 에 `memory` 를 추가하지 않는다(format⊥hardware, KVCache 가 이미
-    /// 동일 allocator 보유). 여전히 unwired 라 무회귀(production 호출처 0).
+    /// 동일 allocator 보유). 표준 forward 의 write 진입점(`write_kv`/`write_kv_batch` 위임)이다.
     fn write_inner(
         &self,
         new_k: &Tensor,

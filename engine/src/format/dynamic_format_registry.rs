@@ -9,8 +9,10 @@
 //! 동적 fallback 으로 source-agnostic `Box<dyn KVFormat>` 를 돌려준다. Stage 와 달리 `KVFormat` 은
 //! 콜백 0(순수 descriptor)이라 host 측 어댑터([`DynFormat`])는 `layout` fn-ptr 호출 + `drop` 뿐이다.
 //!
-//! **purely additive·unwired (CF2)** — 등록/조회 표면만 신설하고 production 소비자(`--load-plugin`→
-//! format 배선, `--kv-format` 동적 해석)는 후속. dlopen 메커니즘은
+//! **purely additive (CF2), now wired** — 등록/조회 표면. production 소비자가 배선됨:
+//! `make_format`(`--kv-format` 해석, `session/bin_setup`), `try_register_format`(`--load-plugin`,
+//! `session/plugin_dispatch`). (`register_dynamic_formats`/`dynamic_registered_format_names` 는
+//! 여전히 gate-test 전용.) dlopen 메커니즘은
 //! `engine/tests/gate_c_format_dlopen_equivalence.rs`(CF4) 격리 테스트가 descriptor-identity 로 증명.
 
 use std::ffi::CStr;
