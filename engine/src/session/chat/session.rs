@@ -22,7 +22,6 @@ use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
-use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
 use crate::kv::eviction::stage_registry::StageBackedPolicy;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
@@ -489,15 +488,16 @@ pub struct ChatStandardArgs {
     pub sink_size: usize,
     pub streaming_window: usize,
     pub kv_budget: usize,
-    pub h2o_keep_ratio: f32,
+    /// The active eviction variant's heavy-hitter keep-ratio (h2o/h2o_plus/d2o report their own;
+    /// others default 0.5). Replaces the former separate `h2o_keep_ratio` / `d2o_keep_ratio` fields.
+    pub keep_ratio: f32,
     pub h2o_tracked_layers: usize,
     pub h2o_decay: f32,
     pub h2o_raw_scores: bool,
-    pub d2o_keep_ratio: f32,
-    /// d2o-private knobs (target_ratio/ema_beta/merge_e/layer_alloc/protected_layers/merge_axis) as
-    /// an opaque `(key, val)` blob parsed by `d2o::D2OConfig::from_args`. Keeps chat from knowing
-    /// d2o's params and carries `merge_axis` (previously dropped on the chat path).
-    pub d2o_args: Vec<(String, String)>,
+    /// The active stage's technique-private knobs as an opaque `(key, val)` blob, parsed by the
+    /// plugin's own `from_args` (e.g. d2o's `ema_beta`/`merge_axis`/…). Keeps chat from knowing any
+    /// plugin's params. Built by `Args::stage_args()`.
+    pub stage_args: Vec<(String, String)>,
     pub memory_threshold_mb: u64,
     /// Base sampling config (CLI defaults / OpenAI request seed). Installed into a
     /// shared handle so the server can override `temperature`/`top_p` per request.
@@ -784,13 +784,17 @@ fn build_chat_eviction_internal(
         return Ok((None, None, false, "none".to_string()));
     }
 
-    let actual_protected_prefix =
-        args.protected_prefix
-            .unwrap_or(match args.eviction_policy.as_str() {
-                "h2o" | "h2o_plus" | "d2o" => 4,
-                "streaming" => args.sink_size,
-                _ => 4,
-            });
+    // Score-based stages declare a protected-prefix (4 sinks); score-free ones declare 0 → chat
+    // protects 4 sinks by default (streaming derives its own sink and ignores the value). No
+    // per-name branch.
+    let actual_protected_prefix = args.protected_prefix.unwrap_or_else(|| {
+        match crate::kv::eviction::stage_registry::stage_default_protected_prefix(
+            &args.eviction_policy,
+        ) {
+            0 => 4,
+            cap => cap,
+        }
+    });
 
     let monitor: Box<dyn crate::resilience::sys_monitor::SystemMonitor> =
         if args.backend.is_discrete_gpu() {
@@ -804,65 +808,51 @@ fn build_chat_eviction_internal(
     crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
 
     let cache_manager = {
-        let policy: Box<dyn crate::kv::eviction::EvictionPolicy> = match args
-            .eviction_policy
-            .as_str()
-        {
-            // h2o_plus(per-head)는 KVCacheStage plan 표면으로 표현 불가(plan_keep→None) + head_score
-            // source(F5) 미완 → 단계 ⑤ 까지 레거시 직생성 잔류.
-            "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                args.h2o_keep_ratio,
+        let name = args.eviction_policy.as_str();
+        // h2o_plus is the only remaining engine-internal (non-plugin) policy — built generically via
+        // the internal-policy helper so this site never names it. Everything else resolves through
+        // the plugin registry by name (static linkme + dynamic --load-plugin), with its private knobs
+        // riding the opaque StageArgs blob (built generically in chat/build.rs by `Args::stage_args`).
+        let policy: Box<dyn crate::kv::eviction::EvictionPolicy> = if let Some(p) =
+            crate::kv::eviction::internal_policy::engine_internal_policy(
+                name,
+                args.keep_ratio,
                 actual_protected_prefix,
-            )),
-            // sliding/streaming/h2o → KVCacheStage 레지스트리(OCP: closed match arm 제거).
-            // 새 LayerWide 기법 추가 = crate 등록만, 본 사이트 무수정. 레지스트리 miss = unknown
-            // 정책(기존 bail 메시지 보존). World B(plan→compact, compact_parity 게이트).
-            name => {
-                // streaming window 유도는 StageParams 5필드 밖이라 caller(여기)에서 해소해 baked.
-                // 비-streaming 정책의 make 는 이 필드를 무시한다.
-                let streaming_window = if args.streaming_window > 0 {
-                    args.streaming_window
-                } else if args.kv_budget > 0 {
-                    args.kv_budget.saturating_sub(args.sink_size)
-                } else {
-                    args.eviction_window
-                };
-                // d2o reads its own keep-ratio; other stages use the h2o keep-ratio slot.
-                let keep_ratio = if name == "d2o" {
-                    args.d2o_keep_ratio
-                } else {
-                    args.h2o_keep_ratio
-                };
-                let params = argus_extension_api::StageParams {
-                    eviction_window: args.eviction_window,
-                    protected_prefix: actual_protected_prefix,
-                    keep_ratio,
-                    sink_size: args.sink_size,
-                    streaming_window,
-                };
-                // d2o-private knobs ride the opaque StageArgs blob (built in chat/build.rs via
-                // `d2o_stage_args`, incl. merge_axis — previously dropped); other policies pass &[].
-                let extra: Vec<argus_extension_api::PluginArg> = if name == "d2o" {
-                    args.d2o_args
-                        .iter()
-                        .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                // 정적(linkme) + 동적(--load-plugin dlopen) 통합 조회. miss = unknown.
-                let stage = crate::kv::eviction::stage_registry::make_stage_with_args(
-                    name, &params, &extra,
-                )
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>)",
-                        name,
-                        if cfg!(feature = "caote") { ", caote" } else { "" }
-                    )
-                })?;
-                Box::new(StageBackedPolicy::new(stage))
-            }
+            ) {
+            p
+        } else {
+            // streaming window 유도는 StageParams 5필드 밖이라 caller(여기)에서 해소해 baked.
+            // 비-streaming 정책의 make 는 이 필드를 무시한다.
+            let streaming_window = if args.streaming_window > 0 {
+                args.streaming_window
+            } else if args.kv_budget > 0 {
+                args.kv_budget.saturating_sub(args.sink_size)
+            } else {
+                args.eviction_window
+            };
+            let params = argus_extension_api::StageParams {
+                eviction_window: args.eviction_window,
+                protected_prefix: actual_protected_prefix,
+                keep_ratio: args.keep_ratio,
+                sink_size: args.sink_size,
+                streaming_window,
+            };
+            let extra: Vec<argus_extension_api::PluginArg> = args
+                .stage_args
+                .iter()
+                .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
+                .collect();
+            // 정적(linkme) + 동적(--load-plugin dlopen) 통합 조회. miss = unknown.
+            let stage =
+                crate::kv::eviction::stage_registry::make_stage_with_args(name, &params, &extra)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>)",
+                            name,
+                            if cfg!(feature = "caote") { ", caote" } else { "" }
+                        )
+                    })?;
+            Box::new(StageBackedPolicy::new(stage))
         };
         CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
     };
@@ -871,10 +861,8 @@ fn build_chat_eviction_internal(
     // 가중치 a_i 는 importance 가 공급돼야 한다. score_based=true 여야 decode 루프가
     // force_evict_with_scores 로 importance 를 흘려보내 KVStageCtx(Some(importance)) 가 된다
     // (미공급 시 weight=0 → degenerate). attn-weight(last_attn) 정밀화는 Tier 2 deferred.
-    let score_based = matches!(
-        args.eviction_policy.as_str(),
-        "h2o" | "h2o_plus" | "d2o" | "caote"
-    );
+    let score_based =
+        crate::kv::eviction::stage_registry::stage_is_score_based(&args.eviction_policy);
 
     let mut acc = AttentionScoreAccumulator::new_gqa(
         args.max_seq_len,

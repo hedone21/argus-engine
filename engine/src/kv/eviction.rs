@@ -76,6 +76,9 @@ pub trait EvictionPolicy: Send + Sync {
 // `h2o` → `h2o`, `d2o` → `d2o`, `sliding` → `sliding-window`, `none` → `no-eviction`,
 // `rkv` → `rkv` (feature-gated). The engine retains only the generic plumbing here.
 pub mod h2o_plus;
+// Engine-internal (non-plugin) eviction policies + their caps table — currently only h2o_plus,
+// pending stage ⑤ (per-head executor). Deleted once h2o_plus extracts to a plugin crate.
+pub(crate) mod internal_policy;
 pub mod method;
 pub mod stage_registry;
 

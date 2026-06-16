@@ -52,7 +52,6 @@ const KV_FILL_HIGH_WATER_PCT: u32 = 85;
 ///
 /// - `args.qcf_dump.is_none()`               — `--qcf-dump` 비활성 (importance_collector 미장착)
 /// - `args.skip_ratio.unwrap_or(0.0) == 0.0` — `--skip-ratio=0` (skip_config 미장착)
-/// - `!args.d2o_layer_alloc()`                 — `--d2o-layer-alloc` 비활성 (last-layer 보호 knob — eviction 정책 경로 전용)
 /// - `!args.profile && !args.profile_events` — profile 비활성 (profiler 미장착)
 /// - `args.eviction_policy() == "none"`        — eviction 비활성 (score_accumulator 미장착)
 /// - `args.tensor_partition == 0.0`          — Phase 4-4.7: tensor_partition 활성 시
@@ -73,9 +72,10 @@ const KV_FILL_HIGH_WATER_PCT: u32 = 85;
 pub fn is_standard_happy_path(args: &Args) -> bool {
     args.qcf_dump.is_none()
         && args.skip_ratio.unwrap_or(0.0) == 0.0
-        && !args.d2o_layer_alloc()
         && !args.profile
         && !args.profile_events
+        // `--d2o-layer-alloc` no longer needs its own clause: it only ever applies to `eviction d2o`,
+        // and the `eviction_policy() == "none"` guard below already excludes every eviction policy.
         && args.eviction_policy() == "none"
         && args.tensor_partition == 0.0
         && !args.swap_intra_forward

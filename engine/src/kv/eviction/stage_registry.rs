@@ -435,6 +435,27 @@ pub fn none_backed_policy() -> Box<dyn EvictionPolicy> {
     ))
 }
 
+/// Whether the named stage is score-based (consumes importance) — the generic capability lookup the
+/// CLI/chat/eval/bench paths use instead of `matches!(name, "h2o" | "d2o" | "caote" | "rkv" | ...)`.
+/// Consults the plugin registry's [`stage_caps`](argus_extension_api::stage_caps) first, then the
+/// engine-internal table (h2o_plus, pending stage ⑤). Unknown / unregistered → `false`.
+pub fn stage_is_score_based(name: &str) -> bool {
+    argus_extension_api::stage_caps(name)
+        .or_else(|| super::internal_policy::engine_internal_caps(name))
+        .map(|c| c.is_score_based)
+        .unwrap_or(false)
+}
+
+/// The default `--protected-prefix` the named stage declares (`4` for score-based, `0` = "engine
+/// picks its own fallback"). The generic lookup that replaces the `match name { ... => 4 }` prefix
+/// tables. Consults the plugin registry then the engine-internal table. Unknown → `0`.
+pub fn stage_default_protected_prefix(name: &str) -> usize {
+    argus_extension_api::stage_caps(name)
+        .or_else(|| super::internal_policy::engine_internal_caps(name))
+        .map(|c| c.default_protected_prefix)
+        .unwrap_or(0)
+}
+
 /// 빌트인 LayerWide 기법(sliding/streaming/h2o)이 `KV_CACHE_STAGES` 에 등록됐는지 단언한다 — eviction
 /// CacheManager build 진입 시 1회 호출. fat-LTO `--gc-sections` 가 linkme 등록을 silent
 /// drop 하면 누락 기법에 대해 `Err` 로 fail-fast 한다(release 에서 정책 이름 미해석 → 조용한 폴백 방지).

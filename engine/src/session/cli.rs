@@ -1411,9 +1411,13 @@ impl Args {
         }
     }
 
-    pub fn h2o_keep_ratio(&self) -> f32 {
+    /// The active eviction variant's keep-ratio (heavy-hitter fraction). The single accessor that
+    /// replaces the per-binary keep-ratio branches that switched on the policy name — h2o, h2o_plus,
+    /// and d2o each report their own `--keep-ratio`; other variants default to 0.5.
+    pub fn keep_ratio(&self) -> f32 {
         match self.current_policy() {
             Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.keep_ratio,
+            Some(EvictionCmd::D2o(d)) => d.keep_ratio,
             _ => 0.5,
         }
     }
@@ -1455,94 +1459,45 @@ impl Args {
         std::env::var("LLMRS_H2O_DEBUG").is_ok()
     }
 
-    pub fn d2o_keep_ratio(&self) -> f32 {
+    /// The active eviction variant's technique-private parameters as an opaque `(key, val)` blob for
+    /// `make_stage_with_args(name, …)`. The single accessor that replaces the per-binary blob
+    /// branches that switched on the policy name — the engine routes this blob without knowing any
+    /// plugin's private knobs (each plugin parses its own keys in `from_args`, ignoring the rest):
+    ///
+    /// - typed `eviction d2o` sugar → d2o's keys (`target_ratio`/`ema_beta`/`merge_e`/`layer_alloc`/
+    ///   `protected_layers`/`merge_axis`), mirroring `d2o::D2OConfig::from_args`.
+    /// - typed `eviction rkv` sugar → `lambda`.
+    /// - generic `eviction plugin --name X --set k=v` → the raw `--set` pairs (any out-of-tree stage).
+    /// - everything else (sliding/streaming/h2o/none) → empty.
+    pub fn stage_args(&self) -> Vec<(String, String)> {
         match self.current_policy() {
-            Some(EvictionCmd::D2o(d)) => d.keep_ratio,
-            _ => 0.75,
-        }
-    }
-
-    pub fn d2o_ema_beta(&self) -> f32 {
-        match self.current_policy() {
-            Some(EvictionCmd::D2o(d)) => d.ema_beta,
-            _ => 0.7,
-        }
-    }
-
-    pub fn d2o_merge_e(&self) -> f32 {
-        match self.current_policy() {
-            Some(EvictionCmd::D2o(d)) => d.merge_e,
-            _ => 0.1,
-        }
-    }
-
-    pub fn d2o_layer_alloc(&self) -> bool {
-        match self.current_policy() {
-            Some(EvictionCmd::D2o(d)) => d.layer_alloc,
-            _ => false,
-        }
-    }
-
-    pub fn d2o_protected_layers(&self) -> Option<Vec<usize>> {
-        match self.current_policy() {
-            Some(EvictionCmd::D2o(d)) => d.protected_layers.clone(),
-            _ => None,
-        }
-    }
-
-    /// WeightedKV merge axis (KV 로드맵 항목 2 ablation). 미지정/타 정책 시 `Both`(구 동작).
-    pub fn d2o_merge_axis(&self) -> argus_extension_api::MergeAxis {
-        let s = match self.current_policy() {
-            Some(EvictionCmd::D2o(d)) => d.merge_axis.as_str(),
-            _ => "both",
-        };
-        match s {
-            "key_only" => argus_extension_api::MergeAxis::KeyOnly,
-            "value_only" => argus_extension_api::MergeAxis::ValueOnly,
-            _ => argus_extension_api::MergeAxis::Both,
-        }
-    }
-
-    /// d2o-private knobs as an opaque `(key, val)` blob for `make_stage_with_args("d2o", …)`.
-    /// Keys mirror those parsed by `d2o::D2OConfig::from_args`, so the engine routes them without
-    /// knowing d2o's params. Built only for the `d2o` policy; other policies pass `&[]`.
-    pub fn d2o_stage_args(&self) -> Vec<(String, String)> {
-        let merge_axis = match self.d2o_merge_axis() {
-            argus_extension_api::MergeAxis::KeyOnly => "key_only",
-            argus_extension_api::MergeAxis::ValueOnly => "value_only",
-            argus_extension_api::MergeAxis::Both => "both",
-        };
-        let protected_layers = self
-            .d2o_protected_layers()
-            .unwrap_or_default()
-            .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        vec![
-            (
-                "target_ratio".to_string(),
-                self.eviction_target_ratio().to_string(),
-            ),
-            ("ema_beta".to_string(), self.d2o_ema_beta().to_string()),
-            ("merge_e".to_string(), self.d2o_merge_e().to_string()),
-            (
-                "layer_alloc".to_string(),
-                self.d2o_layer_alloc().to_string(),
-            ),
-            ("protected_layers".to_string(), protected_layers),
-            ("merge_axis".to_string(), merge_axis.to_string()),
-        ]
-    }
-
-    /// R-KV fusion 가중치 λ (KV roadmap 항목 0 측정, feature `rkv`). 미지정/타 정책 시 stage
-    /// 기본(0.1). 측정 schedule 의 stage 직접 생성 경로(d2o if-branch 동형)가 읽는다.
-    #[cfg(feature = "rkv")]
-    pub fn rkv_lambda(&self) -> f32 {
-        match self.current_policy() {
-            Some(EvictionCmd::Rkv(r)) => r.lambda,
-            // R-KV default λ (the `rkv` plugin's RKV_DEFAULT_LAMBDA; redundancy-dominant).
-            _ => 0.1,
+            Some(EvictionCmd::D2o(d)) => {
+                let protected_layers = d
+                    .protected_layers
+                    .clone()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                vec![
+                    (
+                        "target_ratio".to_string(),
+                        self.eviction_target_ratio().to_string(),
+                    ),
+                    ("ema_beta".to_string(), d.ema_beta.to_string()),
+                    ("merge_e".to_string(), d.merge_e.to_string()),
+                    ("layer_alloc".to_string(), d.layer_alloc.to_string()),
+                    ("protected_layers".to_string(), protected_layers),
+                    // D2oArgs.merge_axis is clap-validated to one of both/key_only/value_only.
+                    ("merge_axis".to_string(), d.merge_axis.clone()),
+                ]
+            }
+            #[cfg(feature = "rkv")]
+            Some(EvictionCmd::Rkv(r)) => vec![("lambda".to_string(), r.lambda.to_string())],
+            // `eviction plugin --name X --set k=v` — the raw key=value pairs for an out-of-tree stage.
+            Some(EvictionCmd::Plugin(p)) => p.sets.clone(),
+            _ => Vec::new(),
         }
     }
 

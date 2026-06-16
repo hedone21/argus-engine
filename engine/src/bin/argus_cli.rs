@@ -104,23 +104,19 @@ fn reject_unsupported_modes_v0(args: &Args) -> anyhow::Result<()> {
     if args.skip_ratio.unwrap_or(0.0) > 0.0 {
         bail!("argus-cli v0: --skip-ratio not yet supported (planned for v1)");
     }
-    if args.d2o_layer_alloc() {
-        bail!(
-            "argus-cli: --d2o-layer-alloc (variance measurement) belongs to argus-eval / argus-bench"
-        );
-    }
     // KV offload(`--swap-dir`)는 OffloadStage 배선이 필요 → argus-bench.
     if args.swap_dir.is_some() {
         bail!("argus-cli: --swap-dir (KV offload) belongs to argus-bench");
     }
-    // score-based eviction(importance/score accumulator 의존: h2o/h2o_plus/d2o/caote/rkv)은
-    // AttentionScoreAccumulator 배선이 필요(argus-bench 가 score_cell 을 ModelForward+EvictionStage
-    // 에 연결). argus-cli 는 score-free 만 지원: none / sliding / streaming + `--load-plugin <.so>
-    // eviction plugin --name <stage>`. (caote/rkv 는 feature-gate 시에만 도달 — 문자열 비교는 무해.)
-    if matches!(
-        args.eviction_policy(),
-        "h2o" | "h2o_plus" | "d2o" | "caote" | "rkv"
-    ) {
+    // Score-based eviction (importance / attention-score accumulator dependent) needs the
+    // AttentionScoreAccumulator wired (argus-bench connects score_cell to ModelForward +
+    // EvictionStage); argus-cli is score-free only (none / sliding / streaming + `--load-plugin <.so>
+    // eviction plugin --name <stage>`). The capability is read generically from the stage's declared
+    // StageCaps — no per-name list (this also subsumes the old `--d2o-layer-alloc` reject, since d2o
+    // is score-based). Note: a dynamically-loaded stage's caps don't cross the `.so` ABI yet (caps
+    // are Phase 2), so a score-based dynamic stage is assumed score-free here — the same gap as
+    // before, to be closed when the stage ABI carries caps.
+    if argus_engine::kv::eviction::stage_registry::stage_is_score_based(args.eviction_policy()) {
         bail!(
             "argus-cli: score-based eviction '{}' belongs to argus-bench (needs attention-score \
              accumulator); argus-cli supports none / sliding / streaming and --load-plugin stages",

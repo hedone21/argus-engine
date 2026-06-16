@@ -115,6 +115,21 @@ pub struct PluginArgs {
     /// Registry name of the eviction stage to select.
     #[arg(long = "name")]
     pub name: String,
+
+    /// Technique-private parameter, repeatable: `--set key=value`. The engine routes these opaquely
+    /// into the selected stage's `make_with_args` blob — the plugin parses/validates/defaults its own
+    /// keys and ignores the rest, so the engine knows none of any plugin's private knobs. Example:
+    /// `eviction plugin --name d2o --set ema_beta=0.7 --set merge_axis=value_only`.
+    #[arg(long = "set", value_parser = parse_kv)]
+    pub sets: Vec<(String, String)>,
+}
+
+/// clap value-parser for `--set key=value`. Splits on the FIRST `=` (so values may contain `=`).
+fn parse_kv(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(format!("expected key=value, got '{s}'")),
+    }
 }
 
 /// R-KV 측정 프로토타입 파라미터(feature `rkv`). λ 만 노출 — α/τ 는 측정 상수(rkv_stage.rs).
