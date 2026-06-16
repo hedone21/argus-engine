@@ -1077,60 +1077,6 @@ impl CpuBackendAVX2 {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn matmul_transposed_q4_0_serial(
-        &self,
-        a: &Tensor,
-        b: &Tensor,
-        out: &mut Tensor,
-    ) -> Result<()> {
-        let a_shape = a.shape().dims();
-        let b_shape = b.shape().dims();
-
-        let k = a_shape[a_shape.len() - 1];
-        let n = b_shape[b_shape.len() - 2];
-        let m: usize = a_shape[..a_shape.len() - 1].iter().product();
-
-        let a_data = a.as_slice::<f32>();
-        let nb_k = k / QK4_0;
-
-        // Safety: b is created as Q4_0 tensor, so data is BlockQ4_0
-        let total_blocks = n * nb_k;
-        let b_blocks =
-            unsafe { std::slice::from_raw_parts(b.as_ptr() as *const BlockQ4_0, total_blocks) };
-
-        let out_data = out.as_mut_slice::<f32>();
-
-        for i in 0..m {
-            let a_offset = i * k;
-            let a_row = &a_data[a_offset..a_offset + k];
-
-            for j in 0..n {
-                let b_offset = j * nb_k;
-                let b_row_blocks = &b_blocks[b_offset..b_offset + nb_k];
-
-                let mut sum = 0.0;
-                for (bi, block) in b_row_blocks.iter().enumerate() {
-                    let d = block.d.to_f32();
-                    let a_slice = &a_row[bi * QK4_0..(bi + 1) * QK4_0];
-
-                    let mut isum: f32 = 0.0;
-                    for z in 0..(QK4_0 / 2) {
-                        let b_val = block.qs[z];
-                        let v0 = (b_val & 0x0F) as i8 - 8;
-                        let v1 = (b_val >> 4) as i8 - 8;
-
-                        isum += v0 as f32 * a_slice[z];
-                        isum += v1 as f32 * a_slice[z + QK4_0 / 2];
-                    }
-                    sum += d * isum;
-                }
-                out_data[i * n + j] = sum;
-            }
-        }
-        Ok(())
-    }
-
     #[cfg(target_arch = "x86_64")]
     fn matmul_transposed_q4_1(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         if !is_x86_feature_detected!("avx2") {
