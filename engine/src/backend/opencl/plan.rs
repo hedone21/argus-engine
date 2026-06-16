@@ -390,10 +390,6 @@ pub struct PartitionPlanContext {
     /// residual directly via this pointer instead of issuing a blocking
     /// `enqueue_read_buffer`.
     pub residual_host_ptr: *const u8,
-    #[allow(dead_code)]
-    pub x_buf_handle: Mem,
-    #[allow(dead_code)]
-    pub attn_out_buf_handle: Mem,
     /// Whether the model uses `gelu(tanh)` instead of SiLU (arch-dependent).
     /// The GPU kernel binding picks `kernel_silu_mul_simple` vs
     /// `kernel_gelu_tanh_mul_simple`; this flag mirrors the decision so CPU
@@ -3782,8 +3778,6 @@ pub fn build_partitioned_layer_plan(
         workspace: workspace.clone(),
         residual_buf_handle: config.residual_buf.clone(),
         residual_host_ptr: config.residual_host_ptr,
-        x_buf_handle: config.x_buf.clone(),
-        attn_out_buf_handle: config.attn_out_buf.clone(),
         use_gelu_tanh,
         rms_norm_eps: config.rms_norm_eps,
         rms_norm_add_unit: false,

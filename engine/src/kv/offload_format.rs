@@ -72,12 +72,6 @@ impl OffloadFormat {
         self.inner.lock().unwrap().retain_preload();
     }
 
-    /// `OffloadKVCache::reset_session(&mut)` 를 `&self` 로 미러.
-    #[allow(dead_code)]
-    pub(crate) fn reset_session_locked(&self) {
-        self.inner.lock().unwrap().reset_session();
-    }
-
     /// KV write 흡수 — `forward_gen` 의 KV-update 분기(transformer_layer.rs:35 `update_kv_cache`
     /// 미러)를 format 표면으로 옮긴 것. offload 는 SeqMajor 라 HeadMajor GPU scatter fast-path 부재 —
     /// 비-F32 cast 후 `update` / F32 직접 `update` 두 경로만.

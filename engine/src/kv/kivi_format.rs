@@ -2,9 +2,9 @@
 //!
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §4.1 (R4 ④ KIVI creep 제거 + AWQE 자가 흡수).
 //!
-//! **purely additive, host-only, unwired** — 기존 `KiviCache` 와 `KVCacheOps` 경로를 1바이트도
-//! 건드리지 않고, 신규 wrapper 로 공존한다. production 에서 `KIVIFormat` 를 생성하는 코드는 0
-//! (unit test 에서만 생성). 내부 가변성 = `std::sync::Mutex`.
+//! **purely additive wrapper, now LIVE** — 기존 `KiviCache`/`KVCacheOps` 를 1바이트도 건드리지
+//! 않는 신규 wrapper 로 출발했으나, production KIVI forward 경로가 이제 이 wrapper 를 생성한다
+//! (`session/forward/kivi_forward.rs`). 내부 가변성 = `std::sync::Mutex`.
 //!
 //! `attention_into` 는 kivi-native(GPU fused dequant) 와 fallback(F32 view →
 //! `backend.attention_gen`) 에 더해 AWQE 자가 흡수(scores `Some` 일 때 내부
@@ -30,7 +30,7 @@ pub struct KIVIFormat {
 }
 
 impl KIVIFormat {
-    /// `KiviCache` 를 layer 인덱스와 함께 wrapping. (현재 unit test 전용 — unwired.)
+    /// `KiviCache` 를 layer 인덱스와 함께 wrapping. (KIVI forward 경로가 생성 — live.)
     pub fn new(idx: usize, inner: KiviCache) -> Self {
         Self {
             idx,

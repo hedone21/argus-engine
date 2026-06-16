@@ -5,7 +5,7 @@
 //! prefill workspace, and two reusable logits tensors.
 //!
 //! Out of scope for 4-3 (kept as `None` in the forward args):
-//! `skip_config`, `profiler`, `importance_collector`, `variance_collector`.
+//! `skip_config`, `profiler`, `importance_collector`.
 //! These are absorbed by the `PipelineStage` registry (eviction/observe stages)
 //! — Phase β decode-loop rewrite (the v1 `EvictionStage`/`SwapStage`/
 //! `DecodeObserver` traits were deleted in β-7).

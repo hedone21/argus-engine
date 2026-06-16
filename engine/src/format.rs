@@ -8,8 +8,9 @@
 //!
 //! Phase α-W 는 `WeightFormat`(신설, 현 코드 trait 부재)만 입주시킨다. `KVCacheFormat` 은
 //! **Phase α-K substep (1)** 에서 `format/kv_cache_format.rs` 로 입주한다(C2 연혁 — `Merge`
-//! compact arg 동반). 단 substep (1) 은 purely additive·unwired 이라 현 `kv_cache_ops.rs` 의
-//! `KVCacheOps` 와 **공존**한다(rename 이 아니라 신규 trait 신설; 기존 경로 무변).
+//! compact arg 동반). substep (1) 의 `KVCacheFormat` 은 purely additive 로 입주했고(이제 forward 가
+//! trait-object 로 live 사용), 현 `kv_cache_ops.rs` 의 `KVCacheOps` 와 **공존**한다(rename 이
+//! 아니라 신규 trait 신설; 기존 경로 무변).
 
 pub mod builtin_kv_formats;
 pub mod dtype_layout;

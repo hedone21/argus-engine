@@ -83,16 +83,6 @@ impl QuantizedBlocks {
         }
     }
 
-    #[allow(dead_code)]
-    fn len(&self) -> usize {
-        match self {
-            QuantizedBlocks::Unquantized => 0,
-            QuantizedBlocks::Q2(v) => v.len(),
-            QuantizedBlocks::Q4(v) => v.len(),
-            QuantizedBlocks::Q8(v) => v.len(),
-        }
-    }
-
     fn memory_bytes(&self) -> usize {
         match self {
             QuantizedBlocks::Unquantized => 0,
@@ -122,16 +112,6 @@ impl QuantizedBlocks {
         }
     }
 
-    #[allow(dead_code)]
-    fn capacity(&self) -> usize {
-        match self {
-            QuantizedBlocks::Unquantized => 0,
-            QuantizedBlocks::Q2(v) => v.capacity(),
-            QuantizedBlocks::Q4(v) => v.capacity(),
-            QuantizedBlocks::Q8(v) => v.capacity(),
-        }
-    }
-
     /// Total capacity in bytes (capacity * block_size).
     fn capacity_bytes(&self) -> usize {
         match self {
@@ -150,16 +130,6 @@ impl QuantizedBlocks {
             4 => QuantizedBlocks::Q4(Vec::new()),
             8 => QuantizedBlocks::Q8(Vec::new()),
             _ => panic!("unsupported bits: {bits}"),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn bits(&self) -> u8 {
-        match self {
-            QuantizedBlocks::Unquantized => 16,
-            QuantizedBlocks::Q2(_) => 2,
-            QuantizedBlocks::Q4(_) => 4,
-            QuantizedBlocks::Q8(_) => 8,
         }
     }
 }
@@ -763,11 +733,6 @@ impl KiviCache {
             (self.res_k.capacity() + self.res_v.capacity()) * std::mem::size_of::<f32>();
         let q_bytes = self.qk.capacity_bytes() + self.qv.capacity_bytes();
         attn_bytes + res_bytes + q_bytes
-    }
-
-    /// CPU quantized block count -- for testing.
-    pub fn cpu_quantized_len(&self) -> usize {
-        self.qk.len() + self.qv.len()
     }
 
     /// Get raw GPU buffers for native KIVI attention (no F32 intermediate).
@@ -2753,8 +2718,8 @@ mod tests {
         let res_cap = 64; // larger residual to test groups_per_flush > 1
 
         let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
-        let initial_k_cap = cache.qk.capacity();
-        let initial_v_cap = cache.qv.capacity();
+        let initial_k_cap = cache.qk.capacity_bytes();
+        let initial_v_cap = cache.qv.capacity_bytes();
 
         // Fill to max_seq_len (3 flushes: at 64, 128, 192 → 192 Q2 + 64 residual)
         for _ in 0..max_seq {
@@ -2767,16 +2732,16 @@ mod tests {
 
         // No reallocation should have occurred
         assert_eq!(
-            cache.qk.capacity(),
+            cache.qk.capacity_bytes(),
             initial_k_cap,
             "K vec reallocated (initial={initial_k_cap}, now={})",
-            cache.qk.capacity()
+            cache.qk.capacity_bytes()
         );
         assert_eq!(
-            cache.qv.capacity(),
+            cache.qv.capacity_bytes(),
             initial_v_cap,
             "V vec reallocated (initial={initial_v_cap}, now={})",
-            cache.qv.capacity()
+            cache.qv.capacity_bytes()
         );
     }
 
@@ -3753,7 +3718,7 @@ mod tests {
 
         // CPU mode: flush fills qk/qv
         let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
-        assert_eq!(cache.cpu_quantized_len(), 0);
+        assert_eq!((cache.qk.memory_bytes() + cache.qv.memory_bytes()), 0);
         for i in 0..33 {
             let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1);
             let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1 + 5.0);
@@ -3761,7 +3726,7 @@ mod tests {
         }
         // CPU mode: after flush, qk/qv have data
         assert!(
-            cache.cpu_quantized_len() > 0,
+            (cache.qk.memory_bytes() + cache.qv.memory_bytes()) > 0,
             "CPU mode must have quantized blocks after flush"
         );
 

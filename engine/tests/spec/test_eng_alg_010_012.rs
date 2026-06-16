@@ -1,8 +1,10 @@
-//! ENG-ALG-010 ~ ENG-ALG-012: H2O + Sliding Window + D2O Eviction
+//! ENG-ALG-010 / ENG-ALG-011: H2O + Sliding Window Eviction
 //!
 //! H2O 3-partition budget split, evict_with_scores, 순서 보존.
 //! SlidingWindow protected prefix, 최소 prefix 강제.
-//! D2O find_nearest per-head, d2o_layer_alloc variance/budget.
+//!
+//! (ENG-ALG-012 D2O layer-alloc variance/budget 테스트는 해당 dead 기계
+//! `d2o_layer_alloc`(D2OVarianceCollector/compute_budgets) 제거와 함께 삭제됨.)
 //!
 //! 주의: EvictionPolicy::evict()는 KVCache 내부 데이터를 직접 조작하므로
 //! 통합 테스트에서 CpuBackend/SharedBuffer로 KVCache를 생성해야 한다.
@@ -174,51 +176,4 @@ fn test_eng_alg_011_minimum_protected_prefix_enforced() {
     assert!(!policy.should_evict(&cache, 0)); // 15 <= 10+5
     cache.current_pos = 16;
     assert!(policy.should_evict(&cache, 0)); // 16 > 15
-}
-
-// ══════════════════════════════════════════════════════════════
-// ENG-ALG-012: D2O layer allocation — variance / budget
-// 주의: D2OVarianceCollector는 내부적으로 Q*K attention을 계산하므로
-//       적절한 입력 데이터가 필요. 여기서는 compute_budgets의 속성만 검증.
-// ══════════════════════════════════════════════════════════════
-
-#[test]
-fn test_eng_alg_012_d2o_variance_uniform_attention() {
-    use argus_engine::kv::d2o_layer_alloc::D2OVarianceCollector;
-
-    let n_layers = 4;
-    let collector = D2OVarianceCollector::new(
-        n_layers, 2, // kv_heads
-        2, // heads_q
-        4, // head_dim
-        8, // seq_len
-    );
-
-    // collect_layer를 호출하지 않으면 variance=0 → 균등 budget
-    let budgets = collector.compute_budgets(0.5, 0.3);
-    assert_eq!(budgets.len(), n_layers);
-
-    // 모든 레이어가 동일한 budget을 받아야 함 (variance=0 → 균등 배분)
-    let first = budgets[0];
-    for b in &budgets {
-        assert!(
-            (b.0 - first.0).abs() < 1e-6 && (b.1 - first.1).abs() < 1e-6,
-            "균등 variance에서는 모든 레이어 budget이 동일해야 함"
-        );
-    }
-}
-
-#[test]
-fn test_eng_alg_012_d2o_budget_softmax_clamp() {
-    use argus_engine::kv::d2o_layer_alloc::D2OVarianceCollector;
-
-    let collector = D2OVarianceCollector::new(2, 1, 1, 4, 4);
-    let budgets = collector.compute_budgets(0.6, 0.2);
-    assert_eq!(budgets.len(), 2);
-
-    // budget 값이 0 이상이어야 함
-    for &(hh, recent) in &budgets {
-        assert!(hh >= 0.0, "hh budget은 0 이상");
-        assert!(recent >= 0.0, "recent budget은 0 이상");
-    }
 }

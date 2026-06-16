@@ -60,10 +60,6 @@ use crate::models::weights::secondary_mmap::{LayerTensorSlice, SecondaryTensorIn
 pub struct RpcmemLayerRegion {
     /// Base host pointer returned by `RpcmemAllocator::alloc` (mmap'd DMA-BUF).
     host_ptr: *mut u8,
-    /// Total bytes allocated. Read by Drop diagnostics + size sanity tests.
-    /// Allowed to be `dead_code` on non-Android because the Drop arm is gated.
-    #[allow(dead_code)]
-    size: usize,
     /// Subname (e.g. "attn_q.weight") → (offset_in_region, byte_len, dtype).
     tensor_map: HashMap<String, (usize, usize, DType)>,
     /// rpcmem allocator — Arc 보유로 buffer lifetime ⊂ allocator lifetime
@@ -627,7 +623,6 @@ impl RpcmemSecondaryStore {
 
         Ok(Arc::new(RpcmemLayerRegion {
             host_ptr,
-            size: total,
             tensor_map,
             allocator: Arc::clone(&self.allocator),
         }))
@@ -668,17 +663,4 @@ fn check_metadata_match(primary: &ModelConfig, secondary: &ModelConfig) -> Resul
     check!(intermediate_size);
     check!(vocab_size);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // `RpcmemLayerRegion::size` is currently only consulted via Debug /
-    // diagnostics. This compile-only probe keeps dead_code lint quiet across
-    // feature combinations and documents the field's intended public surface.
-    #[test]
-    fn region_size_field_used() {
-        let _check_field = |r: &RpcmemLayerRegion| -> usize { r.size };
-    }
 }
