@@ -109,10 +109,6 @@ pub struct HybridGpuBuffer {
     buffer: ocl::Buffer<u8>,
     /// Permanent host map pointer. Valid between `new_host_visible` and Drop.
     host_ptr: *mut u8,
-    /// Number of elements (not bytes). Element dtype is implicit in the
-    /// caller's cast.
-    #[allow(dead_code)]
-    elem_count: usize,
     /// Queue used for map/unmap (kept alive for Drop).
     queue: Queue,
 }
@@ -127,11 +123,7 @@ impl HybridGpuBuffer {
     /// Allocate a host-visible buffer (ALLOC_HOST_PTR) sized `byte_size` and
     /// permanent-map it. The returned handle keeps the cl_mem and the host
     /// map alive until dropped.
-    pub fn new_host_visible(
-        queue: &Queue,
-        byte_size: usize,
-        elem_count: usize,
-    ) -> anyhow::Result<Self> {
+    pub fn new_host_visible(queue: &Queue, byte_size: usize) -> anyhow::Result<Self> {
         use anyhow::anyhow;
         use ocl::flags;
 
@@ -159,7 +151,6 @@ impl HybridGpuBuffer {
         Ok(Self {
             buffer,
             host_ptr,
-            elem_count,
             queue: queue.clone(),
         })
     }
@@ -262,9 +253,9 @@ impl HybridAttnSetup {
         let o_elems = n_heads_q * head_dim;
         let flag_elems = n_heads_q;
 
-        let partial_ml_gpu = HybridGpuBuffer::new_host_visible(queue, ml_elems * 4, ml_elems)?;
-        let partial_o_gpu = HybridGpuBuffer::new_host_visible(queue, o_elems * 4, o_elems)?;
-        let ready_flags_gpu = HybridGpuBuffer::new_host_visible(queue, flag_elems * 4, flag_elems)?;
+        let partial_ml_gpu = HybridGpuBuffer::new_host_visible(queue, ml_elems * 4)?;
+        let partial_o_gpu = HybridGpuBuffer::new_host_visible(queue, o_elems * 4)?;
+        let ready_flags_gpu = HybridGpuBuffer::new_host_visible(queue, flag_elems * 4)?;
 
         // Stage D: ready_flags 를 0으로 초기 설정. Plan dispatch 진입 시에도
         // 매 layer 리셋하지만, 첫 layer가 폴링을 곧바로 시작하기 때문에 할당

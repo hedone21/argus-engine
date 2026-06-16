@@ -581,23 +581,6 @@ fn build_meta_from_gguf(gguf: &argus_engine::models::loader::gguf::GgufFile) -> 
     })
 }
 
-/// 레거시 호환을 위한 단순 분리 (transpose / unshuffle 없음). 새 코드에서는
-/// `crate::auf::q4_0_aos_to_adreno_soa`를 사용하라. 일부 단위 테스트가 이
-/// 헬퍼의 경계 동작을 그대로 사용하므로 보존한다.
-#[allow(dead_code)]
-fn q4_0_aos_to_soa(blocks: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    const BLOCK_SIZE: usize = 18;
-    let n_blocks = blocks.len() / BLOCK_SIZE;
-    let mut q_buf = Vec::with_capacity(n_blocks * 16);
-    let mut d_buf = Vec::with_capacity(n_blocks * 2);
-    for i in 0..n_blocks {
-        let off = i * BLOCK_SIZE;
-        d_buf.extend_from_slice(&blocks[off..off + 2]);
-        q_buf.extend_from_slice(&blocks[off + 2..off + 18]);
-    }
-    (q_buf, d_buf)
-}
-
 /// Q4_0 AOS 바이트에 64B 또는 128B 패딩(align)을 추가하여 반환한다.
 ///
 /// CPU AOS: 64B align, CUDA AOS: 128B align.
@@ -816,17 +799,12 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
 /// 한 tensor의 source-dtype-원본 정보 + dtype별 candidate bytes.
 ///
 /// `shape_logical`은 outermost-first (논리적 순서).
-/// `source_dtype`은 GGUF에서 추출한 raw bytes의 dtype (Q/K permute 후에도 동일).
 /// `dtype_bytes`는 candidate dtype별 변환된 bytes (Sprint C-A 파이프라인).
 ///   v0.1.x single-dtype 모드에서는 1개. v0.2 multi-dtype 모드에서는 ≥1개.
 #[derive(Debug, Clone)]
 struct WeightBlob {
     name: String,
     shape_logical: Vec<u64>,
-    /// GGUF source bytes의 dtype. 디버깅 / 로깅용으로만 사용 (실제 변환은 dtype_bytes 등록 시
-    /// build_dtype_candidates 안에서 처리).
-    #[allow(dead_code)]
-    source_dtype: TensorDType,
     /// candidate dtype과 그 bytes — TensorIndex entry 정렬과 무관하게 stable order.
     dtype_bytes: Vec<(TensorDType, Vec<u8>)>,
 }
@@ -842,7 +820,6 @@ impl WeightBlob {
         WeightBlob {
             name,
             shape_logical,
-            source_dtype,
             dtype_bytes: vec![(source_dtype, bytes)],
         }
     }
@@ -946,7 +923,6 @@ fn extract_weight_blobs(
             blobs.push(WeightBlob {
                 name: name.to_owned(),
                 shape_logical,
-                source_dtype: src_dtype,
                 dtype_bytes,
             });
         }
@@ -1055,7 +1031,6 @@ fn extract_weight_blobs(
                 blobs.push(WeightBlob {
                     name: LM_HEAD_SEPARATE_NAME.to_owned(),
                     shape_logical,
-                    source_dtype: src_dtype,
                     dtype_bytes,
                 });
                 lm_head_q4_0_present = true;
@@ -1101,7 +1076,6 @@ fn extract_weight_blobs(
                 blobs.push(WeightBlob {
                     name: LM_HEAD_SEPARATE_NAME.to_owned(),
                     shape_logical,
-                    source_dtype: src_dtype,
                     dtype_bytes,
                 });
                 lm_head_q4_0_present = true;
@@ -1181,7 +1155,6 @@ fn extract_weight_blobs(
                 blobs.push(WeightBlob {
                     name,
                     shape_logical,
-                    source_dtype: src_dtype,
                     dtype_bytes,
                 });
             } else if !quiet && kind.ends_with(".weight") && !kind.contains("norm") {
@@ -2311,33 +2284,6 @@ mod tests {
     fn normalize_tag_pass_through() {
         assert_eq!(normalize_tag("META"), "META");
         assert_eq!(normalize_tag("TOKENIZER"), "TOKENIZER");
-    }
-
-    #[test]
-    fn q4_0_aos_to_soa_basic() {
-        // 1 block: 2B scale + 16B nibbles
-        let mut block = vec![0u8; 18];
-        block[0] = 0xAB;
-        block[1] = 0xCD; // scale f16
-        for (i, item) in block[2..18].iter_mut().enumerate() {
-            *item = (i + 2) as u8; // nibbles
-        }
-        let (q_buf, d_buf) = q4_0_aos_to_soa(&block);
-        assert_eq!(q_buf.len(), 16);
-        assert_eq!(d_buf.len(), 2);
-        assert_eq!(d_buf[0], 0xAB);
-        assert_eq!(d_buf[1], 0xCD);
-        assert_eq!(q_buf[0], 2);
-        assert_eq!(q_buf[15], 17);
-    }
-
-    #[test]
-    fn q4_0_aos_to_soa_multi_block() {
-        let n = 4;
-        let block = vec![0xFFu8; 18 * n]; // n blocks
-        let (q_buf, d_buf) = q4_0_aos_to_soa(&block);
-        assert_eq!(q_buf.len(), 16 * n);
-        assert_eq!(d_buf.len(), 2 * n);
     }
 
     #[test]

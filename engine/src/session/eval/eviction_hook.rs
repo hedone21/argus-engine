@@ -64,9 +64,6 @@ pub struct KVCacheSnapshot {
     backend: std::sync::Arc<dyn crate::backend::Backend>,
     /// Per-layer `current_pos` values.
     positions: Vec<usize>,
-    /// Per-layer capacity at snapshot time.
-    #[allow(dead_code)]
-    capacities: Vec<usize>,
 }
 
 impl CacheSnapshot<KVCache> for KVCacheSnapshot {
@@ -551,7 +548,6 @@ impl StepHook<KVCache> for EvictionHook {
         let mut data = Vec::with_capacity(caches.len());
         let mut k_sizes = Vec::with_capacity(caches.len());
         let mut positions = Vec::with_capacity(caches.len());
-        let mut capacities = Vec::with_capacity(caches.len());
         for cache in caches {
             let k_size = cache.k_buffer.buffer().size();
             let v_size = cache.v_buffer.buffer().size();
@@ -579,13 +575,11 @@ impl StepHook<KVCache> for EvictionHook {
             data.push(buf);
             k_sizes.push(k_size);
             positions.push(cache.current_pos);
-            capacities.push(cache.capacity());
         }
         Box::new(KVCacheSnapshot {
             data,
             k_sizes,
             positions,
-            capacities,
             backend: self.backend.clone(),
         })
     }

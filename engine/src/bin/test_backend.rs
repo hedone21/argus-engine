@@ -28,8 +28,6 @@ struct Args {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum OpType {
-    #[allow(dead_code)]
-    MatMul,
     MatMulTransposed,
     MatMulSlice,
     Softmax,
@@ -53,8 +51,6 @@ struct TestResult {
     backend: String,
     duration: Duration,
     error: f32,
-    #[allow(dead_code)]
-    msg: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -358,7 +354,6 @@ fn run_matmul_test(
                 backend: backend.name().to_string(),
                 duration: dur,
                 error: diff,
-                msg: "".to_string(),
             });
         }
         Err(e) => {
@@ -371,7 +366,6 @@ fn run_matmul_test(
                 backend: backend.name().to_string(),
                 duration: Duration::from_secs(0),
                 error: -1.0,
-                msg: e.to_string(),
             });
         }
     }
@@ -409,17 +403,6 @@ fn perform_matmul_test(
 
     // Prepare B Tensor
     let b = match (op, dtype) {
-        (OpType::MatMul, DType::F32) => {
-            let buf_b = memory.alloc(k * n * 4, DType::F32)?;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    b_vec_f32.as_ptr(),
-                    buf_b.as_mut_ptr() as *mut f32,
-                    k * n,
-                );
-            }
-            Tensor::new(Shape::new(vec![k, n]), buf_b, backend.clone())
-        }
         (OpType::MatMulTransposed, DType::F32) => {
             let buf_b = memory.alloc(n * k * 4, DType::F32)?;
             unsafe {
@@ -524,7 +507,6 @@ fn perform_matmul_test(
     let iterations = 10; // Reduced from 50 to prevent OOM on large tensors
     for _ in 0..iterations {
         match op {
-            OpType::MatMul => backend.matmul(&a_gpu, &b_gpu, &mut c_gpu)?,
             OpType::MatMulTransposed => backend.matmul_transposed(&a_gpu, &b_gpu, &mut c_gpu)?,
             OpType::MatMulSlice => backend.matmul_slice(&a_gpu, &b_gpu, m, n, &mut c_gpu)?,
             OpType::RMSNorm => backend.rms_norm(&mut c_gpu, &b_gpu, 1e-5, false)?,
@@ -640,11 +622,6 @@ fn perform_matmul_test(
     let mut ref_sum = 0.0;
 
     match (op, dtype) {
-        (OpType::MatMul, DType::F32) => {
-            for idx_k in 0..k {
-                ref_sum += a_vec[r_m * k + idx_k] * b_vec_f32[idx_k * n + r_n];
-            }
-        }
         (OpType::MatMulTransposed, DType::F32) => {
             for idx_k in 0..k {
                 ref_sum += a_vec[r_m * k + idx_k] * b_vec_f32[r_n * k + idx_k];
@@ -828,7 +805,6 @@ fn run_kivi_attention_test(
                 backend: backend.name().to_string(),
                 duration: dur,
                 error,
-                msg: "".to_string(),
             });
         }
         Err(e) => {
@@ -841,7 +817,6 @@ fn run_kivi_attention_test(
                 backend: backend.name().to_string(),
                 duration: Duration::from_secs(0),
                 error: -1.0,
-                msg: e.to_string(),
             });
         }
     }

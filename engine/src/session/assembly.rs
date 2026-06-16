@@ -9,7 +9,7 @@
 //! Phase 4-3 [`crate::session::forward::ModelForward`]는 다음을 미지원하므로
 //! 표준 path 안의 모든 케이스를 흡수하지 못한다 (Phase 4-4.5 별도 sprint):
 //! - chunked prefill (긴 prompt 메모리 spike 회피)
-//! - score_accumulator / skip_config / importance_collector / variance_collector / profiler
+//! - score_accumulator / skip_config / importance_collector / profiler
 //!
 //! 따라서 [`is_standard_happy_path`] 가드를 통과한 args만 `build_standard_loop`로
 //! 위임 가능하며, 미통과 args는 generate.rs의 기존 prefill+decode path를

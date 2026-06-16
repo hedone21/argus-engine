@@ -212,7 +212,6 @@ fn test_eng_alg_091_pipeline_executes_matching_stages() {
         mem_available: 0,
         target_ratio: None,
         qcf_sink: None,
-        layer_ratios: None,
     };
 
     let results = pipeline.execute(&mut ctx).unwrap();
@@ -281,7 +280,6 @@ fn test_eng_alg_091_pipeline_skips_all_at_normal() {
         mem_available: 1024 * 1024 * 1024,
         target_ratio: None,
         qcf_sink: None,
-        layer_ratios: None,
     };
 
     let results = pipeline.execute(&mut ctx).unwrap();
@@ -390,7 +388,6 @@ fn test_eng_alg_092_swap_warning_offloads() {
         mem_available: 0,
         target_ratio: None,
         qcf_sink: None,
-        layer_ratios: None,
     };
 
     let result = handler.handle(&mut ctx).unwrap();
@@ -435,7 +432,6 @@ fn test_eng_alg_092_swap_emergency_offloads() {
         mem_available: 0,
         target_ratio: None,
         qcf_sink: None,
-        layer_ratios: None,
     };
 
     let result = handler.handle(&mut ctx).unwrap();
@@ -491,7 +487,6 @@ fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
         mem_available: 0,
         target_ratio: None,
         qcf_sink: None,
-        layer_ratios: None,
     };
 
     let result = handler.handle(&mut ctx).unwrap();
@@ -569,7 +564,6 @@ fn test_eng_alg_092_eviction_handler_wraps_h2o() {
         mem_available: 0,
         target_ratio: None,
         qcf_sink: None,
-        layer_ratios: None,
     };
 
     let result = handler.handle(&mut ctx).unwrap();
@@ -665,7 +659,6 @@ fn test_eng_alg_091_c08_context_updated_after_eviction() {
         mem_available: 0,
         target_ratio: None,
         qcf_sink: None,
-        layer_ratios: None,
     };
 
     let results = pipeline.execute(&mut ctx).unwrap();

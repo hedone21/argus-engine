@@ -222,7 +222,6 @@ fn test_swap_then_continue() {
         mem_available: 0,
         target_ratio: None,
         qcf_sink: None,
-        layer_ratios: None,
     };
     let result = handler.handle(&mut ctx).unwrap();
     assert!(result.is_action());

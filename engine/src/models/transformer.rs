@@ -274,9 +274,6 @@ pub struct OffloadForwardArgs<'a, C> {
     /// Saves ~3GB GPU memory for long-context prefill (e.g., eval-ll with 5K+ tokens).
     /// logits_out shape should be [1, 1, vocab_size] instead of [1, seq_len, vocab_size].
     pub logits_last_only: bool,
-    /// Optional D2O variance collector for layer-level allocation.
-    /// When provided during prefill, captures per-layer attention column-sums.
-    pub variance_collector: Option<&'a mut dyn crate::qcf_collector::VarianceObserver>,
     /// Optional layer boundary hook (LISWAP-4 / ENG-ALG-235).
     ///
     /// When `Some`, `forward_into` calls `hook.on_layer_boundary(idx, seq_len)`
@@ -3600,7 +3597,6 @@ mod tests {
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
-            variance_collector: None,
             layer_boundary_hook: None,
             read_stage: None, // S6: 이 필드가 컴파일 통과 = 배선 연결 확인
         };

@@ -25,7 +25,6 @@ pub mod standard_format;
 // the out-of-tree `d2o` plugin crate). Consumed by the StageCtx Key/Value handles + R-KV stage.
 pub(crate) mod dequant;
 // Pressure pipeline handlers (구 core/pressure/ 내용 flat 병합)
-pub mod d2o_layer_alloc;
 pub mod eviction_handler;
 pub mod quantize_handler;
 // R-KV 측정 프로토타입(KV roadmap 항목 0, P2a). feature `rkv` OFF = 미컴파일(production 표면 불변).
@@ -69,12 +68,6 @@ pub struct HandlerContext<'a> {
     /// Optional sink for proxy metrics collected during handler execution.
     /// When `Some`, handlers push `QcfMetric` values for degradation estimation.
     pub qcf_sink: Option<&'a mut Vec<crate::qcf_types::QcfMetric>>,
-    /// Optional per-layer budget ratios for D2O layer-level allocation. A layer-aware handler would
-    /// use per-layer target_len instead of uniform. NOTE: currently unwired at runtime — the
-    /// variance collector that would populate this is never mounted, and only the test-only
-    /// `force_evict_with_scores_and_budgets` passes `Some`. Length must equal caches.len().
-    /// Each element: (hh_ratio, recent_ratio) for that layer.
-    pub layer_ratios: Option<&'a [(f32, f32)]>,
 }
 
 // ── Action result ──────────────────────────────────────────────────
@@ -313,7 +306,6 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
-            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -351,7 +343,6 @@ mod tests {
             mem_available: 1024 * 1024 * 1024,
             target_ratio: None,
             qcf_sink: None,
-            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -390,7 +381,6 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
-            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -413,7 +403,6 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
-            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -446,7 +435,6 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
-            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -536,7 +524,6 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
-            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();

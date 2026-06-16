@@ -54,28 +54,3 @@ pub trait ImportanceLookup: Send + Sync {
     /// decider 등이 layer/sublayer 기준으로 filter/sort 한다.
     fn entries(&self) -> &[ImportanceEntry];
 }
-
-/// D2O layer-level variance 수집 trait (S-C3).
-///
-/// L3-inference (transformer forward) 가 매 layer attention 종료 시점에
-/// per-token attention column-sums 를 수집하여 layer-level keep ratio 할당
-/// (compute_budgets) 에 사용한다. caller(transformer/forward)는
-/// `Option<&mut dyn VarianceObserver>` 로 trait dispatch.
-///
-/// 구현체는 `engine/src/pressure/d2o_layer_alloc.rs::D2OVarianceCollector`.
-pub trait VarianceObserver: Send {
-    /// Per-layer attention column-sums 수집. hot path 호출 (per-layer).
-    #[allow(clippy::too_many_arguments)]
-    fn collect_layer(
-        &mut self,
-        layer_idx: usize,
-        q: &[f32],
-        k: &[f32],
-        seq_len: usize,
-        cache_seq_len: usize,
-        q_stride: usize,
-        k_stride: usize,
-        kv_head_stride: usize,
-        start_pos: usize,
-    );
-}

@@ -13,8 +13,9 @@
 //! **guard rail: impl 은 여기 금지** (§2.1) — `StandardFormat`/`KIVIFormat` impl 은 `pressure/`
 //! (그들이 감싸는 `KVCache`/`KiviCache` 옆)에 둔다.
 //!
-//! **Phase α-K substep (1)** 신설 — purely additive, host-only, unwired. 기존 `KVCacheOps`
-//! 경로(`kv_cache_ops.rs`)와 공존하며, production 에서 이 trait 을 생성·호출하는 코드는 0.
+//! **Phase α-K substep (1)** 신설 — purely additive, host-only. 기존 `KVCacheOps`
+//! 경로(`kv_cache_ops.rs`)와 공존하며, 이제 표준/KIVI/offload forward 가 이 trait 을
+//! trait-object(`Arc<dyn KVCacheFormat>`)로 live 사용한다.
 
 use anyhow::Result;
 
