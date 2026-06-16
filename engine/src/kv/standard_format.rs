@@ -434,7 +434,7 @@ impl KVCacheFormat for StandardFormat {
         // causal-mask 부재라 재사용 불가 → forward_prefill(forward.rs:259-585) attention 블록을
         // `prefill_attention` 으로 미러. effective_cache_len clamp 를 **우회**하고(전체 cache_seq_len
         // K + window 를 flash 내부 마스킹에 위임) q_start_pos = cache_seq_len - seq_len. prefill 은
-        // score 누적 안 함(scores 무시 — forward_prefill 의 `_need_scores`/variance_collector 와 동일).
+        // score 누적 안 함(scores 무시 — forward_prefill 의 `_need_scores` 와 동일).
         if seq_len > 1 {
             let kv_capacity = cache.capacity();
             let kv_layout = cache.layout();
@@ -809,7 +809,7 @@ fn merge_row_weighted_opaque(
 /// `flash_attention_prefill` 시도 → 미dispatch(Q4_0 / head_dim 미지원 / CPU)면 dtype별 dequant +
 /// `flash_attention_forward_strided`(causal mask 는 `q_start_pos`). prefill 은 score 누적 안 함
 /// (forward_prefill 의 `_need_scores` 동일) → scores 인자 없음. `window` 는 flash 내부 마스킹에
-/// 위임(decode 진입부의 `effective_cache_len` clamp **우회** — 정정 C). variance_collector/profiler/
+/// 위임(decode 진입부의 `effective_cache_len` clamp **우회** — 정정 C). profiler/
 /// fallback warn 은 happy-path 미진입·수치-무관이라 생략. forward_prefill 무수정(additive fork) —
 /// 중복은 host parity test 로 bit-identical 증명, Step 5(forward_prefill<C> 삭제)에서 자연 해소.
 ///

@@ -4,8 +4,8 @@
 //!
 //! **branch-by-abstraction, additive**: 기존 `forward_prefill<C: KVCacheOps>`(forward.rs:41)를 1바이트도
 //! 안 건드린다. 본 fork 는 **prefill PrefillWorkspace 라이브 경로**(forward.rs:114-787 의 happy-path:
-//! partition off / variance_collector off / profile off)만 재현하고, dead/optional 블록(partition_ctx
-//! 626-740 / variance_collector 499-513 / profiler / fallback-path 789-1271)은 전부 생략한다. 두 지점만
+//! partition off / profile off)만 재현하고, dead/optional 블록(partition_ctx
+//! 626-740 / profiler / fallback-path 789-1271)은 전부 생략한다. 두 지점만
 //! 위임:
 //!   - KV update 블록(forward.rs:182-249)  → `fmt.write_kv_batch(&k_rope, &ws.v, backend)` (C3 흡수)
 //!   - attention dispatch(forward.rs:251-585) → `fmt.attention_into(...)` (multi-token prefill arm = C-1)
