@@ -134,21 +134,6 @@ impl QuantizedBlocks {
     }
 }
 
-/// All GPU buffer references needed for KIVI Plan building.
-///
-/// Unlike `KiviRawBuffers`, this includes the F32 attention buffers (attn_k/attn_v)
-/// used by the assembled attention path.
-pub struct KiviPlanBuffers<'a> {
-    pub res_k: &'a Tensor,
-    pub res_v: &'a Tensor,
-    pub q2k: &'a Tensor,
-    pub q2v: &'a Tensor,
-    pub attn_k: &'a Tensor,
-    pub attn_v: &'a Tensor,
-    pub res_cap: usize,
-    pub bits: u8,
-}
-
 /// KIVI KV cache: quantized compressed storage + FP32 residual buffer.
 ///
 /// SeqMajor layout only (Phase 1). Data layout for residual:
@@ -764,26 +749,6 @@ impl KiviCache {
             return None;
         }
         Some((self.gpu_attn_k.as_ref()?, self.gpu_attn_v.as_ref()?))
-    }
-
-    /// Get all GPU buffer references needed for KIVI Plan building.
-    ///
-    /// Unlike `get_raw_gpu_buffers()`, this always returns buffers if GPU mode is active
-    /// (even before first flush, when q2_tokens == 0). Returns None only in CPU mode.
-    pub fn get_plan_gpu_buffers(&self) -> Option<KiviPlanBuffers<'_>> {
-        if !self.is_gpu() || self.bits == 16 {
-            return None;
-        }
-        Some(KiviPlanBuffers {
-            res_k: self.gpu_res_k.as_ref()?,
-            res_v: self.gpu_res_v.as_ref()?,
-            q2k: self.gpu_q2k.as_ref()?,
-            q2v: self.gpu_q2v.as_ref()?,
-            attn_k: self.gpu_attn_k.as_ref()?,
-            attn_v: self.gpu_attn_v.as_ref()?,
-            res_cap: self.res_cap,
-            bits: self.bits,
-        })
     }
 
     /// Dry-run QCF estimate for KIVI quantization (read-only, no state mutation).
