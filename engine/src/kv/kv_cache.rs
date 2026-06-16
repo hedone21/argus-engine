@@ -1884,12 +1884,6 @@ mod tests {
         cache.k_buffer.as_slice::<f32>()[off]
     }
 
-    #[allow(dead_code)]
-    fn hm_read_v(cache: &KVCache, pos: usize, head: usize) -> f32 {
-        let off = cache.offset(pos, head);
-        cache.v_buffer.as_slice::<f32>()[off]
-    }
-
     #[test]
     fn test_hm_update_single_token() {
         let heads = 2;
