@@ -103,6 +103,8 @@ impl KVCacheStage for Caote {
 static CAOTE: KVCacheStageReg = KVCacheStageReg {
     name: "caote",
     make: |_params: StageParams| Box::new(Caote),
+    // caote takes no technique-private args — drop the blob.
+    make_with_args: |_params: StageParams, _args| Box::new(Caote),
 };
 
 #[cfg(test)]

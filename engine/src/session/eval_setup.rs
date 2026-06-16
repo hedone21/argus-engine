@@ -181,31 +181,7 @@ fn build_eval_cache_manager(
     };
     let threshold_bytes = args.memory_threshold_mb() * 1024 * 1024;
 
-    let mut cache_manager = if args.eviction_policy() == "d2o" {
-        // D2O extracted to the out-of-tree `d2o` plugin. Build `D2OStage` with the full CLI config
-        // and wrap it as an EvictionPolicy (StageBackedPolicy → execute_kv_plan applies its Eq.11
-        // WeightedMerges). Constructed directly (not via make_stage) because StageParams carries
-        // only keep_ratio/protected_prefix — the d2o-specific params go straight into D2OConfig.
-        let stage = d2o::D2OStage::new(d2o::D2OConfig {
-            keep_ratio: args.d2o_keep_ratio(),
-            protected_prefix: actual_protected_prefix,
-            target_ratio: args.eviction_target_ratio(),
-            ema_beta: args.d2o_ema_beta(),
-            merge_e: args.d2o_merge_e(),
-            use_layer_allocation: args.d2o_layer_alloc(),
-            protected_layers: args.d2o_protected_layers().unwrap_or_default(),
-            merge_axis: args.d2o_merge_axis(),
-        });
-        let policy: Box<dyn EvictionPolicy> = Box::new(
-            crate::kv::eviction::stage_registry::StageBackedPolicy::new(Box::new(stage)),
-        );
-        CacheManager::new(
-            policy,
-            monitor,
-            threshold_bytes,
-            args.eviction_target_ratio(),
-        )
-    } else if cfg!(feature = "rkv") && args.eviction_policy() == "rkv" {
+    let mut cache_manager = if cfg!(feature = "rkv") && args.eviction_policy() == "rkv" {
         // R-KV(KV roadmap 항목 0 측정, P2a): RkvStage(KVCacheStage)를 StageBackedPolicy 로
         // 감싸 EvictionPolicy 표면으로 노출 → CacheManager::new 등록(d2o if-branch 동형).
         // λ 는 CLI(--lambda)에서, α/τ 는 측정 상수. importance 는 score accumulator 가
@@ -254,20 +230,39 @@ fn build_eval_cache_manager(
                 } else {
                     args.eviction_window()
                 };
+                // d2o reads its own keep-ratio flag; other stages use the h2o keep-ratio slot.
+                let keep_ratio = if name == "d2o" {
+                    args.d2o_keep_ratio()
+                } else {
+                    args.h2o_keep_ratio()
+                };
                 let params = argus_extension_api::StageParams {
                     eviction_window: args.eviction_window(),
                     protected_prefix: actual_protected_prefix,
-                    keep_ratio: args.h2o_keep_ratio(),
+                    keep_ratio,
                     sink_size: args.sink_size(),
                     streaming_window,
                 };
-                let stage = crate::kv::eviction::stage_registry::make_stage(name, &params)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "argus-eval: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o (or --load-plugin <.so>).",
-                            name
-                        )
-                    })?;
+                // d2o-private knobs ride the opaque StageArgs blob (parsed by d2o::from_args);
+                // other policies get an empty blob. The engine never constructs D2OConfig.
+                let extra_owned = if name == "d2o" {
+                    args.d2o_stage_args()
+                } else {
+                    Vec::new()
+                };
+                let extra: Vec<argus_extension_api::PluginArg> = extra_owned
+                    .iter()
+                    .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
+                    .collect();
+                let stage = crate::kv::eviction::stage_registry::make_stage_with_args(
+                    name, &params, &extra,
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "argus-eval: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o (or --load-plugin <.so>).",
+                        name
+                    )
+                })?;
                 Box::new(crate::kv::eviction::stage_registry::StageBackedPolicy::new(
                     stage,
                 ))

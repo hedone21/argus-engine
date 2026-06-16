@@ -47,8 +47,8 @@ use ::h2o as _;
 
 // D2O production force-link. Extracted from the engine core into the `d2o` technique crate
 // (registers "d2o", a WeightedMerge-producing stage); makes `find_stage("d2o")` visible. Production
-// constructs `d2o::D2OStage` directly with the full CLI config (eval_setup/build_bench_loop/chat),
-// but the registration must survive fat-LTO for `make_stage("d2o")` + the registry self-test.
+// resolves it via `make_stage_with_args("d2o", &params, &blob)` (eval_setup/build_bench_loop/chat),
+// with the d2o-private knobs in the StageArgs blob; the registration must survive fat-LTO.
 use d2o as _;
 
 /// 기존 [`EvictionPolicy`](in-place `evict*` + `plan_keep`)를 plan-returning [`KVCacheStage`] 로 노출.
@@ -470,6 +470,12 @@ static SLIDING_STAGE: KVCacheStageReg = KVCacheStageReg {
             SlidingWindowPolicy::new(p.eviction_window, p.protected_prefix),
         )))
     },
+    // sliding takes no technique-private args — drop the blob, build from StageParams.
+    make_with_args: |p: StageParams, _args| {
+        Box::new(EvictionPolicyAsStage::new(Box::new(
+            SlidingWindowPolicy::new(p.eviction_window, p.protected_prefix),
+        )))
+    },
 };
 
 // `streaming` is registered by the out-of-tree `streaming-llm` technique crate (force-linked
@@ -480,8 +486,9 @@ static SLIDING_STAGE: KVCacheStageReg = KVCacheStageReg {
 
 // `d2o` is registered by the out-of-tree `d2o` technique crate (force-linked above via
 // `use d2o as _;`), not here — extracted from the engine core. It emits WeightedMerge (Eq.11);
-// the engine executor `apply_weighted_merges` applies them. Production builds `d2o::D2OStage`
-// directly with the full CLI config (StageParams carries only protected_prefix/keep_ratio).
+// the engine executor `apply_weighted_merges` applies them. Production resolves it via
+// `make_stage_with_args("d2o", &params, &blob)`: StageParams carries keep_ratio/protected_prefix,
+// and the d2o-private knobs ride the StageArgs blob (parsed by `d2o::D2OConfig::from_args`).
 
 /// R-KV(KV roadmap 항목 0 측정, P2a) — `RkvStage`(cosine redundancy + importance joint eviction).
 /// `StageParams` 에 R-KV 전용 필드(λ)가 없어 기본 `RkvConfig`(λ=0.1, α=8, τ=0.5)로 등록한다 — CLI
@@ -492,6 +499,10 @@ static SLIDING_STAGE: KVCacheStageReg = KVCacheStageReg {
 static RKV_STAGE: KVCacheStageReg = KVCacheStageReg {
     name: "rkv",
     make: |_p: StageParams| Box::new(crate::kv::rkv_stage::RkvStage::new(Default::default())),
+    // rkv's λ override rides the eval stage-direct path, not StageParams — no private blob here.
+    make_with_args: |_p: StageParams, _args| {
+        Box::new(crate::kv::rkv_stage::RkvStage::new(Default::default()))
+    },
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -643,13 +654,22 @@ pub fn dynamic_registered_stage_names() -> Vec<String> {
 }
 
 /// 이름으로 stage 인스턴스를 만든다 — **정적 우선 → 동적 fallback**(D3). 호출부는 source 를 모른다.
-/// 정적/동적 모두 miss 면 `None`(graceful unknown).
-pub fn make_stage(name: &str, params: &StageParams) -> Option<Box<dyn KVCacheStage>> {
-    // 1) 정적(linkme) 우선.
+/// technique-private 인자(d2o 의 ema_beta/merge_axis 등)는 `args` blob([`StageArgs`])으로 전달되고
+/// plugin 이 직접 파싱한다(`make_with_args`) — 엔진은 plugin 의 private 파라미터를 모른다. built-in/
+/// args-무시 기법은 빈 blob 으로 동작한다. 정적/동적 모두 miss 면 `None`(graceful unknown).
+///
+/// **동적(dlopen) plugin 은 현재 private 인자를 받지 않는다**(소비자 0 — d2o 는 force-link 정적 등록;
+/// vtable C-ABI(`PluginVTableAbi.make`)는 `StageParams` 만 운반). 필요해지면 그때 `.so` ABI 를 확장한다.
+pub fn make_stage_with_args(
+    name: &str,
+    params: &StageParams,
+    args: argus_extension_api::StageArgs<'_>,
+) -> Option<Box<dyn KVCacheStage>> {
+    // 1) 정적(linkme) 우선 — make_with_args 로 technique-private blob 전달.
     if let Some(reg) = argus_extension_api::find_stage(name) {
-        return Some((reg.make)(*params));
+        return Some((reg.make_with_args)(*params, args));
     }
-    // 2) 동적(dlopen) fallback.
+    // 2) 동적(dlopen) fallback — vtable.make 는 StageParams 만 받으므로 blob 은 무시(소비자 0).
     let registry = DYN_REGISTRY.get()?;
     let (vtable, lib) = {
         let guard = registry.read().expect("DYN_REGISTRY RwLock poisoned");
@@ -667,6 +687,11 @@ pub fn make_stage(name: &str, params: &StageParams) -> Option<Box<dyn KVCacheSta
         vtable,
         _lib: lib,
     }))
+}
+
+/// [`make_stage_with_args`] 의 빈-blob shim — technique-private 인자 없이 stage 를 만든다.
+pub fn make_stage(name: &str, params: &StageParams) -> Option<Box<dyn KVCacheStage>> {
+    make_stage_with_args(name, params, &[])
 }
 
 /// 동적 plugin stage 의 host 측 어댑터 — vtable 마샬링으로 [`KVCacheStage`] 를 구현(D2).

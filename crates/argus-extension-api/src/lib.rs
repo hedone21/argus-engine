@@ -278,12 +278,11 @@ pub trait KVCacheStage: Send + Sync {
 /// The common parameters needed to create a technique instance. The engine maps CLI args into this struct and passes it along
 /// (carrying only flat values so argus-extension-api does not depend on the engine's args type).
 ///
-/// NOTE: d2o-specific parameters (ema_beta/merge_e/use_layer_allocation, etc.) are deliberately
-/// **not carried here** — rather than bloat this shared struct, the engine constructs `d2o::D2OStage`
-/// directly with its full `D2OConfig` (see the eval/bench/chat wiring) and wraps it in
-/// `StageBackedPolicy`; the `make_stage("d2o")` registry path maps only `keep_ratio`/`protected_prefix`
-/// (defaults for the rest). The current built-ins (sliding/streaming/h2o/no_eviction) are well served
-/// by the 5 fields below.
+/// NOTE: technique-private parameters (e.g. d2o's `ema_beta`/`merge_e`/`merge_axis`/`protected_layers`)
+/// are deliberately **not carried here** — rather than bloat this shared struct, they ride the opaque
+/// [`StageArgs`] blob into [`KVCacheStageReg::make_with_args`], where the plugin parses its own params
+/// (see `d2o::D2OConfig::from_args`). This keeps the engine from knowing any plugin's private knobs.
+/// The 5 fields below are the common params shared by the built-ins (sliding/streaming/h2o/no_eviction).
 #[repr(C)] // GATE-C: the `.so` C-ABI passes it by value as a POD (the make-thunk argument).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StageParams {
@@ -299,13 +298,35 @@ pub struct StageParams {
     pub streaming_window: usize,
 }
 
+/// One engine-supplied plugin argument: a `key=value` pair carrying a technique-private parameter
+/// that does not fit the shared [`StageParams`] POD (e.g. d2o's `ema_beta`, `merge_axis`,
+/// `protected_layers`). The plugin owns parsing, range-checks, and defaults for every key it
+/// recognizes, and ignores keys it does not. This inverts the old coupling — the engine routes an
+/// opaque blob, the plugin declares/receives its own params. `key`/`val` borrow from the caller for
+/// the duration of the `make_with_args` call.
+pub struct PluginArg<'a> {
+    /// The parameter name (e.g. `"ema_beta"`).
+    pub key: &'a str,
+    /// The unparsed parameter value (e.g. `"0.7"`, `"value_only"`, `"0,1,27"`).
+    pub val: &'a str,
+}
+
+/// The technique-private argument blob passed to [`KVCacheStageReg::make_with_args`]. Empty (`&[]`)
+/// for built-ins served entirely by [`StageParams`].
+pub type StageArgs<'a> = &'a [PluginArg<'a>];
+
 /// The registration entry for one stage technique. A technique crate submits it via
 /// `#[distributed_slice(KV_CACHE_STAGES)] static FOO: KVCacheStageReg = ...`.
 pub struct KVCacheStageReg {
     /// The CLI selector name (`eviction plugin --name <name>`, or a built-in `eviction <policy>`). Must be unique within the slice.
     pub name: &'static str,
-    /// The factory that builds a technique instance from the parameters.
+    /// The factory that builds a technique instance from the common parameters (no private args).
     pub make: fn(StageParams) -> Box<dyn KVCacheStage>,
+    /// Like [`KVCacheStageReg::make`] but also receives the technique-private [`StageArgs`] blob —
+    /// CLI knobs that do not fit [`StageParams`]. Techniques that take no private args set this to a
+    /// shim that drops the blob and delegates to `make` (`register_kv_stage!` wires that shim
+    /// automatically). The engine calls this via `make_stage_with_args`; `make_stage` passes `&[]`.
+    pub make_with_args: fn(StageParams, StageArgs<'_>) -> Box<dyn KVCacheStage>,
 }
 
 /// The global registration slice — the registrations of all linked technique crates are gathered at **link time**.
@@ -720,6 +741,20 @@ macro_rules! register_kv_stage {
             static __REG: $crate::KVCacheStageReg = $crate::KVCacheStageReg {
                 name: $name,
                 make: $make,
+                // args-ignoring shim: macro-registered stages take no technique-private args, so
+                // make_with_args drops the blob and delegates to `make` (keeps the macro surface unchanged).
+                make_with_args: {
+                    fn __mwa(
+                        p: $crate::StageParams,
+                        _args: $crate::StageArgs<'_>,
+                    ) -> ::std::boxed::Box<dyn $crate::KVCacheStage> {
+                        let f: fn(
+                            $crate::StageParams,
+                        ) -> ::std::boxed::Box<dyn $crate::KVCacheStage> = $make;
+                        f(p)
+                    }
+                    __mwa
+                },
             };
         };
 
@@ -1713,6 +1748,7 @@ mod tests {
     static DUMMY_REG: KVCacheStageReg = KVCacheStageReg {
         name: "dummy",
         make: |_params| Box::new(Dummy),
+        make_with_args: |_params, _args| Box::new(Dummy),
     };
 
     #[test]

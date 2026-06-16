@@ -27,6 +27,19 @@ project is pre-1.0; minor releases may include breaking changes.
 
 ### Changed
 
+- Added a plugin-declared argument channel to `argus-extension-api`. `KVCacheStageReg` gained
+  `make_with_args(StageParams, StageArgs)` alongside `make`, where `StageArgs = &[PluginArg]` is an
+  opaque `key=value` blob the engine routes **without knowing any technique's private params**. The
+  `d2o` plugin now parses its own knobs (`target_ratio`/`ema_beta`/`merge_e`/`layer_alloc`/
+  `protected_layers`/`merge_axis`) in `D2OConfig::from_args`, and `eval`/`bench`/`chat` resolve d2o
+  through the generic `make_stage_with_args("d2o", &params, &blob)` path instead of hard-constructing
+  `D2OConfig` — the engine no longer references d2o's config type (the inversion is gone). This fixes
+  two divergences: the chat path now forwards `--merge-axis` (previously dropped) and `argus-bench`
+  now honors explicit `eviction d2o` flags (previously hard-coded; default runs are unchanged).
+  `register_kv_stage!`-based plugins are unchanged (the macro auto-wires an args-ignoring shim), and
+  the dynamic `.so` stage C-ABI is unchanged — no out-of-tree stage plugin needs private args yet, so
+  that ABI extension is deferred until one does.
+
 - Renamed the extension-API crate `technique-api` → `argus-extension-api` (import
   `argus_extension_api`); the name now states what it is (the public plugin/extension surface).
 - Extracted the **StreamingLLM** and **H2O** KV-cache eviction policies out of the engine core

@@ -108,6 +108,8 @@ impl KVCacheStage for H2o {
 static H2O: KVCacheStageReg = KVCacheStageReg {
     name: "h2o",
     make: |p: StageParams| Box::new(H2o::new(p.keep_ratio, p.protected_prefix)),
+    // h2o takes no technique-private args — drop the blob, build from StageParams.
+    make_with_args: |p: StageParams, _args| Box::new(H2o::new(p.keep_ratio, p.protected_prefix)),
 };
 
 #[cfg(test)]
