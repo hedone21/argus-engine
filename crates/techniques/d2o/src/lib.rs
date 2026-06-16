@@ -27,7 +27,7 @@
 
 use argus_extension_api::{
     KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, MergeAxis, StageArgs,
-    StageCtx, StageParams, WeightedMerge,
+    StageCaps, StageCtx, StageParams, WeightedMerge,
 };
 use linkme::distributed_slice;
 use std::sync::Mutex;
@@ -489,6 +489,11 @@ static D2O: KVCacheStageReg = KVCacheStageReg {
     name: "d2o",
     make: |p: StageParams| Box::new(D2OStage::new(D2OConfig::from_args(p, &[]))),
     make_with_args: |p: StageParams, args| Box::new(D2OStage::new(D2OConfig::from_args(p, args))),
+    // D2O ranks tokens by accumulated importance (score-based); protect 4 attention sinks by default.
+    caps: StageCaps {
+        is_score_based: true,
+        default_protected_prefix: 4,
+    },
 };
 
 #[cfg(test)]

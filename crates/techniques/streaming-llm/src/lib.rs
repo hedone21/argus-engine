@@ -17,7 +17,8 @@
 //! (plan-returning, D1). It never references engine types (`KVCache`/`Backend`).
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCtx, StageParams,
+    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCaps, StageCtx,
+    StageParams,
 };
 use linkme::distributed_slice;
 
@@ -82,6 +83,9 @@ static STREAMING: KVCacheStageReg = KVCacheStageReg {
     make_with_args: |p: StageParams, _args| {
         Box::new(StreamingLlm::new(p.sink_size, p.streaming_window))
     },
+    // StreamingLLM is score-free (sink + recent window); the engine picks the protected-prefix
+    // fallback (it derives the sink itself), so declare no stage default.
+    caps: StageCaps::SCORE_FREE,
 };
 
 #[cfg(test)]

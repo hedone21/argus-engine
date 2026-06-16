@@ -15,8 +15,8 @@
 use anyhow::{Context, Result};
 use argus_extension_api::{
     KV_CACHE_STAGES, KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage,
-    KVCacheStageReg, KeepSpec, PlanAbi, PluginVTableAbi, StageCtx, StageCtxAbi, StageExportAbi,
-    StageParams, TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
+    KVCacheStageReg, KeepSpec, PlanAbi, PluginVTableAbi, StageCaps, StageCtx, StageCtxAbi,
+    StageExportAbi, StageParams, TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
 };
 use core::ffi::c_void;
 use linkme::distributed_slice;
@@ -451,11 +451,28 @@ pub(crate) fn h2o_backed_policy(
 /// CacheManager build 진입 시 1회 호출. fat-LTO `--gc-sections` 가 linkme 등록을 silent
 /// drop 하면 누락 기법에 대해 `Err` 로 fail-fast 한다(release 에서 정책 이름 미해석 → 조용한 폴백 방지).
 pub fn ensure_builtin_stages_registered() -> Result<()> {
-    for name in ["sliding", "streaming", "h2o", "d2o"] {
-        if argus_extension_api::find_stage(name).is_none() {
+    // (name, expected is_score_based). The caps assertion fail-fasts if a built-in/plugin author
+    // forgets to declare `is_score_based` (the registry path defaults a macro-registered stage to
+    // score-free) — otherwise that stage would silently lose the attention-score accumulator at
+    // runtime instead of failing at startup.
+    for (name, want_score_based) in [
+        ("sliding", false),
+        ("streaming", false),
+        ("h2o", true),
+        ("d2o", true),
+    ] {
+        let Some(caps) = argus_extension_api::stage_caps(name) else {
             anyhow::bail!(
                 "built-in KVCacheStage '{name}' not registered — suspect linkme fat-LTO --gc-sections silent drop\
                  stage_registry's #[distributed_slice] registration was not linked."
+            );
+        };
+        if caps.is_score_based != want_score_based {
+            anyhow::bail!(
+                "built-in KVCacheStage '{name}' declares is_score_based={} but the engine expects {} \
+                 — its StageCaps registration is wrong (would mis-route attention scores).",
+                caps.is_score_based,
+                want_score_based
             );
         }
     }
@@ -476,6 +493,9 @@ static SLIDING_STAGE: KVCacheStageReg = KVCacheStageReg {
             SlidingWindowPolicy::new(p.eviction_window, p.protected_prefix),
         )))
     },
+    // Sliding is score-free (recency only); the engine picks the protected-prefix fallback (the
+    // SlidingWindowPolicy itself clamps to a 4-sink minimum), so declare no stage default.
+    caps: StageCaps::SCORE_FREE,
 };
 
 // `streaming` is registered by the out-of-tree `streaming-llm` technique crate (force-linked
@@ -502,6 +522,12 @@ static RKV_STAGE: KVCacheStageReg = KVCacheStageReg {
     // rkv's λ override rides the eval stage-direct path, not StageParams — no private blob here.
     make_with_args: |_p: StageParams, _args| {
         Box::new(crate::kv::rkv_stage::RkvStage::new(Default::default()))
+    },
+    // R-KV's fusion Z = λ·I − (1−λ)·R includes the importance term, so it is score-based; protect 4
+    // attention sinks by default (same as the other score-based stages).
+    caps: StageCaps {
+        is_score_based: true,
+        default_protected_prefix: 4,
     },
 };
 

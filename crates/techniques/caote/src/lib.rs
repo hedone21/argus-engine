@@ -10,8 +10,8 @@
 //! per-head 는 단계 ⑤ executor 대기). feature `caote` 설치 시 `eviction caote` 서브커맨드로 선택.
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCtx, StageParams,
-    TensorKind,
+    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCaps, StageCtx,
+    StageParams, TensorKind,
 };
 use linkme::distributed_slice;
 
@@ -105,6 +105,12 @@ static CAOTE: KVCacheStageReg = KVCacheStageReg {
     make: |_params: StageParams| Box::new(Caote),
     // caote takes no technique-private args — drop the blob.
     make_with_args: |_params: StageParams, _args| Box::new(Caote),
+    // CAOTE weights its value-aware criticality by importance (a_i), so it is score-based; protect 4
+    // attention sinks by default.
+    caps: StageCaps {
+        is_score_based: true,
+        default_protected_prefix: 4,
+    },
 };
 
 #[cfg(test)]
