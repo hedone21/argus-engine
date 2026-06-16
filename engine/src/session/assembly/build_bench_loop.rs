@@ -17,9 +17,9 @@ use crate::backend::Backend;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::eviction::EvictionPolicy;
-use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
-use crate::kv::eviction::no_eviction::NoEvictionPolicy;
-use crate::kv::eviction::stage_registry::StageBackedPolicy;
+use crate::kv::eviction::stage_registry::{
+    StageBackedPolicy, make_stage_with_args, stage_default_protected_prefix,
+};
 use crate::kv::kv_cache::KVCache;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
@@ -68,10 +68,14 @@ pub fn build_resilience_cache_manager(
         return Ok(None);
     }
 
-    let actual_protected_prefix = args.protected_prefix().unwrap_or(match policy_name {
-        "h2o" | "h2o_plus" | "d2o" => 4,
-        "streaming" => args.sink_size(),
-        _ => 4,
+    // Score-based stages declare a protected-prefix (4 sinks); score-free ones declare 0 → bench
+    // protects 4 sinks by default (sliding clamps to ≥4 anyway; streaming derives its own sink and
+    // ignores the value). No per-name branch.
+    let actual_protected_prefix = args.protected_prefix().unwrap_or_else(|| {
+        match stage_default_protected_prefix(policy_name) {
+            0 => 4,
+            cap => cap,
+        }
     });
 
     let monitor: Box<dyn crate::resilience::sys_monitor::SystemMonitor> =
@@ -86,65 +90,46 @@ pub fn build_resilience_cache_manager(
     // linkme fat-LTO 생존 self-test: 빌트인 stage 미등록 시 fail-fast.
     crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
 
+    // Heavy-hitter keep-ratio = the active variant's own keep_ratio (h2o/h2o_plus → 0.5 default,
+    // d2o → 0.75 default), identical to the chat/eval path — no `name == "d2o"` test. (The prior
+    // bench code coupled d2o's keep-ratio to --eviction-target-ratio; that only matched for default
+    // ratios and silently changed h2o/h2o_plus, so the generic accessor is used instead. The overall
+    // d2o budget is still driven by --eviction-target-ratio via the engine-resolved target_len.)
+    let keep_ratio = args.keep_ratio();
     let mut cm = {
-        let policy: Box<dyn EvictionPolicy> = match policy_name {
-            // eviction=none + swap-dir 전용(AB-3): eviction 은 안 하고 offload 만.
-            "none" => Box::new(NoEvictionPolicy::new()),
-            // h2o_plus(per-head, plan_keep→None) → 레거시 직생성 잔류(단계 ⑤).
-            "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                args.h2o_keep_ratio(),
-                actual_protected_prefix,
-            )),
-            // sliding/streaming/h2o → KVCacheStage 레지스트리(OCP). chat 경로(session.rs)와 동일
-            // factory. 레지스트리 miss = unknown(기존 bail 메시지 보존). World B(compact_parity 게이트).
-            name => {
-                let streaming_window = if args.streaming_window() > 0 {
-                    args.streaming_window()
-                } else if args.kv_budget() > 0 {
-                    args.kv_budget().saturating_sub(args.sink_size())
-                } else {
-                    args.eviction_window()
-                };
-                // d2o couples its keep-ratio to --eviction-target-ratio here (bench convention,
-                // preserved); other stages use the h2o keep-ratio slot.
-                let keep_ratio = if policy_name == "d2o" {
-                    target_ratio
-                } else {
-                    args.h2o_keep_ratio()
-                };
-                let params = argus_extension_api::StageParams {
-                    eviction_window: args.eviction_window(),
-                    protected_prefix: actual_protected_prefix,
-                    keep_ratio,
-                    sink_size: args.sink_size(),
-                    streaming_window,
-                };
-                // d2o-private knobs ride the opaque StageArgs blob (parsed by d2o::from_args); other
-                // policies pass an empty blob. The engine no longer constructs D2OConfig. Default
-                // runs match the prior hard-coded values (they were the d2o defaults); explicit
-                // `eviction d2o --ema-beta/--merge-axis/…` flags are now honored (divergence fixed).
-                let extra_owned = if policy_name == "d2o" {
-                    args.d2o_stage_args()
-                } else {
-                    Vec::new()
-                };
-                let extra: Vec<argus_extension_api::PluginArg> = extra_owned
-                    .iter()
-                    .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
-                    .collect();
-                // 정적(linkme) + 동적(--load-plugin dlopen) 통합 조회. miss = unknown.
-                let stage = crate::kv::eviction::stage_registry::make_stage_with_args(
-                    name, &params, &extra,
+        // Every policy (none/sliding/streaming/h2o/h2o_plus/d2o/rkv) resolves through the plugin
+        // registry by name (static linkme + dynamic --load-plugin); eviction=none + swap-dir (AB-3)
+        // flows through make_stage("none") = a no-op stage. This site names no plugin.
+        let policy: Box<dyn EvictionPolicy> = {
+            let streaming_window = if args.streaming_window() > 0 {
+                args.streaming_window()
+            } else if args.kv_budget() > 0 {
+                args.kv_budget().saturating_sub(args.sink_size())
+            } else {
+                args.eviction_window()
+            };
+            let params = argus_extension_api::StageParams {
+                eviction_window: args.eviction_window(),
+                protected_prefix: actual_protected_prefix,
+                keep_ratio,
+                sink_size: args.sink_size(),
+                streaming_window,
+            };
+            // Technique-private knobs ride the opaque StageArgs blob (each plugin parses its own keys;
+            // the engine knows none). Built generically by `Args::stage_args()`.
+            let extra_owned = args.stage_args();
+            let extra: Vec<argus_extension_api::PluginArg> = extra_owned
+                .iter()
+                .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
+                .collect();
+            let stage = make_stage_with_args(policy_name, &params, &extra).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>).",
+                    policy_name,
+                    if cfg!(feature = "caote") { ", caote" } else { "" }
                 )
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>).",
-                        name,
-                        if cfg!(feature = "caote") { ", caote" } else { "" }
-                    )
-                })?;
-                Box::new(StageBackedPolicy::new(stage))
-            }
+            })?;
+            Box::new(StageBackedPolicy::new(stage))
         };
         CacheManager::new(policy, monitor, threshold_bytes, target_ratio)
     };

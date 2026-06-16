@@ -315,6 +315,37 @@ pub struct PluginArg<'a> {
 /// for built-ins served entirely by [`StageParams`].
 pub type StageArgs<'a> = &'a [PluginArg<'a>];
 
+/// Plugin-declared capabilities the engine reads **before** instantiating a stage (off the
+/// [`KVCacheStageReg`], not via a trait method — the decision precedes `make`). This is the surface
+/// that lets the engine CLI/chat/eval/bench paths stay free of any plugin-name knowledge: instead of
+/// `matches!(name, "h2o" | "d2o" | ...)` capability lists and `match name { ... => 4 }` prefix
+/// tables, each consumer reads these caps generically through [`stage_caps`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageCaps {
+    /// Whether `plan()` consumes [`StageCtx::importance`]. When `true` the engine wires an attention
+    /// score accumulator and routes per-token (and, for per-head stages, per-head) scores into the
+    /// stage; when `false` the stage is score-free (sliding/streaming/no-eviction). Replaces the
+    /// scattered `matches!(name, "h2o" | "h2o_plus" | "d2o" | "caote" | "rkv")` capability checks.
+    pub is_score_based: bool,
+    /// The default `--protected-prefix` to apply when the user omits it. Score-based stages use `4`
+    /// (attention sinks — protecting the whole prompt would defeat heavy-hitter selection); `0` means
+    /// "no stage-declared default — the engine applies its own fallback" (sliding/streaming/none let
+    /// the engine pick the recency/prompt-length default). Replaces the `match name { ... => 4 }`
+    /// prefix tables.
+    pub default_protected_prefix: usize,
+}
+
+impl StageCaps {
+    /// Score-free defaults — no importance, no stage-declared prefix (`{ false, 0 }`). Used by the
+    /// `register_kv_stage!` macro so macro-registered (and example) plugins compile unchanged: a
+    /// score-free LayerWide technique is the common case, and any stage that needs scores declares
+    /// `is_score_based: true` via a direct-literal [`KVCacheStageReg`].
+    pub const SCORE_FREE: StageCaps = StageCaps {
+        is_score_based: false,
+        default_protected_prefix: 0,
+    };
+}
+
 /// The registration entry for one stage technique. A technique crate submits it via
 /// `#[distributed_slice(KV_CACHE_STAGES)] static FOO: KVCacheStageReg = ...`.
 pub struct KVCacheStageReg {
@@ -327,6 +358,9 @@ pub struct KVCacheStageReg {
     /// shim that drops the blob and delegates to `make` (`register_kv_stage!` wires that shim
     /// automatically). The engine calls this via `make_stage_with_args`; `make_stage` passes `&[]`.
     pub make_with_args: fn(StageParams, StageArgs<'_>) -> Box<dyn KVCacheStage>,
+    /// Capabilities the engine reads pre-`make` ([`StageCaps`]) — whether the stage is score-based and
+    /// its default protected prefix. Read via [`stage_caps`] so consumers never name a plugin.
+    pub caps: StageCaps,
 }
 
 /// The global registration slice — the registrations of all linked technique crates are gathered at **link time**.
@@ -344,6 +378,14 @@ pub fn find_stage(name: &str) -> Option<&'static KVCacheStageReg> {
 /// All registered technique names (for self-test / diagnostics).
 pub fn registered_names() -> Vec<&'static str> {
     KV_CACHE_STAGES.iter().map(|r| r.name).collect()
+}
+
+/// The [`StageCaps`] of a statically registered technique, by name. `None` if the name is not a
+/// statically linked stage. This is the lookup the engine CLI/chat/eval/bench paths use to read a
+/// stage's score-based-ness and default protected prefix **without naming any plugin** — the one
+/// site that makes the name-match collapse possible.
+pub fn stage_caps(name: &str) -> Option<StageCaps> {
+    find_stage(name).map(|r| r.caps)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -755,6 +797,9 @@ macro_rules! register_kv_stage {
                     }
                     __mwa
                 },
+                // Macro-registered stages declare score-free defaults; a stage that needs scores or a
+                // non-default prefix registers via a direct-literal `KVCacheStageReg` with its own caps.
+                caps: $crate::StageCaps::SCORE_FREE,
             };
         };
 
@@ -1749,6 +1794,7 @@ mod tests {
         name: "dummy",
         make: |_params| Box::new(Dummy),
         make_with_args: |_params, _args| Box::new(Dummy),
+        caps: StageCaps::SCORE_FREE,
     };
 
     #[test]

@@ -576,7 +576,7 @@ mod tests {
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
     use crate::format::KVCacheFormat;
-    use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
+    use crate::kv::eviction::stage_registry::sliding_backed_policy;
     use crate::kv::kv_cache::KVCache;
     use crate::memory::host::shared::SharedBuffer;
     use crate::resilience::sys_monitor::NoOpMonitor;
@@ -602,7 +602,7 @@ mod tests {
     }
 
     fn make_cm() -> Arc<Mutex<CacheManager>> {
-        let policy = Box::new(SlidingWindowPolicy::new(10, 4));
+        let policy = sliding_backed_policy(10, 4);
         Arc::new(Mutex::new(CacheManager::new(
             policy,
             Box::new(NoOpMonitor),

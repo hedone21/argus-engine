@@ -73,9 +73,19 @@ quest = { path = "../crates/techniques/quest" }
 # StreamingLLM (attention-sink + recent-window KVCacheStage). Extracted from the engine
 # core; non-optional, force-linked so `eviction streaming` resolves the out-of-tree plugin.
 streaming-llm = { path = "../crates/techniques/streaming-llm" }
+# Sliding-window (recent-window KVCacheStage) + no-eviction ("none"). Extracted from the engine
+# core; non-optional, force-linked so `eviction sliding` / `eviction none` resolve the plugins.
+sliding-window = { path = "../crates/techniques/sliding-window" }
+no-eviction = { path = "../crates/techniques/no-eviction" }
+# R-KV (cosine redundancy + importance joint eviction) measurement KVCacheStage. Extracted from
+# the engine core; gated by the `rkv` feature, force-linked so `eviction rkv` resolves the plugin.
+rkv = { path = "../crates/techniques/rkv", optional = true }
 # H2O (Heavy-Hitter Oracle, score-based KVCacheStage). Extracted from the engine core;
 # non-optional, force-linked so `eviction h2o` resolves the out-of-tree plugin.
 h2o = { path = "../crates/techniques/h2o" }
+# H2O+ (GQA-aware per-head heavy-hitter KVCacheStage — the first PerHead-plan plugin). Extracted
+# from the engine core; non-optional, force-linked so `eviction h2o_plus` resolves the plugin.
+h2o-plus = { path = "../crates/techniques/h2o-plus" }
 # D2O (Dynamic Discriminative Operations, WeightedMerge-producing KVCacheStage). Extracted from
 # the engine core; non-optional, force-linked. Production builds `d2o::D2OStage` directly with the
 # full CLI config; the linkme registration backs `make_stage("d2o")` + the registry self-test.
@@ -151,8 +161,8 @@ profile = []
 # and the `eviction caote` subcommand becomes available.
 caote = ["dep:caote"]
 # R-KV (cosine redundancy + importance joint eviction) measurement prototype.
-# Pure cfg gate, no external dependency. Default OFF.
-rkv = []
+# Links + force-links the out-of-tree `rkv` technique crate. Default OFF.
+rkv = ["dep:rkv"]
 cuda = ["cudarc"]               # PC / discrete GPU
 cuda-embedded = ["cudarc"]      # Embedded UMA, e.g. Jetson Xavier
 resilience = ["zbus"]

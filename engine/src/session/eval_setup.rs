@@ -34,9 +34,10 @@ use crate::inference::skip_config::SkipConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::eviction::EvictMethod;
 use crate::kv::eviction::EvictionPolicy;
-use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
-use crate::kv::eviction::no_eviction::NoEvictionPolicy;
-use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
+use crate::kv::eviction::stage_registry::{
+    StageBackedPolicy, make_stage, make_stage_with_args, stage_default_protected_prefix,
+    stage_is_score_based,
+};
 use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor, SystemMonitor};
 use crate::session::bin_setup::{
@@ -140,8 +141,7 @@ fn build_eval_base(args: &Args) -> Result<EvalBase> {
 /// importance I 를 항(λ·I)으로 포함하므로 score-based 로 분류 → `force_evict_with_scores` 경로로
 /// accumulator importance 가 stage 에 흐른다. feature OFF 시 "rkv" 정책명 자체가 부재(불변).
 pub fn is_score_based_eviction(args: &Args) -> bool {
-    matches!(args.eviction_policy(), "h2o" | "h2o_plus" | "d2o")
-        || (cfg!(feature = "rkv") && args.eviction_policy() == "rkv")
+    stage_is_score_based(args.eviction_policy())
 }
 
 /// eval/ppl 의 protected_prefix 기본값을 legacy generate.rs:849-860 등가로 계산.
@@ -153,12 +153,13 @@ pub fn is_score_based_eviction(args: &Args) -> bool {
 /// - sliding/none → prompt 전체 보호(legacy 동작).
 pub fn eval_protected_prefix(args: &Args, prompt_len: usize) -> usize {
     args.protected_prefix().unwrap_or_else(|| {
-        if is_score_based_eviction(args) {
-            4
-        } else if args.eviction_policy() == "streaming" {
-            args.sink_size()
-        } else {
-            prompt_len
+        // Score-based stages declare a protected-prefix (4 attention sinks); score-free stages
+        // declare 0 → the engine protects the whole prompt (legacy sliding/none default). Streaming
+        // derives its own sink and ignores StageParams.protected_prefix, so no per-name branch is
+        // needed.
+        match stage_default_protected_prefix(args.eviction_policy()) {
+            0 => prompt_len,
+            cap => cap,
         }
     })
 }
@@ -181,92 +182,38 @@ fn build_eval_cache_manager(
     };
     let threshold_bytes = args.memory_threshold_mb() * 1024 * 1024;
 
-    let mut cache_manager = if cfg!(feature = "rkv") && args.eviction_policy() == "rkv" {
-        // R-KV(KV roadmap 항목 0 측정, P2a): RkvStage(KVCacheStage)를 StageBackedPolicy 로
-        // 감싸 EvictionPolicy 표면으로 노출 → CacheManager::new 등록(d2o if-branch 동형).
-        // λ 는 CLI(--lambda)에서, α/τ 는 측정 상수. importance 는 score accumulator 가
-        // force_evict_with_scores 로 흘려보낸다(아래 score_based_eviction 포함).
-        #[cfg(feature = "rkv")]
-        {
-            use crate::kv::eviction::stage_registry::StageBackedPolicy;
-            use crate::kv::rkv_stage::{RkvConfig, RkvStage};
-            let stage = RkvStage::new(RkvConfig {
-                lambda: args.rkv_lambda(),
-                ..RkvConfig::default()
-            });
-            let policy: Box<dyn EvictionPolicy> = Box::new(StageBackedPolicy::new(Box::new(stage)));
-            CacheManager::new(
-                policy,
-                monitor,
-                threshold_bytes,
-                args.eviction_target_ratio(),
-            )
-        }
-        // feature OFF 에서는 위 cfg!() 가 false 라 도달 불가하나, 컴파일러 만족을 위해 분기를 닫는다.
-        #[cfg(not(feature = "rkv"))]
-        unreachable!("rkv branch gated by cfg!(feature = \"rkv\")")
-    } else {
-        let policy: Box<dyn EvictionPolicy> = match args.eviction_policy() {
-            "none" => Box::new(NoEvictionPolicy::new()),
-            "sliding" => Box::new(SlidingWindowPolicy::new(
-                args.eviction_window(),
-                actual_protected_prefix,
-            )),
-            // "streaming" and "h2o" are no longer built-in match arms — they fall through to the
-            // generic `name =>` path below (make_stage(name) → the streaming-llm / h2o plugin),
-            // which builds StageParams (keep_ratio/protected_prefix/streaming_window) identically.
-            "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                args.h2o_keep_ratio(),
-                actual_protected_prefix,
-            )),
-            name => {
-                // Plugin/registry stage (static linkme + dynamic `--load-plugin`), mirroring
-                // build_bench_loop: any registered KVCacheStage name resolves via make_stage,
-                // wrapped as an EvictionPolicy. miss = unknown (bail, builtin names listed).
-                let streaming_window = if args.streaming_window() > 0 {
-                    args.streaming_window()
-                } else if args.kv_budget() > 0 {
-                    args.kv_budget().saturating_sub(args.sink_size())
-                } else {
-                    args.eviction_window()
-                };
-                // d2o reads its own keep-ratio flag; other stages use the h2o keep-ratio slot.
-                let keep_ratio = if name == "d2o" {
-                    args.d2o_keep_ratio()
-                } else {
-                    args.h2o_keep_ratio()
-                };
-                let params = argus_extension_api::StageParams {
-                    eviction_window: args.eviction_window(),
-                    protected_prefix: actual_protected_prefix,
-                    keep_ratio,
-                    sink_size: args.sink_size(),
-                    streaming_window,
-                };
-                // d2o-private knobs ride the opaque StageArgs blob (parsed by d2o::from_args);
-                // other policies get an empty blob. The engine never constructs D2OConfig.
-                let extra_owned = if name == "d2o" {
-                    args.d2o_stage_args()
-                } else {
-                    Vec::new()
-                };
-                let extra: Vec<argus_extension_api::PluginArg> = extra_owned
-                    .iter()
-                    .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
-                    .collect();
-                let stage = crate::kv::eviction::stage_registry::make_stage_with_args(
-                    name, &params, &extra,
+    let mut cache_manager = {
+        let name = args.eviction_policy();
+        // Every policy (none/sliding/streaming/h2o/h2o_plus/d2o/rkv) resolves through the plugin
+        // registry by name (static linkme + dynamic `--load-plugin`), with its private knobs riding
+        // the opaque StageArgs blob — this site names no plugin.
+        let policy: Box<dyn EvictionPolicy> = {
+            let streaming_window = if args.streaming_window() > 0 {
+                args.streaming_window()
+            } else if args.kv_budget() > 0 {
+                args.kv_budget().saturating_sub(args.sink_size())
+            } else {
+                args.eviction_window()
+            };
+            let params = argus_extension_api::StageParams {
+                eviction_window: args.eviction_window(),
+                protected_prefix: actual_protected_prefix,
+                keep_ratio: args.keep_ratio(),
+                sink_size: args.sink_size(),
+                streaming_window,
+            };
+            let extra_owned = args.stage_args();
+            let extra: Vec<argus_extension_api::PluginArg> = extra_owned
+                .iter()
+                .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
+                .collect();
+            let stage = make_stage_with_args(name, &params, &extra).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "argus-eval: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o (or --load-plugin <.so>).",
+                    name
                 )
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "argus-eval: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o (or --load-plugin <.so>).",
-                        name
-                    )
-                })?;
-                Box::new(crate::kv::eviction::stage_registry::StageBackedPolicy::new(
-                    stage,
-                ))
-            }
+            })?;
+            Box::new(StageBackedPolicy::new(stage))
         };
         CacheManager::new(
             policy,
@@ -290,26 +237,30 @@ fn build_eval_cache_manager(
         let h2o_params = argus_extension_api::StageParams {
             eviction_window: args.eviction_window(),
             protected_prefix: resilience_protected_prefix,
-            keep_ratio: args.h2o_keep_ratio(),
+            keep_ratio: args.keep_ratio(),
             sink_size: args.sink_size(),
             streaming_window: 0,
         };
-        if let Some(stage) = crate::kv::eviction::stage_registry::make_stage("h2o", &h2o_params) {
+        if let Some(stage) = make_stage("h2o", &h2o_params) {
+            cache_manager
+                .register_policy(EvictMethod::H2o, Box::new(StageBackedPolicy::new(stage)));
+        }
+    }
+    // Sliding was extracted to the `sliding-window` plugin; build the stage by registry name and
+    // wrap it as an EvictionPolicy for the Manager-directed register_policy path.
+    {
+        let sliding_params = argus_extension_api::StageParams {
+            eviction_window: args.eviction_window(),
+            protected_prefix: resilience_protected_prefix,
+            ..Default::default()
+        };
+        if let Some(stage) = make_stage("sliding", &sliding_params) {
             cache_manager.register_policy(
-                EvictMethod::H2o,
-                Box::new(crate::kv::eviction::stage_registry::StageBackedPolicy::new(
-                    stage,
-                )),
+                EvictMethod::Sliding,
+                Box::new(StageBackedPolicy::new(stage)),
             );
         }
     }
-    cache_manager.register_policy(
-        EvictMethod::Sliding,
-        Box::new(SlidingWindowPolicy::new(
-            args.eviction_window(),
-            resilience_protected_prefix,
-        )),
-    );
 
     Ok(cache_manager)
 }
@@ -331,7 +282,7 @@ fn build_eval_score_accumulator(
         _ => crate::qcf::QcfMode::Attn,
     };
     let needs_caote = qcf_mode.has_caote();
-    let needs_score_based = matches!(args.eviction_policy(), "h2o" | "d2o" | "h2o_plus");
+    let needs_score_based = stage_is_score_based(args.eviction_policy());
     let has_eviction_policy = args.eviction_policy() != "none";
     let needs_accumulator =
         needs_score_based || needs_caote || args.enable_resilience || has_eviction_policy;
@@ -339,8 +290,9 @@ fn build_eval_score_accumulator(
         return None;
     }
 
-    // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + CAOTE).
-    let use_gqa = args.eviction_policy() == "h2o_plus" || needs_caote || has_eviction_policy;
+    // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + CAOTE) and for any per-head stage.
+    // Any non-none eviction policy already enables it (has_eviction_policy), so no per-name branch.
+    let use_gqa = needs_caote || has_eviction_policy;
     let mut acc = if use_gqa {
         AttentionScoreAccumulator::new_gqa(
             max_seq_len,

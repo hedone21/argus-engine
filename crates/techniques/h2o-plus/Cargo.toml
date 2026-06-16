@@ -1,0 +1,15 @@
+[package]
+name = "h2o-plus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# H2O+ (GQA-aware per-head heavy-hitter eviction) technique crate. Extracted from the engine core
+# (the streaming-llm/h2o/d2o precedent): depends only on `argus-extension-api` + `linkme`, and is the
+# first plugin to emit a per-head plan (`KeepSpec::PerHead`) — the engine's per-head plan executor
+# (stage ⑤) compacts each KV head independently. Force-linked via one `use h2o_plus as _;`.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

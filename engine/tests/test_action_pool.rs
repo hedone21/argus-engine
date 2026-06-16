@@ -75,21 +75,11 @@ fn make_headmajor_cache(num_tokens: usize, kv_heads: usize, head_dim: usize) -> 
 
 // ── AP-4-1: Unit test coverage ───────────────────────────────────────────────
 
-#[test]
-fn test_streaming_alias_parameters() {
-    // Verify streaming eviction parameters are semantically equivalent to
-    // SlidingWindowPolicy with specific prefix/window values.
-    use argus_engine::kv::eviction::EvictionPolicy;
-    use argus_engine::kv::eviction::sliding_window::SlidingWindowPolicy;
-
-    let streaming = SlidingWindowPolicy::new(2000, 4);
-    let mut cache = make_seqmajor_cache(50, 1, 4);
-    // 50 tokens < 2000 + 4 = 2004, should not evict
-    assert!(!streaming.should_evict(&cache, 0));
-
-    cache.current_pos = 2005;
-    assert!(streaming.should_evict(&cache, 0));
-}
+// `test_streaming_alias_parameters` was removed when SlidingWindow was extracted to the
+// `sliding-window` plugin: it asserted `should_evict()` thresholds, but the stage no longer owns
+// the WHEN decision (StageBackedPolicy delegates the trigger to the engine MIN_EVICT/target guard).
+// The sink+window / recent-window keep-list specs are pinned by the `streaming-llm` and
+// `sliding-window` crates' own unit tests.
 
 #[test]
 fn test_kivi_q4_q8_roundtrip_error_bounds() {
@@ -197,10 +187,9 @@ fn test_throttle_plus_eviction_independence() {
     // Eviction modifies cache. They don't interfere.
 
     let mut cache = make_seqmajor_cache(50, 1, 4);
-    use argus_engine::kv::eviction::EvictionPolicy;
-    use argus_engine::kv::eviction::sliding_window::SlidingWindowPolicy;
+    use argus_engine::kv::eviction::stage_registry::sliding_backed_policy;
 
-    let sliding = SlidingWindowPolicy::new(10, 4);
+    let sliding = sliding_backed_policy(10, 4);
     // Evict while "throttled" (simulated — no actual delay needed for correctness test)
     sliding.evict(&mut cache, 14).unwrap();
     assert_eq!(cache.current_pos, 14);
@@ -270,8 +259,8 @@ fn test_all_actions_data_flow() {
     // configured, and invoked without crash.
 
     // C6: StreamingLLM (SlidingWindowPolicy with sink)
-    use argus_engine::kv::eviction::sliding_window::SlidingWindowPolicy;
-    let _streaming = SlidingWindowPolicy::new(2000, 4);
+    use argus_engine::kv::eviction::stage_registry::sliding_backed_policy;
+    let _streaming = sliding_backed_policy(2000, 4);
 
     // C8: KIVI multi-bit
     let cache = KiviCache::new_with_bits(8, 64, 2048, 32, 4);

@@ -1,0 +1,15 @@
+[package]
+name = "no-eviction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# No-eviction technique crate — the "none" policy: never evicts (keeps the whole cache).
+# Extracted from the engine core (the streaming-llm/h2o/d2o precedent): depends only on
+# `argus-extension-api` + `linkme`. Force-linked via one `use no_eviction as _;`. Plan-only —
+# `plan()` returns `None` (no-op), so the cache simply grows up to its capacity.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

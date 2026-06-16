@@ -15,7 +15,8 @@
 //! keep-list; the engine executes the compaction (plan-returning, D1).
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCtx, StageParams,
+    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCaps, StageCtx,
+    StageParams,
 };
 use linkme::distributed_slice;
 
@@ -110,6 +111,11 @@ static H2O: KVCacheStageReg = KVCacheStageReg {
     make: |p: StageParams| Box::new(H2o::new(p.keep_ratio, p.protected_prefix)),
     // h2o takes no technique-private args — drop the blob, build from StageParams.
     make_with_args: |p: StageParams, _args| Box::new(H2o::new(p.keep_ratio, p.protected_prefix)),
+    // H2O selects heavy hitters by accumulated importance (score-based); protect 4 sinks by default.
+    caps: StageCaps {
+        is_score_based: true,
+        default_protected_prefix: 4,
+    },
 };
 
 #[cfg(test)]

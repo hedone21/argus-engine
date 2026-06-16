@@ -92,9 +92,9 @@ mod tests {
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
     use crate::kv::PressureLevel;
-    use crate::kv::eviction::no_eviction::NoEvictionPolicy;
-    use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
     use crate::kv::eviction::stage_registry::h2o_backed_policy;
+    use crate::kv::eviction::stage_registry::none_backed_policy;
+    use crate::kv::eviction::stage_registry::sliding_backed_policy;
     use crate::kv::kv_cache::KVCache;
     use crate::memory::host::shared::SharedBuffer;
     use crate::shape::Shape;
@@ -128,7 +128,7 @@ mod tests {
     fn test_wraps_sliding_window() {
         // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let handler = EvictionHandler::new(
-            Box::new(SlidingWindowPolicy::new(10, 0)), // window=10, prefix=0
+            sliding_backed_policy(10, 0), // window=10, prefix=0
             0.3,
         );
 
@@ -218,7 +218,7 @@ mod tests {
     fn test_noop_when_below_target() {
         // target_len = 1 * 0.99 = 0 → clamped to 1.
         // current_pos=1 <= target_len=1 → NoOp.
-        let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(50, 0)), 0.99);
+        let handler = EvictionHandler::new(sliding_backed_policy(50, 0), 0.99);
 
         let mut caches = make_caches(2, 1);
         let mut ctx = HandlerContext {
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_noop_on_empty_caches() {
-        let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(10, 0)), 0.5);
+        let handler = EvictionHandler::new(sliding_backed_policy(10, 0), 0.5);
 
         let mut caches: Vec<KVCache> = vec![];
         let mut ctx = HandlerContext {
@@ -259,13 +259,13 @@ mod tests {
 
     #[test]
     fn test_name_delegates_to_policy() {
-        let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(10, 0)), 0.5);
+        let handler = EvictionHandler::new(sliding_backed_policy(10, 0), 0.5);
         assert_eq!(handler.name(), "sliding");
 
         let handler = EvictionHandler::new(h2o_backed_policy(0.5, 0), 0.5);
         assert_eq!(handler.name(), "h2o");
 
-        let handler = EvictionHandler::new(Box::new(NoEvictionPolicy::new()), 0.5);
+        let handler = EvictionHandler::new(none_backed_policy(), 0.5);
         assert_eq!(handler.name(), "none");
     }
 
@@ -273,7 +273,7 @@ mod tests {
     fn test_skip_when_tokens_to_remove_below_threshold() {
         // current_pos=100, target_ratio=0.95 → target_len=95, tokens_to_remove=5 < MIN_EVICT_TOKENS=64
         // Expected: NoOp, current_pos unchanged.
-        let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(200, 0)), 0.95);
+        let handler = EvictionHandler::new(sliding_backed_policy(200, 0), 0.95);
 
         let mut caches = make_caches(2, 100);
         let mut ctx = HandlerContext {
@@ -303,7 +303,7 @@ mod tests {
     fn test_skip_does_not_fire_when_above_threshold() {
         // current_pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS=64
         // Expected: Evicted, not NoOp.
-        let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(200, 0)), 0.3);
+        let handler = EvictionHandler::new(sliding_backed_policy(200, 0), 0.3);
 
         let mut caches = make_caches(2, 100);
         let mut ctx = HandlerContext {
@@ -330,7 +330,7 @@ mod tests {
     fn test_target_ratio_clamping() {
         // ratio=0.0 should clamp to 0.1.
         // pos=100, clamped ratio=0.1 → target_len=10, tokens_to_remove=90 >= MIN_EVICT_TOKENS(64).
-        let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(10, 0)), 0.0);
+        let handler = EvictionHandler::new(sliding_backed_policy(10, 0), 0.0);
 
         let mut caches = make_caches(1, 100);
         let mut ctx = HandlerContext {

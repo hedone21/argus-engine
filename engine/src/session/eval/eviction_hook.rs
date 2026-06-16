@@ -645,7 +645,7 @@ impl StepHook<KVCache> for EvictionHook {
 mod tests {
     use super::*;
     use crate::kv::cache_manager::CacheManager;
-    use crate::kv::eviction::no_eviction::NoEvictionPolicy;
+    use crate::kv::eviction::stage_registry::none_backed_policy;
     use crate::qcf_types::{QcfConfig, QcfMode};
     use crate::resilience::sys_monitor::{MemoryStats, SystemMonitor};
     use anyhow::Result as AResult;
@@ -666,7 +666,7 @@ mod tests {
     }
 
     fn make_hook_with_d2o(budget: usize, score_based: bool, is_d2o: bool) -> EvictionHook {
-        let policy = Box::new(NoEvictionPolicy::new());
+        let policy = none_backed_policy();
         let monitor = Box::new(AlwaysOkMonitor);
         let manager = CacheManager::new(policy, monitor, 0, 1.0);
         let config = QcfConfig {
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn test_qcf_sample_layers_explicit() {
         // When explicit layers are provided, they should be stored unchanged.
-        let policy = Box::new(NoEvictionPolicy::new());
+        let policy = none_backed_policy();
         let monitor = Box::new(AlwaysOkMonitor);
         let manager = CacheManager::new(policy, monitor, 0, 1.0);
         let config = QcfConfig {

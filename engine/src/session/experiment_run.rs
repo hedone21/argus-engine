@@ -127,7 +127,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         use crate::inference::attention_scores::AttentionScoreAccumulator;
         use std::sync::{Arc, Mutex};
         let policy = args.eviction_policy();
-        if matches!(policy, "h2o" | "h2o_plus" | "d2o") {
+        if crate::kv::eviction::stage_registry::stage_is_score_based(policy) {
             let n_layers = model.config.num_hidden_layers;
             let n_kv_heads = model.config.num_key_value_heads;
             let n_heads = model.config.num_attention_heads;
@@ -377,7 +377,7 @@ pub fn run_experiment_schedule_path(
         use crate::inference::attention_scores::AttentionScoreAccumulator;
         use std::sync::{Arc, Mutex};
         let policy = args.eviction_policy();
-        if matches!(policy, "h2o" | "h2o_plus" | "d2o") {
+        if crate::kv::eviction::stage_registry::stage_is_score_based(policy) {
             let n_layers = model.config.num_hidden_layers;
             let n_kv_heads = model.config.num_key_value_heads;
             let n_heads = model.config.num_attention_heads;

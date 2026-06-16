@@ -1,6 +1,6 @@
 use argus_engine::backend::cpu::CpuBackend;
 use argus_engine::buffer::DType;
-use argus_engine::kv::eviction::{EvictionPolicy, SlidingWindowPolicy};
+use argus_engine::kv::eviction::stage_registry::sliding_backed_policy;
 use argus_engine::kv::kv_cache::KVCache;
 use argus_engine::memory::host::shared::SharedBuffer;
 use argus_engine::shape::Shape;
@@ -36,7 +36,7 @@ fn test_sliding_window_validity() {
     let mut cache = KVCache::new(k_tensor, v_tensor, max_seq_len);
 
     // 2. Setup Policy
-    let policy = SlidingWindowPolicy::new(60, 0);
+    let policy = sliding_backed_policy(60, 0);
 
     // 3. Simulate Generation Loop
     let mut start_pos: usize = 0; // Logical position (RoPE index)

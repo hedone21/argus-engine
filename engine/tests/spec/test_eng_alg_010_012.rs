@@ -11,8 +11,10 @@
 
 use argus_engine::backend::cpu::CpuBackend;
 use argus_engine::buffer::{Buffer, DType};
-use argus_engine::kv::eviction::stage_registry::{StageBackedPolicy, make_stage};
-use argus_engine::kv::eviction::{EvictionPolicy, SlidingWindowPolicy};
+use argus_engine::kv::eviction::EvictionPolicy;
+use argus_engine::kv::eviction::stage_registry::{
+    StageBackedPolicy, make_stage, sliding_backed_policy,
+};
 use argus_engine::kv::kv_cache::KVCache;
 use argus_engine::memory::host::shared::SharedBuffer;
 use argus_engine::shape::Shape;
@@ -126,7 +128,7 @@ fn test_eng_alg_010_c01_h2o_evict_with_scores_preserves_important() {
 
 #[test]
 fn test_eng_alg_011_sliding_evict_no_prefix() {
-    let policy = SlidingWindowPolicy::new(10, 0); // prefix는 4로 클램프
+    let policy = sliding_backed_policy(10, 0); // prefix는 4로 클램프
     let mut cache = make_cache_with_data(20);
     policy.evict(&mut cache, 5).unwrap();
     assert_eq!(cache.current_pos, 14); // max_keep = 10 + 4 = 14
@@ -134,7 +136,7 @@ fn test_eng_alg_011_sliding_evict_no_prefix() {
 
 #[test]
 fn test_eng_alg_011_sliding_evict_with_protected_prefix() {
-    let policy = SlidingWindowPolicy::new(4, 4);
+    let policy = sliding_backed_policy(4, 4);
     let mut cache = make_cache_with_data(12);
     policy.evict(&mut cache, 6).unwrap();
     assert_eq!(cache.current_pos, 8); // max_keep = 4 + 4 = 8
@@ -146,34 +148,14 @@ fn test_eng_alg_011_sliding_evict_with_protected_prefix() {
 
 #[test]
 fn test_eng_alg_011_sliding_evict_no_action_needed() {
-    let policy = SlidingWindowPolicy::new(20, 0);
+    let policy = sliding_backed_policy(20, 0);
     let mut cache = make_cache_with_data(10);
     policy.evict(&mut cache, 20).unwrap();
     assert_eq!(cache.current_pos, 10); // 변경 없음
 }
 
-#[test]
-fn test_eng_alg_011_minimum_protected_prefix_enforced() {
-    // prefix=0,1,2,3 모두 내부적으로 4로 클램프
-    for input_prefix in 0..=3 {
-        let policy = SlidingWindowPolicy::new(10, input_prefix);
-        let mut cache = make_cache_with_data(14);
-        assert!(
-            !policy.should_evict(&cache, 0),
-            "prefix={input_prefix}: 14 should NOT trigger eviction (threshold=14)"
-        );
-
-        cache.current_pos = 15;
-        assert!(
-            policy.should_evict(&cache, 0),
-            "prefix={input_prefix}: 15 should trigger eviction (threshold=14)"
-        );
-    }
-
-    // prefix=5 이상은 그대로 유지
-    let policy = SlidingWindowPolicy::new(10, 5);
-    let mut cache = make_cache_with_data(15);
-    assert!(!policy.should_evict(&cache, 0)); // 15 <= 10+5
-    cache.current_pos = 16;
-    assert!(policy.should_evict(&cache, 0)); // 16 > 15
-}
+// `test_eng_alg_011_minimum_protected_prefix_enforced` was removed when SlidingWindow was extracted
+// to the `sliding-window` plugin: it asserted `should_evict()` thresholds, but the stage no longer
+// owns the WHEN decision (StageBackedPolicy delegates the trigger to the engine MIN_EVICT/target
+// guard, same as the h2o case above). The 4-token minimum-prefix clamp is now pinned by the
+// `sliding-window` crate's own unit tests (`min_prefix_clamped_to_four`).

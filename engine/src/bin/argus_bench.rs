@@ -68,10 +68,11 @@ fn main() -> anyhow::Result<()> {
 fn bench_supported(args: &Args) -> bool {
     args.qcf_dump.is_none()
         && args.skip_ratio.unwrap_or(0.0) == 0.0
-        && !args.d2o_layer_alloc()
         && !args.profile
         && !args.profile_events
-    // swap mode 3종(intra_forward/phase_aware/layer_immediate)은 §5.9.2 실배선 완료로 허용.
+    // `--d2o-layer-alloc` is no longer gated here: it is a d2o-private knob that rides the StageArgs
+    // blob, the per-layer variance machinery is runtime-dead, and the d2o plugin ignores it — so
+    // accepting it is a no-op. swap mode 3종(intra_forward/phase_aware/layer_immediate)은 §5.9.2 허용.
 }
 
 /// AB-0 에서 미구현인 mode 진입 flag 를 검사하여 즉시 reject 한다.

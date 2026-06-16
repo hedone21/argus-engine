@@ -1091,7 +1091,7 @@ pub fn run_ppl(
                         let action = if score_based_eviction {
                             QcfActionType::EvictH2o {
                                 target_len,
-                                keep_ratio: args.h2o_keep_ratio(),
+                                keep_ratio: args.keep_ratio(),
                                 protected_prefix,
                             }
                         } else {
@@ -1241,7 +1241,7 @@ pub fn run_ppl(
             "kv_type": args.kv_type,
             "max_seq_len": max_seq_len,
             "eviction_target_ratio": args.eviction_target_ratio(),
-            "h2o_keep_ratio": args.h2o_keep_ratio(),
+            "h2o_keep_ratio": args.keep_ratio(),
             "protected_prefix": protected_prefix,
             "skip_layers": args.skip_layers,
             "skip_ratio": args.skip_ratio,

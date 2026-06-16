@@ -1,11 +1,14 @@
-//! R-KV 측정 프로토타입 — cosine redundancy + importance joint eviction stage.
+//! R-KV measurement technique crate — cosine redundancy + importance joint eviction stage.
 //!
 //! arXiv 2505.24133 (NeurIPS'25). KV roadmap 항목 0 측정 스프린트(P2a):
 //! `arch/kv_roadmap_item0_measurement.md` §2.1 / §4.1.
 //!
-//! **측정 전용 — feature `rkv` 게이트**(CAOTE 선례 동형). production 빌드(feature OFF)에서는
-//! 이 모듈 전체가 미컴파일 → `eviction rkv` subcommand 부재 → production 정책 카탈로그 불변
-//! (빌드 타임 격리, §6 Spec Triage). 측정 GO 시 production 승격은 별도 Triage.
+//! Extracted from the engine core into a self-registering technique crate (the
+//! `streaming-llm`/`h2o`/`d2o` precedent): depends only on `argus-extension-api` + `linkme`,
+//! implements [`KVCacheStage`], and registers under the name `"rkv"` via
+//! `#[distributed_slice(KV_CACHE_STAGES)]`. The engine force-links it under the `rkv` feature with
+//! `#[cfg(feature = "rkv")] use rkv as _;` and finds it via `find_stage("rkv")` — feature OFF =
+//! unlinked + `eviction rkv` subcommand absent (production catalog unchanged).
 //!
 //! **수식** (per-KV-head, §2.1):
 //! 1. redundancy R: K(key) pairwise cosine N×N 행렬의 row-mean → softmax 정규화.
@@ -13,18 +16,23 @@
 //! 3. fusion Z = λ·I − (1−λ)·R, **λ=0.1**(redundancy 지배).
 //! 4. 최근 α=8 항상 보존 + 나머지 budget 을 Z 상위 single-shot top-k.
 //!
-//! **GQA**: redundancy/importance 모두 KV-head 단위(8개)로 측정. head 별 Z 를 평균해 단일
-//! layer-wide keep 산출(per-head 차등 keep 은 §6 항목 6 영역 — 본 프로토타입은 layer-wide 근사).
+//! **GQA**: redundancy/importance 모두 KV-head 단위로 측정. head 별 Z 를 평균해 단일 layer-wide
+//! keep 산출(per-head 차등 keep 은 별도 영역 — 본 프로토타입은 layer-wide 근사).
 //!
-//! **재사용**(§4.1): K 읽기는 `StageCtx::dequant_k`(`kv::dequant::dequantize_k` 정본 위임),
-//! cosine 은 `kv::dequant::cosine_similarity`. N×N row-mean 집계 루프만 신규.
+//! **재사용**(§4.1): K 읽기는 `StageCtx::dequant_k`(엔진 `dequantize_k` 정본 위임), cosine 은 이
+//! crate 가 자체 보유한 [`cosine_similarity`](d2o 선례). N×N row-mean 집계 루프만 신규.
+//!
+//! λ 는 CLI(`eviction rkv --lambda`)에서 opaque [`StageArgs`] blob(`lambda` 키)으로 흘러들어와
+//! [`RkvStage`]가 직접 파싱한다 — 엔진은 rkv 의 private 파라미터를 모른다.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use argus_extension_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, TensorKind};
-
-use crate::kv::dequant::cosine_similarity;
+use argus_extension_api::{
+    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageArgs, StageCaps,
+    StageCtx, StageParams, TensorKind,
+};
+use linkme::distributed_slice;
 
 /// 1단 측정 덤프 게이트 env var. set 시 plan() 마다 per-kv_head `[RkvStats]` 마커 라인을 stderr 로
 /// 출력한다(파싱 가능 포맷). 측정 전용 — 미설정 시 덤프 경로 미진입(production 무영향).
@@ -37,7 +45,23 @@ pub const RKV_TAU: f32 = 0.5;
 /// 항상 보존하는 최근 토큰 수 α (importance window 겸용).
 pub const RKV_RECENT_ALPHA: usize = 8;
 
-/// R-KV 측정 전용 설정(CLI 노출 안 함 — 측정 schedule 내부 상수). λ 만 측정 조정 가능.
+/// 두 벡터의 코사인 유사도. 엔진 `kv::dequant::cosine_similarity` 와 bit-identical(plugin 은 엔진을
+/// 참조할 수 없으므로 d2o 선례대로 자체 보유한다).
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    let denom = (norm_a * norm_b).sqrt();
+    if denom < 1e-10 { 0.0 } else { dot / denom }
+}
+
+/// R-KV 측정 전용 설정(CLI 노출은 λ 만 — α/τ 는 측정 상수).
 #[derive(Clone, Copy, Debug)]
 pub struct RkvConfig {
     /// fusion 가중치 λ.
@@ -58,6 +82,20 @@ impl Default for RkvConfig {
     }
 }
 
+impl RkvConfig {
+    /// opaque [`StageArgs`] blob 에서 λ(`lambda` 키)를 파싱한다. 나머지 키는 무시, α/τ 는 측정 상수.
+    /// 엔진은 이 키를 모르고 `eviction rkv --lambda <L>` 의 값을 blob 으로만 전달한다.
+    pub fn from_args(args: StageArgs<'_>) -> Self {
+        let mut cfg = Self::default();
+        for a in args.iter().filter(|a| a.key == "lambda") {
+            if let Ok(v) = a.val.parse::<f32>() {
+                cfg.lambda = v;
+            }
+        }
+        cfg
+    }
+}
+
 /// 1단 측정 게이트 지표(§2.1-C). per-(layer, kv_head) 로 덤프한다.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RedundancyStats {
@@ -69,20 +107,18 @@ pub struct RedundancyStats {
 
 /// R-KV stage — `KVCacheStage` 구현체. λ/α/τ 는 [`RkvConfig`] 보유(plan 간 불변, 상태는 없음).
 ///
-/// `Mutex<RkvConfig>`는 불필요하나(불변), 측정 hook 이 마지막 계산 stats 를 보관하도록 한다 —
-/// 측정 schedule 이 plan() 호출 후 [`last_stats`](Self::last_stats)로 읽는다(stderr/CSV 덤프).
+/// 측정 hook 이 마지막 계산 stats 를 보관하도록 `Mutex<Vec<RedundancyStats>>`를 둔다 — 측정 schedule
+/// 이 plan() 호출 후 [`last_stats`](Self::last_stats)로 읽는다(stderr/CSV 덤프).
 pub struct RkvStage {
     config: RkvConfig,
     /// 마지막 plan() 의 per-kv_head redundancy stats (측정 1단 덤프용). plan 은 `&self` 라 내부가변.
     last_stats: Mutex<Vec<RedundancyStats>>,
-    /// plan() 호출 순번 — `[RkvStats]` 덤프의 `layer=` 필드. eviction 은 layer cache 를 순차 호출
-    /// (KVStageCtx.layer_idx() 는 0 고정)하므로 호출 카운터가 layer 진행을 누적 추적한다. 측정
-    /// schedule 이 `% num_layers` 로 layer 인덱스 역산. 누적이므로 reset 안 함(측정 전용).
+    /// plan() 호출 순번 — `[RkvStats]` 덤프의 `layer=` 필드(누적 카운터, 측정 전용).
     plan_calls: AtomicUsize,
 }
 
 impl RkvStage {
-    /// 기본 설정(λ=0.1, α=8, τ=0.5)으로 생성.
+    /// 주어진 설정으로 생성.
     pub fn new(config: RkvConfig) -> Self {
         Self {
             config,
@@ -92,15 +128,12 @@ impl RkvStage {
     }
 
     /// 직전 plan() 이 계산한 per-kv_head redundancy stats 의 복사본(측정 1단 덤프 진입점).
-    /// plan() 호출 전이면 빈 Vec.
     pub fn last_stats(&self) -> Vec<RedundancyStats> {
         self.last_stats.lock().expect("rkv stats poisoned").clone()
     }
 }
 
 /// per-kv_head redundancy stats 를 `[RkvStats]` 마커 라인으로 stderr 덤프(env `ARGUS_RKV_DUMP` 게이트).
-/// 포맷(파싱 가능): `[RkvStats] layer=<L> head=<H> mpc=<X> fraction=<Y>`. `layer` = plan() 호출 순번
-/// (측정 schedule 이 num_layers 로 modulo). 측정 전용 — feature `rkv` 안에 격리.
 fn dump_redundancy_stats(layer: usize, stats: &[RedundancyStats]) {
     if std::env::var_os(RKV_DUMP_ENV).is_none() {
         return;
@@ -125,36 +158,27 @@ impl KVCacheStage for RkvStage {
         if n == 0 || target >= n {
             return None;
         }
-        // K 텐서가 없으면(score-free 엔진) redundancy 계산 불가 → no-op. 핸들은 dequant_k sugar 로
-        // 재접근하므로 존재 여부만 게이트(`?` 로 early-return).
+        // K 텐서가 없으면(score-free 엔진) redundancy 계산 불가 → no-op.
         ctx.tensor(TensorKind::Key)?;
 
         let n_kv_heads = ctx.n_kv_heads().max(1);
         let head_dim = ctx.head_dim();
         let importance = ctx.importance();
 
-        // per-KV-head K 행렬을 dequant 해 N×N cosine row-mean → R 산출 후 head 평균.
-        // Z[t] = λ·I[t] − (1−λ)·R[t] (head 평균). 최근 α 항상 보존 + 나머지 top-k(Z).
         let mut k_rows = vec![0.0f32; n * head_dim]; // 재사용 버퍼(per head)
         let mut z_sum = vec![0.0f32; n]; // head 합산 Z
         let mut stats = Vec::with_capacity(n_kv_heads);
 
         for h in 0..n_kv_heads {
-            // (1) head h 의 모든 토큰 K 를 dequant.
             for (t, row) in k_rows.chunks_mut(head_dim).enumerate().take(n) {
                 ctx.dequant_k(t, h, row);
             }
-            // (2) N×N pairwise cosine → row-mean R + 1단 게이트 지표(MPC, redundant fraction).
-            //     softmax 정규화(§2.1 R 정의) 후 fusion 에 사용.
             let (mut r, stat) = redundancy_row_mean(&k_rows, n, head_dim, self.config.tau);
             softmax_in_place(&mut r);
-            // (3) importance I 를 최근 α window 로 추출(설계서 근사: accumulator score 재사용).
-            //     I[t] = importance[t] (score-based) 또는 0(score-free).
             for t in 0..n {
                 let i = importance
                     .and_then(|imp| imp.get(t).copied())
                     .unwrap_or(0.0);
-                // Z = λ·I − (1−λ)·R. head 합산(후에 평균).
                 z_sum[t] += self.config.lambda * i - (1.0 - self.config.lambda) * r[t];
             }
             stats.push(stat);
@@ -165,7 +189,6 @@ impl KVCacheStage for RkvStage {
             *z *= inv_heads;
         }
 
-        // 1단 측정 hook: per-kv_head redundancy stats 를 stderr 마커로 덤프(env 게이트) 후 보관.
         let layer = self.plan_calls.fetch_add(1, Ordering::Relaxed);
         dump_redundancy_stats(layer, &stats);
         *self.last_stats.lock().expect("rkv stats poisoned") = stats;
@@ -179,16 +202,6 @@ impl KVCacheStage for RkvStage {
 }
 
 /// N×N pairwise cosine 행렬의 **row-mean redundancy R** + 1단 게이트 지표(MPC, redundant fraction).
-///
-/// `k_rows`: `[n * head_dim]` row-major (토큰 t 의 K 벡터 = `k_rows[t*head_dim..(t+1)*head_dim]`).
-/// 반환 `(r, stats)`:
-/// - `r[t]` = 토큰 t 의 다른 토큰들과의 cosine 평균 (대각 제외). N=1 이면 0.
-/// - `stats.mpc` = 전체 비대각 cosine 평균(스칼라).
-/// - `stats.redundant_fraction` = nearest-neighbour cosine > τ 인 토큰 비율.
-///
-/// 반환 `r` 은 **raw row-mean**(softmax 미적용) — §2.1 정의의 softmax 정규화는 호출부(stage plan)
-/// 가 [`softmax_in_place`]로 적용해 fusion Z 에 쓴다(단위 테스트는 두 단계를 분리 검증). 1단 게이트
-/// (MPC/redundant fraction)는 R 정규화와 무관한 원시 cosine 통계이므로 본 함수가 직접 산출한다.
 pub(crate) fn redundancy_row_mean(
     k_rows: &[f32],
     n: usize,
@@ -250,8 +263,7 @@ pub(crate) fn redundancy_row_mean(
     )
 }
 
-/// row-mean R 을 softmax 로 정규화(in-place). 설계서 §2.1 "softmax 정규화 = R" 정의의 정본.
-/// numerically-stable(max-shift). 단위 테스트 + 측정 schedule R 분포 덤프에서 사용.
+/// row-mean R 을 softmax 로 정규화(in-place). numerically-stable(max-shift).
 pub(crate) fn softmax_in_place(v: &mut [f32]) {
     if v.is_empty() {
         return;
@@ -271,15 +283,11 @@ pub(crate) fn softmax_in_place(v: &mut [f32]) {
 }
 
 /// 최근 α 항상 보존 + 나머지 budget 을 Z 상위 single-shot top-k 로 채워 **ascending keep** 산출.
-///
-/// `z`: per-token fusion 점수(높을수록 보존 가치 높음). `n`: 현 토큰 수. `target`: 보존 토큰 수.
-/// `recent_alpha`: 항상 보존하는 최근 토큰 수. target < recent_alpha 면 최근 target 개만 보존.
 pub(crate) fn select_keep(z: &[f32], n: usize, target: usize, recent_alpha: usize) -> Vec<usize> {
     let target = target.min(n);
     if target == 0 {
         return Vec::new();
     }
-    // 최근 α window: [n - α, n). target 이 더 작으면 최근 target 개만.
     let recent_start = n.saturating_sub(recent_alpha.min(target));
     let mut kept = vec![false; n];
     for slot in kept.iter_mut().skip(recent_start) {
@@ -287,11 +295,9 @@ pub(crate) fn select_keep(z: &[f32], n: usize, target: usize, recent_alpha: usiz
     }
     let recent_count = n - recent_start;
 
-    // 나머지 budget 을 최근 window 밖에서 Z 상위로 채운다(single-shot top-k).
     let remaining = target.saturating_sub(recent_count);
     if remaining > 0 {
         let mut candidates: Vec<usize> = (0..recent_start).collect();
-        // Z 내림차순(동점은 위치 오름차순으로 결정성 보장).
         candidates.sort_unstable_by(|&a, &b| {
             z[b].partial_cmp(&z[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -305,9 +311,25 @@ pub(crate) fn select_keep(z: &[f32], n: usize, target: usize, recent_alpha: usiz
     (0..n).filter(|&p| kept[p]).collect()
 }
 
+/// Registration — `find_stage("rkv")`. λ rides the opaque [`StageArgs`] blob (`lambda` key);
+/// α/τ are measurement constants. Score-based (fusion includes the importance term).
+#[distributed_slice(KV_CACHE_STAGES)]
+static RKV: KVCacheStageReg = KVCacheStageReg {
+    name: "rkv",
+    make: |_p: StageParams| Box::new(RkvStage::new(RkvConfig::default())),
+    make_with_args: |_p: StageParams, args| Box::new(RkvStage::new(RkvConfig::from_args(args))),
+    // R-KV's fusion Z = λ·I − (1−λ)·R includes the importance term, so it is score-based; protect 4
+    // attention sinks by default (same as the other score-based stages).
+    caps: StageCaps {
+        is_score_based: true,
+        default_protected_prefix: 4,
+    },
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argus_extension_api::{PluginArg, TensorDtype, TensorHandle, TensorShape, find_stage};
 
     /// 동일 벡터 N개 → 모든 pairwise cosine ≈ 1 → R 균등(≈1), MPC≈1, redundant_fraction=1.
     #[test]
@@ -333,7 +355,6 @@ mod tests {
     /// 직교 벡터(서로 cosine 0) → R 균등(≈0), MPC≈0, redundant_fraction=0(τ=0.5).
     #[test]
     fn row_mean_orthogonal_vectors_low() {
-        // 3개 표준기저 벡터(서로 직교).
         let k = vec![
             1.0, 0.0, 0.0, // t0
             0.0, 1.0, 0.0, // t1
@@ -351,8 +372,7 @@ mod tests {
         );
     }
 
-    /// 부분 중복: t0≈t1(중복쌍), t2 직교 → t0,t1 의 NN cosine > τ, t2 는 ≤ τ.
-    /// redundant_fraction = 2/3.
+    /// 부분 중복: t0≈t1, t2 직교 → redundant_fraction = 2/3.
     #[test]
     fn row_mean_partial_redundancy_fraction() {
         let k = vec![
@@ -361,7 +381,6 @@ mod tests {
             0.0, 1.0, 0.0, // t2 직교
         ];
         let (_r, stats) = redundancy_row_mean(&k, 3, 3, 0.5);
-        // t0/t1 nearest-neighbour cosine ≈ 0.9999 > 0.5; t2 의 NN(=max(0, ~0.01))< 0.5.
         assert!(
             (stats.redundant_fraction - 2.0 / 3.0).abs() < 1e-5,
             "redundant_fraction=2/3, got {}",
@@ -379,7 +398,6 @@ mod tests {
         assert_eq!(stats.redundant_fraction, 0.0);
     }
 
-    /// softmax: 균등 입력 → 균등 출력(합=1).
     #[test]
     fn softmax_uniform() {
         let mut v = vec![2.0, 2.0, 2.0, 2.0];
@@ -390,7 +408,6 @@ mod tests {
         assert!((v.iter().sum::<f32>() - 1.0).abs() < 1e-6);
     }
 
-    /// softmax: 단조성 — 큰 입력이 큰 출력.
     #[test]
     fn softmax_monotone() {
         let mut v = vec![1.0, 2.0, 3.0];
@@ -399,17 +416,14 @@ mod tests {
         assert!((v.iter().sum::<f32>() - 1.0).abs() < 1e-6);
     }
 
-    /// select_keep: 최근 α 보존 + 나머지 Z top-k. ascending 보장.
     #[test]
     fn select_keep_recent_plus_topk() {
-        // n=10, target=5, α=2 → 최근 2(pos 8,9) 보존 + 나머지 3 을 Z top-k(pos 0..8).
         let z = vec![0.0, 9.0, 0.0, 8.0, 0.0, 7.0, 0.0, 0.0, 0.0, 0.0];
         let keep = select_keep(&z, 10, 5, 2);
         assert_eq!(keep, vec![1, 3, 5, 8, 9], "Z top-3(1,3,5) + 최근2(8,9)");
         assert!(keep.windows(2).all(|w| w[0] < w[1]), "ascending");
     }
 
-    /// select_keep: target < α → 최근 target 개만.
     #[test]
     fn select_keep_target_below_alpha() {
         let z = vec![5.0; 10];
@@ -417,11 +431,123 @@ mod tests {
         assert_eq!(keep, vec![7, 8, 9], "target=3 < α=8 → 최근 3개");
     }
 
-    /// select_keep: target >= n → 전부 보존(plan 상위에서 None 처리하나 함수 자체 안전성).
     #[test]
     fn select_keep_full() {
         let z = vec![1.0; 4];
         let keep = select_keep(&z, 4, 4, 2);
         assert_eq!(keep, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn registers_with_score_based_caps() {
+        let reg = find_stage("rkv").expect("rkv registered in KV_CACHE_STAGES");
+        assert_eq!(reg.name, "rkv");
+        assert!(reg.caps.is_score_based, "rkv fusion includes importance");
+        assert_eq!(reg.caps.default_protected_prefix, 4);
+    }
+
+    #[test]
+    fn from_args_parses_lambda() {
+        let cfg = RkvConfig::from_args(&[PluginArg {
+            key: "lambda",
+            val: "0.42",
+        }]);
+        assert!((cfg.lambda - 0.42).abs() < 1e-6);
+        // unknown keys ignored; α/τ unchanged.
+        let cfg2 = RkvConfig::from_args(&[PluginArg {
+            key: "nope",
+            val: "x",
+        }]);
+        assert!((cfg2.lambda - RKV_DEFAULT_LAMBDA).abs() < 1e-6);
+    }
+
+    /// 단일-head K 행렬을 공급하는 최소 ctx — `dequant_k`(Key 핸들) + importance 로 plan 산출 검증.
+    struct KCtx {
+        n: usize,
+        head_dim: usize,
+        k: Vec<f32>, // [n * head_dim]
+        target: usize,
+        importance: Vec<f32>,
+    }
+    struct KHandle<'a> {
+        k: &'a [f32],
+        n: usize,
+        head_dim: usize,
+    }
+    impl TensorHandle for KHandle<'_> {
+        fn shape(&self) -> TensorShape {
+            TensorShape {
+                rows: self.n,
+                cols: self.head_dim,
+                per_head: true,
+            }
+        }
+        fn dtype(&self) -> TensorDtype {
+            TensorDtype::F32
+        }
+        fn read_row(&self, row: usize, _kv_head: usize, out: &mut [f32]) {
+            out.copy_from_slice(&self.k[row * self.head_dim..(row + 1) * self.head_dim]);
+        }
+    }
+    impl StageCtx for KCtx {
+        fn current_pos(&self) -> usize {
+            self.n
+        }
+        fn target_len(&self) -> usize {
+            self.target
+        }
+        fn layer_idx(&self) -> usize {
+            0
+        }
+        fn importance(&self) -> Option<&[f32]> {
+            Some(&self.importance)
+        }
+        fn n_kv_heads(&self) -> usize {
+            1
+        }
+        fn head_dim(&self) -> usize {
+            self.head_dim
+        }
+        fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
+            match kind {
+                TensorKind::Key => Some(Box::leak(Box::new(KHandle {
+                    k: &self.k,
+                    n: self.n,
+                    head_dim: self.head_dim,
+                })) as &dyn TensorHandle),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn plan_keeps_target_len_and_dumps_stats() {
+        // 8 tokens, distinct K per token, target=4 → keep 4 ascending, last_stats populated.
+        let head_dim = 3;
+        let n = 8;
+        let mut k = vec![0.0f32; n * head_dim];
+        for t in 0..n {
+            k[t * head_dim] = t as f32; // distinct per token
+        }
+        let ctx = KCtx {
+            n,
+            head_dim,
+            k,
+            target: 4,
+            importance: vec![1.0; n],
+        };
+        let stage = RkvStage::new(RkvConfig::default());
+        let plan = stage.plan(&ctx).expect("rkv plan Some (target<n)");
+        match plan.keep {
+            KeepSpec::LayerWide(keep) => {
+                assert_eq!(keep.len(), 4, "target_len=4 만큼 보존");
+                assert!(keep.windows(2).all(|w| w[0] < w[1]), "ascending");
+            }
+            KeepSpec::PerHead(_) => panic!("rkv prototype is layer-wide"),
+        }
+        let stats = stage.last_stats();
+        assert_eq!(stats.len(), 1, "kv_heads=1 → stats 1개");
+        assert!(stats[0].mpc.is_finite());
+        assert!((0.0..=1.0).contains(&stats[0].redundant_fraction));
     }
 }

@@ -109,8 +109,8 @@ fn reject_unsupported_for_chat(args: &Args) -> anyhow::Result<()> {
     if args.skip_ratio.unwrap_or(0.0) > 0.0 {
         bail!("argus-chat: --skip-ratio not supported");
     }
-    if args.d2o_layer_alloc() {
-        bail!("argus-chat: --d2o-layer-alloc (variance measurement) belongs to argus-eval");
-    }
+    // (`--d2o-layer-alloc` is a d2o-private knob that rides the StageArgs blob now; the d2o plugin
+    // ignores it — the per-layer variance machinery is runtime-dead — so chat no longer special-cases
+    // it. The engine names no plugin knob here.)
     Ok(())
 }
