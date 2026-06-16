@@ -8,6 +8,23 @@ project is pre-1.0; minor releases may include breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Added a synthetic **`kivi`** backend-capability plugin (`crates/techniques/kivi`, registers
+  `kivi_abi`) — the last KV technique to move out, and the first non-example user of the
+  backend-capability axis (`register_kivi_attention_plugin!`). It exercises the full dynamic
+  C-ABI round-trip (`register_backend_caps_v2` envelope → category bridge → `DynKiviAttentionBackend`
+  adapter → make/dispatch/drop) **without GPU math**: `attention_gen_kivi` writes a deterministic
+  sentinel so the host gate (`gate_c_kivi_backend_cap`) can verify `KiviAttnArgs` crossed the ABI
+  boundary intact. The real GPU KIVI kernels (`backend/opencl.rs`, `kernels/kivi_*.cl`) and the
+  in-engine KIVI cache/format/forward path stay in the engine and are untouched — this is an
+  ABI-verification artifact, not a runtime KIVI implementation. It is dlopen-only (no engine
+  force-link), so `--backend-cap kivi_abi` requires `--load-plugin`; the `_abi` suffix signals it
+  must not be selected on the decode hot path (it would replace the live attention backend and
+  produce meaningless output). Verified host (unit + dlopen gate) and on-device on Adreno OpenCL
+  (cross-built `.so` loads, resolves, and is selected at construction; absent `--load-plugin` it
+  fail-fasts with `Unknown --backend-cap`).
+
 ### Changed
 
 - Renamed the extension-API crate `technique-api` → `argus-extension-api` (import
@@ -28,7 +45,7 @@ project is pre-1.0; minor releases may include breaking changes.
   `layer_idx`/`n_layers` (so the plugin honours `protected_layers` / last-layer protection) and
   `kv_on_device` (device-only buffers degrade to a keep-only plan, preserving the former GPU
   fallback). Shared dequant helpers (`dequantize_k`/`dequantize_v`/`cosine_similarity`) moved to
-  an engine-core `kv::dequant` module. (KIVI extraction to follow.)
+  an engine-core `kv::dequant` module. (KIVI follows — see the `kivi` plugin under Added.)
 
 ### Removed
 
