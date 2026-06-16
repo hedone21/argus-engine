@@ -90,11 +90,12 @@ pub fn build_resilience_cache_manager(
     // linkme fat-LTO 생존 self-test: 빌트인 stage 미등록 시 fail-fast.
     crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
 
-    // Bench-wide keep-ratio convention: every stage's heavy-hitter slot is driven by
-    // --eviction-target-ratio (preserves the prior d2o coupling, now expressed bench-wide rather than
-    // as a `name == "d2o"` test). Stages that ignore keep_ratio (sliding/streaming/none) are
-    // unaffected.
-    let keep_ratio = target_ratio;
+    // Heavy-hitter keep-ratio = the active variant's own keep_ratio (h2o/h2o_plus → 0.5 default,
+    // d2o → 0.75 default), identical to the chat/eval path — no `name == "d2o"` test. (The prior
+    // bench code coupled d2o's keep-ratio to --eviction-target-ratio; that only matched for default
+    // ratios and silently changed h2o/h2o_plus, so the generic accessor is used instead. The overall
+    // d2o budget is still driven by --eviction-target-ratio via the engine-resolved target_len.)
+    let keep_ratio = args.keep_ratio();
     let mut cm = {
         // Every policy (none/sliding/streaming/h2o/h2o_plus/d2o/rkv) resolves through the plugin
         // registry by name (static linkme + dynamic --load-plugin); eviction=none + swap-dir (AB-3)

@@ -42,7 +42,10 @@ impl H2OPlus {
 /// The shared 3-partition budget split (prefix / heavy-hitters / recent), computed once per plan.
 struct Partition {
     prefix: usize,
+    /// Total evictable budget `keep - prefix` (= hh_budget + recent_budget).
+    available: usize,
     hh_budget: usize,
+    /// Start of the recent window in the **score-based** split (`current - recent_budget`).
     recent_start: usize,
     current: usize,
 }
@@ -62,6 +65,7 @@ impl H2OPlus {
         let recent_start = current.saturating_sub(recent_budget).max(prefix);
         Some(Partition {
             prefix,
+            available,
             hh_budget,
             recent_start,
             current,
@@ -114,12 +118,15 @@ impl KVCacheStage for H2OPlus {
         }
 
         // (2) Flat fallback: heavy hitters from the layer-wide importance score (score-based H2O).
-        // (3) Score-free fallback: no heavy hitters — keep prefix + recent only (recency).
+        // (3) Score-free fallback: no heavy hitters — give the FULL budget to recency (keep prefix +
+        //     the last `available` tokens), matching the original `H2OPlusPolicy::evict` which
+        //     retained `keep` tokens (NOT `keep - hh_budget`).
         let keep = match ctx.importance() {
             Some(imp) => keep_list_from_scores(&p, |pos| imp.get(pos).copied().unwrap_or(0.0)),
             None => {
+                let recent_start = p.current.saturating_sub(p.available).max(p.prefix);
                 let mut keep: Vec<usize> = (0..p.prefix).collect();
-                keep.extend(p.recent_start..p.current);
+                keep.extend(recent_start..p.current);
                 keep
             }
         };
@@ -297,8 +304,9 @@ mod tests {
         };
         let plan = H2OPlus::new(0.5, 4).plan(&ctx).expect("plan Some");
         match plan.keep {
-            // available=6, hh_budget=3, recent_budget=3, recent_start=17 → prefix + [17,20).
-            KeepSpec::LayerWide(k) => assert_eq!(k, vec![0, 1, 2, 3, 17, 18, 19]),
+            // score-free gives the FULL budget to recency: available=6 → keep prefix + last 6 tokens
+            // ([14,20)) = 10 tokens total (= target), matching the old H2OPlusPolicy::evict.
+            KeepSpec::LayerWide(k) => assert_eq!(k, vec![0, 1, 2, 3, 14, 15, 16, 17, 18, 19]),
             KeepSpec::PerHead(_) => panic!("expected LayerWide"),
         }
     }
