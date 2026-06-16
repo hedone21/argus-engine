@@ -53,6 +53,12 @@ argus_extension_api::export_plugin!(); // only needed for the dynamic `.so` path
 
 Working template: [`crates/techniques/example-keep-recent`](../techniques/example-keep-recent).
 
+> Knobs beyond `StageParams`'s five common fields (e.g. d2o's `merge_axis`/`protected_layers`)
+> ride an opaque `key=value` blob: register a direct `KVCacheStageReg` literal with
+> `make_with_args(StageParams, StageArgs)` and parse the blob in the plugin (the engine never
+> names your config type). See [`docs/plugins.md`](../../docs/plugins.md) → *Passing
+> technique-private params*; `crates/techniques/d2o` is the worked example.
+
 ## Add a KV-cache format
 
 Implement [`KVFormat`] and register with `register_kv_format!`:

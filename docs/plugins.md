@@ -406,9 +406,63 @@ value-aware criticality score the engine never had to provide.
 The engine takes this plan and performs the actual buffer rewrite via `compact`. You hold
 any cross-call state (EMA accumulators, page metadata) on `&self` with interior
 mutability (a `Mutex`), since `plan` takes `&self`. See how the built-in `quest`
-(`Mutex<QuestState>`) and the in-engine `d2o` stage (`engine/src/kv/d2o_handler.rs`, not a
-technique crate) hold theirs. (`caote`, by contrast, is stateless: it recomputes from `ctx`
-on every call.)
+(`Mutex<QuestState>`) and the `d2o` technique crate
+([`crates/techniques/d2o`](../crates/techniques/d2o), `Mutex<D2OState>`) hold theirs.
+(`caote`, by contrast, is stateless: it recomputes from `ctx` on every call.)
+
+### Passing technique-private params
+
+`StageParams` is a shared `#[repr(C)]` POD with five common fields (`eviction_window`,
+`protected_prefix`, `keep_ratio`, `sink_size`, `streaming_window`). A technique with extra
+knobs that don't fit there — especially ones that can't cross a C-ABI by value, like d2o's
+`Vec<usize>` `protected_layers` or its `merge_axis` enum — receives them through an opaque
+`key=value` blob instead of bloating the shared struct:
+
+```rust
+pub struct PluginArg<'a> { pub key: &'a str, pub val: &'a str }
+pub type StageArgs<'a> = &'a [PluginArg<'a>];
+```
+
+The engine routes this blob **without interpreting it** — only your plugin knows the key
+names and types, so the engine never references your config type. Your registration gets a
+second factory, `make_with_args`, that receives it. (`register_kv_stage!` auto-fills
+`make_with_args` with an args-ignoring shim, so a macro-registered stage that takes no extra
+knobs needs no change; to *use* the blob, register a direct `KVCacheStageReg` literal as below.)
+
+```rust
+#[distributed_slice(KV_CACHE_STAGES)]
+static MY_STAGE: KVCacheStageReg = KVCacheStageReg {
+    name: "my_stage",
+    // `make` stays for the no-args case; `make_with_args` parses the blob.
+    make:           |p|       Box::new(MyStage::new(MyConfig::from_args(p, &[]))),
+    make_with_args: |p, args| Box::new(MyStage::new(MyConfig::from_args(p, args))),
+};
+
+impl MyConfig {
+    fn from_args(base: StageParams, args: StageArgs<'_>) -> Self {
+        let mut c = MyConfig { keep_ratio: base.keep_ratio, ..Default::default() };
+        for a in args {
+            match a.key {
+                "ema_beta" => if let Ok(v) = a.val.parse() { c.ema_beta = v }
+                _ => {} // unknown keys ignored; malformed values keep the default
+            }
+        }
+        c
+    }
+}
+```
+
+The engine resolves a stage through `make_stage_with_args(name, &params, &blob)`
+(`make_stage` is the empty-blob shim, `&[]`). The worked example is the d2o plugin
+([`crates/techniques/d2o`](../crates/techniques/d2o)): it parses
+`target_ratio`/`ema_beta`/`merge_e`/`layer_alloc`/`protected_layers`/`merge_axis` in
+`D2OConfig::from_args`, and the engine binaries build the blob from the CLI
+(`Args::d2o_stage_args`) — so the engine never names `D2OConfig`. Add a knob with one match
+arm plus one CLI line; no `StageParams` change and no engine edit.
+
+> The blob currently rides the **in-process (force-linked / static)** registration path. The
+> dynamic `.so` stage C-ABI still passes only `StageParams`; a `.so`-loaded stage that needs
+> private args would mean extending `PluginVTableAbi` — deferred until such a consumer exists.
 
 ### Selecting your stage
 

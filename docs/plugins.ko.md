@@ -394,9 +394,61 @@ argus_extension_api::export_plugin!();
 
 엔진은 이 계획을 받아 `compact`로 실제 버퍼 재작성을 수행합니다. 호출 간 상태(EMA 누산기, 페이지
 메타데이터)는 `plan`이 `&self`를 받으므로 `&self`에 내부 가변성(`Mutex`)으로 둡니다. 내장
-`quest`(`Mutex<QuestState>`)와 엔진 내부 `d2o` stage
-(`engine/src/kv/d2o_handler.rs`, 기법 크레이트가 아님)가 어떻게 보관하는지 보세요. (반면 `caote`는
-무상태라 매 호출 `ctx`에서 다시 계산합니다.)
+`quest`(`Mutex<QuestState>`)와 `d2o` 기법 크레이트
+([`crates/techniques/d2o`](../crates/techniques/d2o), `Mutex<D2OState>`)가 어떻게 보관하는지
+보세요. (반면 `caote`는 무상태라 매 호출 `ctx`에서 다시 계산합니다.)
+
+### 기법 전용 파라미터 전달
+
+`StageParams`는 모든 stage가 공유하는 `#[repr(C)]` POD로, 공통 5개 필드(`eviction_window`,
+`protected_prefix`, `keep_ratio`, `sink_size`, `streaming_window`)만 담습니다. 거기에 안 맞는 추가
+노브 — 특히 d2o의 `Vec<usize>` `protected_layers`나 `merge_axis` enum처럼 C-ABI를 값으로 못 넘는
+것 — 는 공유 구조체를 부풀리는 대신 불투명한 `key=value` blob으로 받습니다:
+
+```rust
+pub struct PluginArg<'a> { pub key: &'a str, pub val: &'a str }
+pub type StageArgs<'a> = &'a [PluginArg<'a>];
+```
+
+엔진은 이 blob을 **해석하지 않고 라우팅만** 합니다 — key 이름·타입은 플러그인만 알기에, 엔진은
+플러그인의 config 타입을 절대 참조하지 않습니다. 등록 엔트리에는 이 blob을 받는 두 번째 팩토리
+`make_with_args`가 추가됩니다. (`register_kv_stage!` 매크로는 `make_with_args`에 args를 버리는
+shim을 자동으로 채우므로, 추가 노브가 없는 매크로 등록 stage는 수정이 필요 없습니다. blob을 *쓰려면*
+아래처럼 `KVCacheStageReg` 리터럴로 직접 등록하세요.)
+
+```rust
+#[distributed_slice(KV_CACHE_STAGES)]
+static MY_STAGE: KVCacheStageReg = KVCacheStageReg {
+    name: "my_stage",
+    // `make`는 args 없는 경우용으로 유지; `make_with_args`가 blob을 파싱.
+    make:           |p|       Box::new(MyStage::new(MyConfig::from_args(p, &[]))),
+    make_with_args: |p, args| Box::new(MyStage::new(MyConfig::from_args(p, args))),
+};
+
+impl MyConfig {
+    fn from_args(base: StageParams, args: StageArgs<'_>) -> Self {
+        let mut c = MyConfig { keep_ratio: base.keep_ratio, ..Default::default() };
+        for a in args {
+            match a.key {
+                "ema_beta" => if let Ok(v) = a.val.parse() { c.ema_beta = v }
+                _ => {} // 모르는 key 무시; 깨진 값은 기본값 유지
+            }
+        }
+        c
+    }
+}
+```
+
+엔진은 stage를 `make_stage_with_args(name, &params, &blob)`으로 만듭니다(`make_stage`는 빈 blob
+`&[]` shim). 실제 예시는 d2o 플러그인([`crates/techniques/d2o`](../crates/techniques/d2o))입니다:
+`target_ratio`/`ema_beta`/`merge_e`/`layer_alloc`/`protected_layers`/`merge_axis`를
+`D2OConfig::from_args`에서 파싱하고, 엔진 바이너리는 CLI에서 blob을 만들 뿐(`Args::d2o_stage_args`)
+이라 엔진은 `D2OConfig`를 절대 named하지 않습니다. 노브 추가는 match arm 1줄 + CLI 1줄 — StageParams
+무변경, 엔진 무수정.
+
+> blob은 현재 **in-process(force-link/정적)** 등록 경로로만 흐릅니다. 동적 `.so` stage C-ABI는 아직
+> `StageParams`만 넘기므로, private arg가 필요한 `.so` 로드 stage는 `PluginVTableAbi` 확장이
+> 필요합니다 — 그런 소비자가 생길 때까지 보류.
 
 ### stage 고르기
 
