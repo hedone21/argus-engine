@@ -1,0 +1,17 @@
+[package]
+name = "kivi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"] # rlib=정적 force-link 가시성, cdylib=dlopen .so
+
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3" # 매크로 확장이 linkme:: 경로(재노출)를 쓰므로 plugin 직접 dep 필수
+
+[features]
+plugin-cdylib = [] # cdylib C-ABI export 게이트. .so 빌드 시에만 ON. 정적 force-link 시 #[no_mangle] 충돌 차단
