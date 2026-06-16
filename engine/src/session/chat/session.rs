@@ -494,10 +494,10 @@ pub struct ChatStandardArgs {
     pub h2o_decay: f32,
     pub h2o_raw_scores: bool,
     pub d2o_keep_ratio: f32,
-    pub d2o_ema_beta: f32,
-    pub d2o_merge_e: f32,
-    pub d2o_layer_alloc: bool,
-    pub d2o_protected_layers: Vec<usize>,
+    /// d2o-private knobs (target_ratio/ema_beta/merge_e/layer_alloc/protected_layers/merge_axis) as
+    /// an opaque `(key, val)` blob parsed by `d2o::D2OConfig::from_args`. Keeps chat from knowing
+    /// d2o's params and carries `merge_axis` (previously dropped on the chat path).
+    pub d2o_args: Vec<(String, String)>,
     pub memory_threshold_mb: u64,
     /// Base sampling config (CLI defaults / OpenAI request seed). Installed into a
     /// shared handle so the server can override `temperature`/`top_p` per request.
@@ -803,24 +803,7 @@ fn build_chat_eviction_internal(
     // linkme fat-LTO 생존 self-test: 빌트인 stage 미등록 시 fail-fast.
     crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
 
-    let cache_manager = if args.eviction_policy == "d2o" {
-        // D2O extracted to the out-of-tree `d2o` plugin. Build `D2OStage` with the chat CLI config
-        // and wrap as an EvictionPolicy (StageBackedPolicy → execute_kv_plan applies its Eq.11
-        // WeightedMerges). Constructed directly because StageParams can't carry ema_beta/merge_e.
-        let stage = d2o::D2OStage::new(d2o::D2OConfig {
-            keep_ratio: args.d2o_keep_ratio,
-            protected_prefix: actual_protected_prefix,
-            target_ratio: args.eviction_target_ratio,
-            ema_beta: args.d2o_ema_beta,
-            merge_e: args.d2o_merge_e,
-            use_layer_allocation: args.d2o_layer_alloc,
-            protected_layers: args.d2o_protected_layers.clone(),
-            merge_axis: argus_extension_api::MergeAxis::Both,
-        });
-        let policy: Box<dyn crate::kv::eviction::EvictionPolicy> =
-            Box::new(StageBackedPolicy::new(Box::new(stage)));
-        CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
-    } else {
+    let cache_manager = {
         let policy: Box<dyn crate::kv::eviction::EvictionPolicy> = match args
             .eviction_policy
             .as_str()
@@ -844,22 +827,40 @@ fn build_chat_eviction_internal(
                 } else {
                     args.eviction_window
                 };
+                // d2o reads its own keep-ratio; other stages use the h2o keep-ratio slot.
+                let keep_ratio = if name == "d2o" {
+                    args.d2o_keep_ratio
+                } else {
+                    args.h2o_keep_ratio
+                };
                 let params = argus_extension_api::StageParams {
                     eviction_window: args.eviction_window,
                     protected_prefix: actual_protected_prefix,
-                    keep_ratio: args.h2o_keep_ratio,
+                    keep_ratio,
                     sink_size: args.sink_size,
                     streaming_window,
                 };
+                // d2o-private knobs ride the opaque StageArgs blob (built in chat/build.rs via
+                // `d2o_stage_args`, incl. merge_axis — previously dropped); other policies pass &[].
+                let extra: Vec<argus_extension_api::PluginArg> = if name == "d2o" {
+                    args.d2o_args
+                        .iter()
+                        .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 // 정적(linkme) + 동적(--load-plugin dlopen) 통합 조회. miss = unknown.
-                let stage = crate::kv::eviction::stage_registry::make_stage(name, &params)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>)",
-                            name,
-                            if cfg!(feature = "caote") { ", caote" } else { "" }
-                        )
-                    })?;
+                let stage = crate::kv::eviction::stage_registry::make_stage_with_args(
+                    name, &params, &extra,
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>)",
+                        name,
+                        if cfg!(feature = "caote") { ", caote" } else { "" }
+                    )
+                })?;
                 Box::new(StageBackedPolicy::new(stage))
             }
         };

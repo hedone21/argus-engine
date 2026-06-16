@@ -86,23 +86,7 @@ pub fn build_resilience_cache_manager(
     // linkme fat-LTO 생존 self-test: 빌트인 stage 미등록 시 fail-fast.
     crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
 
-    let mut cm = if policy_name == "d2o" {
-        // D2O extracted to the out-of-tree `d2o` plugin. Build `D2OStage` directly (StageParams
-        // can't carry ema_beta/merge_e/merge_axis) and wrap as an EvictionPolicy — the engine
-        // executor applies its Eq.11 WeightedMerges. Bench keeps the prior hard-coded defaults.
-        let stage = d2o::D2OStage::new(d2o::D2OConfig {
-            keep_ratio: target_ratio,
-            protected_prefix: actual_protected_prefix,
-            target_ratio,
-            ema_beta: 0.7,
-            merge_e: 0.1,
-            use_layer_allocation: false,
-            protected_layers: Vec::new(),
-            merge_axis: argus_extension_api::MergeAxis::Both,
-        });
-        let policy: Box<dyn EvictionPolicy> = Box::new(StageBackedPolicy::new(Box::new(stage)));
-        CacheManager::new(policy, monitor, threshold_bytes, target_ratio)
-    } else {
+    let mut cm = {
         let policy: Box<dyn EvictionPolicy> = match policy_name {
             // eviction=none + swap-dir 전용(AB-3): eviction 은 안 하고 offload 만.
             "none" => Box::new(NoEvictionPolicy::new()),
@@ -121,23 +105,44 @@ pub fn build_resilience_cache_manager(
                 } else {
                     args.eviction_window()
                 };
+                // d2o couples its keep-ratio to --eviction-target-ratio here (bench convention,
+                // preserved); other stages use the h2o keep-ratio slot.
+                let keep_ratio = if policy_name == "d2o" {
+                    target_ratio
+                } else {
+                    args.h2o_keep_ratio()
+                };
                 let params = argus_extension_api::StageParams {
                     eviction_window: args.eviction_window(),
                     protected_prefix: actual_protected_prefix,
-                    keep_ratio: args.h2o_keep_ratio(),
+                    keep_ratio,
                     sink_size: args.sink_size(),
                     streaming_window,
                 };
+                // d2o-private knobs ride the opaque StageArgs blob (parsed by d2o::from_args); other
+                // policies pass an empty blob. The engine no longer constructs D2OConfig. Default
+                // runs match the prior hard-coded values (they were the d2o defaults); explicit
+                // `eviction d2o --ema-beta/--merge-axis/…` flags are now honored (divergence fixed).
+                let extra_owned = if policy_name == "d2o" {
+                    args.d2o_stage_args()
+                } else {
+                    Vec::new()
+                };
+                let extra: Vec<argus_extension_api::PluginArg> = extra_owned
+                    .iter()
+                    .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
+                    .collect();
                 // 정적(linkme) + 동적(--load-plugin dlopen) 통합 조회. miss = unknown.
-                // d2o 는 위 분기에서 처리되나 유효 정책이라 안내에 포함(session.rs 와 일관).
-                let stage = crate::kv::eviction::stage_registry::make_stage(name, &params)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>).",
-                            name,
-                            if cfg!(feature = "caote") { ", caote" } else { "" }
-                        )
-                    })?;
+                let stage = crate::kv::eviction::stage_registry::make_stage_with_args(
+                    name, &params, &extra,
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>).",
+                        name,
+                        if cfg!(feature = "caote") { ", caote" } else { "" }
+                    )
+                })?;
                 Box::new(StageBackedPolicy::new(stage))
             }
         };

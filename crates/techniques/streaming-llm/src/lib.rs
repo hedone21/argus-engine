@@ -78,6 +78,10 @@ impl KVCacheStage for StreamingLlm {
 static STREAMING: KVCacheStageReg = KVCacheStageReg {
     name: "streaming",
     make: |p: StageParams| Box::new(StreamingLlm::new(p.sink_size, p.streaming_window)),
+    // streaming takes no technique-private args — drop the blob, build from StageParams.
+    make_with_args: |p: StageParams, _args| {
+        Box::new(StreamingLlm::new(p.sink_size, p.streaming_window))
+    },
 };
 
 #[cfg(test)]

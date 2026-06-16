@@ -1503,6 +1503,38 @@ impl Args {
         }
     }
 
+    /// d2o-private knobs as an opaque `(key, val)` blob for `make_stage_with_args("d2o", …)`.
+    /// Keys mirror those parsed by `d2o::D2OConfig::from_args`, so the engine routes them without
+    /// knowing d2o's params. Built only for the `d2o` policy; other policies pass `&[]`.
+    pub fn d2o_stage_args(&self) -> Vec<(String, String)> {
+        let merge_axis = match self.d2o_merge_axis() {
+            argus_extension_api::MergeAxis::KeyOnly => "key_only",
+            argus_extension_api::MergeAxis::ValueOnly => "value_only",
+            argus_extension_api::MergeAxis::Both => "both",
+        };
+        let protected_layers = self
+            .d2o_protected_layers()
+            .unwrap_or_default()
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        vec![
+            (
+                "target_ratio".to_string(),
+                self.eviction_target_ratio().to_string(),
+            ),
+            ("ema_beta".to_string(), self.d2o_ema_beta().to_string()),
+            ("merge_e".to_string(), self.d2o_merge_e().to_string()),
+            (
+                "layer_alloc".to_string(),
+                self.d2o_layer_alloc().to_string(),
+            ),
+            ("protected_layers".to_string(), protected_layers),
+            ("merge_axis".to_string(), merge_axis.to_string()),
+        ]
+    }
+
     /// R-KV fusion 가중치 λ (KV roadmap 항목 0 측정, feature `rkv`). 미지정/타 정책 시 stage
     /// 기본(0.1). 측정 schedule 의 stage 직접 생성 경로(d2o if-branch 동형)가 읽는다.
     #[cfg(feature = "rkv")]

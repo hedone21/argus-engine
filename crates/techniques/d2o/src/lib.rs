@@ -26,8 +26,8 @@
 //! [`StageCtx::layer_idx`]/[`StageCtx::n_layers`].
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, MergeAxis, StageCtx,
-    StageParams, WeightedMerge,
+    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, MergeAxis, StageArgs,
+    StageCtx, StageParams, WeightedMerge,
 };
 use linkme::distributed_slice;
 use std::sync::Mutex;
@@ -74,6 +74,59 @@ impl Default for D2OConfig {
             protected_layers: vec![],
             merge_axis: MergeAxis::Both,
         }
+    }
+}
+
+impl D2OConfig {
+    /// Build the full d2o config from the shared [`StageParams`] (`keep_ratio`/`protected_prefix`)
+    /// plus the technique-private [`StageArgs`] blob the engine routes opaquely. Unrecognized keys
+    /// are ignored; a malformed value falls back to the field default. This is the single place that
+    /// knows d2o's private knobs — the engine no longer constructs `D2OConfig` itself.
+    ///
+    /// Recognized keys: `target_ratio`, `ema_beta`, `merge_e` (f32); `layer_alloc` (`"true"`/else);
+    /// `protected_layers` (comma-separated `usize`); `merge_axis` (`key_only`/`value_only`/else=both).
+    pub fn from_args(base: StageParams, args: StageArgs<'_>) -> Self {
+        let mut c = D2OConfig {
+            keep_ratio: base.keep_ratio,
+            protected_prefix: base.protected_prefix,
+            ..D2OConfig::default()
+        };
+        for a in args {
+            match a.key {
+                "target_ratio" => {
+                    if let Ok(v) = a.val.parse() {
+                        c.target_ratio = v;
+                    }
+                }
+                "ema_beta" => {
+                    if let Ok(v) = a.val.parse() {
+                        c.ema_beta = v;
+                    }
+                }
+                "merge_e" => {
+                    if let Ok(v) = a.val.parse() {
+                        c.merge_e = v;
+                    }
+                }
+                "layer_alloc" => c.use_layer_allocation = a.val == "true",
+                "protected_layers" => {
+                    c.protected_layers = a
+                        .val
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                }
+                "merge_axis" => {
+                    c.merge_axis = match a.val {
+                        "key_only" => MergeAxis::KeyOnly,
+                        "value_only" => MergeAxis::ValueOnly,
+                        _ => MergeAxis::Both,
+                    };
+                }
+                _ => {}
+            }
+        }
+        c
     }
 }
 
@@ -426,21 +479,16 @@ impl KVCacheStage for D2OStage {
     }
 }
 
-/// Registration — the engine finds this via `find_stage("d2o")`. Only `keep_ratio`/`protected_prefix`
-/// map from [`StageParams`]; d2o-specific params (ema_beta/merge_e/merge_axis/protected_layers) use
-/// `D2OConfig::default()` here. Production constructs `D2OStage` directly with the full CLI config
-/// (see the engine `eval_setup`/`build_bench_loop`/chat wiring) — this registration is the
-/// `make_stage("d2o")` surface (tests, dlopen-name parity).
+/// Registration — the engine finds this via `find_stage("d2o")` and builds it through
+/// `make_stage_with_args("d2o", &params, &blob)`. `keep_ratio`/`protected_prefix` flow in from
+/// [`StageParams`]; the d2o-private knobs (ema_beta/merge_e/target_ratio/layer_alloc/protected_layers/
+/// merge_axis) ride the [`StageArgs`] blob and are parsed by [`D2OConfig::from_args`]. The plain
+/// `make` (empty blob) keeps the prior `make_stage("d2o")` behavior (only keep_ratio/protected_prefix).
 #[distributed_slice(KV_CACHE_STAGES)]
 static D2O: KVCacheStageReg = KVCacheStageReg {
     name: "d2o",
-    make: |p: StageParams| {
-        Box::new(D2OStage::new(D2OConfig {
-            protected_prefix: p.protected_prefix,
-            keep_ratio: p.keep_ratio,
-            ..D2OConfig::default()
-        }))
-    },
+    make: |p: StageParams| Box::new(D2OStage::new(D2OConfig::from_args(p, &[]))),
+    make_with_args: |p: StageParams, args| Box::new(D2OStage::new(D2OConfig::from_args(p, args))),
 };
 
 #[cfg(test)]
@@ -456,6 +504,80 @@ mod tests {
         assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
         assert!((cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < 1e-6);
         assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0); // zero-norm → 0
+    }
+
+    // ── from_args (engine routes an opaque blob; the plugin parses its own knobs) ──
+
+    #[test]
+    fn from_args_empty_blob_uses_base_and_defaults() {
+        let base = StageParams {
+            keep_ratio: 0.8,
+            protected_prefix: 7,
+            ..StageParams::default()
+        };
+        let c = D2OConfig::from_args(base, &[]);
+        // base supplies keep_ratio/protected_prefix; everything else is the D2OConfig default.
+        assert_eq!(c.keep_ratio, 0.8);
+        assert_eq!(c.protected_prefix, 7);
+        assert_eq!(c.target_ratio, 0.5);
+        assert_eq!(c.ema_beta, 0.7);
+        assert_eq!(c.merge_e, 0.1);
+        assert!(!c.use_layer_allocation);
+        assert!(c.protected_layers.is_empty());
+        assert_eq!(c.merge_axis, MergeAxis::Both);
+    }
+
+    #[test]
+    fn from_args_parses_all_keys_ignores_unknown_and_malformed() {
+        use argus_extension_api::PluginArg;
+        let base = StageParams {
+            keep_ratio: 0.8,
+            protected_prefix: 7,
+            ..StageParams::default()
+        };
+        let args = [
+            PluginArg {
+                key: "target_ratio",
+                val: "0.3",
+            },
+            PluginArg {
+                key: "ema_beta",
+                val: "0.9",
+            },
+            PluginArg {
+                key: "merge_e",
+                val: "0.25",
+            },
+            PluginArg {
+                key: "layer_alloc",
+                val: "true",
+            },
+            PluginArg {
+                key: "protected_layers",
+                val: "0, 1, 27",
+            }, // whitespace tolerated
+            PluginArg {
+                key: "merge_axis",
+                val: "value_only",
+            },
+            PluginArg {
+                key: "unknown_key",
+                val: "ignored",
+            }, // unknown → ignored
+            PluginArg {
+                key: "merge_e",
+                val: "not_a_float",
+            }, // malformed → keeps prior 0.25
+        ];
+        let c = D2OConfig::from_args(base, &args);
+        assert_eq!(c.keep_ratio, 0.8); // still from base
+        assert_eq!(c.protected_prefix, 7);
+        assert_eq!(c.target_ratio, 0.3);
+        assert_eq!(c.ema_beta, 0.9);
+        assert_eq!(c.merge_e, 0.25); // malformed second merge_e left it at 0.25
+        assert!(c.use_layer_allocation);
+        assert_eq!(c.protected_layers, vec![0, 1, 27]);
+        assert_eq!(c.merge_axis, MergeAxis::ValueOnly);
     }
 
     // ── compute_eq11_weights (D = Σ exp(u_i) + e; w_c = e/D; w_i = exp(u_i)/D) ──
