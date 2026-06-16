@@ -16,15 +16,15 @@
 //! **GQA**: redundancy/importance 모두 KV-head 단위(8개)로 측정. head 별 Z 를 평균해 단일
 //! layer-wide keep 산출(per-head 차등 keep 은 §6 항목 6 영역 — 본 프로토타입은 layer-wide 근사).
 //!
-//! **재사용**(§4.1): K 읽기는 `StageCtx::dequant_k`(d2o_handler `dequantize_k` 정본 위임),
-//! cosine 은 `d2o_handler::cosine_similarity`. N×N row-mean 집계 루프만 신규.
+//! **재사용**(§4.1): K 읽기는 `StageCtx::dequant_k`(`kv::dequant::dequantize_k` 정본 위임),
+//! cosine 은 `kv::dequant::cosine_similarity`. N×N row-mean 집계 루프만 신규.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use argus_extension_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, TensorKind};
 
-use crate::kv::d2o_handler::cosine_similarity;
+use crate::kv::dequant::cosine_similarity;
 
 /// 1단 측정 덤프 게이트 env var. set 시 plan() 마다 per-kv_head `[RkvStats]` 마커 라인을 stderr 로
 /// 출력한다(파싱 가능 포맷). 측정 전용 — 미설정 시 덤프 경로 미진입(production 무영향).

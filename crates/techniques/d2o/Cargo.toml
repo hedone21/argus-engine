@@ -1,0 +1,16 @@
+[package]
+name = "d2o"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# D2O (Dynamic Discriminative Operations) technique crate — eviction with cosine-similarity
+# compensation merging (Wan et al., 2024). Extracted from the engine core (the caote/quest/h2o
+# precedent): depends only on `argus-extension-api` + `linkme` (no engine/other-axis reference =
+# proof of additive extension cost). Force-linked via one `use d2o as _;`. Unlike streaming/h2o,
+# D2O emits WeightedMerge (Eq.11) which the engine executor (apply_weighted_merges) applies.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

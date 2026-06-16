@@ -386,8 +386,9 @@ impl CacheManager {
 
     /// Force eviction with importance scores and per-layer budget ratios.
     ///
-    /// Used when D2O layer-level allocation is active. Passes `layer_ratios`
-    /// into `HandlerContext` so the D2OHandler can apply per-layer targets.
+    /// Would be used when D2O layer-level allocation is active: passes `layer_ratios` into
+    /// `HandlerContext` for a per-layer-aware handler. NOTE: unwired at runtime (the variance
+    /// collector that feeds the ratios is never mounted); only test callers exercise this.
     /// Runs at `Emergency` pressure level with scores.
     pub fn force_evict_with_scores_and_budgets(
         &self,
@@ -585,17 +586,19 @@ impl CacheManager {
             } => (Some(*flat), Some(*head), *n_kv_heads),
         };
 
-        for cache in caches.iter_mut() {
+        let n_layers = caches.len();
+        for (layer_idx, cache) in caches.iter_mut().enumerate() {
             if let (Some(flat), Some(head_imp)) = (importance, head_importance) {
                 if n_kv_heads > 0 {
+                    // Per-head (h2o_plus) — not a layer-aware stage; keep the dedicated path.
                     policy.evict_with_head_scores(cache, target_len, flat, head_imp, n_kv_heads)?;
                 } else {
-                    policy.evict_with_scores(cache, target_len, flat)?;
+                    policy.evict_layer(cache, target_len, Some(flat), layer_idx, n_layers)?;
                 }
-            } else if let Some(imp) = importance {
-                policy.evict_with_scores(cache, target_len, imp)?;
             } else {
-                policy.evict(cache, target_len)?;
+                // flat-score or score-free: route through the per-layer entry so a layer-aware
+                // adapter (StageBackedPolicy → d2o) sees the real (layer_idx, n_layers).
+                policy.evict_layer(cache, target_len, importance, layer_idx, n_layers)?;
             }
         }
 

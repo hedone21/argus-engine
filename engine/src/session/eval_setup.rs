@@ -32,13 +32,11 @@ use crate::hardware::DeviceTarget;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::skip_config::SkipConfig;
 use crate::kv::cache_manager::CacheManager;
-use crate::kv::d2o_handler::{D2OConfig, D2OHandler};
 use crate::kv::eviction::EvictMethod;
 use crate::kv::eviction::EvictionPolicy;
 use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
 use crate::kv::eviction::no_eviction::NoEvictionPolicy;
 use crate::kv::eviction::sliding_window::SlidingWindowPolicy;
-use crate::kv::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor, SystemMonitor};
 use crate::session::bin_setup::{
@@ -184,7 +182,11 @@ fn build_eval_cache_manager(
     let threshold_bytes = args.memory_threshold_mb() * 1024 * 1024;
 
     let mut cache_manager = if args.eviction_policy() == "d2o" {
-        let d2o_handler = D2OHandler::new(D2OConfig {
+        // D2O extracted to the out-of-tree `d2o` plugin. Build `D2OStage` with the full CLI config
+        // and wrap it as an EvictionPolicy (StageBackedPolicy → execute_kv_plan applies its Eq.11
+        // WeightedMerges). Constructed directly (not via make_stage) because StageParams carries
+        // only keep_ratio/protected_prefix — the d2o-specific params go straight into D2OConfig.
+        let stage = d2o::D2OStage::new(d2o::D2OConfig {
             keep_ratio: args.d2o_keep_ratio(),
             protected_prefix: actual_protected_prefix,
             target_ratio: args.eviction_target_ratio(),
@@ -194,11 +196,15 @@ fn build_eval_cache_manager(
             protected_layers: args.d2o_protected_layers().unwrap_or_default(),
             merge_axis: args.d2o_merge_axis(),
         });
-        let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
-            min_level: PressureLevel::Warning,
-            handler: Box::new(d2o_handler),
-        }]);
-        CacheManager::with_pipeline(pipeline, monitor, threshold_bytes)
+        let policy: Box<dyn EvictionPolicy> = Box::new(
+            crate::kv::eviction::stage_registry::StageBackedPolicy::new(Box::new(stage)),
+        );
+        CacheManager::new(
+            policy,
+            monitor,
+            threshold_bytes,
+            args.eviction_target_ratio(),
+        )
     } else if cfg!(feature = "rkv") && args.eviction_policy() == "rkv" {
         // R-KV(KV roadmap 항목 0 측정, P2a): RkvStage(KVCacheStage)를 StageBackedPolicy 로
         // 감싸 EvictionPolicy 표면으로 노출 → CacheManager::new 등록(d2o if-branch 동형).

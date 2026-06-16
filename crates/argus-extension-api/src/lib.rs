@@ -182,6 +182,21 @@ pub trait StageCtx {
     fn has_attn_weights(&self) -> bool {
         self.tensor(TensorKind::AttnWeights).is_some()
     }
+
+    /// Total number of transformer layers (caches) in this eviction pass. Paired with [`layer_idx`](Self::layer_idx)
+    /// for techniques that protect specific layers (e.g. d2o's last-layer protection: `layer_idx == n_layers - 1`).
+    /// Default `0` — a single-layer view where no last-layer reasoning applies; the engine overrides it while iterating.
+    fn n_layers(&self) -> usize {
+        0
+    }
+
+    /// Whether the KV buffers live device-only (no CPU-accessible pointer), e.g. a discrete GPU.
+    /// When `true`, a technique MUST NOT read raw K/V (`dequant_k`/`dequant_v` would fault) or emit
+    /// [`WeightedMerge`]s (the engine merge executor is CPU-only); it should degrade to a keep-only plan.
+    /// Default `false` — CPU-accessible (zero-copy / CPU backend), the common on-device case.
+    fn kv_on_device(&self) -> bool {
+        false
+    }
 }
 
 /// A weighted merge instruction. Sums the evicted tokens (`from`) with weights into a single retained token's slot (`into`).
@@ -263,10 +278,12 @@ pub trait KVCacheStage: Send + Sync {
 /// The common parameters needed to create a technique instance. The engine maps CLI args into this struct and passes it along
 /// (carrying only flat values so argus-extension-api does not depend on the engine's args type).
 ///
-/// NOTE(open question): d2o-specific parameters (ema_beta/merge_e/use_layer_allocation, etc.) are
-/// **not carried here** because the "bloating the shared struct vs. per-technique opaque params" decision is unresolved —
-/// it will be settled upon entering the d2o migration (M4). The 4 current built-ins (sliding/streaming/h2o/no_eviction) are well served by the
-/// 5 fields below.
+/// NOTE: d2o-specific parameters (ema_beta/merge_e/use_layer_allocation, etc.) are deliberately
+/// **not carried here** — rather than bloat this shared struct, the engine constructs `d2o::D2OStage`
+/// directly with its full `D2OConfig` (see the eval/bench/chat wiring) and wraps it in
+/// `StageBackedPolicy`; the `make_stage("d2o")` registry path maps only `keep_ratio`/`protected_prefix`
+/// (defaults for the rest). The current built-ins (sliding/streaming/h2o/no_eviction) are well served
+/// by the 5 fields below.
 #[repr(C)] // GATE-C: the `.so` C-ABI passes it by value as a POD (the make-thunk argument).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StageParams {

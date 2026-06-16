@@ -16,13 +16,11 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
-use crate::kv::d2o_handler::{D2OConfig, D2OHandler};
 use crate::kv::eviction::EvictionPolicy;
 use crate::kv::eviction::h2o_plus::H2OPlusPolicy;
 use crate::kv::eviction::no_eviction::NoEvictionPolicy;
 use crate::kv::eviction::stage_registry::StageBackedPolicy;
 use crate::kv::kv_cache::KVCache;
-use crate::kv::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
@@ -89,7 +87,10 @@ pub fn build_resilience_cache_manager(
     crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
 
     let mut cm = if policy_name == "d2o" {
-        let d2o_handler = D2OHandler::new(D2OConfig {
+        // D2O extracted to the out-of-tree `d2o` plugin. Build `D2OStage` directly (StageParams
+        // can't carry ema_beta/merge_e/merge_axis) and wrap as an EvictionPolicy — the engine
+        // executor applies its Eq.11 WeightedMerges. Bench keeps the prior hard-coded defaults.
+        let stage = d2o::D2OStage::new(d2o::D2OConfig {
             keep_ratio: target_ratio,
             protected_prefix: actual_protected_prefix,
             target_ratio,
@@ -99,11 +100,8 @@ pub fn build_resilience_cache_manager(
             protected_layers: Vec::new(),
             merge_axis: argus_extension_api::MergeAxis::Both,
         });
-        let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
-            min_level: PressureLevel::Warning,
-            handler: Box::new(d2o_handler),
-        }]);
-        CacheManager::with_pipeline(pipeline, monitor, threshold_bytes)
+        let policy: Box<dyn EvictionPolicy> = Box::new(StageBackedPolicy::new(Box::new(stage)));
+        CacheManager::new(policy, monitor, threshold_bytes, target_ratio)
     } else {
         let policy: Box<dyn EvictionPolicy> = match policy_name {
             // eviction=none + swap-dir 전용(AB-3): eviction 은 안 하고 offload 만.
