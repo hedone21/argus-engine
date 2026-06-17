@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
     // test 가 new_gpu 에 넘길 때 backend 와 동일 ocl 인스턴스의 clone).
     #[cfg(feature = "opencl")]
     let mut opencl_kivi_handle: Option<
-        Arc<dyn argus_engine::capability::kivi_attention::KiviAttentionBackend>,
+        Arc<dyn argus_engine::capability::kivi_attention::QuantAttnBackend>,
     > = None;
     for name in &args.backends {
         match name.to_lowercase().as_str() {
@@ -91,9 +91,7 @@ fn main() -> anyhow::Result<()> {
                         // 객체). KIVI test 루프(아래)가 이 handle 을 new_gpu 에 전달.
                         let b = Arc::new(b);
                         opencl_kivi_handle = Some(b.clone()
-                            as Arc<
-                                dyn argus_engine::capability::kivi_attention::KiviAttentionBackend,
-                            >);
+                            as Arc<dyn argus_engine::capability::kivi_attention::QuantAttnBackend>);
                         backends.push(b as Arc<dyn Backend>);
                     }
                     Err(e) => println!(
@@ -761,7 +759,7 @@ fn xorshift32(state: &mut u32) -> f32 {
 fn run_kivi_attention_test(
     results: &mut Vec<TestResult>,
     backend: Arc<dyn Backend>,
-    kivi: Option<Arc<dyn argus_engine::capability::kivi_attention::KiviAttentionBackend>>,
+    kivi: Option<Arc<dyn argus_engine::capability::kivi_attention::QuantAttnBackend>>,
     bits: u8,
 ) {
     let kv_heads: usize = 8;
@@ -825,7 +823,7 @@ fn run_kivi_attention_test(
 #[allow(clippy::too_many_arguments)]
 fn perform_kivi_attention_test(
     backend: Arc<dyn Backend>,
-    kivi: Option<Arc<dyn argus_engine::capability::kivi_attention::KiviAttentionBackend>>,
+    kivi: Option<Arc<dyn argus_engine::capability::kivi_attention::QuantAttnBackend>>,
     bits: u8,
     kv_heads: usize,
     head_dim: usize,

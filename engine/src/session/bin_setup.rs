@@ -12,7 +12,7 @@ use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::capability::kivi_attention::KiviAttentionBackend;
+use crate::capability::kivi_attention::QuantAttnBackend;
 use crate::hardware::Hardware;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::kv_cache::{KVCache, KVLayout};
@@ -41,7 +41,7 @@ pub struct InferencePrelude {
 ///
 /// plugin dlopen + fat-LTO self-test + `SessionInitCtx::build` + tokenizer/prompt/token 까지.
 /// caps 보존을 위해 `SessionInitCtx` 전체를 [`InferencePrelude`] 로 반환한다(KIVI 는 caps 가
-/// `caps.get::<dyn KiviAttentionBackend>()` pull 에 필요).
+/// `caps.get::<dyn QuantAttnBackend>()` pull 에 필요).
 pub fn build_inference_prelude(args: &Args) -> anyhow::Result<InferencePrelude> {
     // GATE-C: --load-plugin 의 `.so` 들을 .so 당 1회 dlopen 해 stage+format 양축
     // capability 를 등록한다(cross-axis open-once dispatcher — 번들/단일축 `.so` 모두 흡수). 이후
@@ -416,7 +416,7 @@ pub fn alloc_opaque_kv_caches(
 /// AB-2 §5.7.7: argus-bench KIVI 분기 컨텍스트.
 ///
 /// Standard [`StandardHappyCtx`] 와 달리 KIVI 는 `Vec<KiviCache>`(typed `KVCache` 아님) + caps
-/// (`KiviAttentionBackend` pull) + initial_bits/residual_size 를 보유한다. `build_bench_kivi_loop`
+/// (`QuantAttnBackend` pull) + initial_bits/residual_size 를 보유한다. `build_bench_kivi_loop`
 /// (assembly) 가 이를 소비해 `KiviForward` + `KiviQuantStage` 배선 `DecodeLoop` 를 조립한다.
 pub struct KiviBenchCtx {
     pub args: Args,
@@ -425,7 +425,7 @@ pub struct KiviBenchCtx {
     pub hardware: Arc<Hardware>,
     pub model: TransformerModel,
     /// KIVI native attention capability (OpenCL backend 면 `Some` 필수 — alloc_kivi_kv_caches R3).
-    pub kivi: Option<Arc<dyn KiviAttentionBackend>>,
+    pub kivi: Option<Arc<dyn QuantAttnBackend>>,
     pub tokenizer: Tokenizer,
     pub tokens: Vec<u32>,
     pub max_seq_len: usize,
@@ -456,7 +456,7 @@ pub fn build_kivi_bench_ctx(args: Args) -> anyhow::Result<KiviBenchCtx> {
     let sampling_config = init.sampling_config;
     let model = init.model;
     // KIVI native attention capability pull (R3: OpenCL backend 면 Some 필수, init.rs 가 register).
-    let kivi = init.caps.get::<dyn KiviAttentionBackend>();
+    let kivi = init.caps.get::<dyn QuantAttnBackend>();
 
     let max_seq_len = args.max_seq_len;
     let vocab_size = model.config.vocab_size;

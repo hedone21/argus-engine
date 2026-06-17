@@ -568,7 +568,7 @@ pub struct Args {
     pub load_plugin: Vec<std::path::PathBuf>,
 
     /// Select a backend-capability implementation by registry name — e.g. a KIVI fused
-    /// dequant+attention backend — static (linkme `KIVI_ATTENTION_REGS`) or `--load-plugin`
+    /// dequant+attention backend — static (linkme `QUANT_ATTN_REGS`) or `--load-plugin`
     /// dlopen'd. The backend-capability axis's analogue of `--kv-format`. OpenCL-only;
     /// unset = the engine's built-in OpenCL implementation.
     #[arg(long = "backend-cap")]

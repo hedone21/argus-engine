@@ -43,9 +43,9 @@ pub struct SessionInitCtx {
     pub hardware: Arc<Hardware>,
 
     /// L2 backend capability 레지스트리 (Phase α-W-4 §3.3). OpenCL backend 면
-    /// `KiviAttentionBackend` handle 이 등록되어 있고, 그 외(CPU-only/CUDA)는 빈
+    /// `QuantAttnBackend` handle 이 등록되어 있고, 그 외(CPU-only/CUDA)는 빈
     /// registry 다. 소비자(KiviCache 생성 caller)가 construction 시점에 1회
-    /// `caps.get::<dyn KiviAttentionBackend>()` pull 한다.
+    /// `caps.get::<dyn QuantAttnBackend>()` pull 한다.
     pub caps: Arc<CapabilityRegistry>,
 
     /// swap layer 선택 알고리즘 (--swap-algorithm).
@@ -314,7 +314,7 @@ impl SessionInitCtx {
                 match args.backend_cap.as_deref() {
                     Some(name) => {
                         // --backend-cap <name>: resolve a named KIVI attention capability
-                        // (static KIVI_ATTENTION_REGS first, then dynamic --load-plugin) using
+                        // (static QUANT_ATTN_REGS first, then dynamic --load-plugin) using
                         // the live GPU context, and register it in place of the built-in impl.
                         let cap = gpu_concrete
                             .with_kivi_make_args(|make_args| {
@@ -325,16 +325,14 @@ impl SessionInitCtx {
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "Unknown --backend-cap '{name}' (not found in static \
-                                     KIVI_ATTENTION_REGS or dynamic registration — check --load-plugin)"
+                                     QUANT_ATTN_REGS or dynamic registration — check --load-plugin)"
                                 )
                             })?;
-                        caps.register::<dyn crate::backend::KiviAttentionBackend>(cap);
+                        caps.register::<dyn crate::backend::QuantAttnBackend>(cap);
                     }
                     // Default: the engine's built-in OpenCL KIVI attention impl (unchanged).
                     None => {
-                        caps.register::<dyn crate::backend::KiviAttentionBackend>(
-                            gpu_concrete.clone(),
-                        );
+                        caps.register::<dyn crate::backend::QuantAttnBackend>(gpu_concrete.clone());
                     }
                 }
                 let gpu: Arc<dyn Backend> = gpu_concrete;

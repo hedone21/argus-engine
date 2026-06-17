@@ -10,7 +10,7 @@
 //! 에서만 일어나므로 비용 무관.
 //!
 //! 본 파일은 **Phase α-W 신설**이다 — 자료구조 + sub-trait 모듈 골격까지만. capability sub-trait
-//! 의 *물리적 정착*(`KiviAttentionBackend`/`GpuScoreAccess` 를 `backend.rs` god-trait 에서 이리로
+//! 의 *물리적 정착*(`QuantAttnBackend`/`GpuScoreAccess` 를 `backend.rs` god-trait 에서 이리로
 //! 이동) + backend factory `register` 배선 + per-forward lookup 제거는 Phase α-W-4 다. 현재
 //! `kivi_attention`/`gpu_score` 서브모듈은 `backend.rs` 거주분을 re-export 하는 shim 이라 모든
 //! 기존 call site 가 그대로 동작한다(byte-identical).
@@ -33,7 +33,7 @@ pub mod kivi_attention;
 /// 으로 `register`/`get` — 공유 struct edit 0 (양 축 open: 새 backend / 새 capability).
 ///
 /// **타입 키 규약**: `register::<C>` 와 `get::<C>` 의 타입 인자 `C` 는 `TypeId` 로 키잉되므로
-/// 정확히 동일해야 한다 (보통 `dyn KiviAttentionBackend` 같은 trait object). key mismatch 는
+/// 정확히 동일해야 한다 (보통 `dyn QuantAttnBackend` 같은 trait object). key mismatch 는
 /// panic 이 아니라 `get` 이 `None` 을 돌려주는 silent miss 다 — 등록·조회 양쪽이 같은 trait
 /// bound 을 쓰는지 construction 시점에 보장하라(배선은 α-W-4).
 #[derive(Default)]

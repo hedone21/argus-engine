@@ -4644,10 +4644,10 @@ impl Backend for OpenCLBackend {
         Self::gpu_score_acc_mut(self).map(|s| s as &mut dyn crate::backend::GpuScoreAccess)
     }
 
-    // §13.8-L S-L-3: KiviAttentionBackend trait expose — OpenCL backend
+    // §13.8-L S-L-3: QuantAttnBackend trait expose — OpenCL backend
     // 만 활성. 그 외 backend 는 Backend trait default `None`.
-    fn as_kivi_attention(&self) -> Option<&dyn crate::backend::KiviAttentionBackend> {
-        Some(self as &dyn crate::backend::KiviAttentionBackend)
+    fn as_quant_attn(&self) -> Option<&dyn crate::backend::QuantAttnBackend> {
+        Some(self as &dyn crate::backend::QuantAttnBackend)
     }
 
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
@@ -7109,26 +7109,26 @@ impl OpenCLBackend {
 }
 
 // D8(2026-06-10, single-trait): KIVI native attention trait impl — canonical
-// 정의가 `argus-extension-api` 로 이동, ABI struct(`KiviAttnArgs`/`KiviGatherArgs`,
+// 정의가 `argus-extension-api` 로 이동, ABI struct(`QuantAttnArgs`/`QuantAttnGatherArgs`,
 // cl_mem) 시그니처. trait method 는 args 에서 raw cl_mem 을 꺼내 inherent
 // dispatch(byte-identical 로직) 로 위임하고 `Result` 를 `i32`(0=OK, 음수=err,
 // C3 panic=abort) 로 변환한다. `args.cl_queue` 는 plugin/dlopen 어댑터용 ABI
 // 슬롯 — 엔진 정적 impl 은 `&self.queue`(inherent 내 score readback) 를 직접
 // 알고 있어 사용하지 않는다(host 가 채워준 동일 핸들이라 결과 동일, byte-identical
-// 보존). `as_kivi_attention` 이 `Some(&self as &dyn KiviAttentionBackend)` 를
+// 보존). `as_quant_attn` 이 `Some(&self as &dyn QuantAttnBackend)` 를
 // 반환하므로 caller 는 trait method 만 사용해 downcast 가 사라진다.
 impl OpenCLBackend {
-    /// Build a [`argus_extension_api::KiviMakeArgs`] from this backend's live GPU context and
-    /// invoke `f` with it. Used by `--backend-cap <name>` to construct a named KIVI
+    /// Build a [`argus_extension_api::QuantAttnMakeArgs`] from this backend's live GPU context and
+    /// invoke `f` with it. Used by `--backend-cap <name>` to construct a named quantized
     /// attention capability via `resolve_kivi_capability`. The `build_opts` C string is
-    /// owned only for the duration of `f` — `KiviMakeArgs` is borrow-for-make (C7/D4) and a
+    /// owned only for the duration of `f` — `QuantAttnMakeArgs` is borrow-for-make (C7/D4) and a
     /// Copy POD, so the pointer must not escape `f`.
     pub fn with_kivi_make_args<R>(
         &self,
-        f: impl FnOnce(&argus_extension_api::KiviMakeArgs) -> R,
+        f: impl FnOnce(&argus_extension_api::QuantAttnMakeArgs) -> R,
     ) -> R {
         let opts = std::ffi::CString::new(self.cl_opts.clone()).unwrap_or_default();
-        let make_args = argus_extension_api::KiviMakeArgs {
+        let make_args = argus_extension_api::QuantAttnMakeArgs {
             cl_ctx: <&Context as ClContextPtr>::as_ptr(&&self.context),
             device: <Device as ClDeviceIdPtr>::as_ptr(&self.device),
             build_opts: opts.as_ptr(),
@@ -7137,8 +7137,8 @@ impl OpenCLBackend {
     }
 }
 
-impl crate::backend::KiviAttentionBackend for OpenCLBackend {
-    fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
+impl crate::backend::QuantAttnBackend for OpenCLBackend {
+    fn has_quant_attn_kernel(&self, bits: u8) -> bool {
         Self::has_kivi_attn_kernel(self, bits)
     }
 
@@ -7146,7 +7146,7 @@ impl crate::backend::KiviAttentionBackend for OpenCLBackend {
         Self::is_nosub(self)
     }
 
-    fn attention_gen_kivi(&self, args: &crate::backend::KiviAttnArgs) -> i32 {
+    fn attention_gen_quant(&self, args: &crate::backend::QuantAttnArgs) -> i32 {
         // SAFETY: host(C5) 가 `scores_out`/`scores_len` 을 짝지어 유효 버퍼를
         // 채워줬다(null=score 없음). cl_mem 핸들은 inherent 가 borrow-only 로 사용.
         let scores_out: Option<&mut [f32]> = if args.scores_out.is_null() {
@@ -7184,7 +7184,7 @@ impl crate::backend::KiviAttentionBackend for OpenCLBackend {
         }
     }
 
-    fn kivi_gather_update(&self, args: &crate::backend::KiviGatherArgs) -> i32 {
+    fn gather_update_quant(&self, args: &crate::backend::QuantAttnGatherArgs) -> i32 {
         // SAFETY: host(C5) 가 input/residual cl_mem 을 유효 buffer 로 채웠다(borrow-only).
         let r = unsafe {
             Self::kivi_gather_update(

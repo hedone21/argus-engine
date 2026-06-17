@@ -1349,25 +1349,25 @@ pub fn registered_backend_capability_names() -> Vec<&'static str> {
     BACKEND_CAPABILITIES.iter().map(|r| r.name).collect()
 }
 
-// ── Backend-capability axis — ATTENTION (KIVI) category dynamic C-ABI ──
+// ── Backend-capability axis — ATTENTION (quantized fused attention, e.g. KIVI) category dynamic C-ABI ──
 //
-// D8 (single-trait): argus-extension-api owns the canonical [`KiviAttentionBackend`]. The engine's static OpenCL
+// D8 (single-trait): argus-extension-api owns the canonical [`QuantAttnBackend`]. The engine's static OpenCL
 // impl, the host dlopen adapter, and the plugin `.so` **all implement this one trait** (isomorphic to the stage `KVCacheStage`). The signatures take
-// ABI structs (`KiviAttnArgs`/`KiviGatherArgs`, cl_mem `*mut c_void`) rather than `&Tensor`, so the plugin does not reference engine
+// ABI structs (`QuantAttnArgs`/`QuantAttnGatherArgs`, cl_mem `*mut c_void`) rather than `&Tensor`, so the plugin does not reference engine
 // types (independent). The static `BACKEND_CAPABILITIES` above (keyed by name) stays as-is — for the fat-LTO name-survival smoke test.
 
 /// ABI version of the `register_backend_caps_v2` envelope ([`BackendCapExportAbi`]). The host rejects the `.so` on mismatch.
 pub const BACKEND_CAP_ABI_VERSION: u32 = 1;
 
-/// Capability category tag — ATTENTION (KIVI fused dequant+attention). [`BackendCapVTableAbi::category`].
-/// The host's category bridge (`match`) uses this value to cast the `vtable` pointer to its per-category table ([`KiviAttnVTable`]) (D7).
+/// Capability category tag — ATTENTION (quantized fused dequant+attention, e.g. KIVI). [`BackendCapVTableAbi::category`].
+/// The host's category bridge (`match`) uses this value to cast the `vtable` pointer to its per-category table ([`QuantAttnVTable`]) (D7).
 pub const BACKEND_CAP_CATEGORY_ATTENTION: u32 = 1;
 
-/// Arguments for creating a KIVI capability instance (D4). Using the GPU context/device borrowed from the host plus build options, the plugin
+/// Arguments for creating a quantized fused-attention capability instance (D4). Using the GPU context/device borrowed from the host plus build options, the plugin
 /// builds its kernels **once** and produces an opaque handle. Bare-C handles only (C4) — no `ocl` wrapper types.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct KiviMakeArgs {
+pub struct QuantAttnMakeArgs {
     /// `cl_context` raw handle (owned by the host backend, borrow-for-make).
     pub cl_ctx: *mut c_void,
     /// `cl_device_id` raw handle.
@@ -1376,10 +1376,10 @@ pub struct KiviMakeArgs {
     pub build_opts: *const c_char,
 }
 
-/// Arguments for a KIVI fused dequant+attention call (D6). All GPU resources are **borrow-for-call** (C5: no retain).
+/// Arguments for a quantized fused dequant+attention call (D6). All GPU resources are **borrow-for-call** (C5: no retain).
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct KiviAttnArgs {
+pub struct QuantAttnArgs {
     /// `cl_command_queue` raw handle (lent by the host).
     pub cl_queue: *mut c_void,
     pub q_mem: *mut c_void,
@@ -1401,10 +1401,10 @@ pub struct KiviAttnArgs {
     pub bits: u8,
 }
 
-/// Arguments for a KIVI residual gather-update call (D6). Two mem (input/residual) + five scalars.
+/// Arguments for a quantized-attention residual gather-update call (D6). Two mem (input/residual) + five scalars.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct KiviGatherArgs {
+pub struct QuantAttnGatherArgs {
     pub cl_queue: *mut c_void,
     pub input_mem: *mut c_void,
     pub residual_mem: *mut c_void,
@@ -1418,64 +1418,64 @@ pub struct KiviGatherArgs {
 /// Canonical capability trait for the ATTENTION category (D8 single-trait). Owned by argus-extension-api → the engine's static impl,
 /// the host dlopen adapter, and the plugin `.so` **all implement this one trait**. It takes an ABI struct instead of `&Tensor` so the plugin is
 /// independent (does not reference engine types). Returns `i32` (C3 panic=abort: 0=OK, negative=err — vtable fn-ptrs must not panic).
-pub trait KiviAttentionBackend: Send + Sync {
-    /// Whether a fused KIVI attention kernel for `bits` (2/4/8) is available.
-    fn has_kivi_attn_kernel(&self, bits: u8) -> bool;
+pub trait QuantAttnBackend: Send + Sync {
+    /// Whether a fused quantized-attention kernel for `bits` (2/4/8) is available.
+    fn has_quant_attn_kernel(&self, bits: u8) -> bool;
     /// Whether the device lacks sub-group support (Adreno nosub) — used to select the kernel variant.
     fn is_nosub_device(&self) -> bool;
-    /// Fused dequant+attention. cl_mem lives inside [`KiviAttnArgs`], borrow-for-call (C5).
-    fn attention_gen_kivi(&self, args: &KiviAttnArgs) -> i32;
+    /// Fused dequant+attention. cl_mem lives inside [`QuantAttnArgs`], borrow-for-call (C5).
+    fn attention_gen_quant(&self, args: &QuantAttnArgs) -> i32;
     /// Residual ring gather-update (just before K/V quantization).
-    fn kivi_gather_update(&self, args: &KiviGatherArgs) -> i32;
+    fn gather_update_quant(&self, args: &QuantAttnGatherArgs) -> i32;
 }
 
-/// Static (force-link) KIVI ATTENTION capability registration entry — the backend-axis counterpart of the stage [`KVCacheStageReg`] (D8).
-/// `make` is called only when the host has a GPU context (`KiviMakeArgs`); the fat-LTO survival smoke test checks the name only.
-pub struct KiviAttentionReg {
+/// Static (force-link) quantized-attention capability registration entry — the backend-axis counterpart of the stage [`KVCacheStageReg`] (D8).
+/// `make` is called only when the host has a GPU context (`QuantAttnMakeArgs`); the fat-LTO survival smoke test checks the name only.
+pub struct QuantAttnReg {
     /// Canonical capability name. Unique within the slice.
     pub name: &'static str,
     /// Capability instance factory (builds the kernels once using the host GPU context, D4).
-    pub make: fn(&KiviMakeArgs) -> Box<dyn KiviAttentionBackend>,
+    pub make: fn(&QuantAttnMakeArgs) -> Box<dyn QuantAttnBackend>,
 }
 
-/// Global static registration slice for KIVI ATTENTION capabilities (linkme). Contributed to by `register_kivi_attention_plugin!`.
+/// Global static registration slice for quantized-attention capabilities (linkme). Contributed to by `register_quant_attn_plugin!`.
 /// Separate from the dynamic dlopen path ([`PLUGIN_BACKEND_CAP_VTABLES`]) — the host merges them for source-agnostic lookup (mirror of D3).
 #[distributed_slice]
-pub static KIVI_ATTENTION_REGS: [KiviAttentionReg] = [..];
+pub static QUANT_ATTN_REGS: [QuantAttnReg] = [..];
 
-/// Looks up a statically registered KIVI ATTENTION capability by name.
-pub fn find_kivi_attention(name: &str) -> Option<&'static KiviAttentionReg> {
-    KIVI_ATTENTION_REGS.iter().find(|r| r.name == name)
+/// Looks up a statically registered quantized-attention capability by name.
+pub fn find_quant_attn(name: &str) -> Option<&'static QuantAttnReg> {
+    QUANT_ATTN_REGS.iter().find(|r| r.name == name)
 }
 
-/// All statically registered KIVI ATTENTION capability names (for the fat-LTO survival smoke test / diagnostics).
-pub fn registered_kivi_attention_names() -> Vec<&'static str> {
-    KIVI_ATTENTION_REGS.iter().map(|r| r.name).collect()
+/// All statically registered quantized-attention capability names (for the fat-LTO survival smoke test / diagnostics).
+pub fn registered_quant_attn_names() -> Vec<&'static str> {
+    QUANT_ATTN_REGS.iter().map(|r| r.name).collect()
 }
 
 /// ATTENTION category C-ABI vtable (D7) — the table [`BackendCapVTableAbi::vtable`] points to when category==ATTENTION.
-/// make/drop live here too (make's arguments are the per-category [`KiviMakeArgs`], so they cannot go in the common header).
+/// make/drop live here too (make's arguments are the per-category [`QuantAttnMakeArgs`], so they cannot go in the common header).
 #[repr(C)]
-pub struct KiviAttnVTable {
-    /// [`KiviMakeArgs`] → opaque plugin handle (one-time kernel build, D4). Called on host `make`.
-    pub make: unsafe extern "C" fn(*const KiviMakeArgs) -> *mut c_void,
+pub struct QuantAttnVTable {
+    /// [`QuantAttnMakeArgs`] → opaque plugin handle (one-time kernel build, D4). Called on host `make`.
+    pub make: unsafe extern "C" fn(*const QuantAttnMakeArgs) -> *mut c_void,
     /// handle + bits → bool for whether the kernel is present.
-    pub has_kivi_attn_kernel: unsafe extern "C" fn(*mut c_void, u8) -> bool,
+    pub has_quant_attn_kernel: unsafe extern "C" fn(*mut c_void, u8) -> bool,
     /// handle → nosub-device bool.
     pub is_nosub_device: unsafe extern "C" fn(*mut c_void) -> bool,
-    /// handle + [`KiviAttnArgs`] → i32 (0=OK, negative=err). Per-token hot path.
-    pub attention_gen_kivi: unsafe extern "C" fn(*mut c_void, *const KiviAttnArgs) -> i32,
-    /// handle + [`KiviGatherArgs`] → i32. residual gather-update.
-    pub kivi_gather_update: unsafe extern "C" fn(*mut c_void, *const KiviGatherArgs) -> i32,
+    /// handle + [`QuantAttnArgs`] → i32 (0=OK, negative=err). Per-token hot path.
+    pub attention_gen_quant: unsafe extern "C" fn(*mut c_void, *const QuantAttnArgs) -> i32,
+    /// handle + [`QuantAttnGatherArgs`] → i32. residual gather-update.
+    pub gather_update_quant: unsafe extern "C" fn(*mut c_void, *const QuantAttnGatherArgs) -> i32,
     /// Release the handle (called once by the host when the capability is dropped).
     pub drop: unsafe extern "C" fn(*mut c_void),
 }
 
 // SAFETY: the vtable is immutable and fn-ptrs are inherently Send+Sync. Required to declare a distributed_slice element static.
-unsafe impl Sync for KiviAttnVTable {}
+unsafe impl Sync for QuantAttnVTable {}
 
 /// backend-cap axis entry (D7 tagged pointer) — a thin `{name, category, vtable}`. The actual functions live in
-/// a per-category table (e.g. [`KiviAttnVTable`]). The host casts `vtable` using `category` (the category bridge).
+/// a per-category table (e.g. [`QuantAttnVTable`]). The host casts `vtable` using `category` (the category bridge).
 #[repr(C)]
 pub struct BackendCapVTableAbi {
     /// null-terminated canonical name (for registry matching). A `'static` str in the plugin `.so`.
@@ -1483,7 +1483,7 @@ pub struct BackendCapVTableAbi {
     pub name: *const c_char,
     /// Category tag (e.g. [`BACKEND_CAP_CATEGORY_ATTENTION`]). The host's `match` key.
     pub category: u32,
-    /// Pointer to the per-category `#[repr(C)]` table (e.g. `*const KiviAttnVTable`). The host casts it using `category`.
+    /// Pointer to the per-category `#[repr(C)]` table (e.g. `*const QuantAttnVTable`). The host casts it using `category`.
     pub vtable: *const c_void,
 }
 
@@ -1503,75 +1503,75 @@ pub struct BackendCapExportAbi {
 }
 
 /// Slice that accumulates backend-cap vtables inside a plugin `.so`. **Declared in exactly one place: argus-extension-api.**
-/// `register_kivi_attention_plugin!` contributes to it under the plugin-cdylib gate. Harmlessly empty in static builds.
+/// `register_quant_attn_plugin!` contributes to it under the plugin-cdylib gate. Harmlessly empty in static builds.
 #[distributed_slice]
 pub static PLUGIN_BACKEND_CAP_VTABLES: [BackendCapVTableAbi] = [..];
 
-/// dual-wiring macro (D8) that registers a KIVI ATTENTION capability plugin both statically (rlib → linkme name survival)
-/// and dynamically (cdylib → C-ABI vtable). `$make` = `fn(&KiviMakeArgs) -> Box<dyn KiviAttentionBackend>` (a closure is allowed).
+/// dual-wiring macro (D8) that registers a quantized-attention capability plugin both statically (rlib → linkme name survival)
+/// and dynamically (cdylib → C-ABI vtable). `$make` = `fn(&QuantAttnMakeArgs) -> Box<dyn QuantAttnBackend>` (a closure is allowed).
 ///
-/// **Static path**: contributes `$make` to the [`KIVI_ATTENTION_REGS`] slice (name survives under force-link — for the fat-LTO survival
-/// smoke test, where `registered_kivi_attention_names()` checks the name). **Dynamic path** (plugin-cdylib): wraps `$make` and the trait methods
-/// in C thunks and contributes a [`KiviAttnVTable`] + envelope entry to [`PLUGIN_BACKEND_CAP_VTABLES`]. The `.so` entry point
+/// **Static path**: contributes `$make` to the [`QUANT_ATTN_REGS`] slice (name survives under force-link — for the fat-LTO survival
+/// smoke test, where `registered_quant_attn_names()` checks the name). **Dynamic path** (plugin-cdylib): wraps `$make` and the trait methods
+/// in C thunks and contributes a [`QuantAttnVTable`] + envelope entry to [`PLUGIN_BACKEND_CAP_VTABLES`]. The `.so` entry point
 /// (`register_backend_caps_v2`) is emitted by [`export_plugin!`]. May be invoked multiple times within one `.so` (multiple capabilities).
 #[macro_export]
-macro_rules! register_kivi_attention_plugin {
+macro_rules! register_quant_attn_plugin {
     ($name:literal, $make:expr) => {
-        // ── Static path (rlib → linkme KIVI_ATTENTION_REGS, name survives under force-link). Ungated (common to both builds). ──
+        // ── Static path (rlib → linkme QUANT_ATTN_REGS, name survives under force-link). Ungated (common to both builds). ──
         // Store `$make` in a live distributed_slice static → the static-lookup infrastructure, and even feature-OFF builds,
         // keep `$make`/its associated types reachable (isomorphic to the Stage `register_kv_stage!`, no unused warnings).
         const _: () = {
-            #[$crate::distributed_slice($crate::KIVI_ATTENTION_REGS)]
-            static __REG: $crate::KiviAttentionReg = $crate::KiviAttentionReg {
+            #[$crate::distributed_slice($crate::QUANT_ATTN_REGS)]
+            static __REG: $crate::QuantAttnReg = $crate::QuantAttnReg {
                 name: $name,
                 make: $make,
             };
         };
 
-        // ── Dynamic path (cdylib → KiviAttnVTable + envelope entry). Gated by plugin-cdylib, so not emitted in static builds. ──
+        // ── Dynamic path (cdylib → QuantAttnVTable + envelope entry). Gated by plugin-cdylib, so not emitted in static builds. ──
         #[cfg(feature = "plugin-cdylib")]
         const _: () = {
-            // handle = Box<Box<dyn KiviAttentionBackend>> (thin ptr). All thunks share this representation.
-            type __Handle = ::std::boxed::Box<dyn $crate::KiviAttentionBackend>;
+            // handle = Box<Box<dyn QuantAttnBackend>> (thin ptr). All thunks share this representation.
+            type __Handle = ::std::boxed::Box<dyn $crate::QuantAttnBackend>;
 
             unsafe extern "C" fn __make(
-                p: *const $crate::KiviMakeArgs,
+                p: *const $crate::QuantAttnMakeArgs,
             ) -> *mut ::core::ffi::c_void {
-                // SAFETY: the host passes a valid KiviMakeArgs pointer (D4). KiviMakeArgs is a Copy POD.
-                let args: &$crate::KiviMakeArgs = unsafe { &*p };
-                let make_fn: fn(&$crate::KiviMakeArgs) -> __Handle = $make;
+                // SAFETY: the host passes a valid QuantAttnMakeArgs pointer (D4). QuantAttnMakeArgs is a Copy POD.
+                let args: &$crate::QuantAttnMakeArgs = unsafe { &*p };
+                let make_fn: fn(&$crate::QuantAttnMakeArgs) -> __Handle = $make;
                 let be: __Handle = make_fn(args);
                 ::std::boxed::Box::into_raw(::std::boxed::Box::new(be)) as *mut ::core::ffi::c_void
             }
 
             unsafe extern "C" fn __has(h: *mut ::core::ffi::c_void, bits: u8) -> bool {
                 // SAFETY: h is the Box<Box<dyn>> created by __make.
-                let be: &dyn $crate::KiviAttentionBackend = unsafe { &**(h as *const __Handle) };
-                be.has_kivi_attn_kernel(bits)
+                let be: &dyn $crate::QuantAttnBackend = unsafe { &**(h as *const __Handle) };
+                be.has_quant_attn_kernel(bits)
             }
 
             unsafe extern "C" fn __nosub(h: *mut ::core::ffi::c_void) -> bool {
                 // SAFETY: same as above.
-                let be: &dyn $crate::KiviAttentionBackend = unsafe { &**(h as *const __Handle) };
+                let be: &dyn $crate::QuantAttnBackend = unsafe { &**(h as *const __Handle) };
                 be.is_nosub_device()
             }
 
             unsafe extern "C" fn __attn(
                 h: *mut ::core::ffi::c_void,
-                a: *const $crate::KiviAttnArgs,
+                a: *const $crate::QuantAttnArgs,
             ) -> i32 {
-                // SAFETY: h is the Box<Box<dyn>> created by __make; a is a valid KiviAttnArgs filled in by the host (C5).
-                let be: &dyn $crate::KiviAttentionBackend = unsafe { &**(h as *const __Handle) };
-                be.attention_gen_kivi(unsafe { &*a })
+                // SAFETY: h is the Box<Box<dyn>> created by __make; a is a valid QuantAttnArgs filled in by the host (C5).
+                let be: &dyn $crate::QuantAttnBackend = unsafe { &**(h as *const __Handle) };
+                be.attention_gen_quant(unsafe { &*a })
             }
 
             unsafe extern "C" fn __gather(
                 h: *mut ::core::ffi::c_void,
-                a: *const $crate::KiviGatherArgs,
+                a: *const $crate::QuantAttnGatherArgs,
             ) -> i32 {
                 // SAFETY: same as above.
-                let be: &dyn $crate::KiviAttentionBackend = unsafe { &**(h as *const __Handle) };
-                be.kivi_gather_update(unsafe { &*a })
+                let be: &dyn $crate::QuantAttnBackend = unsafe { &**(h as *const __Handle) };
+                be.gather_update_quant(unsafe { &*a })
             }
 
             unsafe extern "C" fn __drop(h: *mut ::core::ffi::c_void) {
@@ -1579,12 +1579,12 @@ macro_rules! register_kivi_attention_plugin {
                 drop(unsafe { ::std::boxed::Box::from_raw(h as *mut __Handle) });
             }
 
-            static __VTABLE: $crate::KiviAttnVTable = $crate::KiviAttnVTable {
+            static __VTABLE: $crate::QuantAttnVTable = $crate::QuantAttnVTable {
                 make: __make,
-                has_kivi_attn_kernel: __has,
+                has_quant_attn_kernel: __has,
                 is_nosub_device: __nosub,
-                attention_gen_kivi: __attn,
-                kivi_gather_update: __gather,
+                attention_gen_quant: __attn,
+                gather_update_quant: __gather,
                 drop: __drop,
             };
 
@@ -1593,7 +1593,7 @@ macro_rules! register_kivi_attention_plugin {
             static __ENTRY: $crate::BackendCapVTableAbi = $crate::BackendCapVTableAbi {
                 name: ::core::concat!($name, "\0").as_ptr() as *const ::core::ffi::c_char,
                 category: $crate::BACKEND_CAP_CATEGORY_ATTENTION,
-                vtable: &__VTABLE as *const $crate::KiviAttnVTable as *const ::core::ffi::c_void,
+                vtable: &__VTABLE as *const $crate::QuantAttnVTable as *const ::core::ffi::c_void,
             };
         };
     };

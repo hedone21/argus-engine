@@ -114,12 +114,12 @@ pub const EXT_RPCMEM_ALLOCATOR: &str = "rpcmem_allocator";
 // §13.8-L S-L-3/S-L-2 — KIVI native attention / GPU score accumulator 추상화.
 //
 // Phase α-W-4 에서 두 trait 의 정의 본체를 `capability/` 서브모듈로 물리 이동했다.
-// 기존 import path(`crate::backend::KiviAttentionBackend` 등)를 보존하기 위해
+// 기존 import path(`crate::backend::QuantAttnBackend` 등)를 보존하기 위해
 // 여기서 re-export 한다 (byte-identical). `Backend` god-trait 의
-// `as_kivi_attention`/`gpu_score_acc`/`gpu_score_acc_mut` default 메서드는 본
+// `as_quant_attn`/`gpu_score_acc`/`gpu_score_acc_mut` default 메서드는 본
 // re-export 된 trait 를 그대로 참조한다.
 pub use crate::capability::gpu_score::GpuScoreAccess;
-pub use crate::capability::kivi_attention::{KiviAttentionBackend, KiviAttnArgs, KiviGatherArgs};
+pub use crate::capability::kivi_attention::{QuantAttnArgs, QuantAttnBackend, QuantAttnGatherArgs};
 
 pub trait Backend: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
@@ -1298,7 +1298,7 @@ pub trait Backend: Send + Sync {
     /// 만 활성, 그 외 backend 는 default `None`. forward_gen.rs / kivi_cache.rs
     /// 의 hot-path `OpenCLBackend` downcast 가 본 trait method 호출로
     /// 축약된다.
-    fn as_kivi_attention(&self) -> Option<&dyn KiviAttentionBackend> {
+    fn as_quant_attn(&self) -> Option<&dyn QuantAttnBackend> {
         None
     }
 

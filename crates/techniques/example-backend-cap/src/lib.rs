@@ -1,17 +1,19 @@
 //! example-backend-cap — Backend 축(3번째 axis) capability dlopen plugin 의 synthetic 예제(design D8).
 //!
 //! **GPU 수학을 하지 않는다** — ABI 마샬링·등록·디스패치 round-trip 만 증명(host-검증 범위, C12 device 제외).
-//! `attention_gen_kivi` 는 [`KiviAttnArgs`] 스칼라로 결정적 sentinel 을 계산해 `scores_out[0]` 에 기록,
+//! `attention_gen_quant` 는 [`QuantAttnArgs`] 스칼라로 결정적 sentinel 을 계산해 `scores_out[0]` 에 기록,
 //! host 게이트가 args struct 가 ABI 경계를 정확히 넘었는지(필드 정렬·값) 확인하게 한다. make 인자(cl_ctx 등)는
 //! synthetic 이라 무시. example-kv-format 의 backend 축 짝.
 
-use argus_extension_api::{KiviAttentionBackend, KiviAttnArgs, KiviGatherArgs, KiviMakeArgs};
+use argus_extension_api::{
+    QuantAttnArgs, QuantAttnBackend, QuantAttnGatherArgs, QuantAttnMakeArgs,
+};
 
 /// synthetic capability — 상태 없음(GPU 자원 비보유). 핸들 lifecycle(make/drop) round-trip 만 운반.
 struct SynthKivi;
 
-impl KiviAttentionBackend for SynthKivi {
-    fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
+impl QuantAttnBackend for SynthKivi {
+    fn has_quant_attn_kernel(&self, bits: u8) -> bool {
         // synthetic: 2/4/8-bit 모두 "보유"한다고 보고(실 커널 없음).
         matches!(bits, 2 | 4 | 8)
     }
@@ -20,7 +22,7 @@ impl KiviAttentionBackend for SynthKivi {
         false
     }
 
-    fn attention_gen_kivi(&self, args: &KiviAttnArgs) -> i32 {
+    fn attention_gen_quant(&self, args: &QuantAttnArgs) -> i32 {
         // mem 포인터가 null 이면 마샬링 실패로 간주(host 가 유효 핸들 패킹 확인).
         if args.q_mem.is_null() || args.out_mem.is_null() {
             return -1;
@@ -39,7 +41,7 @@ impl KiviAttentionBackend for SynthKivi {
         0
     }
 
-    fn kivi_gather_update(&self, args: &KiviGatherArgs) -> i32 {
+    fn gather_update_quant(&self, args: &QuantAttnGatherArgs) -> i32 {
         if args.input_mem.is_null() || args.residual_mem.is_null() {
             return -1;
         }
@@ -48,9 +50,9 @@ impl KiviAttentionBackend for SynthKivi {
 }
 
 // 정적(linkme 이름 생존) + 동적(cdylib C-ABI vtable) 양쪽 한 줄 등록.
-argus_extension_api::register_kivi_attention_plugin!(
+argus_extension_api::register_quant_attn_plugin!(
     "synth_kivi_attn",
-    |_a: &KiviMakeArgs| -> Box<dyn KiviAttentionBackend> { Box::new(SynthKivi) }
+    |_a: &QuantAttnMakeArgs| -> Box<dyn QuantAttnBackend> { Box::new(SynthKivi) }
 );
 // .so 당 1회 — register_kv_stages_v2 / register_kv_formats_v2 / register_backend_caps_v2 엔트리 emit.
 argus_extension_api::export_plugin!();

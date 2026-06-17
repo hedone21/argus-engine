@@ -154,15 +154,15 @@ impl KVCacheFormat for KIVIFormat {
 
         // kivi-native 경로 게이팅(host 미검증 — device 검증은 후속 substep). 게이팅 조건만 미리
         // 평가하고(borrow 분리), dispatch 는 별도 헬퍼에 위임해 scores ownership 을 단일 경로로 가둔다.
-        // get_kivi_raw_buffers 가 Some + backend 가 KiviAttentionBackend + has_kivi_attn_kernel +
+        // get_kivi_raw_buffers 가 Some + backend 가 QuantAttnBackend + has_quant_attn_kernel +
         // is_nosub_device(NVIDIA) + 토큰 존재 일 때만. Adreno(subgroup)는 F32 dequant 경로가 더
         // 빠르므로 native 미사용(forward_gen 의 기존 게이팅 보존).
         let use_native = backend.is_gpu()
             && backend
-                .as_kivi_attention()
+                .as_quant_attn()
                 .zip(cache.get_kivi_raw_buffers())
                 .map(|(kivi_be, raw)| {
-                    kivi_be.has_kivi_attn_kernel(raw.bits)
+                    kivi_be.has_quant_attn_kernel(raw.bits)
                         && kivi_be.is_nosub_device()
                         && (raw.q_tokens + raw.res_tokens) > 0
                 })
@@ -236,8 +236,8 @@ impl KIVIFormat {
         let n_heads_kv = cache.kv_heads();
         let head_dim = cache.head_dim();
         let kivi_be = backend
-            .as_kivi_attention()
-            .expect("attention_native gated on as_kivi_attention().is_some()");
+            .as_quant_attn()
+            .expect("attention_native gated on as_quant_attn().is_some()");
         let raw = cache
             .get_kivi_raw_buffers()
             .expect("attention_native gated on get_kivi_raw_buffers().is_some()");
@@ -251,7 +251,7 @@ impl KIVIFormat {
             Vec::new()
         };
         // D8: ABI struct(cl_mem) 시그니처. `&Tensor` 6개를 raw cl_mem 으로 추출해
-        // `KiviAttnArgs` 패킹. score 는 `(ptr, len)` 으로 변환(None → (null, 0)).
+        // `QuantAttnArgs` 패킹. score 는 `(ptr, len)` 으로 변환(None → (null, 0)).
         // cl_queue 는 OpenCL 정적 impl 이 `&self.queue` 를 직접 알아 사용하지 않으므로
         // null 패킹(plugin/dlopen 어댑터용 ABI 슬롯).
         use crate::backend::opencl::get_cl_mem;
@@ -267,7 +267,7 @@ impl KIVIFormat {
         } else {
             (std::ptr::null_mut(), 0)
         };
-        let args = crate::backend::KiviAttnArgs {
+        let args = crate::backend::QuantAttnArgs {
             cl_queue: std::ptr::null_mut(),
             q_mem,
             qk_mem,
@@ -286,9 +286,9 @@ impl KIVIFormat {
             scale,
             bits: raw.bits,
         };
-        let rc = kivi_be.attention_gen_kivi(&args);
+        let rc = kivi_be.attention_gen_quant(&args);
         if rc != 0 {
-            anyhow::bail!("KIVI attention_gen_kivi failed (rc={rc})");
+            anyhow::bail!("KIVI attention_gen_quant failed (rc={rc})");
         }
         // 이후 `raw`(cache immutable borrow) 미사용 → NLL 이 set_attn_scores(가변) 전에 borrow 종료.
 

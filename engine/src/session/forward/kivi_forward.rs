@@ -13,7 +13,7 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
-use crate::capability::kivi_attention::KiviAttentionBackend;
+use crate::capability::kivi_attention::QuantAttnBackend;
 use crate::format::KVCacheFormat;
 use crate::inference::sampling::StepCtx;
 use crate::kv::kivi_cache::KiviCache;
@@ -307,7 +307,7 @@ fn alloc_logits(
 /// CPU 모드 `KiviCache::new_with_bits`를 사용한다.
 ///
 /// `kivi` 는 KIVI native attention capability handle (Phase α-W-4 §3.3). caller 가
-/// `caps.get::<dyn KiviAttentionBackend>()` 로 pull 해 전달한다. R3 불변식: OpenCL
+/// `caps.get::<dyn QuantAttnBackend>()` 로 pull 해 전달한다. R3 불변식: OpenCL
 /// backend 면 반드시 `Some` (init.rs 가 OpenCL 에 register).
 #[allow(clippy::too_many_arguments)]
 pub fn alloc_kivi_kv_caches(
@@ -318,7 +318,7 @@ pub fn alloc_kivi_kv_caches(
     residual_size: usize,
     bits: u8,
     backend: &Arc<dyn Backend>,
-    kivi: &Option<Arc<dyn KiviAttentionBackend>>,
+    kivi: &Option<Arc<dyn QuantAttnBackend>>,
     memory: &Arc<dyn Memory>,
 ) -> Vec<KiviCache> {
     if backend.name() == "OpenCL" {
@@ -356,7 +356,7 @@ mod tests {
 
         let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn Memory> = Arc::new(Galloc::new());
-        let kivi: Option<Arc<dyn KiviAttentionBackend>> = None;
+        let kivi: Option<Arc<dyn QuantAttnBackend>> = None;
 
         // residual_size와 head_dim은 QKKV(=32)의 배수여야 한다.
         let caches = alloc_kivi_kv_caches(
@@ -384,7 +384,7 @@ mod tests {
 
         let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn Memory> = Arc::new(Galloc::new());
-        let kivi: Option<Arc<dyn KiviAttentionBackend>> = None;
+        let kivi: Option<Arc<dyn QuantAttnBackend>> = None;
 
         // residual_size=32(QKKV), head_dim=64(QKKV*2) 로 제약 충족.
         for &bits in &[2u8, 4, 8] {
