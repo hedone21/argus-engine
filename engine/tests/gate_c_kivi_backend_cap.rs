@@ -1,7 +1,7 @@
 //! GATE-C (kivi) — Backend 축 capability dlopen 재증명 게이트, `kivi` 플러그인 짝
 //! (design D2/D7/D8, CB5). `gate_c_backend_cap_dlopen.rs`(synthetic `example-backend-cap`)의
 //! 자매 게이트로, 첫 *비-example* backend-cap 플러그인 `kivi`(이름 `kivi_abi`)가 ABI 경계
-//! (register_backend_caps_v2 봉투 → category 다리 → `DynKiviAttentionBackend` 어댑터 → make/dispatch)를
+//! (register_backend_caps_v2 봉투 → category 다리 → `DynQuantAttnBackend` 어댑터 → make/dispatch)를
 //! **정확히** 넘는지 증명한다.
 //!
 //! **host-검증 범위(C12)**: `kivi` 플러그인은 GPU 수학을 하지 않는다 — `QuantAttnArgs` 스칼라로 결정적
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use argus_engine::capability::dynamic_backend_registry::{
-    dynamic_registered_backend_cap_names, resolve_kivi_capability,
+    dynamic_registered_backend_cap_names, resolve_quant_attn_capability,
 };
 use argus_engine::session::plugin_dispatch::register_dynamic_plugins;
 use argus_extension_api::{QuantAttnArgs, QuantAttnGatherArgs, QuantAttnMakeArgs};
@@ -67,14 +67,14 @@ fn gate_c_kivi_backend_cap_dlopen_round_trip() {
         "kivi_abi 미등록: {names:?}"
     );
 
-    // ── 4. category 다리(D7) → DynKiviAttentionBackend 어댑터 생성(resolve, vtable.make 호출). ──
+    // ── 4. category 다리(D7) → DynQuantAttnBackend 어댑터 생성(resolve, vtable.make 호출). ──
     let make_args = QuantAttnMakeArgs {
         cl_ctx: std::ptr::null_mut(),
         device: std::ptr::null_mut(),
         build_opts: std::ptr::null(),
     };
-    let cap = resolve_kivi_capability("kivi_abi", &make_args)
-        .expect("resolve_kivi_capability None — category 다리/make 실패");
+    let cap = resolve_quant_attn_capability("kivi_abi", &make_args)
+        .expect("resolve_quant_attn_capability None — category 다리/make 실패");
 
     // ── 5. 어댑터 메서드 round-trip — bool 쿼리(vtable.has/nosub). ──
     assert!(
@@ -152,7 +152,7 @@ fn gate_c_kivi_backend_cap_dlopen_round_trip() {
 
     // ── 9. 미지 이름 → None (graceful unknown). ──
     assert!(
-        resolve_kivi_capability("nonexistent_cap", &make_args).is_none(),
+        resolve_quant_attn_capability("nonexistent_cap", &make_args).is_none(),
         "미지 이름이 None 아님"
     );
 }

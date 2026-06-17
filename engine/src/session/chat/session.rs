@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 
 use crate::buffer::DType;
-use crate::capability::kivi_attention::QuantAttnBackend;
+use crate::capability::quant_attn::QuantAttnBackend;
 use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::SamplingConfig;

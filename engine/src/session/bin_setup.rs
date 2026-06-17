@@ -12,7 +12,7 @@ use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::capability::kivi_attention::QuantAttnBackend;
+use crate::capability::quant_attn::QuantAttnBackend;
 use crate::hardware::Hardware;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::kv_cache::{KVCache, KVLayout};

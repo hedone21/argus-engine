@@ -7120,10 +7120,10 @@ impl OpenCLBackend {
 impl OpenCLBackend {
     /// Build a [`argus_extension_api::QuantAttnMakeArgs`] from this backend's live GPU context and
     /// invoke `f` with it. Used by `--backend-cap <name>` to construct a named quantized
-    /// attention capability via `resolve_kivi_capability`. The `build_opts` C string is
+    /// attention capability via `resolve_quant_attn_capability`. The `build_opts` C string is
     /// owned only for the duration of `f` — `QuantAttnMakeArgs` is borrow-for-make (C7/D4) and a
     /// Copy POD, so the pointer must not escape `f`.
-    pub fn with_kivi_make_args<R>(
+    pub fn with_quant_attn_make_args<R>(
         &self,
         f: impl FnOnce(&argus_extension_api::QuantAttnMakeArgs) -> R,
     ) -> R {

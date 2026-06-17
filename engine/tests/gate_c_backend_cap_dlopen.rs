@@ -2,7 +2,7 @@
 //!
 //! Stage(`gate_c_plugin_bundle.rs` plan-identity) · Format(descriptor-identity) 축 게이트의 backend
 //! 축 짝. dlopen 된 synthetic backend-cap `.so` 가 ABI 경계(register_backend_caps_v2 봉투 → category
-//! 다리 → `DynKiviAttentionBackend` 어댑터 → make/dispatch)를 **정확히** 넘는지 증명한다.
+//! 다리 → `DynQuantAttnBackend` 어댑터 → make/dispatch)를 **정확히** 넘는지 증명한다.
 //!
 //! **host-검증 범위(C12)**: synthetic plugin 은 GPU 수학을 하지 않는다 — `QuantAttnArgs` 스칼라로
 //! 결정적 sentinel 을 계산해 `scores_out[0]` 에 기록하므로, host 가 args struct 의 필드 정렬·값이
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use argus_engine::capability::dynamic_backend_registry::{
-    dynamic_registered_backend_cap_names, resolve_kivi_capability,
+    dynamic_registered_backend_cap_names, resolve_quant_attn_capability,
 };
 use argus_engine::session::plugin_dispatch::register_dynamic_plugins;
 use argus_extension_api::{QuantAttnArgs, QuantAttnGatherArgs, QuantAttnMakeArgs};
@@ -68,14 +68,14 @@ fn gate_c_backend_cap_dlopen_round_trip() {
         "synth_kivi_attn 미등록: {names:?}"
     );
 
-    // ── 4. category 다리(D7) → DynKiviAttentionBackend 어댑터 생성(resolve, vtable.make 호출). ──
+    // ── 4. category 다리(D7) → DynQuantAttnBackend 어댑터 생성(resolve, vtable.make 호출). ──
     let make_args = QuantAttnMakeArgs {
         cl_ctx: std::ptr::null_mut(),
         device: std::ptr::null_mut(),
         build_opts: std::ptr::null(),
     };
-    let cap = resolve_kivi_capability("synth_kivi_attn", &make_args)
-        .expect("resolve_kivi_capability None — category 다리/make 실패");
+    let cap = resolve_quant_attn_capability("synth_kivi_attn", &make_args)
+        .expect("resolve_quant_attn_capability None — category 다리/make 실패");
 
     // ── 5. 어댑터 메서드 round-trip — bool 쿼리(vtable.has/nosub). ──
     assert!(
@@ -148,7 +148,7 @@ fn gate_c_backend_cap_dlopen_round_trip() {
 
     // ── 9. 미지 이름 → None (graceful unknown). ──
     assert!(
-        resolve_kivi_capability("nonexistent_cap", &make_args).is_none(),
+        resolve_quant_attn_capability("nonexistent_cap", &make_args).is_none(),
         "미지 이름이 None 아님"
     );
 }

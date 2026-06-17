@@ -322,8 +322,8 @@ impl SessionInitCtx {
                         // (static QUANT_ATTN_REGS first, then dynamic --load-plugin) using
                         // the live GPU context, and register it in place of the built-in impl.
                         let cap = gpu_concrete
-                            .with_kivi_make_args(|make_args| {
-                                crate::capability::dynamic_backend_registry::resolve_kivi_capability(
+                            .with_quant_attn_make_args(|make_args| {
+                                crate::capability::dynamic_backend_registry::resolve_quant_attn_capability(
                                     name, make_args,
                                 )
                             })

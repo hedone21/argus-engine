@@ -13,7 +13,7 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
-use crate::capability::kivi_attention::QuantAttnBackend;
+use crate::capability::quant_attn::QuantAttnBackend;
 use crate::format::KVCacheFormat;
 use crate::inference::sampling::StepCtx;
 use crate::kv::kivi_cache::KiviCache;
