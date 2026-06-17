@@ -232,7 +232,7 @@ pub fn aggregate_heads(per_head: &[f32], mode: &AggregationMode) -> f32 {
 // ── Flush parameter structs (used by L3-qcf compute functions) ────
 
 /// Parameters for flush proxy computation.
-pub struct KiviFlushParams<'a> {
+pub struct QuantFlushParams<'a> {
     pub res_k: &'a [f32],
     pub res_v: &'a [f32],
     pub kv_heads: usize,
