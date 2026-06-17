@@ -1,37 +1,34 @@
 //! Assemble a [`ChatSession`] from parsed [`Args`] + a built [`SessionInitCtx`].
 //!
-//! Mirrors [`build_inference_ctx`](crate::session::bin_setup::build_inference_ctx)
-//! for the chat path: dispatches on [`Args::effective_kv_mode`] to the right
-//! `build_chat_*` builder, allocating KV caches and wiring the resilience adapter
-//! (manager IPC). The actual decode-loop assembly + resilience wiring lives in the
-//! builders ([`build_chat_standard`] etc.).
+//! Resolves [`Args::effective_kv_mode`] through the engine KV-mode registry
+//! ([`resolve_kv_mode`]) and calls the mode's `build` fn-ptr to construct the
+//! whole-pipeline `Box<dyn Forward>` (+ resilience handles / `ChatKvMode` payload).
+//! The decode-loop assembly (sampler / registry / resilience wiring) is
+//! mode-agnostic and lives here — it no longer matches on a concrete KV technique
+//! identity (FORMAT-axis mode/knob declaration, design §4.3).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
-use crate::buffer::DType;
-use crate::capability::kivi_attention::QuantAttnBackend;
-use crate::hardware::DeviceTarget;
-use crate::session::bin_setup::alloc_standard_kv_caches;
-use crate::session::chat::session::{
-    ChatKiviArgs, ChatOffloadArgs, ChatSession, ChatStandardArgs, build_chat_kivi,
-    build_chat_offload, build_chat_standard,
-};
-use crate::session::cli::{Args, KvMode};
+use crate::session::chat::sampler::{ChatSampler, SharedSamplingConfig};
+use crate::session::chat::session::{ChatSession, finish_chat_loop, make_chat_registry};
+use crate::session::cli::Args;
 use crate::session::init::SessionInitCtx;
+use crate::session::mode::ChatModeBuild;
+use crate::session::mode::ModeBuildCtx;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::resilience_init::build_command_executor;
+use crate::session::{DecodeLoopBuilder, HasForward};
 
 /// Build a [`ChatSession`] for the requested KV mode. Consumes `init` (owns the
 /// loaded model). The resilience adapter is created here (manager IPC) when
-/// `args.enable_resilience` is set, and the per-mode builder wires it into the
-/// decode loop.
+/// `args.enable_resilience` is set; the mode's `build` closure surfaces the
+/// resilience heartbeat handles, which are wired in here.
 pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSession> {
     // Resilience adapter (before the model is moved). Graceful: transport failure
-    // returns None inside build_command_executor; the eviction policy is set by
-    // the per-mode builder.
-    let resilience: Option<ResilienceAdapter> = if args.enable_resilience {
+    // returns None inside build_command_executor; the eviction policy is set below.
+    let mut resilience: Option<ResilienceAdapter> = if args.enable_resilience {
         build_command_executor(args, &init.model)?.map(ResilienceAdapter::new)
     } else {
         None
@@ -52,102 +49,71 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
     let kv_heads = model.config.num_key_value_heads;
     let head_dim = model.config.head_dim;
     let num_layers = model.config.num_hidden_layers;
+    let vocab_size = model.config.vocab_size;
 
-    match args.effective_kv_mode() {
-        KvMode::Standard => {
-            let kv_dtype = parse_kv_type(&args.kv_type)?;
-            let initial = {
-                let r = args.initial_kv_capacity();
-                if r > 0 {
-                    r.min(max_seq_len)
-                } else {
-                    256.min(max_seq_len)
-                }
-            };
-            let cpu_backend = hardware
-                .resolve(DeviceTarget::Cpu)
-                .expect("Cpu device always resolves")
-                .0
-                .clone();
-            let kv_caches = alloc_standard_kv_caches(
-                &backend,
-                memory.clone(),
-                num_layers,
-                initial,
-                max_seq_len,
-                kv_heads,
-                head_dim,
-                kv_dtype,
-            )?;
-            build_chat_standard(ChatStandardArgs {
-                backend,
-                memory,
-                cpu_backend,
-                model,
-                kv_caches,
-                initial_kv_capacity: initial,
-                max_seq_len,
-                kv_dtype,
-                eviction_policy: args.eviction_policy().to_string(),
-                eviction_target_ratio: args.eviction_target_ratio(),
-                eviction_window: args.eviction_window(),
-                protected_prefix: args.protected_prefix(),
-                sink_size: args.sink_size(),
-                streaming_window: args.streaming_window(),
-                kv_budget: args.kv_budget(),
-                keep_ratio: args.keep_ratio(),
-                h2o_tracked_layers: args.h2o_tracked_layers(),
-                h2o_decay: args.h2o_decay(),
-                h2o_raw_scores: args.h2o_raw_scores(),
-                stage_args: args.stage_args(),
-                memory_threshold_mb: args.memory_threshold_mb() as u64,
-                sampling_config,
-                resilience,
-            })
+    let cpu_backend = hardware
+        .resolve(crate::hardware::DeviceTarget::Cpu)
+        .expect("Cpu device always resolves")
+        .0
+        .clone();
+
+    // Resolve the mode name through the engine KV-mode registry via the shared
+    // checked funnel (fail-fast on an unknown name, listing the registered names —
+    // the same funnel guards bench/eval, so the reject can't drift between bins).
+    let mode_name = args.effective_kv_mode();
+    let reg = crate::session::mode::resolve_kv_mode_checked(mode_name)?;
+
+    // Mode's `build` fn-ptr constructs the whole-pipeline forward + handles. No
+    // name-match here — the registry is the factory.
+    let built = (reg.build)(ModeBuildCtx {
+        args,
+        backend,
+        memory,
+        cpu_backend,
+        model,
+        caps: &caps,
+        kv_heads,
+        head_dim,
+        num_layers,
+        max_seq_len,
+    })?;
+    let ChatModeBuild {
+        forward,
+        kv_handles,
+        kv_handle,
+        quant_handle,
+        eviction_policy,
+        kv_mode,
+    } = built;
+
+    // Mode-agnostic resilience handle wiring (§4.5: pos/capacity via base handle,
+    // bit-width via the neutral QuantStageHandle).
+    if let Some(adapter) = resilience.as_mut() {
+        adapter.set_eviction_policy(&eviction_policy);
+        if let Some(h) = kv_handle {
+            adapter.set_kv_handle(h);
         }
-        KvMode::Kivi => {
-            let kivi = caps.get::<dyn QuantAttnBackend>();
-            build_chat_kivi(ChatKiviArgs {
-                backend,
-                kivi,
-                memory,
-                model,
-                kv_heads,
-                head_dim,
-                num_layers,
-                max_seq_len,
-                bits: args.effective_kivi_bits(),
-                residual_size: args.effective_kivi_residual_size(),
-                sampling_config,
-                resilience,
-            })
-        }
-        KvMode::Offload => {
-            let kv_dtype = parse_kv_type(&args.kv_type)?;
-            build_chat_offload(ChatOffloadArgs {
-                backend,
-                memory,
-                model,
-                kv_heads,
-                head_dim,
-                num_layers,
-                max_seq_len,
-                kv_dtype,
-                offload_mode: args.effective_kv_offload_storage(),
-                disk_dir: args.swap_dir.clone(),
-                max_prefetch_depth: args.kv_mode_args.kv_max_prefetch_depth,
-                sampling_config,
-                resilience,
-            })
+        if let Some(q) = quant_handle {
+            adapter.set_quant_handle(q);
         }
     }
-}
 
-fn parse_kv_type(s: &str) -> Result<DType> {
-    match s {
-        "f32" => Ok(DType::F32),
-        "f16" => Ok(DType::F16),
-        "q4" => Ok(DType::Q4_0),
-        other => bail!("Unsupported KV type: {other}. Use f32, f16, or q4."),
-    }
+    // Per-request sampling: the in-loop ChatSampler reads this shared config each
+    // step; the server overwrites it per OpenAI request.
+    let sampling: SharedSamplingConfig = Arc::new(Mutex::new(sampling_config));
+    let (registry, stop_slot, stream_slot) = make_chat_registry();
+    let builder: DecodeLoopBuilder<HasForward> = DecodeLoopBuilder::new()
+        .with_forward_boxed(forward)
+        .with_kv_capacity(max_seq_len)
+        .with_sampler(ChatSampler::new(Arc::clone(&sampling), vocab_size));
+    let decode_loop = finish_chat_loop(builder, registry, resilience, kv_handles);
+
+    Ok(ChatSession::from_parts(
+        decode_loop,
+        kv_mode,
+        max_seq_len,
+        stop_slot,
+        stream_slot,
+        Some(sampling),
+    ))
 }

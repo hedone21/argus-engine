@@ -15,9 +15,23 @@ use anyhow::Result;
 use argus_shared::{EngineCapability, EngineCommand, EngineMessage, QcfEstimate, WeightSwapReport};
 
 use crate::format::KVCacheFormat;
-use crate::kv::kivi_format::KIVIFormat;
 use crate::resilience::{CommandExecutor, KVSnapshot};
 use crate::session::command_dispatcher::{CommandSource, EngineReport};
+
+/// Narrow neutral seam for a quantized-KV format's current bit-width (§4.5,
+/// FORMAT-axis mode/knob declaration design). The base [`KVCacheFormat`]/
+/// [`Forward`](crate::session::forward::Forward) surfaces deliberately omit a
+/// bit-width query (`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC` — no base-trait
+/// downcast). Instead, a quantized-KV technique exposes its runtime bits through
+/// this sub-trait, and the [`ResilienceAdapter`] holds it generically (no concrete
+/// `KIVIFormat` in its signature). The engine reads it only to fill the heartbeat
+/// `kv_dtype` field; a non-quantized (Standard/Offload) path simply never installs
+/// a handle, so `kv_dtype` stays the default `""` (behaviour unchanged).
+pub trait QuantStageHandle: Send + Sync {
+    /// Current quantization bit-width (e.g. 16/8/4/2). Mapped to a `kv_dtype`
+    /// string for the heartbeat snapshot.
+    fn current_kv_bits(&self) -> u8;
+}
 
 /// [`CommandExecutor`]를 session 3-trait으로 연결하는 어댑터 (β-4: ManagerCommandSource 역할).
 ///
@@ -31,9 +45,10 @@ pub struct ResilienceAdapter {
     /// β-4: heartbeat payload 의 kv_cache_tokens/capacity 를 query 할 held-handle.
     /// `None` 이면 partial snapshot(pos=0) — set_kv_handle 미주입 경로.
     kv_handle: Option<Arc<dyn KVCacheFormat>>,
-    /// AB-2 §5.7.6: heartbeat kv_dtype 를 query 할 KIVI concrete handle (layer-0). `None` 이면
-    /// KIVI 미배선(Standard/Offload) → `kv_dtype` 는 default `""` 유지(기존 동작 불변 — 회귀 금지).
-    kivi_handle: Option<Arc<KIVIFormat>>,
+    /// §4.5: heartbeat kv_dtype 를 query 할 quantized-KV handle (layer-0), [`QuantStageHandle`] 뒤로
+    /// 중립화 — 구체 `KIVIFormat` 을 adapter 시그니처에서 제거. `None` 이면 비양자화 경로
+    /// (Standard/Offload) → `kv_dtype` 는 default `""` 유지(기존 동작 불변 — 회귀 금지).
+    quant_handle: Option<Arc<dyn QuantStageHandle>>,
     /// 설정된 eviction policy 의 canonical 이름 (예: "h2o"). 빈 문자열이면 heartbeat 가
     /// "none" 으로 보고해 `compute_available_actions` 에서 kv.evict_* 가 빠진다 —
     /// Capability(12 액션) 를 manager merge 가 heartbeat 의 non-empty 3-액션 리스트로
@@ -46,7 +61,7 @@ impl ResilienceAdapter {
         Self {
             executor,
             kv_handle: None,
-            kivi_handle: None,
+            quant_handle: None,
             eviction_policy: String::new(),
         }
     }
@@ -63,15 +78,14 @@ impl ResilienceAdapter {
         self.kv_handle = Some(handle);
     }
 
-    /// AB-2 §5.7.6: KIVI bench 경로에서 heartbeat kv_dtype query 용 KIVI concrete handle 주입.
+    /// §4.5: 양자화-KV 경로에서 heartbeat kv_dtype query 용 quant handle 주입.
     ///
-    /// base `KVCacheFormat` 표면에 bit-width query 가 없어 `KIVIFormat::current_bits()` concrete
-    /// 접근이 필요하다(base trait downcast 미추가 — INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC). 같은
-    /// layer-0 handle 을 pos/capacity query 용 `kv_handle`(base coerce)에도 설치한다. Standard 경로는
-    /// 이 seam 미주입 → `kv_dtype` default `""` 유지(기존 동작 불변 — 회귀 금지).
-    pub fn set_kivi_handle(&mut self, handle: Arc<KIVIFormat>) {
-        self.kv_handle = Some(handle.clone() as Arc<dyn KVCacheFormat>);
-        self.kivi_handle = Some(handle);
+    /// base `KVCacheFormat` 표면에 bit-width query 가 없어(base trait downcast 미추가 —
+    /// INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC) [`QuantStageHandle`] sub-trait 으로 중립 접근한다. 같은
+    /// layer-0 handle 의 base coerce(pos/capacity query 용 `kv_handle`)는 caller 가 별도 [`set_kv_handle`]
+    /// 로 설치한다. 비양자화 경로는 이 seam 미주입 → `kv_dtype` default `""` 유지(기존 동작 불변).
+    pub fn set_quant_handle(&mut self, handle: Arc<dyn QuantStageHandle>) {
+        self.quant_handle = Some(handle);
     }
 
     /// 직접 접근이 필요한 caller (capability send 전 `set_has_secondary` 등)를 위해
@@ -103,13 +117,13 @@ impl ResilienceAdapter {
             Some(h) => KVSnapshot {
                 total_tokens: h.current_pos(),
                 capacity: h.capacity(),
-                // AB-2 §5.7.6: KIVI 경로면 layer-0 KIVIFormat 의 현재 bits 를 dtype 문자열로 매핑
-                // (v1 census `generate.rs`(d5ed71d2^) L4352 동형). Standard 경로(kivi_handle=None)는
+                // §4.5: 양자화-KV 경로면 layer-0 handle 의 현재 bits 를 dtype 문자열로 매핑
+                // (v1 census `generate.rs`(d5ed71d2^) L4352 동형). 비양자화 경로(quant_handle=None)는
                 // default `""` 유지(회귀 금지).
                 kv_dtype: self
-                    .kivi_handle
+                    .quant_handle
                     .as_ref()
-                    .map(|k| bits_to_kv_dtype(k.current_bits()))
+                    .map(|k| bits_to_kv_dtype(k.current_kv_bits()))
                     .unwrap_or_default(),
                 eviction_policy: self.eviction_policy.clone(),
                 ..KVSnapshot::default()

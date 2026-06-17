@@ -18,7 +18,7 @@ use crate::inference::sampling::SamplingConfig;
 use crate::kv::kv_cache::{KVCache, KVLayout};
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::session::cli::{Args, KvMode};
+use crate::session::cli::Args;
 use crate::session::init::SessionInitCtx;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::resilience_init::build_command_executor;
@@ -51,6 +51,9 @@ pub fn build_inference_prelude(args: &Args) -> anyhow::Result<InferencePrelude> 
     // fat-LTO self-test(C3 배선): 내장 KV format 4종 링크 확인 — --gc-sections silent
     // drop 시 --kv-format 미해석 폴백 대신 fail-fast.
     crate::format::ensure_builtin_kv_formats_registered()?;
+    // 같은 self-test 의 KV-mode 짝: 내장 mode 3종(standard/kivi/offload)이 KV_MODES 에
+    // 링크됐는지 확인 — drop 시 mode_caps 가 silent None(폴백) 대신 fail-fast.
+    crate::session::mode::ensure_builtin_kv_modes_registered()?;
 
     let init = SessionInitCtx::build(args)?;
 
@@ -431,9 +434,9 @@ pub struct KiviBenchCtx {
     pub max_seq_len: usize,
     pub sampling_config: SamplingConfig,
     pub vocab_size: usize,
-    /// KIVI 진입 시 양자화 bits (`--kv-mode kivi` → `--kv-kivi-bits`, `--kv-dynamic-quant` → 16).
+    /// KIVI 진입 시 양자화 bits (`--kv-mode kivi` → `--kivi-bits`, `--kv-dynamic-quant` → 16).
     pub initial_bits: u8,
-    /// KIVI residual buffer 길이 (`--kv-mode kivi` → `--kv-kivi-residual-len`,
+    /// KIVI residual buffer 길이 (`--kv-mode kivi` → `--kivi-residual-len`,
     /// `--kv-dynamic-quant` → `(max_seq_len/32)*32`).
     pub residual_size: usize,
     pub resilience: Option<ResilienceAdapter>,
@@ -468,8 +471,11 @@ pub fn build_kivi_bench_ctx(args: Args) -> anyhow::Result<KiviBenchCtx> {
         max_seq_len
     );
 
-    // v1 census 재현: --kv-mode kivi → Q2 진입, --kv-dynamic-quant → bits=16 진입.
-    let is_kivi_mode = matches!(args.effective_kv_mode(), KvMode::Kivi);
+    // v1 census 재현: quantized-KV mode → Q2 진입, --kv-dynamic-quant → bits=16 진입.
+    // 경로 게이트는 선언 cap(`ModeCaps.is_quantized_kv`)을 읽는다 — 구체 기술 이름 분기 0
+    // (site #6). bits/residual 도출 자체는 kivi-specific 진입부라 여기 머문다(dispatch 아님).
+    let is_kivi_mode = crate::session::mode::mode_caps(args.effective_kv_mode())
+        .is_some_and(|c| c.is_quantized_kv);
     let initial_bits: u8 = if is_kivi_mode {
         args.effective_kivi_bits()
     } else {

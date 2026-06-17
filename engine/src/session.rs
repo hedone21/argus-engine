@@ -17,6 +17,7 @@ pub mod forward;
 pub mod head_concentration;
 pub mod init;
 pub mod local_pressure;
+pub mod mode;
 pub mod pipeline_registry;
 pub mod plugin_dispatch;
 pub mod ppl;

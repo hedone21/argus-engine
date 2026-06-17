@@ -85,10 +85,14 @@ pub fn build_bench_kivi_loop(
 
     let registry = Arc::new(PipelineRegistry::new());
 
-    // §5.7.6: resilience adapter 에 KIVI handle 주입 → heartbeat kv_dtype 를 현재 bits 에서 query.
+    // §5.7.6/§4.5: resilience adapter 에 KIVI handle 주입 → heartbeat kv_dtype 를 현재 bits 에서
+    // query. pos/capacity 는 base `set_kv_handle`, bit-width 는 중립 `set_quant_handle`.
     let resilience = match (resilience, kivi_handle) {
         (Some(mut adapter), Some(h)) => {
-            adapter.set_kivi_handle(h);
+            adapter.set_kv_handle(h.clone() as Arc<dyn crate::format::KVCacheFormat>);
+            adapter.set_quant_handle(
+                h as Arc<dyn crate::session::resilience_adapter::QuantStageHandle>,
+            );
             Some(adapter)
         }
         (other, _) => other,
