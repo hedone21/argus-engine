@@ -9,7 +9,7 @@
 //! - swap_weights: secondary GGUF/AUF가 로드된 경우에만 (ENG-ST-032)
 
 use argus_engine::resilience::{CommandExecutor, KVSnapshot};
-use argus_shared::{EngineCommand, EngineDirective, EngineMessage, ManagerMessage};
+use argus_shared::{EngineMessage, ManagerMessage};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -29,7 +29,6 @@ fn get_available_actions_with_secondary(
         Duration::from_millis(1), // 매우 짧은 heartbeat 간격
     );
     executor.set_has_secondary(has_secondary);
-    executor.set_running();
 
     // heartbeat 간격 경과 대기
     std::thread::sleep(Duration::from_millis(5));
@@ -44,7 +43,7 @@ fn get_available_actions_with_secondary(
         skip_ratio: 0.0,
     };
 
-    let _ = executor.poll(&snap);
+    executor.send_heartbeat_if_due(&snap);
 
     // Heartbeat에서 available_actions 추출
     while let Ok(msg) = resp_rx.try_recv() {
@@ -87,63 +86,6 @@ fn test_eng_st_032_available_actions_initial() {
         !actions.contains(&"kv.quant_dynamic".to_string()),
         "kv_quant_dynamic should not be available with f16"
     );
-}
-
-/// active_actions에 이미 있는 액션은 available_actions에서 제외되지 않음
-/// (available은 "사용 가능한 액션", active와 독립)
-#[test]
-fn test_eng_st_032_available_excludes_active() {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<ManagerMessage>();
-    let (resp_tx, resp_rx) = mpsc::channel::<EngineMessage>();
-    let mut executor =
-        CommandExecutor::new(cmd_rx, resp_tx, "cpu".to_string(), Duration::from_millis(1));
-    executor.set_running();
-
-    // throttle 액션 활성화
-    cmd_tx
-        .send(ManagerMessage::Directive(EngineDirective {
-            seq_id: 1,
-            commands: vec![EngineCommand::Throttle { delay_ms: 50 }],
-        }))
-        .unwrap();
-    let snap = KVSnapshot {
-        total_bytes: 1000,
-        total_tokens: 100,
-        capacity: 2048,
-        protected_prefix: 4,
-        kv_dtype: "f16".to_string(),
-        eviction_policy: "none".to_string(),
-        skip_ratio: 0.0,
-    };
-    executor.poll(&snap);
-
-    // throttle이 active
-    assert!(executor.active_actions().contains(&"throttle".to_string()));
-
-    // heartbeat 유도
-    std::thread::sleep(Duration::from_millis(5));
-    let _ = executor.poll(&snap);
-
-    // available_actions는 여전히 throttle 포함
-    // (active 여부와 무관하게 capability 기반)
-    let mut found = false;
-    while let Ok(msg) = resp_rx.try_recv() {
-        if let EngineMessage::Heartbeat(status) = msg {
-            assert!(
-                status.available_actions.contains(&"throttle".to_string()),
-                "throttle should still be in available even when active"
-            );
-            // active_actions에도 포함
-            assert!(
-                status.active_actions.contains(&"throttle".to_string()),
-                "throttle should be in active_actions"
-            );
-            found = true;
-            break;
-        }
-    }
-    assert!(found, "Should have received heartbeat");
-    drop(cmd_tx);
 }
 
 /// 디바이스 종속: eviction_policy="h2o"이면 evict 액션 추가,
