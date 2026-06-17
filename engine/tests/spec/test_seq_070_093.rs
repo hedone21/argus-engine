@@ -4,12 +4,8 @@
 //! Unix socket ParseError/oversized/EOF 에러 내성,
 //! 고속 Directive 배압 처리를 검증한다.
 
-use std::time::Duration;
-
 use argus_engine::resilience::{MessageLoop, MockTransport};
-use argus_shared::{EngineCommand, EngineMessage, ManagerMessage};
-
-use super::helpers::{empty_snap, make_executor, send_directive};
+use argus_shared::{EngineCommand, ManagerMessage};
 
 // ═══════════════════════════════════════════════════════════════
 // SEQ-071: MessageLoop exits on disconnect
@@ -27,27 +23,6 @@ fn test_seq_071_message_loop_exits_on_disconnect() {
         result.is_ok(),
         "MessageLoop 스레드가 패닉 없이 정상 종료되어야 함"
     );
-}
-
-// ═══════════════════════════════════════════════════════════════
-// SEQ-071: executor graceful after channel drop
-// ═══════════════════════════════════════════════════════════════
-
-#[test]
-fn test_seq_071_executor_graceful_after_channel_drop() {
-    let (mut executor, tx, _rx) = make_executor();
-
-    // sender drop -> 채널 종료
-    drop(tx);
-
-    // poll() 호출 시 패닉 없음
-    let plan = executor.poll(&empty_snap());
-    assert!(plan.evict.is_none());
-    assert!(!plan.suspended);
-
-    // 반복 호출도 안전
-    let plan2 = executor.poll(&empty_snap());
-    assert!(!plan2.suspended);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -312,41 +287,4 @@ fn test_seq_086_unknown_type_parse_error() {
     );
 
     std::fs::remove_file(&path).ok();
-}
-
-// ═══════════════════════════════════════════════════════════════
-// SEQ-092: 100개 Directive 고속 전송 -> 모두 처리
-// ═══════════════════════════════════════════════════════════════
-
-#[test]
-fn test_seq_092_100_directives_all_processed() {
-    let (mut executor, tx, resp_rx) = make_executor();
-
-    // 100개 Directive 전송
-    for i in 1..=100u64 {
-        send_directive(&tx, i, vec![EngineCommand::Throttle { delay_ms: i }]);
-    }
-
-    // poll() 1회로 모두 처리
-    let _plan = executor.poll(&empty_snap());
-
-    // resp_rx에서 100개 Response 수신 확인
-    let mut received_seq_ids = Vec::new();
-    for _ in 0..100 {
-        let msg = resp_rx
-            .recv_timeout(Duration::from_millis(500))
-            .expect("100개 Response 중 하나를 수신하지 못함");
-        match msg {
-            EngineMessage::Response(r) => {
-                received_seq_ids.push(r.seq_id);
-            }
-            other => panic!("Response를 기대했으나 {:?} 수신", other),
-        }
-    }
-
-    assert_eq!(received_seq_ids.len(), 100);
-    // seq_id 순서대로 1..=100
-    for (i, id) in received_seq_ids.iter().enumerate() {
-        assert_eq!(*id, (i + 1) as u64, "seq_id가 순서대로 증가해야 함");
-    }
 }

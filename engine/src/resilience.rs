@@ -12,9 +12,7 @@ pub mod transport;
 #[cfg(feature = "resilience")]
 pub mod dbus_transport;
 
-// LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N §F enum-as-data identifier re-export (V-10)
-pub use crate::kv::eviction::EvictMethod;
-pub use executor::{CommandExecutor, EvictPlan, ExecutionPlan, KVSnapshot, StreamingParams};
+pub use executor::{CommandExecutor, KVSnapshot};
 pub use gpu_self_meter::{GpuSelfMeter, NoOpGpuMeter};
 pub use manager::ResilienceManager;
 pub use signal::{
