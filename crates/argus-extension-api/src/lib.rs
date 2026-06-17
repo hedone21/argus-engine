@@ -1357,7 +1357,11 @@ pub fn registered_backend_capability_names() -> Vec<&'static str> {
 // types (independent). The static `BACKEND_CAPABILITIES` above (keyed by name) stays as-is — for the fat-LTO name-survival smoke test.
 
 /// ABI version of the `register_backend_caps_v2` envelope ([`BackendCapExportAbi`]). The host rejects the `.so` on mismatch.
-pub const BACKEND_CAP_ABI_VERSION: u32 = 1;
+///
+/// v2 (FORMAT Phase 2, Stage A): [`QuantAttnVTable`] gained `dequant_flush`/`scatter_residual`
+/// fn-ptrs so the residual-flush GPU kernels cross the cap trait (closing the engine's
+/// concrete-`OpenCLBackend` downcast on the live FORMAT-flush path). A v1 `.so` is rejected.
+pub const BACKEND_CAP_ABI_VERSION: u32 = 2;
 
 /// Capability category tag — ATTENTION (quantized fused dequant+attention, e.g. KIVI). [`BackendCapVTableAbi::category`].
 /// The host's category bridge (`match`) uses this value to cast the `vtable` pointer to its per-category table ([`QuantAttnVTable`]) (D7).
@@ -1415,6 +1419,52 @@ pub struct QuantAttnGatherArgs {
     pub res_pos: usize,
 }
 
+/// Arguments for a residual-flush dequant call (FORMAT Phase 2, Stage A). The GPU half of a
+/// KVCache residual-ring flush: dequantize a freshly-written block range into the F16
+/// attention buffer. One struct serves both the per-channel **key** and per-token **value**
+/// kernels (identical arity); `is_key` selects which, and `n_groups_or_tokens` carries the K
+/// `groups_per_flush` or the V `flush_tokens`. cl_mem is **borrow-for-call** (C5).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QuantDequantFlushArgs {
+    /// `cl_command_queue` raw handle. The engine's static impl uses its own queue (mirrors
+    /// [`QuantAttnArgs::cl_queue`]); a plugin uses the queue it built in `make`. May be null.
+    pub cl_queue: *mut c_void,
+    /// Quantized block buffer (source).
+    pub q_blocks_mem: *mut c_void,
+    /// F16 attention buffer (destination).
+    pub attn_mem: *mut c_void,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    /// K: `groups_per_flush` (per-channel); V: `flush_tokens` (per-token).
+    pub n_groups_or_tokens: usize,
+    pub tok_base: usize,
+    /// Block index the freshly-uploaded blocks start at (the kernel's `block_offset`).
+    pub block_start: usize,
+    pub bits: u8,
+    /// true → per-channel key dequant; false → per-token value dequant.
+    pub is_key: bool,
+}
+
+/// Arguments for scattering the F32 residual ring into the F16 attention buffer (Stage A).
+/// cl_mem is **borrow-for-call** (C5).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QuantScatterResidualArgs {
+    /// `cl_command_queue` raw handle (see [`QuantDequantFlushArgs::cl_queue`]). May be null.
+    pub cl_queue: *mut c_void,
+    /// F32 residual ring buffer (source).
+    pub res_mem: *mut c_void,
+    /// F16 attention buffer (destination).
+    pub attn_mem: *mut c_void,
+    pub kv_heads: usize,
+    pub res_cap: usize,
+    pub head_dim: usize,
+    pub res_pos: usize,
+    /// Token base in the attention buffer (the assembled-view's quantized-token count).
+    pub tok_base: usize,
+}
+
 /// Canonical capability trait for the ATTENTION category (D8 single-trait). Owned by argus-extension-api → the engine's static impl,
 /// the host dlopen adapter, and the plugin `.so` **all implement this one trait**. It takes an ABI struct instead of `&Tensor` so the plugin is
 /// independent (does not reference engine types). Returns `i32` (C3 panic=abort: 0=OK, negative=err — vtable fn-ptrs must not panic).
@@ -1427,6 +1477,16 @@ pub trait QuantAttnBackend: Send + Sync {
     fn attention_gen_quant(&self, args: &QuantAttnArgs) -> i32;
     /// Residual ring gather-update (just before K/V quantization).
     fn gather_update_quant(&self, args: &QuantAttnGatherArgs) -> i32;
+    /// Residual-flush dequant (per-channel key / per-token value) — the GPU half of a KVCache
+    /// flush. Default `-1` (unsupported) so existing impls compile; the host's OpenCL backend
+    /// and the dlopen adapter override it (FORMAT Phase 2, Stage A).
+    fn dequant_flush(&self, _args: &QuantDequantFlushArgs) -> i32 {
+        -1
+    }
+    /// Scatter the F32 residual ring into the F16 attention buffer. Default `-1` (unsupported).
+    fn scatter_residual(&self, _args: &QuantScatterResidualArgs) -> i32 {
+        -1
+    }
 }
 
 /// Static (force-link) quantized-attention capability registration entry — the backend-axis counterpart of the stage [`KVCacheStageReg`] (D8).
@@ -1467,6 +1527,10 @@ pub struct QuantAttnVTable {
     pub attention_gen_quant: unsafe extern "C" fn(*mut c_void, *const QuantAttnArgs) -> i32,
     /// handle + [`QuantAttnGatherArgs`] → i32. residual gather-update.
     pub gather_update_quant: unsafe extern "C" fn(*mut c_void, *const QuantAttnGatherArgs) -> i32,
+    /// handle + [`QuantDequantFlushArgs`] → i32. residual-flush dequant (ABI v2).
+    pub dequant_flush: unsafe extern "C" fn(*mut c_void, *const QuantDequantFlushArgs) -> i32,
+    /// handle + [`QuantScatterResidualArgs`] → i32. residual scatter (ABI v2).
+    pub scatter_residual: unsafe extern "C" fn(*mut c_void, *const QuantScatterResidualArgs) -> i32,
     /// Release the handle (called once by the host when the capability is dropped).
     pub drop: unsafe extern "C" fn(*mut c_void),
 }
@@ -1574,6 +1638,24 @@ macro_rules! register_quant_attn_plugin {
                 be.gather_update_quant(unsafe { &*a })
             }
 
+            unsafe extern "C" fn __dequant_flush(
+                h: *mut ::core::ffi::c_void,
+                a: *const $crate::QuantDequantFlushArgs,
+            ) -> i32 {
+                // SAFETY: h is the Box<Box<dyn>> created by __make; a is a valid QuantDequantFlushArgs (C5).
+                let be: &dyn $crate::QuantAttnBackend = unsafe { &**(h as *const __Handle) };
+                be.dequant_flush(unsafe { &*a })
+            }
+
+            unsafe extern "C" fn __scatter_residual(
+                h: *mut ::core::ffi::c_void,
+                a: *const $crate::QuantScatterResidualArgs,
+            ) -> i32 {
+                // SAFETY: same as above.
+                let be: &dyn $crate::QuantAttnBackend = unsafe { &**(h as *const __Handle) };
+                be.scatter_residual(unsafe { &*a })
+            }
+
             unsafe extern "C" fn __drop(h: *mut ::core::ffi::c_void) {
                 // SAFETY: h is the Box<Box<dyn>> created by __make; the host calls this exactly once.
                 drop(unsafe { ::std::boxed::Box::from_raw(h as *mut __Handle) });
@@ -1585,6 +1667,8 @@ macro_rules! register_quant_attn_plugin {
                 is_nosub_device: __nosub,
                 attention_gen_quant: __attn,
                 gather_update_quant: __gather,
+                dequant_flush: __dequant_flush,
+                scatter_residual: __scatter_residual,
                 drop: __drop,
             };
 
@@ -2210,6 +2294,64 @@ mod tests {
                 .unwrap();
             assert_eq!(&name, expect);
         }
+    }
+
+    /// FORMAT Phase 2, Stage A — backend-cap ABI v2: the residual-flush surface exists, the
+    /// arg structs have a stable `repr(C)` layout, and the trait defaults are `-1` (unsupported)
+    /// so pre-v2 impls compile unchanged.
+    #[test]
+    fn backend_cap_abi_v2_flush_surface() {
+        // Envelope ABI bumped to 2 (a v1 `.so` is rejected by the loader).
+        assert_eq!(BACKEND_CAP_ABI_VERSION, 2);
+
+        // repr(C) layout stability — guards against silent field drift across the `.so` boundary.
+        assert_eq!(core::mem::size_of::<QuantDequantFlushArgs>(), 72);
+        assert_eq!(core::mem::align_of::<QuantDequantFlushArgs>(), 8);
+        assert_eq!(core::mem::size_of::<QuantScatterResidualArgs>(), 64);
+        assert_eq!(core::mem::align_of::<QuantScatterResidualArgs>(), 8);
+
+        // The two new methods default to -1 so impls predating v2 (e.g. the synthetic plugins)
+        // keep compiling and report "unsupported" rather than dispatching a missing kernel.
+        struct NoFlush;
+        impl QuantAttnBackend for NoFlush {
+            fn has_quant_attn_kernel(&self, _bits: u8) -> bool {
+                false
+            }
+            fn is_nosub_device(&self) -> bool {
+                false
+            }
+            fn attention_gen_quant(&self, _args: &QuantAttnArgs) -> i32 {
+                0
+            }
+            fn gather_update_quant(&self, _args: &QuantAttnGatherArgs) -> i32 {
+                0
+            }
+        }
+        let be = NoFlush;
+        let dq = QuantDequantFlushArgs {
+            cl_queue: core::ptr::null_mut(),
+            q_blocks_mem: core::ptr::null_mut(),
+            attn_mem: core::ptr::null_mut(),
+            kv_heads: 1,
+            head_dim: 64,
+            n_groups_or_tokens: 1,
+            tok_base: 0,
+            block_start: 0,
+            bits: 2,
+            is_key: true,
+        };
+        let sc = QuantScatterResidualArgs {
+            cl_queue: core::ptr::null_mut(),
+            res_mem: core::ptr::null_mut(),
+            attn_mem: core::ptr::null_mut(),
+            kv_heads: 1,
+            res_cap: 128,
+            head_dim: 64,
+            res_pos: 0,
+            tok_base: 0,
+        };
+        assert_eq!(be.dequant_flush(&dq), -1);
+        assert_eq!(be.scatter_residual(&sc), -1);
     }
 
     /// StageExportAbi isomorphic round-trip (symmetric across both axes).

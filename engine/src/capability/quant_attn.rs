@@ -8,5 +8,6 @@
 //! 동일 TypeId, CapabilityRegistry register/get 일관).
 
 pub use argus_extension_api::{
-    QuantAttnArgs, QuantAttnBackend, QuantAttnGatherArgs, QuantAttnMakeArgs,
+    QuantAttnArgs, QuantAttnBackend, QuantAttnGatherArgs, QuantAttnMakeArgs, QuantDequantFlushArgs,
+    QuantScatterResidualArgs,
 };

@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use argus_extension_api::{
     BACKEND_CAP_ABI_VERSION, BACKEND_CAP_CATEGORY_ATTENTION, BackendCapExportAbi, QuantAttnArgs,
     QuantAttnBackend, QuantAttnGatherArgs, QuantAttnMakeArgs, QuantAttnVTable,
+    QuantDequantFlushArgs, QuantScatterResidualArgs,
 };
 use core::ffi::c_void;
 
@@ -249,6 +250,18 @@ impl QuantAttnBackend for DynQuantAttnBackend {
         // SAFETY: 위와 동일.
         unsafe {
             ((*self.vtable).gather_update_quant)(self.handle, args as *const QuantAttnGatherArgs)
+        }
+    }
+
+    fn dequant_flush(&self, args: &QuantDequantFlushArgs) -> i32 {
+        // SAFETY: args 는 host 가 채운 유효 QuantDequantFlushArgs(C5). vtable fn-ptr(ABI v2)로 전달.
+        unsafe { ((*self.vtable).dequant_flush)(self.handle, args as *const QuantDequantFlushArgs) }
+    }
+
+    fn scatter_residual(&self, args: &QuantScatterResidualArgs) -> i32 {
+        // SAFETY: 위와 동일.
+        unsafe {
+            ((*self.vtable).scatter_residual)(self.handle, args as *const QuantScatterResidualArgs)
         }
     }
 }
