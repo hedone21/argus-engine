@@ -137,10 +137,5 @@ pub fn build_command_executor(
     if args.tensor_partition > 0.0 && args.tensor_partition < 1.0 {
         executor.set_partition_ratio(args.tensor_partition);
     }
-    // throttle seed
-    if args.throttle_delay_ms > 0 {
-        executor.set_throttle_delay_ms(args.throttle_delay_ms);
-    }
-
     Ok(Some(executor))
 }
