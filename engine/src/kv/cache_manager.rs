@@ -1,9 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::kv::eviction::EvictMethod;
 use crate::kv::eviction::EvictionPolicy;
 use crate::kv::kv_cache::{KVCache, max_cache_pos};
 use crate::kv::{
@@ -54,8 +52,6 @@ pub struct CacheManager {
     monitor: Box<dyn SystemMonitor>,
     /// Eviction triggers when available memory drops below this threshold (bytes).
     threshold_bytes: usize,
-    /// Named eviction policies for Manager-directed dispatch (resilience).
-    policies: HashMap<EvictMethod, Box<dyn EvictionPolicy>>,
     /// Optional disk-backed swap handler for `KvOffload` directives.
     /// Not part of the pressure pipeline — invoked directly by `offload()` /
     /// `recall()` so it only runs when the Manager explicitly asks for it.
@@ -81,7 +77,6 @@ impl CacheManager {
             pipeline,
             monitor,
             threshold_bytes,
-            policies: HashMap::new(),
             swap_handler: None,
         }
     }
@@ -99,7 +94,6 @@ impl CacheManager {
             pipeline,
             monitor,
             threshold_bytes,
-            policies: HashMap::new(),
             swap_handler: None,
         }
     }
@@ -404,96 +398,12 @@ impl CacheManager {
         self.pipeline.name()
     }
 
-    // ── Named policy registry (Manager-directed dispatch) ──────────
-
-    /// Register an eviction policy for Manager-directed dispatch.
-    pub fn register_policy(&mut self, method: EvictMethod, policy: Box<dyn EvictionPolicy>) {
-        self.policies.insert(method, policy);
-    }
-
-    /// Force eviction using a specific named policy (for resilience directives).
-    ///
-    /// Bypasses the default pipeline and directly invokes the registered policy.
-    /// Events are emitted through the same event_sink as auto-eviction.
-    pub fn force_evict_by_policy(
-        &self,
-        method: EvictMethod,
-        caches: &mut [KVCache],
-        target_ratio: f32,
-        scores: ScoreContext,
-    ) -> Result<EvictionResult> {
-        let policy = self
-            .policies
-            .get(&method)
-            .ok_or_else(|| anyhow::anyhow!("no registered policy for {:?}", method))?;
-
-        let target_len = Self::resolve_target_len(max_cache_pos(caches), target_ratio);
-        let result = Self::run_policy_eviction(policy.as_ref(), caches, target_len, scores)?;
-
-        if result.evicted {
-            for cache in caches.iter_mut() {
-                cache.release_unused_pages();
-            }
-            log::info!(
-                "[CacheEvent] Eviction completed: policy='{}', removed={}, new_pos={}",
-                policy.name(),
-                result.tokens_removed,
-                result.new_pos,
-            );
-        }
-
-        Ok(result)
-    }
-
-    /// Force eviction using a caller-provided policy reference.
-    ///
-    /// Like `force_evict_by_policy()` but takes a `&dyn EvictionPolicy` directly
-    /// instead of looking up a registered policy by method. Useful for policies
-    /// whose parameters are determined at runtime (e.g. StreamingLLM).
-    pub fn force_evict_by_policy_ref(
-        &self,
-        policy: &dyn EvictionPolicy,
-        caches: &mut [KVCache],
-        target_ratio: f32,
-        scores: ScoreContext,
-    ) -> Result<EvictionResult> {
-        let target_len = Self::resolve_target_len(max_cache_pos(caches), target_ratio);
-        let result = Self::run_policy_eviction(policy, caches, target_len, scores)?;
-
-        if result.evicted {
-            for cache in caches.iter_mut() {
-                cache.release_unused_pages();
-            }
-            log::info!(
-                "[CacheEvent] Eviction completed: policy='{}', removed={}, new_pos={}",
-                policy.name(),
-                result.tokens_removed,
-                result.new_pos,
-            );
-        }
-
-        Ok(result)
-    }
-
-    /// `target_ratio` → `target_len` 변환 (registry 경로 전용 helper).
-    ///
-    /// `target_ratio <= 0.0` 은 "정책이 결정" (StreamingLLM 이 자기 sink+window
-    /// 사용) → `target_len = 0` 으로 정책 default keep_size 를 쓴다 (1 로 강제 안 함).
-    fn resolve_target_len(current_pos: usize, target_ratio: f32) -> usize {
-        if target_ratio <= 0.0 {
-            0
-        } else {
-            ((current_pos as f32) * target_ratio).max(1.0) as usize
-        }
-    }
-
     /// Shared eviction core: guard on `target_len`, dispatch to policy methods,
     /// assemble result. `target_len == 0` means "policy decides" (guards skipped).
     ///
-    /// pressure 파이프라인의 `EvictionHandler::handle` 와 registry 경로의
-    /// `force_evict_by_policy(_ref)` 가 공유하는 **단일 eviction 알고리즘** (α-K 2b
-    /// 통합 — 구 EvictionHandler 인라인 복제 제거). 호출자는 각자 자기 규칙으로
-    /// `target_len` 을 미리 해소해 전달한다 (EHH=`max(1)`, registry=`resolve_target_len`).
+    /// pressure 파이프라인의 `EvictionHandler::handle` 가 호출하는 **단일 eviction
+    /// 알고리즘** (α-K 2b 통합 — 구 EvictionHandler 인라인 복제 제거). 호출자는 자기
+    /// 규칙으로 `target_len` 을 미리 해소해 전달한다 (EHH=`max(1)`).
     // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path eviction dispatch
     pub(crate) fn run_policy_eviction(
         policy: &dyn EvictionPolicy,
@@ -1222,224 +1132,5 @@ mod tests {
         let result = cm.maybe_evict(&mut caches).unwrap();
         assert!(!result.evicted);
         assert_eq!(result.new_pos, 40);
-    }
-
-    // ── Resilience eviction integration tests ──
-    // These test the END-TO-END eviction result (cache_pos after eviction),
-    // not just plan structure. They catch bugs where eviction appears to succeed
-    // but the cache size doesn't actually decrease.
-
-    #[test]
-    fn test_resilience_sliding_eviction_reduces_cache_pos() {
-        // Simulate Manager-directed sliding eviction with small protected_prefix.
-        // Keep ratio = 0.2: should reduce 90 tokens to ~18.
-        // tokens_to_remove = 90 - 18 = 72 >= MIN_EVICT_TOKENS(64) → guard does not fire.
-        let policy = sliding_backed_policy(50, 4); // protected_prefix=4, NOT prompt length
-        let mut cm = CacheManager::new(
-            none_backed_policy(),
-            Box::new(MockMonitor {
-                available: usize::MAX,
-            }),
-            0,
-            1.0,
-        );
-        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, policy);
-
-        let mut caches = make_caches(4, 90);
-        let result = cm
-            .force_evict_by_policy(
-                crate::kv::eviction::EvictMethod::Sliding,
-                &mut caches,
-                0.2,
-                ScoreContext::None,
-            )
-            .unwrap();
-
-        assert!(result.evicted);
-        // SlidingWindowPolicy clamps to prefix+min_keep; actual new_pos may differ from target_len.
-        assert!(
-            result.new_pos < 90,
-            "cache should be reduced from 90 tokens, got {}",
-            result.new_pos
-        );
-        assert!(
-            result.tokens_removed >= 64,
-            "must remove >= MIN_EVICT_TOKENS(64), removed {}",
-            result.tokens_removed
-        );
-    }
-
-    #[test]
-    fn test_resilience_sliding_large_protected_prefix_limits_eviction() {
-        // If protected_prefix is too large (e.g. entire prompt), eviction is limited.
-        // This documents the behavior the undershoot warning catches.
-        let policy = sliding_backed_policy(50, 70); // protected_prefix=70 out of 80 tokens
-        let mut cm = CacheManager::new(
-            none_backed_policy(),
-            Box::new(MockMonitor {
-                available: usize::MAX,
-            }),
-            0,
-            1.0,
-        );
-        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, policy);
-
-        let mut caches = make_caches(4, 80);
-        let result = cm
-            .force_evict_by_policy(
-                crate::kv::eviction::EvictMethod::Sliding,
-                &mut caches,
-                0.5,
-                ScoreContext::None,
-            )
-            .unwrap();
-
-        // target_len=40, but min_keep=(70+16).min(120)=86 > 80 → clamp to 80
-        // current_pos(80) <= keep(80) → no meaningful eviction
-        assert!(
-            result.tokens_removed < 5,
-            "large protected_prefix should severely limit eviction (removed {})",
-            result.tokens_removed
-        );
-    }
-
-    #[test]
-    fn test_resilience_streaming_keeps_sink_plus_window() {
-        use crate::kv::eviction::stage_registry::{StageBackedPolicy, make_stage};
-
-        // Streaming with sink=4, window=20 should keep exactly 24 tokens. StreamingLLM was
-        // extracted to the streaming-llm plugin, so build the stage by registry name and wrap
-        // it as an EvictionPolicy (the same StageBackedPolicy seam production uses).
-        let params = argus_extension_api::StageParams {
-            eviction_window: 0,
-            protected_prefix: 0,
-            keep_ratio: 0.0,
-            sink_size: 4,
-            streaming_window: 20,
-        };
-        let stage = make_stage("streaming", &params).expect("streaming stage registered");
-        let policy = StageBackedPolicy::new(stage);
-        let cm = CacheManager::new(
-            none_backed_policy(),
-            Box::new(MockMonitor {
-                available: usize::MAX,
-            }),
-            0,
-            1.0,
-        );
-
-        let mut caches = make_caches(4, 80);
-        // target_ratio=0.0 means "let the policy decide"
-        let result = cm
-            .force_evict_by_policy_ref(&policy, &mut caches, 0.0, ScoreContext::None)
-            .unwrap();
-
-        assert!(result.evicted);
-        assert_eq!(
-            result.new_pos, 24,
-            "streaming should keep sink(4) + window(20) = 24 tokens, got {}",
-            result.new_pos
-        );
-    }
-
-    #[test]
-    fn test_run_policy_eviction_skips_small_request() {
-        // current_pos=100, target_ratio=0.98 → target_len=98, tokens_to_remove=2 < MIN_EVICT_TOKENS=64
-        // Expected: evicted=false (guard fires).
-        let policy = sliding_backed_policy(200, 0);
-        let mut cm = CacheManager::new(
-            none_backed_policy(),
-            Box::new(MockMonitor {
-                available: usize::MAX,
-            }),
-            0,
-            1.0,
-        );
-        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, policy);
-
-        let mut caches = make_caches(2, 100);
-        let result = cm
-            .force_evict_by_policy(
-                crate::kv::eviction::EvictMethod::Sliding,
-                &mut caches,
-                0.98, // target_len = 98, tokens_to_remove = 2
-                ScoreContext::None,
-            )
-            .unwrap();
-
-        assert!(
-            !result.evicted,
-            "Should skip eviction when tokens_to_remove < MIN_EVICT_TOKENS, got evicted={}",
-            result.evicted
-        );
-        assert_eq!(result.tokens_removed, 0);
-        assert_eq!(result.new_pos, 100, "current_pos should remain unchanged");
-    }
-
-    #[test]
-    fn test_run_policy_eviction_proceeds_when_above_threshold() {
-        // current_pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS=64
-        // Expected: evicted=true (guard does not fire).
-        let policy = sliding_backed_policy(200, 0);
-        let mut cm = CacheManager::new(
-            none_backed_policy(),
-            Box::new(MockMonitor {
-                available: usize::MAX,
-            }),
-            0,
-            1.0,
-        );
-        cm.register_policy(crate::kv::eviction::EvictMethod::Sliding, policy);
-
-        let mut caches = make_caches(2, 100);
-        let result = cm
-            .force_evict_by_policy(
-                crate::kv::eviction::EvictMethod::Sliding,
-                &mut caches,
-                0.3, // target_len = 30, tokens_to_remove = 70
-                ScoreContext::None,
-            )
-            .unwrap();
-
-        assert!(
-            result.evicted,
-            "Should proceed with eviction when tokens_to_remove >= MIN_EVICT_TOKENS"
-        );
-        assert!(caches[0].current_pos < 100);
-    }
-
-    #[test]
-    fn test_resilience_h2o_eviction_respects_keep_ratio() {
-        use crate::kv::eviction::stage_registry::h2o_backed_policy;
-
-        // H2O with protected_prefix=4, keep_ratio=0.5 on 80 tokens.
-        // target_ratio=0.2 → target_len=16, tokens_to_remove=64 == MIN_EVICT_TOKENS → guard does not fire.
-        let policy = h2o_backed_policy(0.5, 4);
-        let mut cm = CacheManager::new(
-            none_backed_policy(),
-            Box::new(MockMonitor {
-                available: usize::MAX,
-            }),
-            0,
-            1.0,
-        );
-        cm.register_policy(crate::kv::eviction::EvictMethod::H2o, policy);
-
-        let mut caches = make_caches(4, 80);
-        let result = cm
-            .force_evict_by_policy(
-                crate::kv::eviction::EvictMethod::H2o,
-                &mut caches,
-                0.2,
-                ScoreContext::None,
-            )
-            .unwrap();
-
-        assert!(result.evicted);
-        assert_eq!(
-            result.new_pos, 16,
-            "H2O should reduce to 16 tokens (ratio 0.2), got {}",
-            result.new_pos
-        );
     }
 }
