@@ -4,7 +4,7 @@
 //! 축 짝. dlopen 된 synthetic backend-cap `.so` 가 ABI 경계(register_backend_caps_v2 봉투 → category
 //! 다리 → `DynKiviAttentionBackend` 어댑터 → make/dispatch)를 **정확히** 넘는지 증명한다.
 //!
-//! **host-검증 범위(C12)**: synthetic plugin 은 GPU 수학을 하지 않는다 — `KiviAttnArgs` 스칼라로
+//! **host-검증 범위(C12)**: synthetic plugin 은 GPU 수학을 하지 않는다 — `QuantAttnArgs` 스칼라로
 //! 결정적 sentinel 을 계산해 `scores_out[0]` 에 기록하므로, host 가 args struct 의 필드 정렬·값이
 //! ABI 경계를 정확히 넘었는지 확인할 수 있다. 실제 KIVI 커널 실행·`&Tensor↔cl_mem` 다리 무회귀는
 //! S25 device 재증명(C12) 영역으로 본 게이트 밖.
@@ -19,7 +19,7 @@ use argus_engine::capability::dynamic_backend_registry::{
     dynamic_registered_backend_cap_names, resolve_kivi_capability,
 };
 use argus_engine::session::plugin_dispatch::register_dynamic_plugins;
-use argus_extension_api::{KiviAttnArgs, KiviGatherArgs, KiviMakeArgs};
+use argus_extension_api::{QuantAttnArgs, QuantAttnGatherArgs, QuantAttnMakeArgs};
 
 /// `cargo build -p <pkg> [--features plugin-cdylib] --message-format=json` 으로 `.so` 산출 → 경로를
 /// `CARGO_TARGET_TMPDIR` 의 고유 이름으로 복사. (`gate_c_plugin_bundle.rs` 의 헬퍼와 동일.)
@@ -69,7 +69,7 @@ fn gate_c_backend_cap_dlopen_round_trip() {
     );
 
     // ── 4. category 다리(D7) → DynKiviAttentionBackend 어댑터 생성(resolve, vtable.make 호출). ──
-    let make_args = KiviMakeArgs {
+    let make_args = QuantAttnMakeArgs {
         cl_ctx: std::ptr::null_mut(),
         device: std::ptr::null_mut(),
         build_opts: std::ptr::null(),
@@ -79,18 +79,18 @@ fn gate_c_backend_cap_dlopen_round_trip() {
 
     // ── 5. 어댑터 메서드 round-trip — bool 쿼리(vtable.has/nosub). ──
     assert!(
-        cap.has_kivi_attn_kernel(2),
-        "has_kivi_attn_kernel(2) != true"
+        cap.has_quant_attn_kernel(2),
+        "has_quant_attn_kernel(2) != true"
     );
-    assert!(cap.has_kivi_attn_kernel(4));
+    assert!(cap.has_quant_attn_kernel(4));
     assert!(!cap.is_nosub_device(), "is_nosub_device != false");
 
-    // ── 6. attention_gen_kivi dispatch round-trip — KiviAttnArgs 가 ABI 경계를 정확히 넘었는지 ──
+    // ── 6. attention_gen_quant dispatch round-trip — QuantAttnArgs 가 ABI 경계를 정확히 넘었는지 ──
     //       sentinel 로 검증. 더미 non-null cl_mem(synthetic 은 null 검사만 — GPU 안 씀).
     let mut dummy = 0u8;
     let dummy_mem = (&mut dummy as *mut u8) as *mut c_void;
     let mut scores = [0.0f32; 1];
-    let attn = KiviAttnArgs {
+    let attn = QuantAttnArgs {
         cl_queue: std::ptr::null_mut(),
         q_mem: dummy_mem,
         qk_mem: dummy_mem,
@@ -109,24 +109,28 @@ fn gate_c_backend_cap_dlopen_round_trip() {
         scale: 0.125,
         bits: 2,
     };
-    let rc = cap.attention_gen_kivi(&attn);
-    assert_eq!(rc, 0, "attention_gen_kivi rc != 0 (마샬링 실패)");
+    let rc = cap.attention_gen_quant(&attn);
+    assert_eq!(rc, 0, "attention_gen_quant rc != 0 (마샬링 실패)");
     // synthetic sentinel = num_heads_q*1000 + head_dim + bits*0.5 + scale (동일 f32 연산 순서).
     let expected = 32.0_f32 * 1000.0 + 64.0 + 2.0 * 0.5 + 0.125;
     assert_eq!(
         scores[0], expected,
-        "scores_out sentinel 불일치 — KiviAttnArgs scalar 가 ABI 경계를 잘못 넘음"
+        "scores_out sentinel 불일치 — QuantAttnArgs scalar 가 ABI 경계를 잘못 넘음"
     );
 
     // ── 7. null mem → 어댑터→vtable→plugin 이 -1(마샬링 실패 감지). ──
-    let bad = KiviAttnArgs {
+    let bad = QuantAttnArgs {
         q_mem: std::ptr::null_mut(),
         ..attn
     };
-    assert_eq!(cap.attention_gen_kivi(&bad), -1, "null q_mem 인데 rc != -1");
+    assert_eq!(
+        cap.attention_gen_quant(&bad),
+        -1,
+        "null q_mem 인데 rc != -1"
+    );
 
-    // ── 8. kivi_gather_update round-trip. ──
-    let gather = KiviGatherArgs {
+    // ── 8. gather_update_quant round-trip. ──
+    let gather = QuantAttnGatherArgs {
         cl_queue: std::ptr::null_mut(),
         input_mem: dummy_mem,
         residual_mem: dummy_mem,
@@ -137,9 +141,9 @@ fn gate_c_backend_cap_dlopen_round_trip() {
         res_pos: 0,
     };
     assert_eq!(
-        cap.kivi_gather_update(&gather),
+        cap.gather_update_quant(&gather),
         0,
-        "kivi_gather_update rc != 0"
+        "gather_update_quant rc != 0"
     );
 
     // ── 9. 미지 이름 → None (graceful unknown). ──

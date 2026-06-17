@@ -623,12 +623,12 @@ pub fn build_dump_importance_ctx(args: Args) -> Result<DumpImportanceCtx> {
 ///
 /// legacy generate.rs:274-369 재현. `EvalLlRunCtx` 를 경유하지 않고
 /// `run_eval_ll_generic` 을 KiviHook + `Vec<KiviCache>` 로 직접 호출한다.
-/// `caps.get::<dyn KiviAttentionBackend>()` 를 closure 밖에서 1회 pull —
+/// `caps.get::<dyn QuantAttnBackend>()` 를 closure 밖에서 1회 pull —
 /// chat 의 `build_chat_kivi`(session/chat/session.rs:412) thread-through 미러.
 ///
 /// 빌드부터 run 까지 한 함수에 둔다 (KIVI 는 ctx struct 표면이 없음).
 pub fn run_eval_ll_kivi(args: Args) -> Result<()> {
-    use crate::backend::KiviAttentionBackend;
+    use crate::backend::QuantAttnBackend;
     use crate::kv::kivi_cache::KiviCache;
     use crate::session::cli::parse_qcf_sample_layers;
     use crate::session::eval::{EvalConfig, KiviHook, run_eval_ll_generic};
@@ -666,7 +666,7 @@ pub fn run_eval_ll_kivi(args: Args) -> Result<()> {
     let kivi_bits = args.effective_kivi_bits();
 
     // KIVI native attention handle 을 caps 에서 1회 pull (closure 밖). OpenCL 면 Some.
-    let kivi_cap = caps.get::<dyn KiviAttentionBackend>();
+    let kivi_cap = caps.get::<dyn QuantAttnBackend>();
     let mut kv_caches: Vec<KiviCache> = (0..num_layers)
         .map(|_| {
             KiviCache::new_gpu(
@@ -747,10 +747,10 @@ pub fn run_eval_ll_kivi(args: Args) -> Result<()> {
 /// legacy generate.rs:372-389 재현. `run_kivi_ppl` free fn 을 caps 에서 pull 한
 /// KIVI handle 과 함께 직접 호출한다.
 pub fn run_ppl_kivi(args: Args, ppl_path: &str) -> Result<()> {
-    use crate::backend::KiviAttentionBackend;
+    use crate::backend::QuantAttnBackend;
 
     let base = build_eval_base(&args)?;
-    let kivi = base.caps.get::<dyn KiviAttentionBackend>();
+    let kivi = base.caps.get::<dyn QuantAttnBackend>();
     crate::session::ppl::run_kivi_ppl(
         &args,
         &base.model,

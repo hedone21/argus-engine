@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 
 use crate::buffer::DType;
-use crate::capability::kivi_attention::KiviAttentionBackend;
+use crate::capability::kivi_attention::QuantAttnBackend;
 use crate::hardware::DeviceTarget;
 use crate::session::bin_setup::alloc_standard_kv_caches;
 use crate::session::chat::session::{
@@ -106,7 +106,7 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
             })
         }
         KvMode::Kivi => {
-            let kivi = caps.get::<dyn KiviAttentionBackend>();
+            let kivi = caps.get::<dyn QuantAttnBackend>();
             build_chat_kivi(ChatKiviArgs {
                 backend,
                 kivi,

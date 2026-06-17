@@ -20,7 +20,7 @@ use crate::backend::Backend;
 // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
-use crate::capability::kivi_attention::KiviAttentionBackend;
+use crate::capability::kivi_attention::QuantAttnBackend;
 use crate::kv_cache_ops::{KVLayout, KiviRawBuffers};
 use crate::memory::Memory;
 use crate::memory::host::shared::{SharedBuffer, SharedBufferView};
@@ -207,11 +207,11 @@ pub struct KiviCache {
     /// GPU backend handle. Some ↔ GPU mode enabled.
     gpu_backend: Option<Arc<dyn Backend>>,
     /// KIVI native attention capability handle (Phase α-W-4 §3.3). Some ↔ GPU
-    /// 모드 + OpenCL backend. `update_gpu` 의 `kivi_gather_update` dispatch 가
-    /// 매 토큰 `as_kivi_attention()` lookup 대신 본 handle 을 직접 쓴다. caller
-    /// 가 `caps.get::<dyn KiviAttentionBackend>()` 로 pull 해 `new_gpu` 에 전달
+    /// 모드 + OpenCL backend. `update_gpu` 의 `gather_update_quant` dispatch 가
+    /// 매 토큰 `as_quant_attn()` lookup 대신 본 handle 을 직접 쓴다. caller
+    /// 가 `caps.get::<dyn QuantAttnBackend>()` 로 pull 해 `new_gpu` 에 전달
     /// (R4: gpu_backend 와 동일 ocl 인스턴스의 clone).
-    kivi: Option<Arc<dyn KiviAttentionBackend>>,
+    kivi: Option<Arc<dyn QuantAttnBackend>>,
     /// Memory allocator used to create GPU buffers (used by ensure_gpu_attn_capacity).
     gpu_memory: Option<Arc<dyn Memory>>,
     /// GPU F32 residual K buffer: [kv_heads, res_cap, head_dim]
@@ -385,7 +385,7 @@ impl KiviCache {
     /// residual and attention data. Falls back to CPU-only mode if GPU allocation fails.
     ///
     /// `kivi` 는 KIVI native attention capability handle (Phase α-W-4 §3.3). caller 가
-    /// `caps.get::<dyn KiviAttentionBackend>()` 로 pull 해 전달한다. R3 불변식: OpenCL
+    /// `caps.get::<dyn QuantAttnBackend>()` 로 pull 해 전달한다. R3 불변식: OpenCL
     /// backend 로 GPU 모드 진입 시 반드시 `Some` (init.rs 가 OpenCL 에 register). R4
     /// 불변식: `backend` 와 동일 ocl 인스턴스의 clone.
     #[allow(clippy::too_many_arguments)]
@@ -396,7 +396,7 @@ impl KiviCache {
         residual_size: usize,
         bits: u8,
         backend: Arc<dyn Backend>,
-        kivi: Option<Arc<dyn KiviAttentionBackend>>,
+        kivi: Option<Arc<dyn QuantAttnBackend>>,
         memory: Arc<dyn Memory>,
     ) -> Self {
         let mut cache = Self::new_with_bits(kv_heads, head_dim, max_seq_len, residual_size, bits);
@@ -1500,16 +1500,16 @@ impl KiviCache {
     // ── GPU-mode private helpers ──────────────────────────────────────────────
 
     /// GPU update path: scatter input tokens into GPU residual buffer using
-    /// `kivi_gather_update` kernel, flushing when the residual is full.
-    // §13.8-L S-L-3: KiviAttentionBackend trait 으로 OpenCLBackend
-    // downcast 제거. fast path 의 `kivi_gather_update` 2건은 trait method,
+    /// `gather_update_quant` kernel, flushing when the residual is full.
+    // §13.8-L S-L-3: QuantAttnBackend trait 으로 OpenCLBackend
+    // downcast 제거. fast path 의 `gather_update_quant` 2건은 trait method,
     // slow path 의 `copy_slice` 는 Backend trait 의 일반 메서드라 그대로
     // dyn dispatch — 함수 내 잔존 downcast/import 0 이므로 marker 제거.
     fn update_gpu(&mut self, new_k: &Tensor, new_v: &Tensor, seq_len: usize) -> Result<()> {
         // slow path 의 `copy_slice` 는 Backend trait 의 일반 ops → gpu_backend 유지.
         let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
-        // fast path 의 `kivi_gather_update` 는 KIVI native capability → 매 토큰
-        // `as_kivi_attention()` lookup 대신 construction 시 pull 된 handle 직접 사용
+        // fast path 의 `gather_update_quant` 는 KIVI native capability → 매 토큰
+        // `as_quant_attn()` lookup 대신 construction 시 pull 된 handle 직접 사용
         // (Phase α-W-4 §3.3). R3: GPU 모드면 OpenCL backend 라 caller 가 Some 보장.
         // owned clone 으로 self 의 mutable borrow(gpu_res_k/flush_residual_gpu)와
         // 충돌 회피 (기존 backend_arc 패턴과 동일).
@@ -1539,7 +1539,7 @@ impl KiviCache {
             if written == 0 && batch == seq_len {
                 // Fast path: pass entire input at once.
                 // D8: ABI struct(cl_mem) 시그니처. input/residual `&Tensor` 를 raw
-                // cl_mem 으로 추출해 `KiviGatherArgs` 패킹 → trait 호출 → rc!=0 이면
+                // cl_mem 으로 추출해 `QuantAttnGatherArgs` 패킹 → trait 호출 → rc!=0 이면
                 // bail. cl_queue 는 OpenCL 정적 impl 이 `&self.queue` 를 직접 알아
                 // 사용하지 않으므로 null 패킹.
                 use crate::backend::opencl::get_cl_mem;
@@ -1550,7 +1550,7 @@ impl KiviCache {
                 let new_v_mem = get_cl_mem(new_v.buffer().as_ref())?.as_ptr();
                 let res_k_mem = get_cl_mem(gpu_res_k.buffer().as_ref())?.as_ptr();
                 let res_v_mem = get_cl_mem(gpu_res_v.buffer().as_ref())?.as_ptr();
-                let args_k = crate::backend::KiviGatherArgs {
+                let args_k = crate::backend::QuantAttnGatherArgs {
                     cl_queue: std::ptr::null_mut(),
                     input_mem: new_k_mem,
                     residual_mem: res_k_mem,
@@ -1560,11 +1560,11 @@ impl KiviCache {
                     seq_len: batch,
                     res_pos: self.res_pos,
                 };
-                let rc_k = kivi_be.kivi_gather_update(&args_k);
+                let rc_k = kivi_be.gather_update_quant(&args_k);
                 if rc_k != 0 {
-                    anyhow::bail!("KIVI kivi_gather_update (K) failed (rc={rc_k})");
+                    anyhow::bail!("KIVI gather_update_quant (K) failed (rc={rc_k})");
                 }
-                let args_v = crate::backend::KiviGatherArgs {
+                let args_v = crate::backend::QuantAttnGatherArgs {
                     cl_queue: std::ptr::null_mut(),
                     input_mem: new_v_mem,
                     residual_mem: res_v_mem,
@@ -1574,9 +1574,9 @@ impl KiviCache {
                     seq_len: batch,
                     res_pos: self.res_pos,
                 };
-                let rc_v = kivi_be.kivi_gather_update(&args_v);
+                let rc_v = kivi_be.gather_update_quant(&args_v);
                 if rc_v != 0 {
-                    anyhow::bail!("KIVI kivi_gather_update (V) failed (rc={rc_v})");
+                    anyhow::bail!("KIVI gather_update_quant (V) failed (rc={rc_v})");
                 }
             } else {
                 // Slow path: token-by-token copy_slice for the sub-range

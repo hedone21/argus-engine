@@ -1,15 +1,15 @@
 //! GATE-C v3 — 런타임 `.so` dlopen backend-capability 레지스트리 (design D2/D7/D8, 봉투 / CB2).
 //!
-//! 거울 = `format/dynamic_format_registry.rs`(Format 축 CF2). 정적 `KIVI_ATTENTION_REGS`(linkme,
-//! `register_kivi_attention_plugin!` 기여)는 그대로 두고(D3 가산), dlopen 된 backend-cap plugin 을
+//! 거울 = `format/dynamic_format_registry.rs`(Format 축 CF2). 정적 `QUANT_ATTN_REGS`(linkme,
+//! `register_quant_attn_plugin!` 기여)는 그대로 두고(D3 가산), dlopen 된 backend-cap plugin 을
 //! 별도 [`struct@DYN_BACKEND_REGISTRY`] 에 모은다. [`resolve_kivi_capability`] 가 정적 우선 → 동적
-//! fallback 으로 source-agnostic `Arc<dyn KiviAttentionBackend>` 를 만든다.
+//! fallback 으로 source-agnostic `Arc<dyn QuantAttnBackend>` 를 만든다.
 //!
 //! **category 다리(D7)**: 동적 엔트리는 얇은 [`BackendCapVTableAbi`]`{name, category, vtable}` 태그드
-//! 포인터. host 가 `category` 로 `vtable` 를 카테고리별 테이블([`KiviAttnVTable`])로 캐스팅한다. 알려진
+//! 포인터. host 가 `category` 로 `vtable` 를 카테고리별 테이블([`QuantAttnVTable`])로 캐스팅한다. 알려진
 //! 카테고리 1개당 `match` arm 1개 — 새 카테고리는 arm 추가 = host 재컴파일(C1).
 //!
-//! **단일 trait(D8) 결과**: [`KiviAttentionBackend`] 가 이미 ABI-shaped(cl_mem [`KiviAttnArgs`])라 host
+//! **단일 trait(D8) 결과**: [`QuantAttnBackend`] 가 이미 ABI-shaped(cl_mem [`QuantAttnArgs`])라 host
 //! 어댑터 [`struct@DynKiviAttentionBackend`] 는 args 를 vtable fn-ptr 로 그대로 전달할 뿐 — `&Tensor` 다리는
 //! 소비자(`kivi_format`/`kivi_cache`)가 한 번 수행한다(static·dynamic 공유).
 
@@ -19,8 +19,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 use argus_extension_api::{
-    BACKEND_CAP_ABI_VERSION, BACKEND_CAP_CATEGORY_ATTENTION, BackendCapExportAbi,
-    KiviAttentionBackend, KiviAttnArgs, KiviAttnVTable, KiviGatherArgs, KiviMakeArgs,
+    BACKEND_CAP_ABI_VERSION, BACKEND_CAP_CATEGORY_ATTENTION, BackendCapExportAbi, QuantAttnArgs,
+    QuantAttnBackend, QuantAttnGatherArgs, QuantAttnMakeArgs, QuantAttnVTable,
 };
 use core::ffi::c_void;
 
@@ -29,7 +29,7 @@ struct RuntimeBackendCapReg {
     name: String,
     /// 카테고리 태그([`BACKEND_CAP_CATEGORY_ATTENTION`] 등) — 다리 `match` 키.
     category: u32,
-    /// category 별 테이블 포인터(`BackendCapVTableAbi.vtable`). 예: `*const KiviAttnVTable`.
+    /// category 별 테이블 포인터(`BackendCapVTableAbi.vtable`). 예: `*const QuantAttnVTable`.
     cat_vtable: *const c_void,
     /// `.so` 를 프로세스 수명 동안 유지(vtable/handle dangling 방지). drop 안 함.
     _lib: Arc<libloading::Library>,
@@ -78,7 +78,7 @@ pub(crate) fn try_register_backend_cap(
         );
     }
     let registry = DYN_BACKEND_REGISTRY.get_or_init(|| RwLock::new(Vec::new()));
-    // ── pass 1: 이름 추출 + category 검증(알려진 것만) + 빌트인(정적 KIVI_ATTENTION_REGS) 충돌 / 봉투 내부 중복. ──
+    // ── pass 1: 이름 추출 + category 검증(알려진 것만) + 빌트인(정적 QUANT_ATTN_REGS) 충돌 / 봉투 내부 중복. ──
     let mut pending: Vec<(String, u32, *const c_void)> = Vec::with_capacity(export.count);
     for i in 0..export.count {
         // SAFETY: vtables 는 `.so` static 배열 base, i < count.
@@ -109,7 +109,7 @@ pub(crate) fn try_register_backend_cap(
                 name
             );
         }
-        if argus_extension_api::find_kivi_attention(&name).is_some() {
+        if argus_extension_api::find_quant_attn(&name).is_some() {
             anyhow::bail!(
                 "plugin {}: backend-cap name '{}' collides with a built-in (built-in takes priority, dynamic registration rejected)",
                 path.display(),
@@ -169,10 +169,10 @@ pub fn dynamic_registered_backend_cap_names() -> Vec<String> {
 /// host 의 `--kivi-impl <name>` 데이터 선언 바인딩(D1) 해석 진입점.
 pub fn resolve_kivi_capability(
     name: &str,
-    make_args: &KiviMakeArgs,
-) -> Option<Arc<dyn KiviAttentionBackend>> {
+    make_args: &QuantAttnMakeArgs,
+) -> Option<Arc<dyn QuantAttnBackend>> {
     // 1) 정적(linkme) 우선.
-    if let Some(reg) = argus_extension_api::find_kivi_attention(name) {
+    if let Some(reg) = argus_extension_api::find_quant_attn(name) {
         return Some(Arc::from((reg.make)(make_args)));
     }
     // 2) 동적(dlopen) fallback — category 다리.
@@ -187,9 +187,9 @@ pub fn resolve_kivi_capability(
     // category 다리(D7): 알려진 카테고리 1개당 arm 1개. 새 카테고리 = arm 추가 = 재컴파일(C1).
     match category {
         BACKEND_CAP_CATEGORY_ATTENTION => {
-            // SAFETY: try_register 가 category==ATTENTION 일 때만 등록 → cat_vtable 은 *const KiviAttnVTable.
-            let vtable = cat_vtable as *const KiviAttnVTable;
-            let handle = unsafe { ((*vtable).make)(make_args as *const KiviMakeArgs) };
+            // SAFETY: try_register 가 category==ATTENTION 일 때만 등록 → cat_vtable 은 *const QuantAttnVTable.
+            let vtable = cat_vtable as *const QuantAttnVTable;
+            let handle = unsafe { ((*vtable).make)(make_args as *const QuantAttnMakeArgs) };
             if handle.is_null() {
                 eprintln!("[resolve_kivi_capability] plugin '{name}' make returned a null handle");
                 return None;
@@ -207,16 +207,16 @@ pub fn resolve_kivi_capability(
     }
 }
 
-/// 동적 plugin KIVI ATTENTION capability 의 host 측 어댑터 — C [`KiviAttnVTable`] 마샬링으로
-/// [`KiviAttentionBackend`] 를 구현(D8). 단일 trait 이 이미 ABI-shaped(cl_mem args)라 args 를 vtable
+/// 동적 plugin KIVI ATTENTION capability 의 host 측 어댑터 — C [`QuantAttnVTable`] 마샬링으로
+/// [`QuantAttnBackend`] 를 구현(D8). 단일 trait 이 이미 ABI-shaped(cl_mem args)라 args 를 vtable
 /// fn-ptr 로 그대로 전달(Format `DynFormat` 거울이나 work-fn 2개 추가).
 struct DynKiviAttentionBackend {
     handle: *mut c_void,
-    vtable: *const KiviAttnVTable,
+    vtable: *const QuantAttnVTable,
     _lib: Arc<libloading::Library>,
 }
 
-// SAFETY: 핸들은 plugin 의 `KiviAttentionBackend`(trait 계약상 Send+Sync) 인스턴스, vtable 불변, lib Arc 유지.
+// SAFETY: 핸들은 plugin 의 `QuantAttnBackend`(trait 계약상 Send+Sync) 인스턴스, vtable 불변, lib Arc 유지.
 unsafe impl Send for DynKiviAttentionBackend {}
 unsafe impl Sync for DynKiviAttentionBackend {}
 
@@ -227,10 +227,10 @@ impl Drop for DynKiviAttentionBackend {
     }
 }
 
-impl KiviAttentionBackend for DynKiviAttentionBackend {
-    fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
+impl QuantAttnBackend for DynKiviAttentionBackend {
+    fn has_quant_attn_kernel(&self, bits: u8) -> bool {
         // SAFETY: handle/vtable 유효(lib 가 살려 둠).
-        unsafe { ((*self.vtable).has_kivi_attn_kernel)(self.handle, bits) }
+        unsafe { ((*self.vtable).has_quant_attn_kernel)(self.handle, bits) }
     }
 
     fn is_nosub_device(&self) -> bool {
@@ -238,13 +238,15 @@ impl KiviAttentionBackend for DynKiviAttentionBackend {
         unsafe { ((*self.vtable).is_nosub_device)(self.handle) }
     }
 
-    fn attention_gen_kivi(&self, args: &KiviAttnArgs) -> i32 {
-        // SAFETY: args 는 host 가 채운 유효 KiviAttnArgs(C5 borrow-for-call). vtable fn-ptr 로 전달.
-        unsafe { ((*self.vtable).attention_gen_kivi)(self.handle, args as *const KiviAttnArgs) }
+    fn attention_gen_quant(&self, args: &QuantAttnArgs) -> i32 {
+        // SAFETY: args 는 host 가 채운 유효 QuantAttnArgs(C5 borrow-for-call). vtable fn-ptr 로 전달.
+        unsafe { ((*self.vtable).attention_gen_quant)(self.handle, args as *const QuantAttnArgs) }
     }
 
-    fn kivi_gather_update(&self, args: &KiviGatherArgs) -> i32 {
+    fn gather_update_quant(&self, args: &QuantAttnGatherArgs) -> i32 {
         // SAFETY: 위와 동일.
-        unsafe { ((*self.vtable).kivi_gather_update)(self.handle, args as *const KiviGatherArgs) }
+        unsafe {
+            ((*self.vtable).gather_update_quant)(self.handle, args as *const QuantAttnGatherArgs)
+        }
     }
 }

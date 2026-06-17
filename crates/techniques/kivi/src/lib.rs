@@ -1,9 +1,9 @@
 //! kivi — Backend 축(3번째 axis) capability dlopen plugin 의 **합성/ABI 검증 전용** 구현 (design D8).
 //!
-//! `register_kivi_attention_plugin!` 의 두 번째(그리고 첫 *비-example*) 실사용자로서, backend-cap
+//! `register_quant_attn_plugin!` 의 두 번째(그리고 첫 *비-example*) 실사용자로서, backend-cap
 //! 축의 ABI round-trip(등록 → category 다리 → vtable 디스패치 → make/drop)을 end-to-end 로 증명한다.
 //!
-//! **GPU 수학을 하지 않는다(synthetic).** `attention_gen_kivi` 는 [`KiviAttnArgs`] 스칼라로 결정적
+//! **GPU 수학을 하지 않는다(synthetic).** `attention_gen_quant` 는 [`QuantAttnArgs`] 스칼라로 결정적
 //! sentinel 을 계산해 `scores_out[0]` 에 기록할 뿐이라, host 게이트가 args struct 의 필드 정렬·값이
 //! ABI 경계를 정확히 넘었는지 확인할 수 있다. make 인자(`cl_ctx` 등)는 무시 → GPU 자원 비보유.
 //!
@@ -16,13 +16,15 @@
 //! 하지 않아 **출력이 깨진다**. 이름의 `_abi` 접미사가 이 플러그인이 ABI 검증 전용임을 알린다.
 //! dlopen-only(엔진 force-link 안 함)라 `--load-plugin` 으로만 opt-in 된다.
 
-use argus_extension_api::{KiviAttentionBackend, KiviAttnArgs, KiviGatherArgs, KiviMakeArgs};
+use argus_extension_api::{
+    QuantAttnArgs, QuantAttnBackend, QuantAttnGatherArgs, QuantAttnMakeArgs,
+};
 
 /// 합성 capability — 상태 없음(GPU 자원 비보유). 핸들 lifecycle(make/drop) round-trip 만 운반.
 struct KiviAbiBackend;
 
-impl KiviAttentionBackend for KiviAbiBackend {
-    fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
+impl QuantAttnBackend for KiviAbiBackend {
+    fn has_quant_attn_kernel(&self, bits: u8) -> bool {
         // synthetic: KIVI 가 지원하는 2/4/8-bit 모두 "보유"한다고 보고(실 커널 없음).
         matches!(bits, 2 | 4 | 8)
     }
@@ -31,7 +33,7 @@ impl KiviAttentionBackend for KiviAbiBackend {
         false
     }
 
-    fn attention_gen_kivi(&self, args: &KiviAttnArgs) -> i32 {
+    fn attention_gen_quant(&self, args: &QuantAttnArgs) -> i32 {
         // mem 포인터가 null 이면 마샬링 실패로 간주(host 가 유효 핸들 패킹 확인).
         if args.q_mem.is_null() || args.out_mem.is_null() {
             return -1;
@@ -50,7 +52,7 @@ impl KiviAttentionBackend for KiviAbiBackend {
         0
     }
 
-    fn kivi_gather_update(&self, args: &KiviGatherArgs) -> i32 {
+    fn gather_update_quant(&self, args: &QuantAttnGatherArgs) -> i32 {
         if args.input_mem.is_null() || args.residual_mem.is_null() {
             return -1;
         }
@@ -60,12 +62,12 @@ impl KiviAttentionBackend for KiviAbiBackend {
 
 /// make 팩토리 — make 인자(`cl_ctx` 등)는 무시(synthetic, GPU 자원 비보유). closure 대신 named fn 으로
 /// 두어 매크로 호출을 한 줄로 유지한다(rustfmt 안정 + 가독성).
-fn make_kivi_abi(_args: &KiviMakeArgs) -> Box<dyn KiviAttentionBackend> {
+fn make_kivi_abi(_args: &QuantAttnMakeArgs) -> Box<dyn QuantAttnBackend> {
     Box::new(KiviAbiBackend)
 }
 
 // 정적(linkme 이름 생존) + 동적(cdylib C-ABI vtable) 양쪽 한 줄 등록.
-argus_extension_api::register_kivi_attention_plugin!("kivi_abi", make_kivi_abi);
+argus_extension_api::register_quant_attn_plugin!("kivi_abi", make_kivi_abi);
 // .so 당 1회 — register_kv_stages_v2 / register_kv_formats_v2 / register_backend_caps_v2 엔트리 emit.
 argus_extension_api::export_plugin!();
 
@@ -82,11 +84,11 @@ mod tests {
     #[test]
     fn has_kernel_gates_supported_bits() {
         let be = KiviAbiBackend;
-        assert!(be.has_kivi_attn_kernel(2));
-        assert!(be.has_kivi_attn_kernel(4));
-        assert!(be.has_kivi_attn_kernel(8));
-        assert!(!be.has_kivi_attn_kernel(3));
-        assert!(!be.has_kivi_attn_kernel(16));
+        assert!(be.has_quant_attn_kernel(2));
+        assert!(be.has_quant_attn_kernel(4));
+        assert!(be.has_quant_attn_kernel(8));
+        assert!(!be.has_quant_attn_kernel(3));
+        assert!(!be.has_quant_attn_kernel(16));
     }
 
     #[test]
@@ -100,7 +102,7 @@ mod tests {
         let mut b = 0u8;
         let mem = dummy_mem(&mut b);
         let mut scores = [0.0f32; 1];
-        let args = KiviAttnArgs {
+        let args = QuantAttnArgs {
             cl_queue: std::ptr::null_mut(),
             q_mem: mem,
             qk_mem: mem,
@@ -119,7 +121,7 @@ mod tests {
             scale: 0.125,
             bits: 2,
         };
-        assert_eq!(be.attention_gen_kivi(&args), 0);
+        assert_eq!(be.attention_gen_quant(&args), 0);
         // sentinel = num_heads_q*1000 + head_dim + bits*0.5 + scale (host 게이트와 동일 연산 순서).
         let expected = 32.0_f32 * 1000.0 + 64.0 + 2.0 * 0.5 + 0.125;
         assert_eq!(scores[0], expected);
@@ -130,7 +132,7 @@ mod tests {
         let be = KiviAbiBackend;
         let mut b = 0u8;
         let mem = dummy_mem(&mut b);
-        let args = KiviAttnArgs {
+        let args = QuantAttnArgs {
             cl_queue: std::ptr::null_mut(),
             q_mem: std::ptr::null_mut(),
             qk_mem: mem,
@@ -149,7 +151,7 @@ mod tests {
             scale: 0.125,
             bits: 2,
         };
-        assert_eq!(be.attention_gen_kivi(&args), -1);
+        assert_eq!(be.attention_gen_quant(&args), -1);
     }
 
     #[test]
@@ -157,7 +159,7 @@ mod tests {
         let be = KiviAbiBackend;
         let mut b = 0u8;
         let mem = dummy_mem(&mut b);
-        let ok = KiviGatherArgs {
+        let ok = QuantAttnGatherArgs {
             cl_queue: std::ptr::null_mut(),
             input_mem: mem,
             residual_mem: mem,
@@ -167,11 +169,11 @@ mod tests {
             seq_len: 1,
             res_pos: 0,
         };
-        assert_eq!(be.kivi_gather_update(&ok), 0);
-        let bad = KiviGatherArgs {
+        assert_eq!(be.gather_update_quant(&ok), 0);
+        let bad = QuantAttnGatherArgs {
             input_mem: std::ptr::null_mut(),
             ..ok
         };
-        assert_eq!(be.kivi_gather_update(&bad), -1);
+        assert_eq!(be.gather_update_quant(&bad), -1);
     }
 }

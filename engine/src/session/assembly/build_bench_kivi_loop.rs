@@ -16,7 +16,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::backend::Backend;
-use crate::capability::kivi_attention::KiviAttentionBackend;
+use crate::capability::kivi_attention::QuantAttnBackend;
 use crate::inference::sampling::SamplingConfig;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
@@ -36,7 +36,7 @@ pub fn build_bench_kivi_loop(
     backend: Arc<dyn Backend>,
     memory: Arc<dyn Memory>,
     model: TransformerModel,
-    kivi: &Option<Arc<dyn KiviAttentionBackend>>,
+    kivi: &Option<Arc<dyn QuantAttnBackend>>,
     initial_bits: u8,
     residual_size: usize,
     max_seq_len: usize,
