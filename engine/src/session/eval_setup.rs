@@ -32,11 +32,9 @@ use crate::hardware::DeviceTarget;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::skip_config::SkipConfig;
 use crate::kv::cache_manager::CacheManager;
-use crate::kv::eviction::EvictMethod;
 use crate::kv::eviction::EvictionPolicy;
 use crate::kv::eviction::stage_registry::{
-    StageBackedPolicy, make_stage, make_stage_with_args, stage_default_protected_prefix,
-    stage_is_score_based,
+    StageBackedPolicy, make_stage_with_args, stage_default_protected_prefix, stage_is_score_based,
 };
 use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor, SystemMonitor};
@@ -226,40 +224,6 @@ fn build_eval_cache_manager(
     if let Some(dir) = args.swap_dir.clone() {
         eprintln!("[Resilience] KV swap enabled: dir={}", dir.display());
         cache_manager.enable_swap(dir);
-    }
-
-    // Manager-directed eviction 용 policy 등록 (legacy generate.rs:944-958).
-    // attention sinks(4)만 보호 — Manager 가 언제/얼마나 evict 할지 결정한다.
-    let resilience_protected_prefix = 4usize;
-    // H2O was extracted to the `h2o` plugin crate; build the stage by registry name and wrap it
-    // as an EvictionPolicy (StageBackedPolicy) for the Manager-directed register_policy path.
-    {
-        let h2o_params = argus_extension_api::StageParams {
-            eviction_window: args.eviction_window(),
-            protected_prefix: resilience_protected_prefix,
-            keep_ratio: args.keep_ratio(),
-            sink_size: args.sink_size(),
-            streaming_window: 0,
-        };
-        if let Some(stage) = make_stage("h2o", &h2o_params) {
-            cache_manager
-                .register_policy(EvictMethod::H2o, Box::new(StageBackedPolicy::new(stage)));
-        }
-    }
-    // Sliding was extracted to the `sliding-window` plugin; build the stage by registry name and
-    // wrap it as an EvictionPolicy for the Manager-directed register_policy path.
-    {
-        let sliding_params = argus_extension_api::StageParams {
-            eviction_window: args.eviction_window(),
-            protected_prefix: resilience_protected_prefix,
-            ..Default::default()
-        };
-        if let Some(stage) = make_stage("sliding", &sliding_params) {
-            cache_manager.register_policy(
-                EvictMethod::Sliding,
-                Box::new(StageBackedPolicy::new(stage)),
-            );
-        }
     }
 
     Ok(cache_manager)

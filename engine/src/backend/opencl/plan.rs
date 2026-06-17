@@ -152,15 +152,10 @@ pub struct KernelStep {
 unsafe impl Send for KernelStep {}
 unsafe impl Sync for KernelStep {}
 
-/// KV update variant — Standard scatter or KIVI gather-to-residual.
+/// KV update variant — Standard scatter.
 pub enum KvUpdateVariant {
     /// Standard F16 scatter: k,v → kv_cache
     Standard(KernelStep),
-    /// KIVI gather: k → res_k, v → res_v (two separate kernels)
-    Kivi {
-        gather_k: KernelStep,
-        gather_v: KernelStep,
-    },
 }
 
 /// Attention variant — Standard half-precision or KIVI fused attention.
@@ -223,9 +218,9 @@ unsafe impl Sync for HybridStepMeta {}
 pub struct LayerKernelPlan {
     /// Steps 1-6: RMSNorm, QKV matmul, RoPE Q, RoPE K
     pub steps_pre_kv: Vec<KernelStep>,
-    /// Step 7: KV update (Standard scatter or KIVI gather)
+    /// Step 7: KV update (Standard scatter)
     pub kv_update: KvUpdateVariant,
-    /// Step 8: Attention (Standard, KIVI assembled, or KIVI native)
+    /// Step 8: Attention (Standard or hybrid KV-split)
     pub attention: AttentionVariant,
     /// Steps 9-10: Wo matmul, add+RMSNorm. FFN input (`residual`) is produced
     /// by the last step here.
@@ -1354,30 +1349,6 @@ impl FullKernelPlan {
                             i, write_pos, kv_cap
                         );
                     }
-                }
-                KvUpdateVariant::Kivi { gather_k, gather_v } => {
-                    Self::dispatch_step(
-                        backend,
-                        gather_k,
-                        start_pos_i32,
-                        cache_seq_len,
-                        write_pos,
-                        kv_cap,
-                        rp,
-                        q2t,
-                        rt,
-                    );
-                    Self::dispatch_step(
-                        backend,
-                        gather_v,
-                        start_pos_i32,
-                        cache_seq_len,
-                        write_pos,
-                        kv_cap,
-                        rp,
-                        q2t,
-                        rt,
-                    );
                 }
             }
 
