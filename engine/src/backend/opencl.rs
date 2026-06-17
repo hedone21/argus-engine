@@ -6736,12 +6736,13 @@ impl OpenCLBackend {
         Ok(())
     }
 
-    /// Dequantize Q2 value blocks on GPU to F16 attention buffer.
+    /// Dequantize Q2 value blocks (per-token) on GPU to the F16 attention buffer.
+    /// cl_mem-based core called by [`Self::kivi_dequantize_value_q2_f16_raw`] (the cap path).
     #[allow(clippy::too_many_arguments)]
-    pub fn kivi_dequantize_value_q2_f16(
+    fn kivi_dequantize_value_q2_f16_core(
         &self,
-        q2_buf: &Tensor,
-        attn_v: &mut Tensor,
+        q2_mem: &ocl::core::Mem,
+        attn_v_mem: &ocl::core::Mem,
         kv_heads: usize,
         head_dim: usize,
         flush_tokens: usize,
@@ -6753,9 +6754,6 @@ impl OpenCLBackend {
             .kernel_kivi_deq_value_q2_f16
             .as_ref()
             .ok_or_else(|| anyhow!("KIVI Q2 F16 value dequant kernel not available"))?;
-
-        let q2_mem = get_cl_mem(q2_buf.buffer().as_ref())?;
-        let attn_v_mem = get_cl_mem(attn_v.buffer().as_ref())?;
 
         let total_blocks = kv_heads * flush_tokens * (head_dim / 32);
         let kv_heads_i = kv_heads as i32;
@@ -6779,12 +6777,43 @@ impl OpenCLBackend {
         Ok(())
     }
 
-    /// Dequantize Q2 key blocks on GPU to F16 attention buffer (per-channel scatter).
+    /// Borrowed-cl_mem variant of [`Self::kivi_dequantize_value_q2_f16`] for the
+    /// `QuantAttnBackend::dequant_flush` cap path (C5 borrow-only).
+    ///
+    /// # Safety
+    /// `q_blocks_mem`/`attn_mem` must be valid, non-null `cl_mem` of this backend's context,
+    /// live for the duration of the call (borrow-only — the caller retains ownership).
     #[allow(clippy::too_many_arguments)]
-    pub fn kivi_dequantize_key_q2_f16(
+    pub unsafe fn kivi_dequantize_value_q2_f16_raw(
         &self,
-        q2_buf: &Tensor,
-        attn_k: &mut Tensor,
+        q_blocks_mem: *mut std::ffi::c_void,
+        attn_mem: *mut std::ffi::c_void,
+        kv_heads: usize,
+        head_dim: usize,
+        flush_tokens: usize,
+        tok_base: usize,
+        block_offset: usize,
+    ) -> Result<()> {
+        let q2_mem = unsafe { Self::borrow_cl_mem(q_blocks_mem) };
+        let attn_v_mem = unsafe { Self::borrow_cl_mem(attn_mem) };
+        self.kivi_dequantize_value_q2_f16_core(
+            &q2_mem,
+            &attn_v_mem,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            tok_base,
+            block_offset,
+        )
+    }
+
+    /// Dequantize Q2 key blocks (per-channel) on GPU to the F16 attention buffer.
+    /// cl_mem-based core called by [`Self::kivi_dequantize_key_q2_f16_raw`] (the cap path).
+    #[allow(clippy::too_many_arguments)]
+    fn kivi_dequantize_key_q2_f16_core(
+        &self,
+        q2_mem: &ocl::core::Mem,
+        attn_k_mem: &ocl::core::Mem,
         kv_heads: usize,
         head_dim: usize,
         groups_per_flush: usize,
@@ -6796,9 +6825,6 @@ impl OpenCLBackend {
             .kernel_kivi_deq_key_q2_f16
             .as_ref()
             .ok_or_else(|| anyhow!("KIVI Q2 F16 key dequant kernel not available"))?;
-
-        let q2_mem = get_cl_mem(q2_buf.buffer().as_ref())?;
-        let attn_k_mem = get_cl_mem(attn_k.buffer().as_ref())?;
 
         let total_blocks = kv_heads * groups_per_flush * head_dim;
         let kv_heads_i = kv_heads as i32;
@@ -6822,12 +6848,43 @@ impl OpenCLBackend {
         Ok(())
     }
 
-    /// Scatter residual F32 buffer to F16 attention buffer.
+    /// Borrowed-cl_mem variant of [`Self::kivi_dequantize_key_q2_f16`] for the
+    /// `QuantAttnBackend::dequant_flush` cap path (C5 borrow-only).
+    ///
+    /// # Safety
+    /// `q_blocks_mem`/`attn_mem` must be valid, non-null `cl_mem` of this backend's context,
+    /// live for the duration of the call (borrow-only — the caller retains ownership).
     #[allow(clippy::too_many_arguments)]
-    pub fn kivi_scatter_residual_f16(
+    pub unsafe fn kivi_dequantize_key_q2_f16_raw(
         &self,
-        residual: &Tensor,
-        attn: &mut Tensor,
+        q_blocks_mem: *mut std::ffi::c_void,
+        attn_mem: *mut std::ffi::c_void,
+        kv_heads: usize,
+        head_dim: usize,
+        groups_per_flush: usize,
+        tok_base: usize,
+        block_offset: usize,
+    ) -> Result<()> {
+        let q2_mem = unsafe { Self::borrow_cl_mem(q_blocks_mem) };
+        let attn_k_mem = unsafe { Self::borrow_cl_mem(attn_mem) };
+        self.kivi_dequantize_key_q2_f16_core(
+            &q2_mem,
+            &attn_k_mem,
+            kv_heads,
+            head_dim,
+            groups_per_flush,
+            tok_base,
+            block_offset,
+        )
+    }
+
+    /// Scatter the F32 residual ring into the F16 attention buffer.
+    /// cl_mem-based core called by [`Self::kivi_scatter_residual_f16_raw`] (the cap path).
+    #[allow(clippy::too_many_arguments)]
+    fn kivi_scatter_residual_f16_core(
+        &self,
+        residual_mem: &ocl::core::Mem,
+        attn_mem: &ocl::core::Mem,
         kv_heads: usize,
         res_cap: usize,
         head_dim: usize,
@@ -6839,9 +6896,6 @@ impl OpenCLBackend {
             .kernel_kivi_scatter_residual_f16
             .as_ref()
             .ok_or_else(|| anyhow!("KIVI F16 scatter_residual kernel not available"))?;
-
-        let residual_mem = get_cl_mem(residual.buffer().as_ref())?;
-        let attn_mem = get_cl_mem(attn.buffer().as_ref())?;
 
         let total = kv_heads * res_pos * head_dim;
         let kv_heads_i = kv_heads as i32;
@@ -6863,6 +6917,36 @@ impl OpenCLBackend {
             self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
         }
         Ok(())
+    }
+
+    /// Borrowed-cl_mem variant of [`Self::kivi_scatter_residual_f16`] for the
+    /// `QuantAttnBackend::scatter_residual` cap path (C5 borrow-only).
+    ///
+    /// # Safety
+    /// `res_mem`/`attn_mem` must be valid, non-null `cl_mem` of this backend's context,
+    /// live for the duration of the call (borrow-only — the caller retains ownership).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn kivi_scatter_residual_f16_raw(
+        &self,
+        res_mem: *mut std::ffi::c_void,
+        attn_mem: *mut std::ffi::c_void,
+        kv_heads: usize,
+        res_cap: usize,
+        head_dim: usize,
+        res_pos: usize,
+        tok_base: usize,
+    ) -> Result<()> {
+        let residual_mem = unsafe { Self::borrow_cl_mem(res_mem) };
+        let attn_mem = unsafe { Self::borrow_cl_mem(attn_mem) };
+        self.kivi_scatter_residual_f16_core(
+            &residual_mem,
+            &attn_mem,
+            kv_heads,
+            res_cap,
+            head_dim,
+            res_pos,
+            tok_base,
+        )
     }
 
     /// Wrap a borrowed raw `cl_mem` (`*mut c_void`, from a host-owned buffer)
@@ -7202,6 +7286,68 @@ impl crate::backend::QuantAttnBackend for OpenCLBackend {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("[KIVI] kivi_gather_update failed: {e:#}");
+                -1
+            }
+        }
+    }
+
+    fn dequant_flush(&self, args: &crate::backend::QuantDequantFlushArgs) -> i32 {
+        // SAFETY: host(C5) 가 q_blocks/attn cl_mem 을 유효 buffer 로 채웠다(borrow-only).
+        // `is_key` 가 per-channel key / per-token value 커널을 선택한다.
+        let r = if args.is_key {
+            unsafe {
+                Self::kivi_dequantize_key_q2_f16_raw(
+                    self,
+                    args.q_blocks_mem,
+                    args.attn_mem,
+                    args.kv_heads,
+                    args.head_dim,
+                    args.n_groups_or_tokens,
+                    args.tok_base,
+                    args.block_start,
+                )
+            }
+        } else {
+            unsafe {
+                Self::kivi_dequantize_value_q2_f16_raw(
+                    self,
+                    args.q_blocks_mem,
+                    args.attn_mem,
+                    args.kv_heads,
+                    args.head_dim,
+                    args.n_groups_or_tokens,
+                    args.tok_base,
+                    args.block_start,
+                )
+            }
+        };
+        match r {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("[KIVI] dequant_flush failed: {e:#}");
+                -1
+            }
+        }
+    }
+
+    fn scatter_residual(&self, args: &crate::backend::QuantScatterResidualArgs) -> i32 {
+        // SAFETY: host(C5) 가 res/attn cl_mem 을 유효 buffer 로 채웠다(borrow-only).
+        let r = unsafe {
+            Self::kivi_scatter_residual_f16_raw(
+                self,
+                args.res_mem,
+                args.attn_mem,
+                args.kv_heads,
+                args.res_cap,
+                args.head_dim,
+                args.res_pos,
+                args.tok_base,
+            )
+        };
+        match r {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("[KIVI] scatter_residual failed: {e:#}");
                 -1
             }
         }

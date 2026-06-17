@@ -1821,159 +1821,143 @@ impl KiviCache {
 
         #[cfg(feature = "opencl")]
         {
-            use crate::backend::opencl::{OpenCLBackend, get_cl_mem};
+            use crate::backend::opencl::get_cl_mem;
 
-            let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
-            if let Some(ocl) = backend_arc.as_any().downcast_ref::<OpenCLBackend>() {
-                // Upload key blocks at byte offset
-                {
-                    let gpu_q2k = self.gpu_q2k.as_ref().unwrap();
-                    let cl_mem = get_cl_mem(gpu_q2k.buffer().as_ref())?;
-                    unsafe {
-                        ocl::core::enqueue_write_buffer(
-                            &ocl.queue,
-                            cl_mem,
-                            true,
-                            k_byte_offset,
-                            &k_bytes,
-                            None::<&ocl::core::Event>,
-                            None::<&mut ocl::core::Event>,
-                        )?;
-                    }
+            // Owned clones so neither borrows `self` while we mutably touch the GPU buffers
+            // (mirrors the gather_update fast-path above). The KIVI Q2 dequant kernels are
+            // reached via the `QuantAttnBackend` cap trait — no concrete-OpenCLBackend downcast.
+            let backend = self.gpu_backend.as_ref().unwrap().clone();
+            let kivi_be = self
+                .kivi
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "KIVI GPU mode but kivi handle missing (registry not registered?)"
+                    )
+                })?
+                .clone();
+
+            // Upload key/value blocks at byte offset via the generic Backend primitive
+            // (OpenCLBackend overrides `write_buffer_range` to a bounded blocking enqueue_write_buffer).
+            backend.write_buffer_range(self.gpu_q2k.as_mut().unwrap(), &k_bytes, k_byte_offset)?;
+            backend.write_buffer_range(self.gpu_q2v.as_mut().unwrap(), &v_bytes, v_byte_offset)?;
+
+            // Dispatch GPU dequant: fill F16 attention buffers for the assembled path.
+            // Q2: dedicated GPU F16 dequant kernel via `dequant_flush` (cl_queue=null: the OpenCL
+            //     static impl uses its own queue, mirroring the gather_update path above).
+            // Q4/Q8: no GPU dequant kernel yet — CPU dequant → F16 convert → write_buffer_range.
+            if self.bits == 2 {
+                let q2k_mem =
+                    get_cl_mem(self.gpu_q2k.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let attn_k_mem =
+                    get_cl_mem(self.gpu_attn_k.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let rc_k = kivi_be.dequant_flush(&crate::backend::QuantDequantFlushArgs {
+                    cl_queue: std::ptr::null_mut(),
+                    q_blocks_mem: q2k_mem,
+                    attn_mem: attn_k_mem,
+                    kv_heads: self.kv_heads,
+                    head_dim: self.head_dim,
+                    n_groups_or_tokens: n_groups,
+                    tok_base,
+                    block_start: k_block_start,
+                    bits: 2,
+                    is_key: true,
+                });
+                if rc_k != 0 {
+                    anyhow::bail!("KIVI dequant_flush (K) failed (rc={rc_k})");
                 }
-                // Upload value blocks at byte offset
-                {
-                    let gpu_q2v = self.gpu_q2v.as_ref().unwrap();
-                    let cl_mem = get_cl_mem(gpu_q2v.buffer().as_ref())?;
-                    unsafe {
-                        ocl::core::enqueue_write_buffer(
-                            &ocl.queue,
-                            cl_mem,
-                            true,
-                            v_byte_offset,
-                            &v_bytes,
-                            None::<&ocl::core::Event>,
-                            None::<&mut ocl::core::Event>,
-                        )?;
-                    }
+                let q2v_mem =
+                    get_cl_mem(self.gpu_q2v.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let attn_v_mem =
+                    get_cl_mem(self.gpu_attn_v.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let rc_v = kivi_be.dequant_flush(&crate::backend::QuantDequantFlushArgs {
+                    cl_queue: std::ptr::null_mut(),
+                    q_blocks_mem: q2v_mem,
+                    attn_mem: attn_v_mem,
+                    kv_heads: self.kv_heads,
+                    head_dim: self.head_dim,
+                    n_groups_or_tokens: flush_tokens,
+                    tok_base,
+                    block_start: v_block_start,
+                    bits: 2,
+                    is_key: false,
+                });
+                if rc_v != 0 {
+                    anyhow::bail!("KIVI dequant_flush (V) failed (rc={rc_v})");
                 }
+            } else {
+                // Q4/Q8: CPU dequant into temporary F32 buffer, convert to F16,
+                // partial upload at byte offset to avoid overwriting earlier flushes.
+                let gs = self.group_size;
+                let flush_buf_size = flush_tokens * self.kv_heads * self.head_dim;
+                let mut tmp_attn_k = vec![0.0f32; flush_buf_size];
+                let mut tmp_attn_v = vec![0.0f32; flush_buf_size];
+                let mut deq_buf = [0.0f32; QKKV];
 
-                // Dispatch GPU dequant: fill F16 attention buffers for the assembled path.
-                // Q2: use dedicated GPU F16 dequant kernel (fast).
-                // Q4/Q8: no GPU dequant kernel yet — CPU dequant → F16 convert → upload.
-                if self.bits == 2 {
-                    let gpu_q2k = self.gpu_q2k.as_ref().unwrap();
-                    let gpu_attn_k = self.gpu_attn_k.as_mut().unwrap();
-                    ocl.kivi_dequantize_key_q2_f16(
-                        gpu_q2k,
-                        gpu_attn_k,
-                        self.kv_heads,
-                        self.head_dim,
-                        n_groups,
-                        tok_base,
-                        k_block_start,
-                    )?;
-                    let gpu_q2v = self.gpu_q2v.as_ref().unwrap();
-                    let gpu_attn_v = self.gpu_attn_v.as_mut().unwrap();
-                    ocl.kivi_dequantize_value_q2_f16(
-                        gpu_q2v,
-                        gpu_attn_v,
-                        self.kv_heads,
-                        self.head_dim,
-                        flush_tokens,
-                        tok_base,
-                        v_block_start,
-                    )?;
-                } else {
-                    // Q4/Q8: CPU dequant into temporary F32 buffer, convert to F16,
-                    // partial upload at byte offset to avoid overwriting earlier flushes.
-                    let gs = self.group_size;
-                    let flush_buf_size = flush_tokens * self.kv_heads * self.head_dim;
-                    let mut tmp_attn_k = vec![0.0f32; flush_buf_size];
-                    let mut tmp_attn_v = vec![0.0f32; flush_buf_size];
-                    let mut deq_buf = [0.0f32; QKKV];
-
-                    // Key: per-channel dequant — relative positions (0-based within flush window)
-                    let mut k_idx = 0usize;
-                    for h in 0..self.kv_heads {
-                        for g in 0..n_groups {
-                            let tok_start = g * gs;
-                            for ch in 0..self.head_dim {
-                                tmp_qk.dequantize_block(k_idx, &mut deq_buf);
-                                k_idx += 1;
-                                for (t, &val) in deq_buf.iter().enumerate().take(gs) {
-                                    let pos = tok_start + t;
-                                    let out_idx = pos * self.kv_heads * self.head_dim
-                                        + h * self.head_dim
-                                        + ch;
-                                    tmp_attn_k[out_idx] = val;
-                                }
+                // Key: per-channel dequant — relative positions (0-based within flush window)
+                let mut k_idx = 0usize;
+                for h in 0..self.kv_heads {
+                    for g in 0..n_groups {
+                        let tok_start = g * gs;
+                        for ch in 0..self.head_dim {
+                            tmp_qk.dequantize_block(k_idx, &mut deq_buf);
+                            k_idx += 1;
+                            for (t, &val) in deq_buf.iter().enumerate().take(gs) {
+                                let pos = tok_start + t;
+                                let out_idx =
+                                    pos * self.kv_heads * self.head_dim + h * self.head_dim + ch;
+                                tmp_attn_k[out_idx] = val;
                             }
                         }
                     }
-                    // Value: per-token dequant — relative positions (0-based within flush window)
-                    let blocks_per_token_v = self.head_dim / QKKV;
-                    let mut v_idx = 0usize;
-                    for h in 0..self.kv_heads {
-                        for t in 0..flush_tokens {
-                            let out_base = t * self.kv_heads * self.head_dim + h * self.head_dim;
-                            for b in 0..blocks_per_token_v {
-                                tmp_qv.dequantize_block(v_idx, &mut deq_buf);
-                                v_idx += 1;
-                                let start = out_base + b * QKKV;
-                                tmp_attn_v[start..start + QKKV].copy_from_slice(&deq_buf);
-                            }
+                }
+                // Value: per-token dequant — relative positions (0-based within flush window)
+                let blocks_per_token_v = self.head_dim / QKKV;
+                let mut v_idx = 0usize;
+                for h in 0..self.kv_heads {
+                    for t in 0..flush_tokens {
+                        let out_base = t * self.kv_heads * self.head_dim + h * self.head_dim;
+                        for b in 0..blocks_per_token_v {
+                            tmp_qv.dequantize_block(v_idx, &mut deq_buf);
+                            v_idx += 1;
+                            let start = out_base + b * QKKV;
+                            tmp_attn_v[start..start + QKKV].copy_from_slice(&deq_buf);
                         }
                     }
-
-                    // Convert F32 → F16 and partial upload to GPU attention buffers
-                    let tmp_attn_k_f16: Vec<half::f16> =
-                        tmp_attn_k.iter().map(|&v| half::f16::from_f32(v)).collect();
-                    let tmp_attn_v_f16: Vec<half::f16> =
-                        tmp_attn_v.iter().map(|&v| half::f16::from_f32(v)).collect();
-
-                    // Byte offset into F16 attention buffer for this flush window
-                    let byte_offset = tok_base * self.kv_heads * self.head_dim * 2;
-
-                    let gpu_attn_k = self.gpu_attn_k.as_ref().unwrap();
-                    let gpu_attn_v = self.gpu_attn_v.as_ref().unwrap();
-                    let cl_mem_k = get_cl_mem(gpu_attn_k.buffer().as_ref())?;
-                    let cl_mem_v = get_cl_mem(gpu_attn_v.buffer().as_ref())?;
-                    // SAFETY: half::f16 is repr(transparent) over u16, contiguous in memory
-                    let k_f16_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            tmp_attn_k_f16.as_ptr() as *const u8,
-                            tmp_attn_k_f16.len() * 2,
-                        )
-                    };
-                    let v_f16_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            tmp_attn_v_f16.as_ptr() as *const u8,
-                            tmp_attn_v_f16.len() * 2,
-                        )
-                    };
-                    // SAFETY: cl_mem handles are valid; byte_offset + data fits within buffer
-                    unsafe {
-                        ocl::core::enqueue_write_buffer(
-                            &ocl.queue,
-                            cl_mem_k,
-                            true,
-                            byte_offset,
-                            k_f16_bytes,
-                            None::<&ocl::core::Event>,
-                            None::<&mut ocl::core::Event>,
-                        )?;
-                        ocl::core::enqueue_write_buffer(
-                            &ocl.queue,
-                            cl_mem_v,
-                            true,
-                            byte_offset,
-                            v_f16_bytes,
-                            None::<&ocl::core::Event>,
-                            None::<&mut ocl::core::Event>,
-                        )?;
-                    }
                 }
+
+                // Convert F32 → F16 and partial upload to GPU attention buffers
+                let tmp_attn_k_f16: Vec<half::f16> =
+                    tmp_attn_k.iter().map(|&v| half::f16::from_f32(v)).collect();
+                let tmp_attn_v_f16: Vec<half::f16> =
+                    tmp_attn_v.iter().map(|&v| half::f16::from_f32(v)).collect();
+
+                // Byte offset into F16 attention buffer for this flush window
+                let byte_offset = tok_base * self.kv_heads * self.head_dim * 2;
+
+                // SAFETY: half::f16 is repr(transparent) over u16, contiguous in memory
+                let k_f16_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        tmp_attn_k_f16.as_ptr() as *const u8,
+                        tmp_attn_k_f16.len() * 2,
+                    )
+                };
+                let v_f16_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        tmp_attn_v_f16.as_ptr() as *const u8,
+                        tmp_attn_v_f16.len() * 2,
+                    )
+                };
+                backend.write_buffer_range(
+                    self.gpu_attn_k.as_mut().unwrap(),
+                    k_f16_bytes,
+                    byte_offset,
+                )?;
+                backend.write_buffer_range(
+                    self.gpu_attn_v.as_mut().unwrap(),
+                    v_f16_bytes,
+                    byte_offset,
+                )?;
             }
         }
 
@@ -2087,34 +2071,54 @@ impl KiviCache {
 
         #[cfg(feature = "opencl")]
         {
-            use crate::backend::opencl::OpenCLBackend;
+            use crate::backend::opencl::get_cl_mem;
 
             if self.res_pos > 0 {
-                let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
-                if let Some(ocl) = backend_arc.as_any().downcast_ref::<OpenCLBackend>() {
-                    // F32 residual → F16 attention buffer (scatter + convert)
-                    let gpu_res_k = self.gpu_res_k.as_ref().unwrap();
-                    let gpu_attn_k = self.gpu_attn_k.as_mut().unwrap();
-                    ocl.kivi_scatter_residual_f16(
-                        gpu_res_k,
-                        gpu_attn_k,
-                        self.kv_heads,
-                        self.res_cap,
-                        self.head_dim,
-                        self.res_pos,
-                        self.q2_tokens,
-                    )?;
-                    let gpu_res_v = self.gpu_res_v.as_ref().unwrap();
-                    let gpu_attn_v = self.gpu_attn_v.as_mut().unwrap();
-                    ocl.kivi_scatter_residual_f16(
-                        gpu_res_v,
-                        gpu_attn_v,
-                        self.kv_heads,
-                        self.res_cap,
-                        self.head_dim,
-                        self.res_pos,
-                        self.q2_tokens,
-                    )?;
+                // Scatter the F32 residual ring into the F16 attention buffers via the
+                // `QuantAttnBackend` cap trait — no concrete-OpenCLBackend downcast.
+                let kivi_be = self
+                    .kivi
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "KIVI GPU mode but kivi handle missing (registry not registered?)"
+                        )
+                    })?
+                    .clone();
+
+                let res_k_mem =
+                    get_cl_mem(self.gpu_res_k.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let attn_k_mem =
+                    get_cl_mem(self.gpu_attn_k.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let rc_k = kivi_be.scatter_residual(&crate::backend::QuantScatterResidualArgs {
+                    cl_queue: std::ptr::null_mut(),
+                    res_mem: res_k_mem,
+                    attn_mem: attn_k_mem,
+                    kv_heads: self.kv_heads,
+                    res_cap: self.res_cap,
+                    head_dim: self.head_dim,
+                    res_pos: self.res_pos,
+                    tok_base: self.q2_tokens,
+                });
+                if rc_k != 0 {
+                    anyhow::bail!("KIVI scatter_residual (K) failed (rc={rc_k})");
+                }
+                let res_v_mem =
+                    get_cl_mem(self.gpu_res_v.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let attn_v_mem =
+                    get_cl_mem(self.gpu_attn_v.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let rc_v = kivi_be.scatter_residual(&crate::backend::QuantScatterResidualArgs {
+                    cl_queue: std::ptr::null_mut(),
+                    res_mem: res_v_mem,
+                    attn_mem: attn_v_mem,
+                    kv_heads: self.kv_heads,
+                    res_cap: self.res_cap,
+                    head_dim: self.head_dim,
+                    res_pos: self.res_pos,
+                    tok_base: self.q2_tokens,
+                });
+                if rc_v != 0 {
+                    anyhow::bail!("KIVI scatter_residual (V) failed (rc={rc_v})");
                 }
             }
             return Ok(());
