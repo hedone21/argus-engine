@@ -6,7 +6,7 @@
 //! via offline-calibrated piecewise-linear coefficients.
 //!
 //! **Layered structure (§13.8-G)**: data identifier 집합(`QcfMetric`,
-//! `QcfConfig`, `QcfMode`, `AggregationMode`, `KiviFlushParams`,
+//! `QcfConfig`, `QcfMode`, `AggregationMode`, `QuantFlushParams`,
 //! `FlushAttentionParams`, `SubLayer`, `ImportanceFormula`)은 L2의
 //! `crate::qcf_types`에 위치하며, 본 모듈에서는 편의를 위해 re-export 한다.
 //! 측정 로직(compute_flush_*, ImportanceCollector 등)은 본 L3-qcf 도메인에
@@ -23,8 +23,8 @@ pub mod topk_retention;
 
 // L2 data identifier re-export (§13.8-G shared identifier promotion).
 pub use crate::qcf_types::{
-    AggregationMode, FlushAttentionParams, ImportanceFormula, KiviFlushParams, QcfConfig,
-    QcfMetric, QcfMode, SubLayer, aggregate_heads,
+    AggregationMode, FlushAttentionParams, ImportanceFormula, QcfConfig, QcfMetric, QcfMode,
+    QuantFlushParams, SubLayer, aggregate_heads,
 };
 
 pub use entropy::{EntropyResult, compute_normalized_entropy};

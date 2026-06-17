@@ -4,7 +4,7 @@
 //! Computed inline during residual buffer flush when FP32 originals are available.
 
 use crate::qcf_types::{
-    FlushAttentionParams, KiviFlushParams, QcfConfig, QcfMetric, aggregate_heads,
+    FlushAttentionParams, QcfConfig, QcfMetric, QuantFlushParams, aggregate_heads,
 };
 use crate::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
 
@@ -57,8 +57,8 @@ pub fn compute_nmse_block(original: &[f32; QKKV], bits: u8, epsilon: f32) -> f32
 /// `proxy = 0.6 × NMSE_K + 0.4 × NMSE_V` (Key is more sensitive per KIVI Table 2).
 ///
 /// Layout: `res_k`/`res_v` are `[kv_heads][flush_tokens][head_dim]` contiguous.
-pub fn compute_flush_nmse(params: &KiviFlushParams, config: &QcfConfig) -> QcfMetric {
-    let KiviFlushParams {
+pub fn compute_flush_nmse(params: &QuantFlushParams, config: &QcfConfig) -> QcfMetric {
+    let QuantFlushParams {
         res_k,
         res_v,
         kv_heads,
@@ -175,8 +175,8 @@ pub fn compute_flush_nmse(params: &KiviFlushParams, config: &QcfConfig) -> QcfMe
 /// - `normalized_value`: same as raw_value
 /// - `per_head`: per-head OPR vector
 /// - `tokens_affected`: flush_tokens
-pub fn compute_flush_opr(params: &KiviFlushParams, _config: &QcfConfig) -> QcfMetric {
-    let KiviFlushParams {
+pub fn compute_flush_opr(params: &QuantFlushParams, _config: &QcfConfig) -> QcfMetric {
+    let QuantFlushParams {
         res_v,
         kv_heads,
         head_dim,
@@ -517,11 +517,11 @@ pub fn compute_flush_aw_vopr(params: &FlushAttentionParams, config: &QcfConfig) 
 pub struct KiviQcfComputer;
 
 impl crate::qcf_computer::QcfComputer for KiviQcfComputer {
-    fn flush_nmse(&self, params: &KiviFlushParams, config: &QcfConfig) -> QcfMetric {
+    fn flush_nmse(&self, params: &QuantFlushParams, config: &QcfConfig) -> QcfMetric {
         compute_flush_nmse(params, config)
     }
 
-    fn flush_opr(&self, params: &KiviFlushParams, config: &QcfConfig) -> QcfMetric {
+    fn flush_opr(&self, params: &QuantFlushParams, config: &QcfConfig) -> QcfMetric {
         compute_flush_opr(params, config)
     }
 
@@ -609,7 +609,7 @@ mod tests {
         let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02).collect();
 
         let config = QcfConfig::default();
-        let params = KiviFlushParams {
+        let params = QuantFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn test_flush_proxy_empty() {
         let config = QcfConfig::default();
-        let params = KiviFlushParams {
+        let params = QuantFlushParams {
             res_k: &[],
             res_v: &[],
             kv_heads: 0,
@@ -655,7 +655,7 @@ mod tests {
         let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02).collect();
 
         let config = QcfConfig::default();
-        let params = KiviFlushParams {
+        let params = QuantFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -685,7 +685,7 @@ mod tests {
 
         let config = QcfConfig::default();
         let proxy_q2 = compute_flush_nmse(
-            &KiviFlushParams {
+            &QuantFlushParams {
                 res_k: &res_k,
                 res_v: &res_v,
                 kv_heads,
@@ -697,7 +697,7 @@ mod tests {
             &config,
         );
         let proxy_q8 = compute_flush_nmse(
-            &KiviFlushParams {
+            &QuantFlushParams {
                 res_k: &res_k,
                 res_v: &res_v,
                 kv_heads,
@@ -731,7 +731,7 @@ mod tests {
         let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02).collect();
 
         let config = QcfConfig::default();
-        let params = KiviFlushParams {
+        let params = QuantFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -766,7 +766,7 @@ mod tests {
         let res_v: Vec<f32> = (0..elems).map(|i| ((i % 100) as f32) * 0.1).collect();
 
         let config = QcfConfig::default();
-        let make_params = |bits: u8| KiviFlushParams {
+        let make_params = |bits: u8| QuantFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -799,7 +799,7 @@ mod tests {
         let res_v = vec![0.0f32; elems];
 
         let config = QcfConfig::default();
-        let params = KiviFlushParams {
+        let params = QuantFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -826,7 +826,7 @@ mod tests {
         let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02 + 1.0).collect();
 
         let config = QcfConfig::default();
-        let params = KiviFlushParams {
+        let params = QuantFlushParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,

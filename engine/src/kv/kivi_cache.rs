@@ -770,7 +770,7 @@ impl KiviCache {
             let flush_tokens = n_groups * gs;
             if flush_tokens > 0 {
                 let config = crate::qcf_types::QcfConfig::default();
-                let params = crate::qcf_types::KiviFlushParams {
+                let params = crate::qcf_types::QuantFlushParams {
                     res_k: &self.res_k,
                     res_v: &self.res_v,
                     kv_heads: self.kv_heads,
@@ -848,7 +848,7 @@ impl KiviCache {
 
         // Compute NMSE proxy before quantization (FP32 originals still available)
         let qcf_config = crate::qcf_types::QcfConfig::default();
-        let proxy_params = crate::qcf_types::KiviFlushParams {
+        let proxy_params = crate::qcf_types::QuantFlushParams {
             res_k: &self.res_k,
             res_v: &self.res_v,
             kv_heads: self.kv_heads,
@@ -1645,7 +1645,7 @@ impl KiviCache {
 
         // 2. Compute QCF proxy metrics (same as CPU path)
         let qcf_config = crate::qcf_types::QcfConfig::default();
-        let proxy_params = crate::qcf_types::KiviFlushParams {
+        let proxy_params = crate::qcf_types::QuantFlushParams {
             res_k: &self.res_k,
             res_v: &self.res_v,
             kv_heads: self.kv_heads,

@@ -8,7 +8,7 @@
 //! 또는 stateless impl). caller (pressure)는 `&dyn QcfComputer` 또는
 //! `&impl QcfComputer` 로 trait dispatch.
 
-use crate::qcf_types::{FlushAttentionParams, KiviFlushParams, QcfConfig, QcfMetric};
+use crate::qcf_types::{FlushAttentionParams, QcfConfig, QcfMetric, QuantFlushParams};
 
 /// KIVI flush proxy 계산 trait.
 ///
@@ -16,10 +16,10 @@ use crate::qcf_types::{FlushAttentionParams, KiviFlushParams, QcfConfig, QcfMetr
 /// KiviCache 가 flush event 시 trait method 를 호출하여 QcfMetric 생성.
 pub trait QcfComputer: Send + Sync {
     /// NMSE 기반 V/K residual quantization error.
-    fn flush_nmse(&self, params: &KiviFlushParams, config: &QcfConfig) -> QcfMetric;
+    fn flush_nmse(&self, params: &QuantFlushParams, config: &QcfConfig) -> QcfMetric;
 
     /// OPR (output perturbation ratio) variant.
-    fn flush_opr(&self, params: &KiviFlushParams, config: &QcfConfig) -> QcfMetric;
+    fn flush_opr(&self, params: &QuantFlushParams, config: &QcfConfig) -> QcfMetric;
 
     /// AWQE (Attention-Weighted Quantization Error) scalar.
     fn flush_awqe(&self, params: &FlushAttentionParams, config: &QcfConfig) -> QcfMetric;
