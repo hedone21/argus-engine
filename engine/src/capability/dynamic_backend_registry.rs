@@ -2,7 +2,7 @@
 //!
 //! 거울 = `format/dynamic_format_registry.rs`(Format 축 CF2). 정적 `QUANT_ATTN_REGS`(linkme,
 //! `register_quant_attn_plugin!` 기여)는 그대로 두고(D3 가산), dlopen 된 backend-cap plugin 을
-//! 별도 [`struct@DYN_BACKEND_REGISTRY`] 에 모은다. [`resolve_kivi_capability`] 가 정적 우선 → 동적
+//! 별도 [`struct@DYN_BACKEND_REGISTRY`] 에 모은다. [`resolve_quant_attn_capability`] 가 정적 우선 → 동적
 //! fallback 으로 source-agnostic `Arc<dyn QuantAttnBackend>` 를 만든다.
 //!
 //! **category 다리(D7)**: 동적 엔트리는 얇은 [`BackendCapVTableAbi`]`{name, category, vtable}` 태그드
@@ -10,7 +10,7 @@
 //! 카테고리 1개당 `match` arm 1개 — 새 카테고리는 arm 추가 = host 재컴파일(C1).
 //!
 //! **단일 trait(D8) 결과**: [`QuantAttnBackend`] 가 이미 ABI-shaped(cl_mem [`QuantAttnArgs`])라 host
-//! 어댑터 [`struct@DynKiviAttentionBackend`] 는 args 를 vtable fn-ptr 로 그대로 전달할 뿐 — `&Tensor` 다리는
+//! 어댑터 [`struct@DynQuantAttnBackend`] 는 args 를 vtable fn-ptr 로 그대로 전달할 뿐 — `&Tensor` 다리는
 //! 소비자(`kivi_format`/`kivi_cache`)가 한 번 수행한다(static·dynamic 공유).
 
 use std::ffi::CStr;
@@ -167,7 +167,7 @@ pub fn dynamic_registered_backend_cap_names() -> Vec<String> {
 /// 이름으로 KIVI ATTENTION capability 인스턴스를 만든다 — **정적 우선 → 동적 fallback**(D3, category 다리 D7).
 /// `make_args`(host GPU context)로 커널을 1회 빌드한다(D4). 정적/동적 모두 miss 면 `None`(graceful unknown).
 /// host 의 `--kivi-impl <name>` 데이터 선언 바인딩(D1) 해석 진입점.
-pub fn resolve_kivi_capability(
+pub fn resolve_quant_attn_capability(
     name: &str,
     make_args: &QuantAttnMakeArgs,
 ) -> Option<Arc<dyn QuantAttnBackend>> {
@@ -191,17 +191,19 @@ pub fn resolve_kivi_capability(
             let vtable = cat_vtable as *const QuantAttnVTable;
             let handle = unsafe { ((*vtable).make)(make_args as *const QuantAttnMakeArgs) };
             if handle.is_null() {
-                eprintln!("[resolve_kivi_capability] plugin '{name}' make returned a null handle");
+                eprintln!(
+                    "[resolve_quant_attn_capability] plugin '{name}' make returned a null handle"
+                );
                 return None;
             }
-            Some(Arc::new(DynKiviAttentionBackend {
+            Some(Arc::new(DynQuantAttnBackend {
                 handle,
                 vtable,
                 _lib: lib,
             }))
         }
         other => {
-            eprintln!("[resolve_kivi_capability] '{name}' category {other} unsupported");
+            eprintln!("[resolve_quant_attn_capability] '{name}' category {other} unsupported");
             None
         }
     }
@@ -210,24 +212,24 @@ pub fn resolve_kivi_capability(
 /// 동적 plugin KIVI ATTENTION capability 의 host 측 어댑터 — C [`QuantAttnVTable`] 마샬링으로
 /// [`QuantAttnBackend`] 를 구현(D8). 단일 trait 이 이미 ABI-shaped(cl_mem args)라 args 를 vtable
 /// fn-ptr 로 그대로 전달(Format `DynFormat` 거울이나 work-fn 2개 추가).
-struct DynKiviAttentionBackend {
+struct DynQuantAttnBackend {
     handle: *mut c_void,
     vtable: *const QuantAttnVTable,
     _lib: Arc<libloading::Library>,
 }
 
 // SAFETY: 핸들은 plugin 의 `QuantAttnBackend`(trait 계약상 Send+Sync) 인스턴스, vtable 불변, lib Arc 유지.
-unsafe impl Send for DynKiviAttentionBackend {}
-unsafe impl Sync for DynKiviAttentionBackend {}
+unsafe impl Send for DynQuantAttnBackend {}
+unsafe impl Sync for DynQuantAttnBackend {}
 
-impl Drop for DynKiviAttentionBackend {
+impl Drop for DynQuantAttnBackend {
     fn drop(&mut self) {
         // SAFETY: handle 은 make 가 만든 plugin 인스턴스, 정확히 1회 해제.
         unsafe { ((*self.vtable).drop)(self.handle) };
     }
 }
 
-impl QuantAttnBackend for DynKiviAttentionBackend {
+impl QuantAttnBackend for DynQuantAttnBackend {
     fn has_quant_attn_kernel(&self, bits: u8) -> bool {
         // SAFETY: handle/vtable 유효(lib 가 살려 둠).
         unsafe { ((*self.vtable).has_quant_attn_kernel)(self.handle, bits) }

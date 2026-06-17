@@ -20,7 +20,7 @@ use crate::backend::Backend;
 // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
-use crate::capability::kivi_attention::QuantAttnBackend;
+use crate::capability::quant_attn::QuantAttnBackend;
 use crate::kv_cache_ops::{KVLayout, KiviRawBuffers};
 use crate::memory::Memory;
 use crate::memory::host::shared::{SharedBuffer, SharedBufferView};

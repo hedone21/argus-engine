@@ -9,7 +9,7 @@ use tokenizers::Tokenizer;
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
-use crate::capability::kivi_attention::QuantAttnBackend;
+use crate::capability::quant_attn::QuantAttnBackend;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::{self};
 use crate::kv::cache_manager::CacheManager;

@@ -12,7 +12,7 @@
 //! 본 파일은 **Phase α-W 신설**이다 — 자료구조 + sub-trait 모듈 골격까지만. capability sub-trait
 //! 의 *물리적 정착*(`QuantAttnBackend`/`GpuScoreAccess` 를 `backend.rs` god-trait 에서 이리로
 //! 이동) + backend factory `register` 배선 + per-forward lookup 제거는 Phase α-W-4 다. 현재
-//! `kivi_attention`/`gpu_score` 서브모듈은 `backend.rs` 거주분을 re-export 하는 shim 이라 모든
+//! `quant_attn`/`gpu_score` 서브모듈은 `backend.rs` 거주분을 re-export 하는 shim 이라 모든
 //! 기존 call site 가 그대로 동작한다(byte-identical).
 //!
 //! 미생성 capability(`ScoreCollector`/`TierMovable`)는 **첫 소비자 등장 전까지 만들지 않는다**
@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 pub mod dynamic_backend_registry;
 pub mod gpu_score;
-pub mod kivi_attention;
+pub mod quant_attn;
 
 /// (backend → capability handle) 매핑을 담는 typed anymap.
 ///
