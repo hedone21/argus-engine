@@ -11,6 +11,8 @@
 // State + manager + I/O
 pub mod cache_manager;
 pub mod eviction;
+// Engine-owned GPU buffer set lent to the KV compute capability (FORMAT Phase 2, Stage B).
+pub(crate) mod gpu_kv_buffers;
 pub mod kivi_cache;
 pub mod kivi_format;
 pub mod kv_cache;

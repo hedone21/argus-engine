@@ -21,6 +21,7 @@ use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
 use crate::capability::quant_attn::QuantAttnBackend;
+use crate::kv::gpu_kv_buffers::GpuKvBuffers;
 use crate::kv_cache_ops::{KVLayout, KiviRawBuffers};
 use crate::memory::Memory;
 use crate::memory::host::shared::{SharedBuffer, SharedBufferView};
@@ -204,36 +205,24 @@ pub struct KiviCache {
     last_attn_scores: Option<AttnScoresSnapshot>,
 
     // ── GPU-native buffers (None = CPU-only mode, backward compatible) ──
-    /// GPU backend handle. Some ↔ GPU mode enabled.
-    gpu_backend: Option<Arc<dyn Backend>>,
     /// KIVI native attention capability handle (Phase α-W-4 §3.3). Some ↔ GPU
     /// 모드 + OpenCL backend. `update_gpu` 의 `gather_update_quant` dispatch 가
     /// 매 토큰 `as_quant_attn()` lookup 대신 본 handle 을 직접 쓴다. caller
     /// 가 `caps.get::<dyn QuantAttnBackend>()` 로 pull 해 `new_gpu` 에 전달
-    /// (R4: gpu_backend 와 동일 ocl 인스턴스의 clone).
+    /// (R4: slab.backend 와 동일 ocl 인스턴스의 clone). COMPUTE capability —
+    /// buffer ownership 인 `slab` 과 별개로 보관(Stage C 에서 vtable/handle 은
+    /// DynQuantCache 가 slab 과 나란히 소유).
     kivi: Option<Arc<dyn QuantAttnBackend>>,
-    /// Memory allocator used to create GPU buffers (used by ensure_gpu_attn_capacity).
-    gpu_memory: Option<Arc<dyn Memory>>,
-    /// GPU F32 residual K buffer: [kv_heads, res_cap, head_dim]
-    gpu_res_k: Option<Tensor>,
-    /// GPU F32 residual V buffer: [kv_heads, res_cap, head_dim]
-    gpu_res_v: Option<Tensor>,
-    /// GPU F16 attention K output: [gpu_attn_cap, kv_heads, head_dim]
-    /// Capacity grows lazily via `ensure_gpu_attn_capacity()`.
-    gpu_attn_k: Option<Tensor>,
-    /// GPU F16 attention V output: [gpu_attn_cap, kv_heads, head_dim]
-    /// Capacity grows lazily via `ensure_gpu_attn_capacity()`.
-    gpu_attn_v: Option<Tensor>,
-    /// Current allocated capacity of gpu_attn_k/v in tokens.
-    /// 0 in CPU-only mode. Grows lazily up to `max_seq_len`.
-    gpu_attn_cap: usize,
-    /// GPU byte buffer for Q2 key blocks (12 bytes per block).
-    gpu_q2k: Option<Tensor>,
-    /// GPU byte buffer for Q2 value blocks (12 bytes per block).
-    gpu_q2v: Option<Tensor>,
-    /// Number of Q2 key blocks written to `gpu_q2k`.
+    /// Engine-owned GPU buffer set (residual/attn/Q-block + backend/memory).
+    /// `Some` ↔ GPU mode enabled (the slab's `backend` is the GPU-mode sentinel;
+    /// `is_gpu() == slab.is_some()`). The individual buffer `Option<Tensor>`
+    /// fields toggle during `transition_bits`; the slab container stays `Some`.
+    slab: Option<GpuKvBuffers>,
+    /// Number of Q2 key blocks written to `slab.q2k`. Write-progress logic state
+    /// (mutated independently of buffer (re)allocation; touched by `reset()` even
+    /// in CPU mode) — kept on `KiviCache`, NOT in the slab.
     gpu_q2k_blocks: usize,
-    /// Number of Q2 value blocks written to `gpu_q2v`.
+    /// Number of Q2 value blocks written to `slab.q2v`. Logic state (see above).
     gpu_q2v_blocks: usize,
 
     /// QCF flush proxy 계산기 (L2 trait dispatch, S-3b-4 γ-2).
@@ -335,16 +324,8 @@ impl KiviCache {
             awqe_enabled: false,
             last_attn_scores: None,
             // GPU fields — None in CPU-only mode
-            gpu_backend: None,
             kivi: None,
-            gpu_memory: None,
-            gpu_res_k: None,
-            gpu_res_v: None,
-            gpu_attn_k: None,
-            gpu_attn_v: None,
-            gpu_attn_cap: 0,
-            gpu_q2k: None,
-            gpu_q2v: None,
+            slab: None,
             gpu_q2k_blocks: 0,
             gpu_q2v_blocks: 0,
             // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cross-L3 default qcf computer (cold-path one-time init, S-3b-4 trail)
@@ -533,16 +514,18 @@ impl KiviCache {
                     return cache;
                 }
 
-                cache.gpu_backend = Some(backend);
                 cache.kivi = kivi;
-                cache.gpu_memory = Some(memory);
-                cache.gpu_res_k = Some(res_k);
-                cache.gpu_res_v = Some(res_v);
-                cache.gpu_attn_k = attn_k;
-                cache.gpu_attn_v = attn_v;
-                cache.gpu_attn_cap = initial_attn_cap;
-                cache.gpu_q2k = q2k;
-                cache.gpu_q2v = q2v;
+                cache.slab = Some(GpuKvBuffers {
+                    backend,
+                    memory,
+                    res_k: Some(res_k),
+                    res_v: Some(res_v),
+                    attn_k,
+                    attn_v,
+                    attn_cap: initial_attn_cap,
+                    q2k,
+                    q2v,
+                });
 
                 // GPU mode: eliminate redundant CPU allocations.
                 // GPU buffers hold the canonical data; CPU Vecs are not needed.
@@ -574,13 +557,13 @@ impl KiviCache {
 
     /// Returns `true` if GPU buffers are active.
     pub fn is_gpu(&self) -> bool {
-        self.gpu_backend.is_some()
+        self.slab.is_some()
     }
 
     /// Current allocated capacity of GPU attention buffers in tokens.
     /// Returns 0 in CPU-only mode.
     pub fn gpu_attn_capacity(&self) -> usize {
-        self.gpu_attn_cap
+        self.slab.as_ref().map_or(0, |s| s.attn_cap)
     }
 
     /// Ensure GPU attention buffers have capacity for at least `needed_tokens`.
@@ -589,19 +572,20 @@ impl KiviCache {
     /// GPU buffers, copies existing data via `copy_slice`, and drops old buffers.
     /// No-op if current capacity is already sufficient.
     fn ensure_gpu_attn_capacity(&mut self, needed_tokens: usize) -> Result<()> {
-        if needed_tokens <= self.gpu_attn_cap {
+        let cur_cap = self.slab.as_ref().map_or(0, |s| s.attn_cap);
+        if needed_tokens <= cur_cap {
             return Ok(());
         }
         let backend = self
-            .gpu_backend
+            .slab
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ensure_gpu_attn_capacity: no GPU backend"))?
-            .clone();
+            .map(|s| s.backend.clone())
+            .ok_or_else(|| anyhow::anyhow!("ensure_gpu_attn_capacity: no GPU backend"))?;
         let memory = self
-            .gpu_memory
+            .slab
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ensure_gpu_attn_capacity: no GPU memory"))?
-            .clone();
+            .map(|s| s.memory.clone())
+            .ok_or_else(|| anyhow::anyhow!("ensure_gpu_attn_capacity: no GPU memory"))?;
 
         let new_cap = needed_tokens.next_power_of_two().min(self.max_seq_len);
         let new_elems = new_cap * self.kv_heads * self.head_dim;
@@ -620,25 +604,23 @@ impl KiviCache {
         backend.write_buffer(&mut new_v, &zeros)?;
 
         // Copy existing data from old buffers
-        let old_elems = self.gpu_attn_cap * self.kv_heads * self.head_dim;
+        let old_elems = cur_cap * self.kv_heads * self.head_dim;
         if old_elems > 0 {
-            if let Some(ref old_k) = self.gpu_attn_k {
+            let slab = self.slab.as_ref().unwrap();
+            if let Some(ref old_k) = slab.attn_k {
                 backend.copy_slice(old_k, &mut new_k, 0, 0, old_elems)?;
             }
-            if let Some(ref old_v) = self.gpu_attn_v {
+            if let Some(ref old_v) = slab.attn_v {
                 backend.copy_slice(old_v, &mut new_v, 0, 0, old_elems)?;
             }
         }
 
-        log::debug!(
-            "KiviCache: GPU attn grow {} -> {} tokens",
-            self.gpu_attn_cap,
-            new_cap
-        );
+        log::debug!("KiviCache: GPU attn grow {} -> {} tokens", cur_cap, new_cap);
 
-        self.gpu_attn_k = Some(new_k);
-        self.gpu_attn_v = Some(new_v);
-        self.gpu_attn_cap = new_cap;
+        let slab = self.slab.as_mut().unwrap();
+        slab.attn_k = Some(new_k);
+        slab.attn_v = Some(new_v);
+        slab.attn_cap = new_cap;
         Ok(())
     }
 
@@ -648,19 +630,19 @@ impl KiviCache {
     /// deferred at `new_gpu()` (bits=16 skips Q-block allocation to save memory).
     /// No-op if Q-block buffers already exist.
     fn allocate_gpu_q_blocks(&mut self, bits: u8) -> Result<()> {
-        if self.gpu_q2k.is_some() {
+        if self.slab.as_ref().is_some_and(|s| s.q2k.is_some()) {
             return Ok(());
         }
         let backend = self
-            .gpu_backend
+            .slab
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("allocate_gpu_q_blocks: no GPU backend"))?
-            .clone();
+            .map(|s| s.backend.clone())
+            .ok_or_else(|| anyhow::anyhow!("allocate_gpu_q_blocks: no GPU backend"))?;
         let memory = self
-            .gpu_memory
+            .slab
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("allocate_gpu_q_blocks: no GPU memory"))?
-            .clone();
+            .map(|s| s.memory.clone())
+            .ok_or_else(|| anyhow::anyhow!("allocate_gpu_q_blocks: no GPU memory"))?;
 
         let gs = QKKV;
         let groups_per_flush = self.res_cap.max(gs) / gs; // use current res_cap (may be max_seq_len)
@@ -704,8 +686,9 @@ impl KiviCache {
             q2v_bytes.max(block_bytes)
         );
 
-        self.gpu_q2k = Some(q2k);
-        self.gpu_q2v = Some(q2v);
+        let slab = self.slab.as_mut().unwrap();
+        slab.q2k = Some(q2k);
+        slab.q2v = Some(q2v);
         Ok(())
     }
 
@@ -728,11 +711,12 @@ impl KiviCache {
         if !self.is_gpu() || self.bits == 16 {
             return None;
         }
+        let s = self.slab.as_ref()?;
         Some(KiviRawBuffers {
-            qk_buf: self.gpu_q2k.as_ref()?,
-            qv_buf: self.gpu_q2v.as_ref()?,
-            res_k: self.gpu_res_k.as_ref()?,
-            res_v: self.gpu_res_v.as_ref()?,
+            qk_buf: s.q2k.as_ref()?,
+            qv_buf: s.q2v.as_ref()?,
+            res_k: s.res_k.as_ref()?,
+            res_v: s.res_v.as_ref()?,
             q_tokens: self.q2_tokens,
             res_tokens: self.res_pos,
             res_cap: self.res_cap,
@@ -745,10 +729,8 @@ impl KiviCache {
     /// Returns (attn_k, attn_v) GPU tensors used as the F32 scatter target for
     /// assembled attention path. Returns None if GPU mode is not active.
     pub fn get_gpu_attn_buffers(&self) -> Option<(&Tensor, &Tensor)> {
-        if !self.is_gpu() {
-            return None;
-        }
-        Some((self.gpu_attn_k.as_ref()?, self.gpu_attn_v.as_ref()?))
+        let s = self.slab.as_ref()?;
+        Some((s.attn_k.as_ref()?, s.attn_v.as_ref()?))
     }
 
     /// Dry-run QCF estimate for KIVI quantization (read-only, no state mutation).
@@ -981,7 +963,7 @@ impl KiviCache {
                 // GPU mode: read F16 GPU attn buffers, convert to F32, populate residual.
                 // Use gpu_attn_cap (not max_seq_len) since lazy grow may not have
                 // expanded to full size yet.
-                let read_cap = self.gpu_attn_cap;
+                let read_cap = self.slab.as_ref().map_or(0, |s| s.attn_cap);
                 let attn_buf_size = read_cap * self.kv_heads * self.head_dim;
 
                 // First, ensure GPU attn buffers are up to date (scatter residual)
@@ -991,8 +973,9 @@ impl KiviCache {
                 let mut tmp_attn_k_f16 = vec![half::f16::ZERO; attn_buf_size];
                 let mut tmp_attn_v_f16 = vec![half::f16::ZERO; attn_buf_size];
 
-                let backend = self.gpu_backend.as_ref().unwrap();
-                if let Some(gpu_attn_k) = self.gpu_attn_k.as_ref() {
+                let slab = self.slab.as_ref().unwrap();
+                let backend = &slab.backend;
+                if let Some(gpu_attn_k) = slab.attn_k.as_ref() {
                     // SAFETY: half::f16 is repr(transparent) over u16, 2 bytes each
                     let dst = unsafe {
                         std::slice::from_raw_parts_mut(
@@ -1002,7 +985,7 @@ impl KiviCache {
                     };
                     backend.read_buffer(gpu_attn_k, dst)?;
                 }
-                if let Some(gpu_attn_v) = self.gpu_attn_v.as_ref() {
+                if let Some(gpu_attn_v) = slab.attn_v.as_ref() {
                     let dst = unsafe {
                         std::slice::from_raw_parts_mut(
                             tmp_attn_v_f16.as_mut_ptr() as *mut u8,
@@ -1072,11 +1055,16 @@ impl KiviCache {
             // GPU mode: release attn and Q-block buffers to reclaim memory.
             // bits=16 uses only F32 residual; these buffers are unused.
             if self.is_gpu() {
-                self.gpu_attn_k = None;
-                self.gpu_attn_v = None;
-                self.gpu_attn_cap = 0;
-                self.gpu_q2k = None;
-                self.gpu_q2v = None;
+                {
+                    // Null the attn + Q-block buffers but KEEP the slab itself (bits=16 =
+                    // residual-only GPU mode retains backend/memory + F32 residual buffers).
+                    let slab = self.slab.as_mut().unwrap();
+                    slab.attn_k = None;
+                    slab.attn_v = None;
+                    slab.attn_cap = 0;
+                    slab.q2k = None;
+                    slab.q2v = None;
+                }
                 self.gpu_q2k_blocks = 0;
                 self.gpu_q2v_blocks = 0;
                 log::info!("KiviCache: GPU attn/Q buffers released (transition to bits=16)");
@@ -1092,15 +1080,16 @@ impl KiviCache {
             self.qk = QuantizedBlocks::new(new_bits);
             self.qv = QuantizedBlocks::new(new_bits);
 
-            if self.gpu_backend.is_some() {
+            if self.is_gpu() {
                 // GPU mode: avoid OOM by releasing large F32 residual buffers before
                 // allocating F16 attn + Q-block buffers.
                 //
                 // Step A: Read GPU F32 residual → CPU (so quantization can proceed).
                 let res_bytes = self.kv_heads * self.res_cap * self.head_dim * 4;
                 {
-                    let backend = self.gpu_backend.as_ref().unwrap();
-                    if let Some(gpu_rk) = self.gpu_res_k.as_ref() {
+                    let slab = self.slab.as_ref().unwrap();
+                    let backend = &slab.backend;
+                    if let Some(gpu_rk) = slab.res_k.as_ref() {
                         // SAFETY: res_k Vec is pre-allocated with res_cap * kv_heads * head_dim
                         // f32 elements. res_bytes = that count * 4 bytes.
                         let k_dst = unsafe {
@@ -1111,7 +1100,7 @@ impl KiviCache {
                         };
                         backend.read_buffer(gpu_rk, k_dst)?;
                     }
-                    if let Some(gpu_rv) = self.gpu_res_v.as_ref() {
+                    if let Some(gpu_rv) = slab.res_v.as_ref() {
                         let v_dst = unsafe {
                             std::slice::from_raw_parts_mut(
                                 self.res_v.as_mut_ptr() as *mut u8,
@@ -1123,16 +1112,19 @@ impl KiviCache {
                 }
 
                 // Step B: Release GPU F32 residual buffers to free memory before
-                // Q-block + F16 attn allocation.
-                self.gpu_res_k = None;
-                self.gpu_res_v = None;
+                // Q-block + F16 attn allocation (slab itself stays Some).
+                {
+                    let slab = self.slab.as_mut().unwrap();
+                    slab.res_k = None;
+                    slab.res_v = None;
+                }
                 log::info!(
                     "KiviCache: GPU F32 residual released before 16→{} transition",
                     new_bits
                 );
 
                 // Step C: Allocate Q-block buffers (deferred from new_gpu).
-                if self.gpu_q2k.is_none() {
+                if self.slab.as_ref().unwrap().q2k.is_none() {
                     self.allocate_gpu_q_blocks(new_bits)?;
                 }
             }
@@ -1141,7 +1133,7 @@ impl KiviCache {
             // GPU mode: flush_residual_gpu() will skip GPU readback (already done above)
             // and use CPU data for quantization. F16 attn allocation happens inside flush.
             if self.res_pos >= self.group_size {
-                if self.gpu_backend.is_some() {
+                if self.is_gpu() {
                     self.flush_residual_gpu()?;
                 } else {
                     self.flush_residual();
@@ -1159,7 +1151,7 @@ impl KiviCache {
                 // Compact GPU residual: write CPU residual (already compacted below) to GPU.
                 // The GPU buffer retains old stride (res_cap=4096), so we overwrite with
                 // correctly-strided CPU data after CPU compaction.
-                let needs_gpu_sync = self.gpu_backend.is_some() && remaining > 0;
+                let needs_gpu_sync = self.is_gpu() && remaining > 0;
 
                 if remaining > 0 && self.kv_heads > 1 {
                     // Move each head's slice into its new packed position
@@ -1183,8 +1175,8 @@ impl KiviCache {
 
                 // Sync compacted CPU residual to GPU.
                 if needs_gpu_sync {
-                    let backend = self.gpu_backend.as_ref().unwrap().clone();
-                    let memory = self.gpu_memory.as_ref().unwrap().clone();
+                    let backend = self.slab.as_ref().unwrap().backend.clone();
+                    let memory = self.slab.as_ref().unwrap().memory.clone();
                     // SAFETY: res_k/res_v contain new_elems f32 values after compaction.
                     let k_bytes = unsafe {
                         std::slice::from_raw_parts(self.res_k.as_ptr() as *const u8, new_elems * 4)
@@ -1193,16 +1185,17 @@ impl KiviCache {
                         std::slice::from_raw_parts(self.res_v.as_ptr() as *const u8, new_elems * 4)
                     };
 
-                    if self.gpu_res_k.is_some() {
+                    if self.slab.as_ref().unwrap().res_k.is_some() {
                         // GPU buffer exists (oversized from old allocation).
                         // Write compacted data to the start; remaining space is unused.
-                        if let Some(gpu_rk) = self.gpu_res_k.as_mut() {
+                        let slab = self.slab.as_mut().unwrap();
+                        if let Some(gpu_rk) = slab.res_k.as_mut() {
                             let gpu_size = gpu_rk.buffer().size();
                             let mut padded = vec![0u8; gpu_size];
                             padded[..k_bytes.len()].copy_from_slice(k_bytes);
                             backend.write_buffer(gpu_rk, &padded)?;
                         }
-                        if let Some(gpu_rv) = self.gpu_res_v.as_mut() {
+                        if let Some(gpu_rv) = slab.res_v.as_mut() {
                             let gpu_size = gpu_rv.buffer().size();
                             let mut padded = vec![0u8; gpu_size];
                             padded[..v_bytes.len()].copy_from_slice(v_bytes);
@@ -1215,31 +1208,31 @@ impl KiviCache {
                         let k_buf = memory.alloc(new_elems * 4, DType::F32)?;
                         let mut gpu_rk = Tensor::new(shape.clone(), k_buf, backend.clone());
                         backend.write_buffer(&mut gpu_rk, k_bytes)?;
-                        self.gpu_res_k = Some(gpu_rk);
+                        self.slab.as_mut().unwrap().res_k = Some(gpu_rk);
 
                         let v_buf = memory.alloc(new_elems * 4, DType::F32)?;
                         let mut gpu_rv = Tensor::new(shape, v_buf, backend.clone());
                         backend.write_buffer(&mut gpu_rv, v_bytes)?;
-                        self.gpu_res_v = Some(gpu_rv);
+                        self.slab.as_mut().unwrap().res_v = Some(gpu_rv);
 
                         log::info!(
                             "KiviCache: GPU F32 residual re-allocated (res_cap={})",
                             new_res_cap
                         );
                     }
-                } else if self.gpu_backend.is_some() && self.gpu_res_k.is_none() {
+                } else if self.slab.as_ref().is_some_and(|s| s.res_k.is_none()) {
                     // No remaining tokens but GPU residual was released.
                     // Allocate empty small GPU residual buffers for future updates.
-                    let backend = self.gpu_backend.as_ref().unwrap().clone();
-                    let memory = self.gpu_memory.as_ref().unwrap().clone();
+                    let backend = self.slab.as_ref().unwrap().backend.clone();
+                    let memory = self.slab.as_ref().unwrap().memory.clone();
                     let shape = Shape::new(vec![self.kv_heads, new_res_cap, self.head_dim]);
                     let k_buf = memory.alloc(new_elems * 4, DType::F32)?;
                     let gpu_rk = Tensor::new(shape.clone(), k_buf, backend.clone());
-                    self.gpu_res_k = Some(gpu_rk);
+                    self.slab.as_mut().unwrap().res_k = Some(gpu_rk);
 
                     let v_buf = memory.alloc(new_elems * 4, DType::F32)?;
                     let gpu_rv = Tensor::new(shape, v_buf, backend.clone());
-                    self.gpu_res_v = Some(gpu_rv);
+                    self.slab.as_mut().unwrap().res_v = Some(gpu_rv);
 
                     log::info!(
                         "KiviCache: GPU F32 residual re-allocated empty (res_cap={})",
@@ -1282,18 +1275,20 @@ impl KiviCache {
                 _ => return Err(anyhow::anyhow!("unsupported bits {}", self.bits)),
             };
 
-            let backend = self.gpu_backend.as_ref().unwrap();
+            // Clone backend out of the slab so the later as_mut() writes don't fight a
+            // live slab borrow.
+            let backend = self.slab.as_ref().unwrap().backend.clone();
 
             // Read GPU q2k blocks
             let k_gpu_bytes = total_k_blocks * old_block_bytes;
             let mut k_raw = vec![0u8; k_gpu_bytes];
-            if let Some(gpu_q2k) = self.gpu_q2k.as_ref() {
+            if let Some(gpu_q2k) = self.slab.as_ref().unwrap().q2k.as_ref() {
                 backend.read_buffer(gpu_q2k, &mut k_raw)?;
             }
             // Read GPU q2v blocks
             let v_gpu_bytes = total_v_blocks * old_block_bytes;
             let mut v_raw = vec![0u8; v_gpu_bytes];
-            if let Some(gpu_q2v) = self.gpu_q2v.as_ref() {
+            if let Some(gpu_q2v) = self.slab.as_ref().unwrap().q2v.as_ref() {
                 backend.read_buffer(gpu_q2v, &mut v_raw)?;
             }
 
@@ -1318,7 +1313,7 @@ impl KiviCache {
             let k_new_bytes = self.serialize_blocks(&new_qk, 0, total_k_blocks);
             let v_new_bytes = self.serialize_blocks(&new_qv, 0, total_v_blocks);
 
-            if let Some(gpu_q2k) = self.gpu_q2k.as_mut() {
+            if let Some(gpu_q2k) = self.slab.as_mut().unwrap().q2k.as_mut() {
                 // Write to start of GPU buffer (it may be larger)
                 let gpu_size = gpu_q2k.buffer().size();
                 let mut padded = vec![0u8; gpu_size];
@@ -1326,7 +1321,7 @@ impl KiviCache {
                 padded[..copy_len].copy_from_slice(&k_new_bytes[..copy_len]);
                 backend.write_buffer(gpu_q2k, &padded)?;
             }
-            if let Some(gpu_q2v) = self.gpu_q2v.as_mut() {
+            if let Some(gpu_q2v) = self.slab.as_mut().unwrap().q2v.as_mut() {
                 let gpu_size = gpu_q2v.buffer().size();
                 let mut padded = vec![0u8; gpu_size];
                 let copy_len = v_new_bytes.len().min(gpu_size);
@@ -1506,8 +1501,8 @@ impl KiviCache {
     // slow path 의 `copy_slice` 는 Backend trait 의 일반 메서드라 그대로
     // dyn dispatch — 함수 내 잔존 downcast/import 0 이므로 marker 제거.
     fn update_gpu(&mut self, new_k: &Tensor, new_v: &Tensor, seq_len: usize) -> Result<()> {
-        // slow path 의 `copy_slice` 는 Backend trait 의 일반 ops → gpu_backend 유지.
-        let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
+        // slow path 의 `copy_slice` 는 Backend trait 의 일반 ops → slab backend 유지.
+        let backend_arc = self.slab.as_ref().unwrap().backend.clone();
         // fast path 의 `gather_update_quant` 는 KIVI native capability → 매 토큰
         // `as_quant_attn()` lookup 대신 construction 시 pull 된 handle 직접 사용
         // (Phase α-W-4 §3.3). R3: GPU 모드면 OpenCL backend 라 caller 가 Some 보장.
@@ -1543,8 +1538,9 @@ impl KiviCache {
                 // bail. cl_queue 는 OpenCL 정적 impl 이 `&self.queue` 를 직접 알아
                 // 사용하지 않으므로 null 패킹.
                 use crate::backend::opencl::get_cl_mem;
-                let gpu_res_k = self.gpu_res_k.as_ref().unwrap();
-                let gpu_res_v = self.gpu_res_v.as_ref().unwrap();
+                let slab = self.slab.as_ref().unwrap();
+                let gpu_res_k = slab.res_k.as_ref().unwrap();
+                let gpu_res_v = slab.res_v.as_ref().unwrap();
                 // `Mem::as_ptr()` 는 이미 `cl_mem`(= `*mut c_void`) 를 반환하므로 캐스트 불요.
                 let new_k_mem = get_cl_mem(new_k.buffer().as_ref())?.as_ptr();
                 let new_v_mem = get_cl_mem(new_v.buffer().as_ref())?.as_ptr();
@@ -1581,8 +1577,9 @@ impl KiviCache {
             } else {
                 // Slow path: token-by-token copy_slice for the sub-range
                 for s in written..written + batch {
-                    let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
-                    let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
+                    let slab = self.slab.as_mut().unwrap();
+                    let gpu_res_k = slab.res_k.as_mut().unwrap();
+                    let gpu_res_v = slab.res_v.as_mut().unwrap();
                     for h in 0..self.kv_heads {
                         let src_off = s * self.kv_heads * self.head_dim + h * self.head_dim;
                         let dst_off = h * self.res_cap * self.head_dim
@@ -1627,11 +1624,16 @@ impl KiviCache {
         // 1. Read GPU residual to CPU (needed for quantization).
         //    Skip if GPU residual buffers were already read back and released
         //    (e.g. during transition_bits 16→Q to avoid OOM).
-        if let (Some(gpu_res_k), Some(gpu_res_v)) =
-            (self.gpu_res_k.as_ref(), self.gpu_res_v.as_ref())
+        if self
+            .slab
+            .as_ref()
+            .is_some_and(|s| s.res_k.is_some() && s.res_v.is_some())
         {
             let res_bytes = self.kv_heads * self.res_cap * self.head_dim * 4;
-            let backend = self.gpu_backend.as_ref().unwrap();
+            let slab = self.slab.as_ref().unwrap();
+            let backend = &slab.backend;
+            let gpu_res_k = slab.res_k.as_ref().unwrap();
+            let gpu_res_v = slab.res_v.as_ref().unwrap();
             // SAFETY: res_k/res_v Vecs hold at least res_bytes / 4 f32 elements.
             let k_dst = unsafe {
                 std::slice::from_raw_parts_mut(self.res_k.as_mut_ptr() as *mut u8, res_bytes)
@@ -1742,15 +1744,19 @@ impl KiviCache {
         // 5. Shift remaining residual tokens on GPU (or CPU if GPU residual was released)
         let remaining = self.res_pos - flush_tokens;
         if remaining > 0 {
-            if let Some(gpu_res_k) = self.gpu_res_k.as_mut() {
-                let backend = self.gpu_backend.as_ref().unwrap().clone();
+            if self.slab.as_ref().is_some_and(|s| s.res_k.is_some()) {
+                // Clone backend out of the slab first so the &mut res_k/res_v borrows
+                // below don't fight a live slab borrow (bind slab once for both buffers).
+                let backend = self.slab.as_ref().unwrap().backend.clone();
+                let slab = self.slab.as_mut().unwrap();
+                let gpu_res_k = slab.res_k.as_mut().unwrap();
                 for h in 0..self.kv_heads {
                     let base = h * self.res_cap * self.head_dim;
                     let src = base + flush_tokens * self.head_dim;
                     let count = remaining * self.head_dim;
                     backend.buffer_shift(gpu_res_k, src, base, count)?;
                 }
-                let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
+                let gpu_res_v = slab.res_v.as_mut().unwrap();
                 for h in 0..self.kv_heads {
                     let base = h * self.res_cap * self.head_dim;
                     let src = base + flush_tokens * self.head_dim;
@@ -1826,7 +1832,7 @@ impl KiviCache {
             // Owned clones so neither borrows `self` while we mutably touch the GPU buffers
             // (mirrors the gather_update fast-path above). The KIVI Q2 dequant kernels are
             // reached via the `QuantAttnBackend` cap trait — no concrete-OpenCLBackend downcast.
-            let backend = self.gpu_backend.as_ref().unwrap().clone();
+            let backend = self.slab.as_ref().unwrap().backend.clone();
             let kivi_be = self
                 .kivi
                 .as_ref()
@@ -1839,18 +1845,44 @@ impl KiviCache {
 
             // Upload key/value blocks at byte offset via the generic Backend primitive
             // (OpenCLBackend overrides `write_buffer_range` to a bounded blocking enqueue_write_buffer).
-            backend.write_buffer_range(self.gpu_q2k.as_mut().unwrap(), &k_bytes, k_byte_offset)?;
-            backend.write_buffer_range(self.gpu_q2v.as_mut().unwrap(), &v_bytes, v_byte_offset)?;
+            backend.write_buffer_range(
+                self.slab.as_mut().unwrap().q2k.as_mut().unwrap(),
+                &k_bytes,
+                k_byte_offset,
+            )?;
+            backend.write_buffer_range(
+                self.slab.as_mut().unwrap().q2v.as_mut().unwrap(),
+                &v_bytes,
+                v_byte_offset,
+            )?;
 
             // Dispatch GPU dequant: fill F16 attention buffers for the assembled path.
             // Q2: dedicated GPU F16 dequant kernel via `dequant_flush` (cl_queue=null: the OpenCL
             //     static impl uses its own queue, mirroring the gather_update path above).
             // Q4/Q8: no GPU dequant kernel yet — CPU dequant → F16 convert → write_buffer_range.
             if self.bits == 2 {
-                let q2k_mem =
-                    get_cl_mem(self.gpu_q2k.as_ref().unwrap().buffer().as_ref())?.as_ptr();
-                let attn_k_mem =
-                    get_cl_mem(self.gpu_attn_k.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let q2k_mem = get_cl_mem(
+                    self.slab
+                        .as_ref()
+                        .unwrap()
+                        .q2k
+                        .as_ref()
+                        .unwrap()
+                        .buffer()
+                        .as_ref(),
+                )?
+                .as_ptr();
+                let attn_k_mem = get_cl_mem(
+                    self.slab
+                        .as_ref()
+                        .unwrap()
+                        .attn_k
+                        .as_ref()
+                        .unwrap()
+                        .buffer()
+                        .as_ref(),
+                )?
+                .as_ptr();
                 let rc_k = kivi_be.dequant_flush(&crate::backend::QuantDequantFlushArgs {
                     cl_queue: std::ptr::null_mut(),
                     q_blocks_mem: q2k_mem,
@@ -1866,10 +1898,28 @@ impl KiviCache {
                 if rc_k != 0 {
                     anyhow::bail!("KIVI dequant_flush (K) failed (rc={rc_k})");
                 }
-                let q2v_mem =
-                    get_cl_mem(self.gpu_q2v.as_ref().unwrap().buffer().as_ref())?.as_ptr();
-                let attn_v_mem =
-                    get_cl_mem(self.gpu_attn_v.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let q2v_mem = get_cl_mem(
+                    self.slab
+                        .as_ref()
+                        .unwrap()
+                        .q2v
+                        .as_ref()
+                        .unwrap()
+                        .buffer()
+                        .as_ref(),
+                )?
+                .as_ptr();
+                let attn_v_mem = get_cl_mem(
+                    self.slab
+                        .as_ref()
+                        .unwrap()
+                        .attn_v
+                        .as_ref()
+                        .unwrap()
+                        .buffer()
+                        .as_ref(),
+                )?
+                .as_ptr();
                 let rc_v = kivi_be.dequant_flush(&crate::backend::QuantDequantFlushArgs {
                     cl_queue: std::ptr::null_mut(),
                     q_blocks_mem: q2v_mem,
@@ -1949,12 +1999,12 @@ impl KiviCache {
                     )
                 };
                 backend.write_buffer_range(
-                    self.gpu_attn_k.as_mut().unwrap(),
+                    self.slab.as_mut().unwrap().attn_k.as_mut().unwrap(),
                     k_f16_bytes,
                     byte_offset,
                 )?;
                 backend.write_buffer_range(
-                    self.gpu_attn_v.as_mut().unwrap(),
+                    self.slab.as_mut().unwrap().attn_v.as_mut().unwrap(),
                     v_f16_bytes,
                     byte_offset,
                 )?;
@@ -2065,7 +2115,7 @@ impl KiviCache {
     fn assemble_view_gpu(&mut self) -> Result<()> {
         // Defensive: ensure attn buffers can hold q2_tokens + res_pos
         let needed = self.q2_tokens + self.res_pos;
-        if needed > self.gpu_attn_cap {
+        if needed > self.gpu_attn_capacity() {
             self.ensure_gpu_attn_capacity(needed)?;
         }
 
@@ -2086,10 +2136,28 @@ impl KiviCache {
                     })?
                     .clone();
 
-                let res_k_mem =
-                    get_cl_mem(self.gpu_res_k.as_ref().unwrap().buffer().as_ref())?.as_ptr();
-                let attn_k_mem =
-                    get_cl_mem(self.gpu_attn_k.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let res_k_mem = get_cl_mem(
+                    self.slab
+                        .as_ref()
+                        .unwrap()
+                        .res_k
+                        .as_ref()
+                        .unwrap()
+                        .buffer()
+                        .as_ref(),
+                )?
+                .as_ptr();
+                let attn_k_mem = get_cl_mem(
+                    self.slab
+                        .as_ref()
+                        .unwrap()
+                        .attn_k
+                        .as_ref()
+                        .unwrap()
+                        .buffer()
+                        .as_ref(),
+                )?
+                .as_ptr();
                 let rc_k = kivi_be.scatter_residual(&crate::backend::QuantScatterResidualArgs {
                     cl_queue: std::ptr::null_mut(),
                     res_mem: res_k_mem,
@@ -2103,10 +2171,28 @@ impl KiviCache {
                 if rc_k != 0 {
                     anyhow::bail!("KIVI scatter_residual (K) failed (rc={rc_k})");
                 }
-                let res_v_mem =
-                    get_cl_mem(self.gpu_res_v.as_ref().unwrap().buffer().as_ref())?.as_ptr();
-                let attn_v_mem =
-                    get_cl_mem(self.gpu_attn_v.as_ref().unwrap().buffer().as_ref())?.as_ptr();
+                let res_v_mem = get_cl_mem(
+                    self.slab
+                        .as_ref()
+                        .unwrap()
+                        .res_v
+                        .as_ref()
+                        .unwrap()
+                        .buffer()
+                        .as_ref(),
+                )?
+                .as_ptr();
+                let attn_v_mem = get_cl_mem(
+                    self.slab
+                        .as_ref()
+                        .unwrap()
+                        .attn_v
+                        .as_ref()
+                        .unwrap()
+                        .buffer()
+                        .as_ref(),
+                )?
+                .as_ptr();
                 let rc_v = kivi_be.scatter_residual(&crate::backend::QuantScatterResidualArgs {
                     cl_queue: std::ptr::null_mut(),
                     res_mem: res_v_mem,
@@ -2133,7 +2219,7 @@ impl KiviCache {
     /// to CPU dequant + assemble path to avoid returning stale/garbage data.
     fn get_view_gpu(&mut self) -> (Tensor, Tensor) {
         let total = self.total_tokens();
-        let backend = self.gpu_backend.as_ref().unwrap().clone();
+        let backend = self.slab.as_ref().unwrap().backend.clone();
 
         if total == 0 {
             let buf = Arc::new(SharedBuffer::new(0, DType::F32));
@@ -2146,8 +2232,9 @@ impl KiviCache {
         // HeadMajor [kv_heads, res_cap, head_dim] → reinterpret as
         // [1, kv_heads, res_cap, head_dim] with only `total` valid tokens.
         if self.bits == 16 {
-            let gpu_res_k = self.gpu_res_k.as_ref().unwrap();
-            let gpu_res_v = self.gpu_res_v.as_ref().unwrap();
+            let slab = self.slab.as_ref().unwrap();
+            let gpu_res_k = slab.res_k.as_ref().unwrap();
+            let gpu_res_v = slab.res_v.as_ref().unwrap();
             // HeadMajor layout: shape encodes [batch=1, kv_heads, capacity, head_dim]
             // The attention kernel reads kv_head_stride and kv_pos_stride from shape.
             let shape = Shape::new(vec![1, self.kv_heads, self.res_cap, self.head_dim]);
@@ -2168,12 +2255,26 @@ impl KiviCache {
         let shape = Shape::new(vec![1, total, self.kv_heads, self.head_dim]);
         let k = Tensor::new(
             shape.clone(),
-            self.gpu_attn_k.as_ref().unwrap().buffer().clone(),
+            self.slab
+                .as_ref()
+                .unwrap()
+                .attn_k
+                .as_ref()
+                .unwrap()
+                .buffer()
+                .clone(),
             backend.clone(),
         );
         let v = Tensor::new(
             shape,
-            self.gpu_attn_v.as_ref().unwrap().buffer().clone(),
+            self.slab
+                .as_ref()
+                .unwrap()
+                .attn_v
+                .as_ref()
+                .unwrap()
+                .buffer()
+                .clone(),
             backend,
         );
         (k, v)
@@ -2193,7 +2294,7 @@ impl KiviCache {
     pub fn capacity(&self) -> usize {
         // bits=16 GPU: return GPU residual capacity (may be smaller than max_seq_len
         // due to grow-on-demand). Used for HeadMajor stride calculations.
-        if self.bits == 16 && self.gpu_res_k.is_some() {
+        if self.bits == 16 && self.slab.as_ref().is_some_and(|s| s.res_k.is_some()) {
             self.res_cap
         } else {
             self.max_seq_len
@@ -2205,7 +2306,7 @@ impl KiviCache {
         // bits=16 GPU mode: residual is HeadMajor [kv_heads, res_cap, head_dim].
         // bits=2/4/8 GPU mode: assembled attn view is SeqMajor [total, kv_heads, head_dim].
         // CPU mode: always SeqMajor.
-        if self.bits == 16 && self.gpu_res_k.is_some() {
+        if self.bits == 16 && self.slab.as_ref().is_some_and(|s| s.res_k.is_some()) {
             KVLayout::HeadMajor
         } else {
             KVLayout::SeqMajor
@@ -2241,7 +2342,7 @@ impl KiviCache {
         }
 
         // GPU path: dispatch GPU kernels for residual update
-        if self.gpu_backend.is_some() {
+        if self.is_gpu() {
             return self.update_gpu(new_k, new_v, seq_len);
         }
 
@@ -2280,7 +2381,7 @@ impl KiviCache {
     /// (KVCache 와 달리 KiviCache 는 기존 `get_view` inherent 부재).
     pub fn get_view(&mut self) -> (Tensor, Tensor) {
         // GPU path: return tensors backed by GPU attention buffers
-        if self.gpu_backend.is_some() {
+        if self.is_gpu() {
             return self.get_view_gpu();
         }
 
@@ -3188,9 +3289,8 @@ mod tests {
     fn test_cpu_mode_is_default() {
         let cache = KiviCache::new(2, 64, 256, 32);
         assert!(!cache.is_gpu(), "new() must return CPU-mode cache");
-        assert!(cache.gpu_backend.is_none());
-        assert!(cache.gpu_res_k.is_none());
-        assert!(cache.gpu_attn_k.is_none());
+        // CPU mode == no GPU buffer slab (slab is the GPU-mode sentinel).
+        assert!(cache.slab.is_none());
     }
 
     /// `new_gpu()` with a non-OpenCL backend must silently fall back to CPU mode.
@@ -3957,14 +4057,10 @@ mod tests {
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
         let cache = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
-        // CPU fallback: gpu_attn_k/v should be None
+        // CPU fallback: no GPU buffer slab at all (so no F16 attn buffers).
         assert!(
-            cache.gpu_attn_k.is_none(),
-            "CPU fallback should not have gpu_attn_k"
-        );
-        assert!(
-            cache.gpu_attn_v.is_none(),
-            "CPU fallback should not have gpu_attn_v"
+            cache.slab.is_none(),
+            "CPU fallback should not allocate a GPU buffer slab"
         );
     }
 }
