@@ -24,7 +24,7 @@
 
 use anyhow::bail;
 use argus_engine::session::bin_setup::build_inference_ctx;
-use argus_engine::session::cli::{Args, KvMode};
+use argus_engine::session::cli::Args;
 use argus_engine::session::standard_happy::run_standard_happy_path;
 use clap::Parser;
 
@@ -82,7 +82,7 @@ fn reject_unsupported_modes_v0(args: &Args) -> anyhow::Result<()> {
     if args.qcf_dump.is_some() {
         bail!("argus-cli v0: --qcf-dump moved to argus-eval (--qcf-dump with --eval-ll or --ppl)");
     }
-    if !matches!(args.effective_kv_mode(), KvMode::Standard) {
+    if args.effective_kv_mode() != "standard" {
         bail!("argus-cli v0: only --kv-mode standard supported (KIVI/Offload planned for v1)");
     }
     if args.secondary_gguf.is_some()

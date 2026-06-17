@@ -10,7 +10,7 @@ use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::TransformerModel;
 use crate::observability::rss_trace::{dump_smaps, io_trace, rss_trace};
-use crate::session::cli::{Args, KvMode};
+use crate::session::cli::Args;
 
 /// Session 초기화 컨텍스트 (Phase 4-1 외곽 추출).
 ///
@@ -120,12 +120,17 @@ impl SessionInitCtx {
         // Standard / kivi / offload paths are each supported; experiment/eval
         // modes and advanced GPU features remain incompatible.
         if args.chat {
-            let kv_offload_active = matches!(args.effective_kv_mode(), KvMode::Offload);
+            // §4.3 / site #5: conflict policy reads declared caps (`ModeCaps`), not a
+            // concrete-technique `matches!`. Exactly as StageCaps removed
+            // `matches!(name, "h2o" | ..)` from the eviction path.
+            let caps = crate::session::mode::mode_caps(args.effective_kv_mode());
+            let is_quantized = caps.is_some_and(|c| c.is_quantized_kv);
+            let kv_offload_active = caps.is_some_and(|c| c.supports_offload);
             let has_eviction = args.eviction_policy() != "none";
-            if matches!(args.effective_kv_mode(), KvMode::Kivi) && kv_offload_active {
+            if is_quantized && kv_offload_active {
                 anyhow::bail!("--chat: --kivi and --kv-offload are mutually exclusive");
             }
-            if matches!(args.effective_kv_mode(), KvMode::Kivi) && has_eviction {
+            if is_quantized && has_eviction {
                 anyhow::bail!("--chat: --kivi cannot combine with eviction in v1 (pick one)");
             }
             if kv_offload_active && has_eviction {

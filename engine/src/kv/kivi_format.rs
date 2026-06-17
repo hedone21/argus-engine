@@ -81,6 +81,13 @@ impl KIVIFormat {
     }
 }
 
+impl crate::session::resilience_adapter::QuantStageHandle for KIVIFormat {
+    /// §4.5: heartbeat kv_dtype query — `current_bits()` 위임. base trait 무변(중립 sub-trait).
+    fn current_kv_bits(&self) -> u8 {
+        self.current_bits()
+    }
+}
+
 impl KVCacheFormat for KIVIFormat {
     fn idx(&self) -> usize {
         self.idx

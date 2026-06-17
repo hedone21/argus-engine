@@ -30,9 +30,10 @@
 use anyhow::bail;
 use argus_engine::experiment::ExperimentSchedule;
 use argus_engine::session::bin_setup::build_inference_ctx;
-use argus_engine::session::cli::{Args, KvMode};
+use argus_engine::session::cli::Args;
 use argus_engine::session::eval_setup;
 use argus_engine::session::experiment::ScheduleCommandSource;
+use argus_engine::session::mode::{mode_caps, resolve_kv_mode_checked};
 use argus_engine::session::run_experiment_schedule_path;
 use clap::Parser;
 
@@ -58,6 +59,13 @@ fn main() -> anyhow::Result<()> {
     if args.num_tokens < 1 {
         bail!("argus-eval: --num-tokens must be >= 1");
     }
+
+    // FORMAT-axis Phase 1: fail-fast on an unknown `--kv-mode` name (the eval runners
+    // only read `mode_caps()`, which folds an unknown name to None → silently
+    // classifies as the Standard runner — wrong numbers for a measurement tool). This
+    // also runs the KV_MODES gc-sections self-test, which the eval prologue
+    // (`build_eval_base`) otherwise skips.
+    resolve_kv_mode_checked(args.effective_kv_mode())?;
 
     let mode = classify_eval_mode(&args)?;
     dispatch_eval(mode, args)
@@ -117,16 +125,19 @@ fn classify_eval_mode(args: &Args) -> anyhow::Result<EvalMode> {
     if experiment_active {
         return Ok(EvalMode::Experiment);
     }
-    let is_kivi = matches!(args.effective_kv_mode(), KvMode::Kivi);
+    // site #4: classify by declared cap (`ModeCaps.is_quantized_kv`), not a concrete
+    // `matches!(.., KvMode::Kivi)`. The `EvalMode::*Kivi` variant *names* are
+    // eval-harness residue (deferred — orthogonal to the selection mechanism).
+    let quantized = mode_caps(args.effective_kv_mode()).is_some_and(|c| c.is_quantized_kv);
     if eval_ll_active {
-        return Ok(if is_kivi {
+        return Ok(if quantized {
             EvalMode::EvalLlKivi
         } else {
             EvalMode::EvalLl
         });
     }
     if ppl_active {
-        return Ok(if is_kivi {
+        return Ok(if quantized {
             EvalMode::PplKivi
         } else {
             EvalMode::Ppl

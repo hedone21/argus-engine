@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::capability::kivi_attention::QuantAttnBackend;
 use crate::format::KVCacheFormat;
@@ -23,13 +22,10 @@ use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::eviction::stage_registry::StageBackedPolicy;
-use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
-use crate::memory::Memory;
-use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::session::DecodeLoopBuilder;
-use crate::session::chat::sampler::{ChatSampler, SharedSamplingConfig};
+use crate::session::chat::sampler::SharedSamplingConfig;
 use crate::session::chat::stop_condition::{ChatStopSlot, ChatStopStage, StopCondition};
 use crate::session::chat::stream_stage::{ChatStreamSlot, ChatStreamStage};
 use crate::session::command_dispatcher::CommandDispatcher;
@@ -97,6 +93,29 @@ pub struct ChatSession {
 }
 
 impl ChatSession {
+    /// production 조립자(`chat/build.rs`)가 mode-agnostic 하게 부품을 모아 세션을 만든다.
+    /// 필드가 private 이므로 build.rs 가 직접 struct literal 을 쓸 수 없어 이 crate-private
+    /// 생성자를 경유한다(decode_loop 은 이미 `finish_chat_loop` 로 stop/stream stage 가 배선됨).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        decode_loop: DecodeLoop,
+        kv_mode: ChatKvMode,
+        max_seq_len: usize,
+        stop_slot: Arc<ChatStopSlot>,
+        stream_slot: Arc<ChatStreamSlot>,
+        sampling: Option<SharedSamplingConfig>,
+    ) -> Self {
+        Self {
+            decode_loop,
+            kv_mode,
+            pos: 0,
+            max_seq_len,
+            stop_slot,
+            stream_slot,
+            sampling,
+        }
+    }
+
     /// spec test용 직접 생성자. 호출자가 DecodeLoop + kv_mode를 직접 조립한다.
     ///
     /// β-6: stop 판정을 `ChatStopStage` 로 수렴하므로, 내부에서 registry + ChatStopStage 를
@@ -120,7 +139,7 @@ impl ChatSession {
 /// β-6: `ChatStopStage`(DecodeEnd) + `ChatStreamStage`(DecodeEnd) 를 등록한 새 registry 와 두
 /// 공유 슬롯을 만든다. **submit 순서가 곧 dispatch 순서** — stop 을 먼저 등록해야 stop 토큰이
 /// 스트리밍되지 않는다(stop 시 dispatch break → stream stage 미발화).
-fn make_chat_registry() -> (
+pub(crate) fn make_chat_registry() -> (
     Arc<PipelineRegistry>,
     Arc<ChatStopSlot>,
     Arc<ChatStreamSlot>,
@@ -149,7 +168,7 @@ fn install_stop_stage(
 /// build() 가 동일 registry 에 `TickStage`(PostSample) 를 submit 하므로 stop/stream/tick stage 가
 /// 한 registry 에 공존한다. eviction directive 는 chat 자체 CacheManager(루프 밖)가 담당하므로
 /// dispatcher 의 cache_manager 는 None(inert) — [`build_standard_loop`] happy 경로와 동형.
-fn finish_chat_loop(
+pub(crate) fn finish_chat_loop(
     builder: DecodeLoopBuilder<HasForward>,
     registry: Arc<PipelineRegistry>,
     resilience: Option<ResilienceAdapter>,
@@ -466,99 +485,47 @@ impl ChatSession {
     }
 }
 
-// ─── Builder 함수 인자 타입 ───────────────────────────────────────────────────
+// ─── 3 forward-build 함수 (KvModeReg.build fn-ptr) ────────────────────────────
+//
+// 각 함수는 [`ModeBuildCtx`] 를 받아 whole-pipeline `Box<dyn Forward>` (+ resilience 핸들/
+// eviction 라벨/`ChatKvMode` stats 페이로드)를 [`ChatModeBuild`] 로 반환한다. mode-agnostic 한
+// ChatSession 조립(sampler/registry/finish_chat_loop/resilience)은 `chat/build.rs` 가 이
+// 결과 *둘레*에서 수행한다 — dispatch 지점이 더는 mode 정체성에 match 하지 않는다.
 
-/// [`build_chat_standard`]에 전달하는 args.
-///
-/// generate.rs의 run_chat_standard + build_chat_eviction에 흩어진 인자들을
-/// 한 struct로 묶는다. 4-5-f에서 generate.rs 호출 site가 이 struct를 사용하게 된다.
-pub struct ChatStandardArgs {
-    pub backend: Arc<dyn Backend>,
-    pub memory: Arc<dyn Memory>,
-    pub cpu_backend: Arc<dyn Backend>,
-    pub model: Arc<TransformerModel>,
-    pub kv_caches: Vec<KVCache>,
-    pub initial_kv_capacity: usize,
-    pub max_seq_len: usize,
-    pub kv_dtype: DType,
-    pub eviction_policy: String,
-    pub eviction_target_ratio: f32,
-    pub eviction_window: usize,
-    pub protected_prefix: Option<usize>,
-    pub sink_size: usize,
-    pub streaming_window: usize,
-    pub kv_budget: usize,
-    /// The active eviction variant's heavy-hitter keep-ratio (h2o/h2o_plus/d2o report their own;
-    /// others default 0.5). Replaces the former separate `h2o_keep_ratio` / `d2o_keep_ratio` fields.
-    pub keep_ratio: f32,
-    pub h2o_tracked_layers: usize,
-    pub h2o_decay: f32,
-    pub h2o_raw_scores: bool,
-    /// The active stage's technique-private knobs as an opaque `(key, val)` blob, parsed by the
-    /// plugin's own `from_args` (e.g. d2o's `ema_beta`/`merge_axis`/…). Keeps chat from knowing any
-    /// plugin's params. Built by `Args::stage_args()`.
-    pub stage_args: Vec<(String, String)>,
-    pub memory_threshold_mb: u64,
-    /// Base sampling config (CLI defaults / OpenAI request seed). Installed into a
-    /// shared handle so the server can override `temperature`/`top_p` per request.
-    pub sampling_config: SamplingConfig,
-    /// Resilience adapter (manager IPC). `None` = no manager integration.
-    pub resilience: Option<ResilienceAdapter>,
-}
+use crate::session::mode::{ChatModeBuild, ModeBuildCtx};
 
-/// [`build_chat_kivi`]에 전달하는 args.
-pub struct ChatKiviArgs {
-    pub backend: Arc<dyn Backend>,
-    /// KIVI native attention capability handle (Phase α-W-4 §3.3). 최외곽 caller 가
-    /// `caps.get::<dyn QuantAttnBackend>()` 로 pull 해 채운다 (OpenCL backend 면
-    /// `Some`, 그 외 `None`). `alloc_kivi_kv_caches` 로 그대로 전달.
-    pub kivi: Option<Arc<dyn QuantAttnBackend>>,
-    pub memory: Arc<dyn Memory>,
-    pub model: Arc<TransformerModel>,
-    pub kv_heads: usize,
-    pub head_dim: usize,
-    pub num_layers: usize,
-    pub max_seq_len: usize,
-    pub bits: u8,
-    pub residual_size: usize,
-    pub sampling_config: SamplingConfig,
-    pub resilience: Option<ResilienceAdapter>,
-}
+/// "standard" mode forward-build (KvModeReg.build) — `ModelForward` + eviction
+/// (CacheManager/score-accumulator). Standard 는 유일한 eviction mode 라 eviction 구성을
+/// 여기서 mode-agnostically 소유한다. (옛 `build_chat_standard` forward 본문 verbatim.)
+pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeBuild> {
+    let max_seq_len = ctx.max_seq_len;
+    let args = ctx.args;
 
-/// [`build_chat_offload`]에 전달하는 args.
-pub struct ChatOffloadArgs {
-    pub backend: Arc<dyn Backend>,
-    pub memory: Arc<dyn Memory>,
-    pub model: Arc<TransformerModel>,
-    pub kv_heads: usize,
-    pub head_dim: usize,
-    pub num_layers: usize,
-    pub max_seq_len: usize,
-    pub kv_dtype: DType,
-    pub offload_mode: String,
-    pub disk_dir: Option<std::path::PathBuf>,
-    pub max_prefetch_depth: usize,
-    pub sampling_config: SamplingConfig,
-    pub resilience: Option<ResilienceAdapter>,
-}
-
-// ─── 3 builder 함수 ──────────────────────────────────────────────────────────
-
-/// Standard KV cache path용 ChatSession 빌더.
-///
-/// generate.rs `run_chat_standard` + `build_chat_eviction` (l.10317~10519) 이관.
-/// `kv_caches`는 caller가 미리 할당하여 전달한다 (alloc_standard_kv_caches 사용).
-pub fn build_chat_standard(mut args: ChatStandardArgs) -> Result<ChatSession> {
-    let max_seq_len = args.max_seq_len;
-    let vocab_size = args.model.config.vocab_size;
-    let sampling_config = args.sampling_config.clone();
-    let mut resilience = args.resilience.take();
+    let kv_dtype = parse_kv_type(&args.kv_type)?;
+    let initial = {
+        let r = args.initial_kv_capacity();
+        if r > 0 {
+            r.min(max_seq_len)
+        } else {
+            256.min(max_seq_len)
+        }
+    };
+    let kv_caches = crate::session::bin_setup::alloc_standard_kv_caches(
+        &ctx.backend,
+        ctx.memory.clone(),
+        ctx.num_layers,
+        initial,
+        max_seq_len,
+        ctx.kv_heads,
+        ctx.head_dim,
+        kv_dtype,
+    )?;
 
     // eviction setup — generate.rs build_chat_eviction 로직 이관
     let (cache_manager, score_accumulator, score_based, policy_name) =
-        build_chat_eviction_internal(&args)?;
+        build_chat_eviction_internal(&ctx, max_seq_len)?;
 
-    let target_ratio = args.eviction_target_ratio;
+    let target_ratio = args.eviction_target_ratio();
 
     // ModelForward 생성
     // §5.9.2 Track B: chat 경로는 swap 미구성 → hook 더미 cell (항상 None).
@@ -570,11 +537,11 @@ pub fn build_chat_standard(mut args: ChatStandardArgs) -> Result<ChatSession> {
         Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>,
     > = Arc::new(Mutex::new(None));
     let mf = ModelForward::new(
-        args.backend,
-        args.memory,
-        args.cpu_backend,
-        args.model,
-        args.kv_caches,
+        ctx.backend,
+        ctx.memory,
+        ctx.cpu_backend,
+        ctx.model,
+        kv_caches,
         max_seq_len,
         false, // chat 모드는 plan path 비활성 (D4: eviction + plan 공존 미지원)
         hook_cell,
@@ -588,25 +555,13 @@ pub fn build_chat_standard(mut args: ChatStandardArgs) -> Result<ChatSession> {
         .fmt_caches()
         .first()
         .map(|f| Arc::clone(f) as Arc<dyn KVCacheFormat>);
-    if let Some(adapter) = resilience.as_mut() {
-        adapter.set_eviction_policy(&policy_name);
-        if let Some(h) = kv_handle {
-            adapter.set_kv_handle(h);
-        }
-    }
 
-    // Per-request sampling: the in-loop ChatSampler reads this shared config each
-    // step; the server overwrites it per OpenAI request.
-    let sampling: SharedSamplingConfig = Arc::new(Mutex::new(sampling_config));
-    let (registry, stop_slot, stream_slot) = make_chat_registry();
-    let builder = DecodeLoopBuilder::new()
-        .with_forward(mf)
-        .with_kv_capacity(max_seq_len)
-        .with_sampler(ChatSampler::new(Arc::clone(&sampling), vocab_size));
-    let decode_loop = finish_chat_loop(builder, registry, resilience, kv_handles);
-
-    Ok(ChatSession {
-        decode_loop,
+    Ok(ChatModeBuild {
+        forward: Box::new(mf),
+        kv_handles,
+        kv_handle,
+        quant_handle: None,
+        eviction_policy: policy_name.clone(),
         kv_mode: ChatKvMode::Standard(Box::new(ChatKvModeStandard {
             cache_manager,
             score_accumulator,
@@ -615,24 +570,18 @@ pub fn build_chat_standard(mut args: ChatStandardArgs) -> Result<ChatSession> {
             target_ratio,
             evicted_total: 0,
         })),
-        pos: 0,
-        max_seq_len,
-        stop_slot,
-        stream_slot,
-        sampling: Some(sampling),
     })
 }
 
-/// KIVI 양자화 KV cache path용 ChatSession 빌더.
-///
-/// generate.rs `run_chat_kivi` (l.10662~10756) 이관.
-pub fn build_chat_kivi(mut args: ChatKiviArgs) -> Result<ChatSession> {
-    let max_seq_len = args.max_seq_len;
-    let bits = args.bits;
-    let residual_size = args.residual_size;
-    let vocab_size = args.model.config.vocab_size;
-    let sampling_config = args.sampling_config.clone();
-    let mut resilience = args.resilience.take();
+/// "kivi" mode forward-build (KvModeReg.build) — KIVI-private 구성 일체
+/// (alloc_kivi_kv_caches / KiviForward::new / bits·residual / caps.get::<QuantAttnBackend>())가
+/// 여기로 이동했다. dispatch 지점은 더는 "kivi" 를 NAME 하지 않는다.
+pub(crate) fn build_chat_kivi_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeBuild> {
+    let max_seq_len = ctx.max_seq_len;
+    let bits = ctx.args.effective_kivi_bits();
+    let residual_size = ctx.args.effective_kivi_residual_size();
+    // §4.3: cap pull moved into the kivi closure (gated by `needs_quant_attn`).
+    let kivi = ctx.caps.get::<dyn QuantAttnBackend>();
 
     eprintln!(
         "[Chat/KIVI] bits={}, residual_size={}, max_seq_len={}",
@@ -640,197 +589,179 @@ pub fn build_chat_kivi(mut args: ChatKiviArgs) -> Result<ChatSession> {
     );
 
     let kv_caches = alloc_kivi_kv_caches(
-        args.num_layers,
-        args.kv_heads,
-        args.head_dim,
+        ctx.num_layers,
+        ctx.kv_heads,
+        ctx.head_dim,
         max_seq_len,
         residual_size,
         bits,
-        &args.backend,
-        &args.kivi,
-        &args.memory,
+        &ctx.backend,
+        &kivi,
+        &ctx.memory,
     );
 
     let fwd = KiviForward::new(
-        args.backend,
-        args.memory,
-        args.model,
+        ctx.backend,
+        ctx.memory,
+        ctx.model,
         kv_caches,
         bits,
         residual_size,
         max_seq_len,
     )?;
 
-    // Resilience: KIVI heartbeat handle is a KIVIFormat (not StandardFormat), so the
-    // dispatcher kv_handles stays empty (evict inert — chat-managed); only the
-    // heartbeat handle is set best-effort.
+    // §4.5: pos/capacity via base `kv_handle`, bit-width via the neutral `quant_handle`.
     let kivi_handle = fwd.kivi_caches().first().cloned();
-    if let Some(adapter) = resilience.as_mut() {
-        adapter.set_eviction_policy(""); // KIVI: no in-loop eviction policy
-        if let Some(h) = kivi_handle {
-            adapter.set_kivi_handle(h);
-        }
-    }
+    let kv_handle = kivi_handle.clone().map(|h| h as Arc<dyn KVCacheFormat>);
+    let quant_handle =
+        kivi_handle.map(|h| h as Arc<dyn crate::session::resilience_adapter::QuantStageHandle>);
 
-    let sampling: SharedSamplingConfig = Arc::new(Mutex::new(sampling_config));
-    let (registry, stop_slot, stream_slot) = make_chat_registry();
-    let builder = DecodeLoopBuilder::new()
-        .with_forward(fwd)
-        .with_kv_capacity(max_seq_len)
-        .with_sampler(ChatSampler::new(Arc::clone(&sampling), vocab_size));
-    let decode_loop = finish_chat_loop(builder, registry, resilience, Vec::new());
-
-    Ok(ChatSession {
-        decode_loop,
+    Ok(ChatModeBuild {
+        forward: Box::new(fwd),
+        kv_handles: Vec::new(), // KIVI: no StandardFormat eviction handles.
+        kv_handle,
+        quant_handle,
+        eviction_policy: String::new(), // KIVI: no in-loop eviction policy.
         kv_mode: ChatKvMode::Kivi {
             bits,
             residual_size,
         },
-        pos: 0,
-        max_seq_len,
-        stop_slot,
-        stream_slot,
-        sampling: Some(sampling),
     })
 }
 
-/// KV offload path용 ChatSession 빌더.
-///
-/// generate.rs `run_chat_offload` (l.10907~11032) 이관.
-pub fn build_chat_offload(mut args: ChatOffloadArgs) -> Result<ChatSession> {
-    let max_seq_len = args.max_seq_len;
-    let offload_mode = args.offload_mode.clone();
-    let max_prefetch_depth = args.max_prefetch_depth;
-    let vocab_size = args.model.config.vocab_size;
-    let sampling_config = args.sampling_config.clone();
-    let mut resilience = args.resilience.take();
+/// "offload" mode forward-build (KvModeReg.build) — `OffloadForward` + offload cache
+/// container. (옛 `build_chat_offload` forward 본문 verbatim.)
+pub(crate) fn build_chat_offload_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeBuild> {
+    let max_seq_len = ctx.max_seq_len;
+    let args = ctx.args;
+    let kv_dtype = parse_kv_type(&args.kv_type)?;
+    let offload_mode = args.effective_kv_offload_storage();
+    let disk_dir = args.swap_dir.clone();
+    let max_prefetch_depth = args.kv_mode_args.kv_max_prefetch_depth;
 
-    let token_bytes = args.kv_heads * args.head_dim * args.kv_dtype.size();
-    let disk_dir_ref = args.disk_dir.as_deref();
+    let token_bytes = ctx.kv_heads * ctx.head_dim * kv_dtype.size();
+    let disk_dir_ref = disk_dir.as_deref();
 
     eprintln!(
         "[Chat/Offload] mode={}, dtype={:?}, layers={}, token_bytes={}, max_seq={}",
-        offload_mode, args.kv_dtype, args.num_layers, token_bytes, max_seq_len
+        offload_mode, kv_dtype, ctx.num_layers, token_bytes, max_seq_len
     );
 
     let kv_caches = alloc_offload_kv_caches(
-        args.num_layers,
+        ctx.num_layers,
         &offload_mode,
-        args.kv_dtype,
-        args.kv_heads,
-        args.head_dim,
+        kv_dtype,
+        ctx.kv_heads,
+        ctx.head_dim,
         max_seq_len,
         token_bytes,
         disk_dir_ref,
-        &args.backend,
-        &args.memory,
+        &ctx.backend,
+        &ctx.memory,
     )?;
 
     let prefetch =
-        crate::kv::offload::prefetch::PrefetchController::new(max_prefetch_depth, args.num_layers);
+        crate::kv::offload::prefetch::PrefetchController::new(max_prefetch_depth, ctx.num_layers);
 
     let fwd = OffloadForward::new(
-        args.backend,
-        args.memory,
-        args.model,
+        ctx.backend,
+        ctx.memory,
+        ctx.model,
         kv_caches,
         prefetch,
         max_seq_len,
     )?;
 
-    // Offload has no KV-format handle accessor → heartbeat KV handle is skipped;
-    // resilience control directives (throttle/suspend) + per-token tick still wire.
-    if let Some(adapter) = resilience.as_mut() {
-        adapter.set_eviction_policy("");
-    }
-
-    let sampling: SharedSamplingConfig = Arc::new(Mutex::new(sampling_config));
-    let (registry, stop_slot, stream_slot) = make_chat_registry();
-    let builder = DecodeLoopBuilder::new()
-        .with_forward(fwd)
-        .with_kv_capacity(max_seq_len)
-        .with_sampler(ChatSampler::new(Arc::clone(&sampling), vocab_size));
-    let decode_loop = finish_chat_loop(builder, registry, resilience, Vec::new());
-
-    Ok(ChatSession {
-        decode_loop,
+    Ok(ChatModeBuild {
+        forward: Box::new(fwd),
+        kv_handles: Vec::new(),
+        // Offload has no KV-format handle accessor → heartbeat KV handle is skipped.
+        kv_handle: None,
+        quant_handle: None,
+        eviction_policy: String::new(),
         kv_mode: ChatKvMode::Offload {
             store_mode: offload_mode,
             max_prefetch_depth,
         },
-        pos: 0,
-        max_seq_len,
-        stop_slot,
-        stream_slot,
-        sampling: Some(sampling),
     })
+}
+
+fn parse_kv_type(s: &str) -> Result<DType> {
+    match s {
+        "f32" => Ok(DType::F32),
+        "f16" => Ok(DType::F16),
+        "q4" => Ok(DType::Q4_0),
+        other => anyhow::bail!("Unsupported KV type: {other}. Use f32, f16, or q4."),
+    }
 }
 
 // ─── 내부 헬퍼 ───────────────────────────────────────────────────────────────
 
-/// generate.rs build_chat_eviction (l.10317~10439) 이관.
+/// generate.rs build_chat_eviction (l.10317~10439) 이관. `ModeBuildCtx` + `ctx.args` 직독.
 ///
 /// Returns (cache_manager, score_accumulator, score_based, policy_name).
 #[allow(clippy::type_complexity)]
 fn build_chat_eviction_internal(
-    args: &ChatStandardArgs,
+    ctx: &ModeBuildCtx<'_>,
+    max_seq_len: usize,
 ) -> Result<(
     Option<CacheManager>,
     Option<AttentionScoreAccumulator>,
     bool,
     String,
 )> {
-    if args.eviction_policy == "none" {
+    let args = ctx.args;
+    let eviction_policy = args.eviction_policy().to_string();
+    if eviction_policy == "none" {
         return Ok((None, None, false, "none".to_string()));
     }
 
     // Score-based stages declare a protected-prefix (4 sinks); score-free ones declare 0 → chat
     // protects 4 sinks by default (streaming derives its own sink and ignores the value). No
     // per-name branch.
-    let actual_protected_prefix = args.protected_prefix.unwrap_or_else(|| {
-        match crate::kv::eviction::stage_registry::stage_default_protected_prefix(
-            &args.eviction_policy,
-        ) {
+    let actual_protected_prefix = args.protected_prefix().unwrap_or_else(|| {
+        match crate::kv::eviction::stage_registry::stage_default_protected_prefix(&eviction_policy)
+        {
             0 => 4,
             cap => cap,
         }
     });
 
     let monitor: Box<dyn crate::resilience::sys_monitor::SystemMonitor> =
-        if args.backend.is_discrete_gpu() {
+        if ctx.backend.is_discrete_gpu() {
             Box::new(NoOpMonitor)
         } else {
             Box::new(LinuxSystemMonitor)
         };
-    let threshold_bytes = (args.memory_threshold_mb * 1024 * 1024) as usize;
+    let threshold_bytes = (args.memory_threshold_mb() as u64 * 1024 * 1024) as usize;
 
     // linkme fat-LTO 생존 self-test: 빌트인 stage 미등록 시 fail-fast.
     crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
 
     let cache_manager = {
-        let name = args.eviction_policy.as_str();
+        let name = eviction_policy.as_str();
         // Every policy (none/sliding/streaming/h2o/h2o_plus/d2o) resolves through the plugin registry
         // by name (static linkme + dynamic --load-plugin), with its private knobs riding the opaque
-        // StageArgs blob (built generically in chat/build.rs by `Args::stage_args`). Names no plugin.
+        // StageArgs blob (built generically by `Args::stage_args`). Names no plugin.
         let policy: Box<dyn crate::kv::eviction::EvictionPolicy> = {
             // streaming window 유도는 StageParams 5필드 밖이라 caller(여기)에서 해소해 baked.
             // 비-streaming 정책의 make 는 이 필드를 무시한다.
-            let streaming_window = if args.streaming_window > 0 {
-                args.streaming_window
-            } else if args.kv_budget > 0 {
-                args.kv_budget.saturating_sub(args.sink_size)
+            let streaming_window = if args.streaming_window() > 0 {
+                args.streaming_window()
+            } else if args.kv_budget() > 0 {
+                args.kv_budget().saturating_sub(args.sink_size())
             } else {
-                args.eviction_window
+                args.eviction_window()
             };
             let params = argus_extension_api::StageParams {
-                eviction_window: args.eviction_window,
+                eviction_window: args.eviction_window(),
                 protected_prefix: actual_protected_prefix,
-                keep_ratio: args.keep_ratio,
-                sink_size: args.sink_size,
+                keep_ratio: args.keep_ratio(),
+                sink_size: args.sink_size(),
                 streaming_window,
             };
-            let extra: Vec<argus_extension_api::PluginArg> = args
-                .stage_args
+            let stage_args = args.stage_args();
+            let extra: Vec<argus_extension_api::PluginArg> = stage_args
                 .iter()
                 .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
                 .collect();
@@ -846,52 +777,51 @@ fn build_chat_eviction_internal(
                     })?;
             Box::new(StageBackedPolicy::new(stage))
         };
-        CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
+        CacheManager::new(
+            policy,
+            monitor,
+            threshold_bytes,
+            args.eviction_target_ratio(),
+        )
     };
 
     // caote 는 value-aware(crit_i = a_i·‖v_i − o_h‖) — V 는 ctx.tensor(Value)로 직접 읽지만
     // 가중치 a_i 는 importance 가 공급돼야 한다. score_based=true 여야 decode 루프가
     // force_evict_with_scores 로 importance 를 흘려보내 KVStageCtx(Some(importance)) 가 된다
     // (미공급 시 weight=0 → degenerate). attn-weight(last_attn) 정밀화는 Tier 2 deferred.
-    let score_based =
-        crate::kv::eviction::stage_registry::stage_is_score_based(&args.eviction_policy);
+    let score_based = crate::kv::eviction::stage_registry::stage_is_score_based(&eviction_policy);
 
     let mut acc = AttentionScoreAccumulator::new_gqa(
-        args.max_seq_len,
-        args.model.config.num_attention_heads,
-        args.model.config.num_key_value_heads,
-        args.model.config.num_hidden_layers,
-        args.h2o_tracked_layers,
-        args.h2o_decay,
+        max_seq_len,
+        ctx.model.config.num_attention_heads,
+        ctx.model.config.num_key_value_heads,
+        ctx.model.config.num_hidden_layers,
+        args.h2o_tracked_layers(),
+        args.h2o_decay(),
     );
     acc.set_active(true);
-    acc.set_time_normalize(!args.h2o_raw_scores);
+    acc.set_time_normalize(!args.h2o_raw_scores());
 
     // GPU-side accumulator init (OpenCL only)
     #[cfg(feature = "opencl")]
-    if let Some(ocl_be) = args
+    if let Some(ocl_be) = ctx
         .backend
         .as_any()
         .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
     {
         let _ = ocl_be.init_gpu_score_acc(
-            args.model.config.num_hidden_layers,
-            args.model.config.num_attention_heads,
-            args.model.config.num_key_value_heads,
-            args.max_seq_len,
-            args.h2o_decay,
+            ctx.model.config.num_hidden_layers,
+            ctx.model.config.num_attention_heads,
+            ctx.model.config.num_key_value_heads,
+            max_seq_len,
+            args.h2o_decay(),
         );
         if let Some(gpu_acc) = ocl_be.gpu_score_acc_mut() {
             gpu_acc.set_active(true);
         }
     }
 
-    Ok((
-        Some(cache_manager),
-        Some(acc),
-        score_based,
-        args.eviction_policy.clone(),
-    ))
+    Ok((Some(cache_manager), Some(acc), score_based, eviction_policy))
 }
 
 #[cfg(test)]

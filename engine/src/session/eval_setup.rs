@@ -624,7 +624,7 @@ pub fn build_dump_importance_ctx(args: Args) -> Result<DumpImportanceCtx> {
 /// legacy generate.rs:274-369 재현. `EvalLlRunCtx` 를 경유하지 않고
 /// `run_eval_ll_generic` 을 KiviHook + `Vec<KiviCache>` 로 직접 호출한다.
 /// `caps.get::<dyn QuantAttnBackend>()` 를 closure 밖에서 1회 pull —
-/// chat 의 `build_chat_kivi`(session/chat/session.rs:412) thread-through 미러.
+/// chat 의 `build_chat_kivi_forward`(session/chat/session.rs, KvModeReg.build) thread-through 미러.
 ///
 /// 빌드부터 run 까지 한 함수에 둔다 (KIVI 는 ctx struct 표면이 없음).
 pub fn run_eval_ll_kivi(args: Args) -> Result<()> {

@@ -332,8 +332,9 @@ mod test_chat_session_multi_turn;
 #[path = "spec/test_chat_repl_v2_multi_turn.rs"]
 mod test_chat_repl_v2_multi_turn;
 
-// ── S-subcmd C4: --kv-mode subcommand (KvMode + KvModeArgs + effective_kv_mode) ──
-// KvMode ValueEnum 파싱, KvModeArgs flatten, legacy --kivi/--kv-offload shim.
+// ── --kv-mode (FORMAT-axis mode/knob declaration) ──
+// `--kv-mode` String parsing + KvModeArgs flatten; resolves against the engine
+// KV-mode registry (no closed ValueEnum). `--kv-mode kivi` still parses + resolves.
 #[path = "spec/test_kv_mode_args.rs"]
 mod test_kv_mode_args;
 

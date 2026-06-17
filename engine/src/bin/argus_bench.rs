@@ -17,9 +17,22 @@
 
 use anyhow::bail;
 use argus_engine::session::bin_setup::{build_inference_ctx, build_kivi_bench_ctx};
-use argus_engine::session::cli::{Args, KvMode};
+use argus_engine::session::cli::Args;
 use argus_engine::session::experiment_run::{run_experiment_path, run_kivi_experiment_path};
+use argus_engine::session::mode::{mode_caps, resolve_kv_mode_checked};
 use clap::Parser;
+
+/// Whether the requested `--kv-mode` runs a quantized-KV pipeline (reads declared
+/// `ModeCaps` — no concrete-technique name). Replaces `matches!(.., KvMode::Kivi)`.
+fn is_quantized_kv_mode(args: &Args) -> bool {
+    mode_caps(args.effective_kv_mode()).is_some_and(|c| c.is_quantized_kv)
+}
+
+/// Whether the requested `--kv-mode` owns an offload cache container. Replaces
+/// `matches!(.., KvMode::Offload)`.
+fn is_offload_mode(args: &Args) -> bool {
+    mode_caps(args.effective_kv_mode()).is_some_and(|c| c.supports_offload)
+}
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -30,6 +43,12 @@ fn main() -> anyhow::Result<()> {
 
     // resilience default-on. `--no-resilience` 명시 시 effective=false.
     args.enable_resilience = !args.no_resilience;
+
+    // FORMAT-axis Phase 1: fail-fast on an unknown `--kv-mode` name. `KvMode` is now a
+    // free `String`, so clap no longer rejects a typo at parse time — restore that via
+    // the shared registry funnel (same one chat/eval use), else a typo'd mode would
+    // silently fall through to the standard pipeline.
+    resolve_kv_mode_checked(args.effective_kv_mode())?;
 
     reject_unsupported_modes_ab0(&args)?;
 
@@ -49,9 +68,10 @@ fn main() -> anyhow::Result<()> {
         bail!("argus-bench: --num-tokens must be >= 1");
     }
 
-    // AB-2: KIVI dynamic-quant 분기. `--kv-mode kivi` 또는 `--kv-dynamic-quant`(orphan flag
-    // 재배선) 진입 시 KiviForward + KiviQuantStage 경로. Standard 는 ModelForward 경로.
-    if matches!(args.effective_kv_mode(), KvMode::Kivi) || args.kv_dynamic_quant {
+    // AB-2: quantized-KV dynamic-quant 분기. quantized-KV mode(`ModeCaps.is_quantized_kv`)
+    // 또는 `--kv-dynamic-quant`(orphan flag 재배선) 진입 시 KiviForward + KiviQuantStage 경로.
+    // 비양자화(Standard)는 ModelForward 경로. `--kv-dynamic-quant` 는 mode 가 아니므로 명시적 OR.
+    if is_quantized_kv_mode(&args) || args.kv_dynamic_quant {
         let ctx = build_kivi_bench_ctx(args)?;
         return run_kivi_experiment_path(ctx);
     }
@@ -106,8 +126,8 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
             "argus-bench AB-0: --qcf-dump moved to argus-eval (--qcf-dump with --eval-ll or --ppl)"
         );
     }
-    // AB-2: --kv-mode kivi 해제 (KiviForward + KiviQuantStage 배선 완료). Offload(AB-3)는 bail 유지.
-    if matches!(args.effective_kv_mode(), KvMode::Offload) {
+    // AB-2: quantized-KV mode 해제 (KiviForward + KiviQuantStage 배선 완료). Offload(AB-3)는 bail 유지.
+    if is_offload_mode(args) {
         bail!("argus-bench AB-3: --kv-mode Offload lands in AB-3");
     }
     // AB-6: `--secondary-gguf` 해제 — SwapWeights runtime directive 경로의 secondary 공급원

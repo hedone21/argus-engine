@@ -6,7 +6,7 @@ pub mod kv_mode;
 pub use eviction::{
     D2oArgs, EvictionCmd, EvictionCommonArgs, H2oArgs, SlidingArgs, StreamingArgs, TopLevelCmd,
 };
-pub use kv_mode::{KvMode, KvModeArgs};
+pub use kv_mode::KvModeArgs;
 
 /// `--secondary-dtype` CLI 인수 값 (D-3, ENG-ALG-225).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1334,9 +1334,11 @@ impl Args {
         }
     }
 
-    /// KV mode (단순 reader — legacy fallback 제거됨, 옵션 C 완료).
-    pub fn effective_kv_mode(&self) -> KvMode {
-        self.kv_mode_args.kv_mode
+    /// KV mode name (runtime string — resolved against the engine KV-mode registry
+    /// `KV_MODES` at the build funnel, not a closed clap enum). Mirrors
+    /// `eviction_policy() -> &str`.
+    pub fn effective_kv_mode(&self) -> &str {
+        &self.kv_mode_args.kv_mode
     }
 
     /// 선택적 KV read stage 이름. 미지정 = None(full read).
@@ -1346,19 +1348,24 @@ impl Args {
 
     /// KIVI quantization bits.
     pub fn effective_kivi_bits(&self) -> u8 {
-        self.kv_mode_args.kv_kivi_bits
+        self.kv_mode_args.kivi_bits
     }
 
     /// KIVI residual buffer size.
     pub fn effective_kivi_residual_size(&self) -> usize {
-        self.kv_mode_args.kv_kivi_residual_len
+        self.kv_mode_args.kivi_residual_len
     }
 
-    /// Offload storage backend. Offload 모드가 아니면 빈 문자열.
+    /// Offload storage backend. Returns `""` unless the active mode owns an offload
+    /// cache container (`ModeCaps.supports_offload`) — reads the declared cap instead
+    /// of matching a concrete `KvMode::Offload`.
     pub fn effective_kv_offload_storage(&self) -> String {
-        match self.kv_mode_args.kv_mode {
-            KvMode::Offload => self.kv_mode_args.kv_offload_storage.clone(),
-            _ => String::new(),
+        if crate::session::mode::mode_caps(&self.kv_mode_args.kv_mode)
+            .is_some_and(|c| c.supports_offload)
+        {
+            self.kv_mode_args.kv_offload_storage.clone()
+        } else {
+            String::new()
         }
     }
 

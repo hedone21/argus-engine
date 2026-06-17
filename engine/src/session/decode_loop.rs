@@ -554,8 +554,16 @@ impl DecodeLoopBuilder<NoForward> {
 
     /// Supply the required Forward. Transitions to `HasForward` state.
     pub fn with_forward<T: Forward + 'static>(self, fwd: T) -> DecodeLoopBuilder<HasForward> {
+        self.with_forward_boxed(Box::new(fwd))
+    }
+
+    /// Supply an already-boxed Forward (`Box<dyn Forward>`). The KV-mode registry's
+    /// `build` fn-ptr returns a boxed forward (the concrete type is mode-private), so
+    /// the mode-agnostic chat assembly wires it through this seam. Transitions to
+    /// `HasForward` state.
+    pub fn with_forward_boxed(self, fwd: Box<dyn Forward>) -> DecodeLoopBuilder<HasForward> {
         DecodeLoopBuilder {
-            forward: HasForward(Box::new(fwd)),
+            forward: HasForward(fwd),
             cmd_source: self.cmd_source,
             sampler: self.sampler,
             stop_flag: self.stop_flag,

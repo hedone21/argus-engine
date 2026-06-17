@@ -1,26 +1,20 @@
-use clap::{Args, ValueEnum};
+use clap::Args;
 
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum KvMode {
-    #[default]
-    Standard,
-    Kivi,
-    Offload,
-}
-
-#[derive(Args, Debug, Clone, Default)]
+#[derive(Args, Debug, Clone)]
 pub struct KvModeArgs {
-    /// KV cache mode (default: standard)
-    #[arg(long, value_enum, default_value_t = KvMode::Standard)]
-    pub kv_mode: KvMode,
+    /// KV cache mode name. Resolved at runtime against the engine KV-mode registry
+    /// (`KV_MODES`). Built-ins: standard (default), kivi, offload. An unknown name
+    /// fails fast at the build funnel, listing the registered names.
+    #[arg(long, default_value = "standard")]
+    pub kv_mode: String,
 
     /// KIVI quantization bits (kv-mode=kivi 한정)
-    #[arg(long = "kv-kivi-bits", default_value_t = 2)]
-    pub kv_kivi_bits: u8,
+    #[arg(long = "kivi-bits", default_value_t = 2)]
+    pub kivi_bits: u8,
 
     /// KIVI residual buffer length (kv-mode=kivi 한정)
-    #[arg(long = "kv-kivi-residual-len", default_value_t = 128)]
-    pub kv_kivi_residual_len: usize,
+    #[arg(long = "kivi-residual-len", default_value_t = 128)]
+    pub kivi_residual_len: usize,
 
     /// Offload storage backend: raw | disk | mmap | tmpfs | ... (kv-mode=offload 한정)
     #[arg(long = "kv-offload-storage", default_value = "mmap")]
@@ -39,4 +33,22 @@ pub struct KvModeArgs {
     /// 활성 format 이 SelectiveRead 미지원이면 stderr 1회 경고 후 full read 폴백.
     #[arg(long = "read-stage")]
     pub read_stage: Option<String>,
+}
+
+/// Manual default mirroring the clap `default_value`s (the `--kv-mode` string
+/// defaults to `"standard"`, not `String::default()` = `""`). Used by any non-clap
+/// construction path (`Args` does not derive `Default`, but this keeps the struct
+/// self-consistent).
+impl Default for KvModeArgs {
+    fn default() -> Self {
+        Self {
+            kv_mode: "standard".to_string(),
+            kivi_bits: 2,
+            kivi_residual_len: 128,
+            kv_offload_storage: "mmap".to_string(),
+            kv_offload_path: String::new(),
+            kv_max_prefetch_depth: 128,
+            read_stage: None,
+        }
+    }
 }
