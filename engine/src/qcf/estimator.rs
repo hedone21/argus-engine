@@ -68,23 +68,12 @@ impl DegradationEstimator {
     ///
     /// Default slopes: all actions map 1:1 (slope=1.0).
     pub fn with_defaults(d_max: f32) -> Self {
-        // 곡선 키는 IPC estimates 키와 일치해야 한다 (qcf_runtime.rs
-        // estimates.insert 및 ENG-ALG-050 키 정렬 노트 참조). B안에서 live
-        // 미장착이라 동작 무변화이나, 키를 정렬해 두어 향후 캘리브레이션
-        // 장착 시 silent 미적용(키 불일치 → 곡선 fallback)을 방지한다.
-        let mut curves = HashMap::new();
-        curves.insert("kv.evict_h2o".to_string(), PiecewiseLinear::linear(1.0));
-        curves.insert("kv.evict_sliding".to_string(), PiecewiseLinear::linear(1.0));
-        curves.insert(
-            "kv.evict_streaming".to_string(),
-            PiecewiseLinear::linear(1.0),
-        );
-        curves.insert("kv.merge_d2o".to_string(), PiecewiseLinear::linear(1.0));
-        curves.insert("kv.quant_dynamic".to_string(), PiecewiseLinear::linear(1.0));
-        curves.insert("weight.skip".to_string(), PiecewiseLinear::linear(1.0));
-
+        // No seeded curves: a missing action key falls back to the identity
+        // `PiecewiseLinear::linear(1.0)` in `estimate`, so default behavior is unchanged. The engine
+        // no longer hardcodes any technique/action key here (those names belong to the plugins);
+        // calibration curves are loaded from JSON via `new` / `load`.
         Self {
-            curves,
+            curves: HashMap::new(),
             d_max,
             ema_alpha: 0.0,
             ema_corrections: HashMap::new(),

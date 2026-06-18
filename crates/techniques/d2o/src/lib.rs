@@ -26,8 +26,9 @@
 //! [`StageCtx::layer_idx`]/[`StageCtx::n_layers`].
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, MergeAxis, StageArgs,
-    StageCaps, StageCtx, StageParams, WeightedMerge,
+    EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, MergeAxis,
+    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
+    WeightedMerge,
 };
 use linkme::distributed_slice;
 use std::sync::Mutex;
@@ -494,6 +495,257 @@ static D2O: KVCacheStageReg = KVCacheStageReg {
         is_score_based: true,
         default_protected_prefix: 4,
     },
+};
+
+// ── QCF estimator (observer/score axis) ──────────────────────────
+
+/// One-shot warning when the D2O QCF simulator falls back to V-based nearest matching (K absent).
+static D2O_VFALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// L2 norm (QCF-simulator local; matches the engine's former `qcf_kv::l2_norm`).
+fn l2_norm(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// Index of the candidate with highest cosine similarity to `query`, plus that similarity. Ported
+/// verbatim from the engine's former `qcf_kv::find_nearest_cosine_with_sim` (per-head cosine, the
+/// D2O QCF simulator's nearest-neighbour rule — preserved across this extraction).
+fn find_nearest_cosine_with_sim(query: &[f32], candidates: &[Vec<f32>]) -> (usize, f32) {
+    let q_norm = l2_norm(query);
+    if q_norm < 1e-10 || candidates.is_empty() {
+        return (0, 0.0);
+    }
+    let mut best_idx = 0;
+    let mut best_sim = f32::NEG_INFINITY;
+    for (i, c) in candidates.iter().enumerate() {
+        let dot: f32 = query.iter().zip(c).map(|(a, b)| a * b).sum();
+        let c_norm = l2_norm(c);
+        let sim = if c_norm > 1e-10 {
+            dot / (q_norm * c_norm)
+        } else {
+            0.0
+        };
+        if sim > best_sim {
+            best_sim = sim;
+            best_idx = i;
+        }
+    }
+    (best_idx, best_sim)
+}
+
+/// D2O QCF retained set. **Decision #2 (re-baseline):** converges the estimate's retained set to the
+/// actuator `compute_d2o_plan`'s 3-partition clamp (`keep = target.max(prefix+2)`, `recent_start`
+/// floored at prefix, `actual_hh_budget` adjusted by the actual recent window) so the estimate matches
+/// actuation. This intentionally changes d2o's QCF numbers versus the old H2O-shaped retained set.
+fn d2o_qcf_retained(
+    importance: &[f32],
+    current_pos: usize,
+    target_len: usize,
+    keep_ratio: f32,
+    protected_prefix: usize,
+) -> Vec<usize> {
+    let prefix = protected_prefix.min(current_pos);
+    let keep = target_len.max(prefix + 2);
+    let available = keep.saturating_sub(prefix);
+    let hh_budget = (available as f32 * keep_ratio) as usize;
+    let recent_budget = available.saturating_sub(hh_budget);
+    let recent_start = current_pos.saturating_sub(recent_budget).max(prefix);
+    let actual_recent = current_pos - recent_start;
+    let actual_hh_budget = available.saturating_sub(actual_recent);
+
+    let mut token_scores: Vec<(usize, f32)> = (prefix..recent_start)
+        .map(|pos| (pos, importance.get(pos).copied().unwrap_or(0.0)))
+        .collect();
+    token_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let hh_positions = token_scores.iter().take(actual_hh_budget).map(|(p, _)| *p);
+
+    let mut retain_all: Vec<usize> = (0..prefix)
+        .chain(hh_positions)
+        .chain(recent_start..current_pos)
+        .collect();
+    retain_all.sort();
+    retain_all
+}
+
+/// Build D2O's per-head O_after: each evicted token additively merges into its cosine-nearest
+/// retained token (paper Eq.11, V-only augment, weights sum to 1), then redistribute by α over the
+/// retained set. Ported verbatim from the engine's former `qcf_kv::compute_o_d2o_merge` (per-head
+/// cosine, V-only, EMA-skip preserved); only the data access is via `EstimatorCtx`.
+#[allow(clippy::too_many_arguments)]
+fn compute_o_d2o_merge(
+    ctx: &dyn EstimatorCtx,
+    head: usize,
+    alpha: &[f32],
+    retained: &[usize],
+    current_pos: usize,
+    head_dim: usize,
+    merge_e: f32,
+    out: &mut [f32],
+) {
+    for x in out.iter_mut() {
+        *x = 0.0;
+    }
+    if retained.is_empty() {
+        return;
+    }
+
+    // 1. Evicted tokens.
+    let retained_set: std::collections::HashSet<usize> = retained.iter().copied().collect();
+    let evicted: Vec<usize> = (0..current_pos)
+        .filter(|t| !retained_set.contains(t))
+        .collect();
+
+    // Nearest-neighbour source = K (per head) when available, else V fallback (one-time warning),
+    // matching the former simulator's `k_source` handling.
+    let mut probe = vec![0.0f32; head_dim];
+    let use_k = ctx.read_k(head, retained[0], &mut probe);
+    if !use_k && !D2O_VFALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[QCF] D2O simulator: k_source unavailable, falling back to V-based nearest matching."
+        );
+    }
+    let read_nn = |pos: usize, buf: &mut [f32]| {
+        if use_k {
+            ctx.read_k(head, pos, buf);
+        } else {
+            ctx.read_v(head, pos, buf);
+        }
+    };
+
+    // 2. NN vectors (K or V) for retained tokens — the candidate set.
+    let nn_retained: Vec<Vec<f32>> = retained
+        .iter()
+        .map(|&t| {
+            let mut b = vec![0.0f32; head_dim];
+            read_nn(t, &mut b);
+            b
+        })
+        .collect();
+
+    // 3. Original V of retained tokens (V is what the simulator augments).
+    let mut v_merged: Vec<Vec<f32>> = retained
+        .iter()
+        .map(|&t| {
+            let mut b = vec![0.0f32; head_dim];
+            ctx.read_v(head, t, &mut b);
+            b
+        })
+        .collect();
+
+    // 4. Group evicted tokens by nearest retained index, recording cosine similarity (Eq.8 m_ij).
+    let mut groups: std::collections::HashMap<usize, Vec<(usize, f32)>> =
+        std::collections::HashMap::new();
+    let mut q = vec![0.0f32; head_dim];
+    for &e in &evicted {
+        read_nn(e, &mut q);
+        let (nearest_idx, sim) = find_nearest_cosine_with_sim(&q, &nn_retained);
+        groups.entry(nearest_idx).or_default().push((e, sim));
+    }
+
+    // 5. Per-group Eq.11 weighted merge: V_c <- w_c·V_c + Σ w_ei·V_ei.
+    let mut v_e = vec![0.0f32; head_dim];
+    for (&retained_idx, group) in &groups {
+        let exps: Vec<f32> = group
+            .iter()
+            .map(|&(_, sim)| sim.clamp(-10.0, 10.0).exp())
+            .collect();
+        let sum_exp: f32 = exps.iter().sum();
+        let denom = sum_exp + merge_e;
+        if denom <= 0.0 {
+            continue;
+        }
+        let inv_denom = 1.0 / denom;
+        let w_c = merge_e * inv_denom;
+        for v in v_merged[retained_idx].iter_mut() {
+            *v *= w_c;
+        }
+        for (i, &(e_pos, _)) in group.iter().enumerate() {
+            let w_e = exps[i] * inv_denom;
+            ctx.read_v(head, e_pos, &mut v_e);
+            for (v, &ve) in v_merged[retained_idx].iter_mut().zip(v_e.iter()) {
+                *v += w_e * ve;
+            }
+        }
+    }
+
+    // 6. O_after = Σ_{c∈R} (α_c / Σα) · V_c^merged (softmax redistribution).
+    let alpha_sum: f32 = retained.iter().map(|&t| alpha[t]).sum();
+    if alpha_sum <= 0.0 {
+        return;
+    }
+    for (i, &t) in retained.iter().enumerate() {
+        let w = alpha[t] / alpha_sum;
+        for d in 0..head_dim {
+            out[d] += w * v_merged[i][d];
+        }
+    }
+}
+
+/// D2O QCF estimator. Per-head cosine / V-only / EMA-skip are preserved from the former engine
+/// simulator; the retained set converges to the actuator plan() (decision #2, re-baseline). `merge_e`
+/// / `keep_ratio` / `protected_prefix` come from the same [`D2OConfig::from_args`] as the actuator.
+struct D2oEstimator {
+    keep_ratio: f32,
+    protected_prefix: usize,
+    merge_e: f32,
+}
+
+impl QcfEstimator for D2oEstimator {
+    fn name(&self) -> &str {
+        "d2o"
+    }
+    fn curve_key(&self) -> &'static str {
+        "kv.merge_d2o"
+    }
+    fn o_after(&self, ctx: &dyn EstimatorCtx, kv_head: usize, out: &mut [f32]) -> bool {
+        let current = ctx.current_pos();
+        let target = ctx.target_len();
+        let head_dim = ctx.head_dim();
+        let prefix = self.protected_prefix.min(current);
+        let keep = target.max(prefix + 2);
+        if current <= keep {
+            return false;
+        }
+        let mut alpha = vec![0.0f32; current];
+        ctx.alpha_h(kv_head, &mut alpha);
+        let retained = d2o_qcf_retained(
+            &alpha,
+            current,
+            target,
+            self.keep_ratio,
+            self.protected_prefix,
+        );
+        compute_o_d2o_merge(
+            ctx,
+            kv_head,
+            &alpha,
+            &retained,
+            current,
+            head_dim,
+            self.merge_e,
+            out,
+        );
+        true
+    }
+}
+
+/// Registration — found via `find_qcf_estimator("d2o")`. Built through [`D2OConfig::from_args`] so
+/// config has a single source shared with the actuator. Score-based; needs no streaming config.
+#[distributed_slice(QCF_ESTIMATORS)]
+static D2O_QCF: QcfEstimatorReg = QcfEstimatorReg {
+    name: "d2o",
+    curve_key: "kv.merge_d2o",
+    make: |p: StageParams, args: StageArgs<'_>| {
+        let c = D2OConfig::from_args(p, args);
+        Box::new(D2oEstimator {
+            keep_ratio: c.keep_ratio,
+            protected_prefix: c.protected_prefix,
+            merge_e: c.merge_e,
+        })
+    },
+    requires_scores: true,
+    requires_streaming_config: false,
 };
 
 #[cfg(test)]

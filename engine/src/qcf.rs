@@ -33,10 +33,7 @@ pub use layer_aggregation::{
     LayerAggregationMode, aggregate_layers, compute_auto_sample_layers, compute_c1, compute_d7,
 };
 pub use layer_importance::{ImportanceCollector, ImportanceTable};
-pub use qcf_kv::{
-    QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv, identify_retained_for_action,
-    identify_retained_h2o, identify_retained_sliding,
-};
+pub use qcf_kv::{QcfKvParams, VDataSource, compute_qcf_kv};
 pub use quant_qcf::{
     QuantFlushQcfComputer, compute_flush_aw_vopr, compute_flush_awqe, compute_flush_nmse,
     compute_flush_opr,
