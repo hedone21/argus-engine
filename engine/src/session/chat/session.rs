@@ -794,6 +794,7 @@ fn build_chat_eviction_internal(
     // (미공급 시 weight=0 → degenerate). attn-weight(last_attn) 정밀화는 Tier 2 deferred.
     let score_based = crate::kv::eviction::stage_registry::stage_is_score_based(&eviction_policy);
 
+    crate::inference::attention_scores::ensure_score_producers_registered()?;
     let mut acc = AttentionScoreAccumulator::new_gqa(
         max_seq_len,
         ctx.model.config.num_attention_heads,

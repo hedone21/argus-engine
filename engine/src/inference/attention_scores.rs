@@ -1,169 +1,117 @@
-// NEON-optimized score accumulation removed: scalar path is used for all
-// architectures. The NEON specialization produced incorrect results on ARM
-// (all-zero importance / NaN sum) while the performance difference was
-// negligible (~0.66ms). See git history for the removed neon_scores module.
+//! Forward-time attention-score accumulation — a thin delegating shell over a [`ScoreProducer`].
+//!
+//! The per-layer score-accumulation policy (per-layer MAX, GQA group averaging, the CAOTE last-layer
+//! overwrite, A2SF decay, cross-step SUM, time-normalization) was extracted into the `attn-score`
+//! technique crate (observer/score axis, EPIC 2 Stage C). `AttentionScoreAccumulator` keeps its exact
+//! public surface — so the decode driver's typed `Option<&mut AttentionScoreAccumulator>` param and
+//! every call site stay byte-untouched — and forwards each call to the registered producer. The
+//! engine core thus holds no concrete scoring arithmetic.
+//!
+//! (The former scalar/NEON inline accumulation lives in git history; the NEON specialization was
+//! removed earlier for producing incorrect results on ARM at negligible benefit.)
 
-/// Accumulates per-token attention importance scores across layers.
-///
-/// During decode, each layer's post-softmax attention weights are aggregated
-/// into a per-token importance score. H2O uses these scores to decide
-/// which tokens to keep vs evict.
+use argus_extension_api::{ScoreProducer, ScoreProducerParams, find_score_producer};
+
+/// Resolve the built-in [`ScoreProducer`] (`"attn_score"`) or panic with a force-link hint. The
+/// producer lives in the `attn-score` crate, force-linked in `kv::eviction::stage_registry`; a miss
+/// means a fat-LTO `--gc-sections` silent drop. Production paths call
+/// [`ensure_score_producers_registered`] first; this panic is the backstop for the sites that build
+/// an accumulator directly (eval / dump / tests). Mirrors `qcf::layer_importance::resolve_scorer`.
+fn resolve_score_producer(params: ScoreProducerParams) -> Box<dyn ScoreProducer> {
+    let reg = find_score_producer("attn_score").unwrap_or_else(|| {
+        panic!(
+            "ScoreProducer 'attn_score' not registered — suspect linkme fat-LTO --gc-sections silent \
+             drop of the attn-score crate (force-linked in kv::eviction::stage_registry)."
+        )
+    });
+    (reg.make)(params)
+}
+
+/// Assert the built-in `attn_score` [`ScoreProducer`] is registered — called once at each production
+/// score-accumulator construction site before any decode scoring. fat-LTO `--gc-sections` can
+/// silently drop the `attn-score` crate's `#[distributed_slice]` registration; without this guard a
+/// dropped producer would make `AttentionScoreAccumulator::new` panic deep in construction instead of
+/// failing fast with a clear error. Mirrors `qcf::layer_importance::ensure_layer_scorers_registered`.
+pub fn ensure_score_producers_registered() -> anyhow::Result<()> {
+    if find_score_producer("attn_score").is_none() {
+        anyhow::bail!(
+            "built-in ScoreProducer 'attn_score' not registered — suspect linkme fat-LTO \
+             --gc-sections silent drop of the attn-score crate (force-linked in \
+             kv::eviction::stage_registry)."
+        );
+    }
+    Ok(())
+}
+
+/// Accumulates per-token attention importance scores across layers, delegating the policy to a
+/// [`ScoreProducer`] plugin. The engine drives it with each layer's post-softmax attention weights;
+/// H2O (and the per-head stages) read the accumulated importance to decide which tokens to keep.
 pub struct AttentionScoreAccumulator {
-    /// Per-token cumulative importance scores, indexed by cache position.
-    /// Updated once per step via `end_step()`.
-    importance: Vec<f32>,
-    /// Per-token step-local importance buffer.
-    /// Within a single decode step, each layer's score is aggregated here
-    /// using MAX (per-layer independence), then flushed to `importance` in `end_step()`.
-    step_importance: Vec<f32>,
-    /// Maximum sequence length.
-    max_seq_len: usize,
-    /// Which layers to track. Empty means track all layers.
-    tracked_layers: Vec<usize>,
-    /// Exponential decay factor (0.0 = no decay, 1.0 = full decay).
-    decay: f32,
-    /// Whether accumulation is active.
-    active: bool,
-    // ── GQA-aware fields ──
-    /// Number of KV heads for GQA grouping. 0 = GQA mode disabled.
-    n_kv_heads: usize,
-    /// Per-KV-head cumulative importance: `[n_kv_heads * max_seq_len]`, row-major.
-    head_importance: Vec<f32>,
-    /// Per-KV-head step-local buffer (same layout).
-    head_step_importance: Vec<f32>,
-    // ── CAOTE fields ──
-    /// Last tracked layer's per-KV-head attention from the most recent decode step.
-    /// Layout: `[n_kv_heads * max_seq_len]`, row-major. Overwritten each layer
-    /// (not MAX), so after a decode step it holds the last tracked layer's values.
-    /// These are proper softmax-derived scores (sum ≈ 1.0 per head).
-    last_layer_head_attn: Vec<f32>,
-    // ── Time-normalization fields ──
-    /// Per-token count of steps in which this position was active.
-    step_count: Vec<u32>,
-    /// Time-normalized importance: `importance[t] / step_count[t]`.
-    /// Computed at each `end_step()` when `time_normalize` is enabled.
-    normalized: Vec<f32>,
-    /// If true, `importance_scores()` returns time-normalized values.
-    time_normalize: bool,
+    /// The registered score-production policy (`"attn_score"` by default). Owns all accumulation
+    /// state; this struct is a transparent forwarder preserving the engine-facing API.
+    producer: Box<dyn ScoreProducer>,
 }
 
 impl AttentionScoreAccumulator {
     pub fn new(
         max_seq_len: usize,
-        _n_heads: usize,
+        n_heads: usize,
         total_layers: usize,
         last_n_layers: usize,
         decay: f32,
     ) -> Self {
-        let tracked_layers = if last_n_layers == 0 || last_n_layers >= total_layers {
-            Vec::new()
-        } else {
-            ((total_layers - last_n_layers)..total_layers).collect()
-        };
-
         Self {
-            importance: vec![0.0; max_seq_len],
-            step_importance: vec![0.0; max_seq_len],
-            max_seq_len,
-            tracked_layers,
-            decay: decay.clamp(0.0, 1.0),
-            active: false,
-            n_kv_heads: 0,
-            head_importance: Vec::new(),
-            head_step_importance: Vec::new(),
-            last_layer_head_attn: Vec::new(),
-            step_count: vec![0; max_seq_len],
-            normalized: vec![0.0; max_seq_len],
-            time_normalize: false,
+            producer: resolve_score_producer(ScoreProducerParams {
+                max_seq_len,
+                n_heads,
+                n_kv_heads: 0,
+                total_layers,
+                last_n_layers,
+                decay,
+            }),
         }
     }
 
-    /// Create a GQA-aware accumulator that tracks per-KV-head importance.
-    ///
-    /// In addition to flat per-token importance (backward compatible),
-    /// maintains a 2D `[n_kv_heads, max_seq_len]` importance matrix where
-    /// Q-head scores are averaged within each GQA group.
+    /// Create a GQA-aware accumulator that tracks per-KV-head importance (and the CAOTE last-layer
+    /// attention) in addition to flat per-token importance.
     pub fn new_gqa(
         max_seq_len: usize,
-        _n_heads: usize,
+        n_heads: usize,
         n_kv_heads: usize,
         total_layers: usize,
         last_n_layers: usize,
         decay: f32,
     ) -> Self {
-        let tracked_layers = if last_n_layers == 0 || last_n_layers >= total_layers {
-            Vec::new()
-        } else {
-            ((total_layers - last_n_layers)..total_layers).collect()
-        };
-
-        let head_buf_size = n_kv_heads * max_seq_len;
         Self {
-            importance: vec![0.0; max_seq_len],
-            step_importance: vec![0.0; max_seq_len],
-            max_seq_len,
-            tracked_layers,
-            decay: decay.clamp(0.0, 1.0),
-            active: false,
-            n_kv_heads,
-            head_importance: vec![0.0; head_buf_size],
-            head_step_importance: vec![0.0; head_buf_size],
-            last_layer_head_attn: vec![0.0; head_buf_size],
-            step_count: vec![0; max_seq_len],
-            normalized: vec![0.0; max_seq_len],
-            time_normalize: false,
+            producer: resolve_score_producer(ScoreProducerParams {
+                max_seq_len,
+                n_heads,
+                n_kv_heads,
+                total_layers,
+                last_n_layers,
+                decay,
+            }),
         }
     }
 
-    /// Enable time-normalized scoring.
-    /// When enabled, `importance_scores()` returns `importance[t] / step_count[t]`
-    /// instead of raw cumulative scores, removing the time-in-cache bias.
+    /// Enable time-normalized scoring (`importance[t] / step_count[t]`).
     pub fn set_time_normalize(&mut self, enable: bool) {
-        self.time_normalize = enable;
+        self.producer.set_time_normalize(enable);
     }
 
     /// Returns whether this layer should be tracked.
     #[inline]
     pub fn should_track_layer(&self, layer_idx: usize) -> bool {
-        self.active && (self.tracked_layers.is_empty() || self.tracked_layers.contains(&layer_idx))
+        self.producer.should_track_layer(layer_idx)
     }
 
-    /// Called once per decode step before layer iteration.
-    /// Applies decay to cumulative importance and clears step-local buffer.
+    /// Called once per decode step before layer iteration (decay + clear step buffers).
     pub fn begin_step(&mut self) {
-        if !self.active {
-            return;
-        }
-        if self.decay > 0.0 {
-            let factor = 1.0 - self.decay;
-            for v in self.importance.iter_mut() {
-                *v *= factor;
-            }
-            for v in self.head_importance.iter_mut() {
-                *v *= factor;
-            }
-        }
-        self.step_importance.fill(0.0);
-        self.head_step_importance.fill(0.0);
-        self.last_layer_head_attn.fill(0.0);
+        self.producer.begin_step();
     }
 
-    /// Accumulate post-softmax attention scores from one layer.
-    ///
-    /// Uses per-layer MAX aggregation: for each token, the step-local importance
-    /// is the maximum across all layers (not sum). This ensures tokens critical
-    /// to ANY layer are preserved, matching the H2O paper's per-layer independence.
-    ///
-    /// Within a single layer, scores across query heads are summed first to get
-    /// a single per-token score for that layer.
-    ///
-    /// `scores`: flat buffer `[n_heads_q * stride]`, where stride >= cache_seq_len.
-    /// `stride`: distance between head score arrays.
-    /// `cache_seq_len`: number of valid token positions covered by this scores buffer.
-    /// `n_heads_q`: number of query heads.
-    /// `score_offset`: cache position of scores[t=0]. 0 for global attention; kv_start_pos
-    ///   for local (sliding-window) attention layers so that scores are mapped to the correct
-    ///   absolute cache positions.
+    /// Accumulate post-softmax attention scores from one layer (flat / non-GQA). See
+    /// [`ScoreProducer::accumulate_layer`].
     pub fn accumulate_layer(
         &mut self,
         scores: &[f32],
@@ -172,29 +120,11 @@ impl AttentionScoreAccumulator {
         n_heads_q: usize,
         score_offset: usize,
     ) {
-        let len = cache_seq_len.min(self.max_seq_len);
-
-        for t in 0..len {
-            let pos = score_offset + t;
-            if pos >= self.max_seq_len {
-                break;
-            }
-            let mut layer_score = 0.0f32;
-            for h in 0..n_heads_q {
-                layer_score += scores[h * stride + t];
-            }
-            self.step_importance[pos] = self.step_importance[pos].max(layer_score);
-        }
+        self.producer
+            .accumulate_layer(scores, stride, cache_seq_len, n_heads_q, score_offset);
     }
 
-    /// GQA-aware accumulation: in addition to flat per-token scores,
-    /// computes per-KV-head importance by averaging Q-head scores within
-    /// each GQA group.
-    ///
-    /// `scores`: flat buffer `[n_heads_q * stride]`.
-    /// `n_heads_q`: total query heads (must be divisible by `n_kv_heads`).
-    /// `score_offset`: cache position of scores[t=0]. 0 for global attention; kv_start_pos
-    ///   for local (sliding-window) attention layers.
+    /// GQA-aware accumulation. See [`ScoreProducer::accumulate_layer_gqa`].
     pub fn accumulate_layer_gqa(
         &mut self,
         scores: &[f32],
@@ -204,171 +134,65 @@ impl AttentionScoreAccumulator {
         n_kv_heads: usize,
         score_offset: usize,
     ) {
-        let len = cache_seq_len.min(self.max_seq_len);
-
-        let n_rep = n_heads_q / n_kv_heads;
-        let inv_rep = 1.0 / n_rep as f32;
-
-        for t in 0..len {
-            let pos = score_offset + t;
-            if pos >= self.max_seq_len {
-                break;
-            }
-            // Flat accumulation (backward compatible with H2O)
-            let mut layer_score = 0.0f32;
-            for h in 0..n_heads_q {
-                layer_score += scores[h * stride + t];
-            }
-            self.step_importance[pos] = self.step_importance[pos].max(layer_score);
-
-            // Per-KV-head: average Q-heads within each GQA group
-            for kv_h in 0..n_kv_heads {
-                let mut group_score = 0.0f32;
-                for r in 0..n_rep {
-                    group_score += scores[(kv_h * n_rep + r) * stride + t];
-                }
-                group_score *= inv_rep;
-                let idx = kv_h * self.max_seq_len + pos;
-                self.head_step_importance[idx] = self.head_step_importance[idx].max(group_score);
-                // CAOTE: overwrite (not MAX) to keep the last tracked layer's raw attention.
-                // NaN guard: softmax can produce NaN when all logits are -inf (e.g.
-                // masked tokens). f32::max() silently swallows NaN for the other
-                // accumulators, but direct assignment propagates it here.
-                self.last_layer_head_attn[idx] = if group_score.is_nan() {
-                    0.0
-                } else {
-                    group_score
-                };
-            }
-        }
+        self.producer.accumulate_layer_gqa(
+            scores,
+            stride,
+            cache_seq_len,
+            n_heads_q,
+            n_kv_heads,
+            score_offset,
+        );
     }
 
-    /// Called once per decode step after all layers have been processed.
-    /// Flushes step-local importance (per-layer MAX) into cumulative importance.
+    /// Called once per decode step after all layers (flush step-local MAX into cumulative importance).
     pub fn end_step(&mut self) {
-        if !self.active {
-            return;
-        }
-
-        for t in 0..self.max_seq_len {
-            let step_val = self.step_importance[t];
-            self.importance[t] += step_val;
-            // Track step count: increment for positions that were in cache this step
-            if step_val > 0.0 {
-                self.step_count[t] += 1;
-            }
-            // Compute time-normalized score
-            if self.time_normalize {
-                let count = self.step_count[t].max(1) as f32;
-                self.normalized[t] = self.importance[t] / count;
-            }
-        }
-        for (cum, &step) in self
-            .head_importance
-            .iter_mut()
-            .zip(self.head_step_importance.iter())
-        {
-            *cum += step;
-        }
+        self.producer.end_step();
     }
 
-    /// Get the importance scores slice.
-    /// When time-normalization is enabled, returns `importance[t] / step_count[t]`
-    /// (average per-step importance), removing the time-in-cache bias.
+    /// Get the importance scores slice (time-normalized if enabled, else raw cumulative).
     pub fn importance_scores(&self) -> &[f32] {
-        if self.time_normalize {
-            &self.normalized
-        } else {
-            &self.importance
-        }
+        self.producer.importance_scores()
     }
 
     /// Get raw cumulative scores regardless of normalization setting.
     pub fn raw_importance_scores(&self) -> &[f32] {
-        &self.importance
+        self.producer.raw_importance_scores()
     }
 
-    /// Import cumulative scores computed on GPU.
-    ///
-    /// Called after `GpuScoreAccumulator::sync_to_cpu()` to transfer GPU-accumulated
-    /// importance into this CPU-side accumulator. Overwrites (not adds to) the
-    /// current importance scores since the GPU accumulator already includes decay
-    /// and cumulative aggregation.
-    ///
-    /// `flat`: `[max_seq_len]` cumulative flat importance from GPU.
-    /// `head`: `[n_kv_heads * max_seq_len]` cumulative per-head importance from GPU.
+    /// Import cumulative scores computed on GPU (overwrites the CPU-side importance). See
+    /// [`ScoreProducer::import_gpu_scores`].
     pub fn import_gpu_scores(&mut self, flat: &[f32], head: &[f32]) {
-        let len = flat.len().min(self.importance.len());
-        self.importance[..len].copy_from_slice(&flat[..len]);
-
-        if self.n_kv_heads > 0 {
-            let head_len = head.len().min(self.head_importance.len());
-            self.head_importance[..head_len].copy_from_slice(&head[..head_len]);
-
-            // Also populate last_layer_head_attn from GPU head importance.
-            // On GPU backends, accumulate_layer_gqa() cannot read GPU-only
-            // score buffers, so last_layer_head_attn remains empty.
-            // Using cumulative head importance as a proxy provides reasonable
-            // QCF estimates (proportional to attention distribution).
-            let attn_len = head_len.min(self.last_layer_head_attn.len());
-            self.last_layer_head_attn[..attn_len].copy_from_slice(&head[..attn_len]);
-        }
-
-        // Recompute time-normalized scores if enabled
-        if self.time_normalize {
-            for t in 0..len {
-                let count = self.step_count[t].max(1) as f32;
-                self.normalized[t] = self.importance[t] / count;
-            }
-        }
+        self.producer.import_gpu_scores(flat, head);
     }
 
     /// Reset all accumulated scores (e.g., after eviction).
     pub fn reset(&mut self) {
-        self.importance.fill(0.0);
-        self.step_importance.fill(0.0);
-        self.head_importance.fill(0.0);
-        self.head_step_importance.fill(0.0);
-        self.last_layer_head_attn.fill(0.0);
-        self.step_count.fill(0);
-        self.normalized.fill(0.0);
+        self.producer.reset();
     }
 
     /// Activate accumulation.
     pub fn set_active(&mut self, active: bool) {
-        self.active = active;
+        self.producer.set_active(active);
     }
 
     pub fn is_active(&self) -> bool {
-        self.active
+        self.producer.is_active()
     }
 
-    /// Returns per-KV-head importance scores if GQA mode is active.
-    /// Layout: `[n_kv_heads * max_seq_len]`, row-major.
+    /// Returns per-KV-head importance scores if GQA mode is active. `[n_kv_heads * max_seq_len]`.
     pub fn head_importance_scores(&self) -> Option<&[f32]> {
-        if self.n_kv_heads > 0 {
-            Some(&self.head_importance)
-        } else {
-            None
-        }
+        self.producer.head_importance_scores()
     }
 
     /// Number of KV heads (0 = GQA mode disabled).
     pub fn n_kv_heads(&self) -> usize {
-        self.n_kv_heads
+        self.producer.n_kv_heads()
     }
 
-    /// Returns the last tracked layer's per-KV-head attention from the most
-    /// recent decode step, if GQA mode is active.
-    ///
-    /// Layout: `[n_kv_heads * max_seq_len]`, row-major.
-    /// Values are softmax-derived (sum ≈ 1.0 per head for active positions).
+    /// Returns the last tracked layer's per-KV-head attention from the most recent decode step, if
+    /// GQA mode is active. `[n_kv_heads * max_seq_len]`.
     pub fn last_step_head_attn(&self) -> Option<&[f32]> {
-        if self.n_kv_heads > 0 {
-            Some(&self.last_layer_head_attn)
-        } else {
-            None
-        }
+        self.producer.last_step_head_attn()
     }
 }
 
@@ -1596,375 +1420,5 @@ mod tests {
         assert!((imp[1] - 10.0).abs() < 1e-6); // 20/2
         assert!((imp[2] - 30.0).abs() < 1e-6); // 30/1
         assert!((imp[3] - 40.0).abs() < 1e-6); // 40/1
-    }
-
-    // ── NEON vectorization correctness tests ──
-    // These verify the NEON path (on aarch64) and scalar path (on x86) produce
-    // identical results by using sizes that exercise both the 4-wide main loop
-    // and the scalar tail.
-
-    /// Helper: scalar reference implementation of accumulate_layer.
-    fn accumulate_layer_scalar(
-        step_importance: &mut [f32],
-        scores: &[f32],
-        stride: usize,
-        len: usize,
-        n_heads_q: usize,
-        score_offset: usize,
-    ) {
-        for t in 0..len {
-            let pos = score_offset + t;
-            if pos >= step_importance.len() {
-                break;
-            }
-            let mut layer_score = 0.0f32;
-            for h in 0..n_heads_q {
-                layer_score += scores[h * stride + t];
-            }
-            step_importance[pos] = step_importance[pos].max(layer_score);
-        }
-    }
-
-    /// Helper: scalar reference implementation of accumulate_layer_gqa.
-    fn accumulate_layer_gqa_scalar(
-        step_importance: &mut [f32],
-        head_step_importance: &mut [f32],
-        last_layer_head_attn: &mut [f32],
-        scores: &[f32],
-        stride: usize,
-        len: usize,
-        n_heads_q: usize,
-        n_kv_heads: usize,
-        max_seq_len: usize,
-        score_offset: usize,
-    ) {
-        let n_rep = n_heads_q / n_kv_heads;
-        let inv_rep = 1.0 / n_rep as f32;
-        for t in 0..len {
-            let pos = score_offset + t;
-            if pos >= max_seq_len {
-                break;
-            }
-            let mut layer_score = 0.0f32;
-            for h in 0..n_heads_q {
-                layer_score += scores[h * stride + t];
-            }
-            step_importance[pos] = step_importance[pos].max(layer_score);
-
-            for kv_h in 0..n_kv_heads {
-                let mut group_score = 0.0f32;
-                for r in 0..n_rep {
-                    group_score += scores[(kv_h * n_rep + r) * stride + t];
-                }
-                group_score *= inv_rep;
-                let idx = kv_h * max_seq_len + pos;
-                head_step_importance[idx] = head_step_importance[idx].max(group_score);
-                last_layer_head_attn[idx] = group_score;
-            }
-        }
-    }
-
-    #[test]
-    fn test_accumulate_layer_vectorized_vs_scalar() {
-        // 13 tokens: exercises 3 full NEON iterations (12) + 1 scalar tail
-        let max_seq = 16;
-        let cache_seq = 13;
-        let n_heads_q = 8;
-        let stride = max_seq;
-
-        // Deterministic scores
-        let mut scores = vec![0.0f32; n_heads_q * stride];
-        for h in 0..n_heads_q {
-            for t in 0..cache_seq {
-                scores[h * stride + t] = ((h * 13 + t * 7 + 3) % 100) as f32 / 100.0;
-            }
-        }
-
-        // Scalar reference
-        let mut step_ref = vec![0.0f32; max_seq];
-        accumulate_layer_scalar(&mut step_ref, &scores, stride, cache_seq, n_heads_q, 0);
-
-        // Through the struct (uses NEON on aarch64, scalar on x86)
-        let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads_q, 1, 0, 0.0);
-        acc.set_active(true);
-        acc.begin_step();
-        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q, 0);
-
-        for t in 0..cache_seq {
-            assert!(
-                (acc.step_importance[t] - step_ref[t]).abs() < 1e-5,
-                "mismatch at t={}: got {}, expected {}",
-                t,
-                acc.step_importance[t],
-                step_ref[t]
-            );
-        }
-    }
-
-    #[test]
-    fn test_accumulate_layer_gqa_vectorized_vs_scalar() {
-        // 11 tokens: 2 full NEON iterations (8) + 3 scalar tail
-        let max_seq = 16;
-        let cache_seq = 11;
-        let n_heads_q = 32;
-        let n_kv_heads = 8;
-        let stride = max_seq;
-
-        let mut scores = vec![0.0f32; n_heads_q * stride];
-        for h in 0..n_heads_q {
-            for t in 0..cache_seq {
-                scores[h * stride + t] = ((h * 11 + t * 5 + 7) % 97) as f32 / 97.0;
-            }
-        }
-
-        // Scalar reference
-        let mut step_ref = vec![0.0f32; max_seq];
-        let mut head_step_ref = vec![0.0f32; n_kv_heads * max_seq];
-        let mut last_attn_ref = vec![0.0f32; n_kv_heads * max_seq];
-        accumulate_layer_gqa_scalar(
-            &mut step_ref,
-            &mut head_step_ref,
-            &mut last_attn_ref,
-            &scores,
-            stride,
-            cache_seq,
-            n_heads_q,
-            n_kv_heads,
-            max_seq,
-            0,
-        );
-
-        // Through the struct
-        let mut acc = AttentionScoreAccumulator::new_gqa(max_seq, n_heads_q, n_kv_heads, 1, 0, 0.0);
-        acc.set_active(true);
-        acc.begin_step();
-        acc.accumulate_layer_gqa(&scores, stride, cache_seq, n_heads_q, n_kv_heads, 0);
-
-        for t in 0..cache_seq {
-            assert!(
-                (acc.step_importance[t] - step_ref[t]).abs() < 1e-5,
-                "flat mismatch at t={}: got {}, expected {}",
-                t,
-                acc.step_importance[t],
-                step_ref[t]
-            );
-        }
-        for kv_h in 0..n_kv_heads {
-            for t in 0..cache_seq {
-                let idx = kv_h * max_seq + t;
-                assert!(
-                    (acc.head_step_importance[idx] - head_step_ref[idx]).abs() < 1e-5,
-                    "head_step mismatch kv_h={} t={}: got {}, expected {}",
-                    kv_h,
-                    t,
-                    acc.head_step_importance[idx],
-                    head_step_ref[idx]
-                );
-                assert!(
-                    (acc.last_layer_head_attn[idx] - last_attn_ref[idx]).abs() < 1e-5,
-                    "last_attn mismatch kv_h={} t={}: got {}, expected {}",
-                    kv_h,
-                    t,
-                    acc.last_layer_head_attn[idx],
-                    last_attn_ref[idx]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_end_step_vectorized_time_normalize() {
-        // 7 tokens: 1 full NEON iteration (4) + 3 scalar tail, with time normalization
-        let max_seq = 7;
-        let n_heads_q = 4;
-        let n_kv_heads = 2;
-
-        let mut acc = AttentionScoreAccumulator::new_gqa(max_seq, n_heads_q, n_kv_heads, 1, 0, 0.0);
-        acc.set_time_normalize(true);
-        acc.set_active(true);
-
-        // Step 1
-        acc.begin_step();
-        let mut scores1 = vec![0.0f32; n_heads_q * max_seq];
-        for h in 0..n_heads_q {
-            for t in 0..5 {
-                scores1[h * max_seq + t] = (t + 1) as f32 * 0.1 + h as f32 * 0.01;
-            }
-        }
-        acc.accumulate_layer_gqa(&scores1, max_seq, 5, n_heads_q, n_kv_heads, 0);
-        acc.end_step();
-
-        // Step 2
-        acc.begin_step();
-        let mut scores2 = vec![0.0f32; n_heads_q * max_seq];
-        for h in 0..n_heads_q {
-            for t in 0..7 {
-                scores2[h * max_seq + t] = (7 - t) as f32 * 0.15 + h as f32 * 0.02;
-            }
-        }
-        acc.accumulate_layer_gqa(&scores2, max_seq, 7, n_heads_q, n_kv_heads, 0);
-        acc.end_step();
-
-        // Verify: positions 0..5 have step_count=2, positions 5..7 have step_count=1
-        assert_eq!(acc.step_count[0], 2);
-        assert_eq!(acc.step_count[4], 2);
-        assert_eq!(acc.step_count[5], 1);
-        assert_eq!(acc.step_count[6], 1);
-
-        // Time-normalized scores should be importance / step_count
-        let imp = acc.importance_scores();
-        let raw = acc.raw_importance_scores();
-        for t in 0..max_seq {
-            let count = acc.step_count[t].max(1) as f32;
-            let expected = raw[t] / count;
-            assert!(
-                (imp[t] - expected).abs() < 1e-5,
-                "time_normalize mismatch at t={}: got {}, expected {}",
-                t,
-                imp[t],
-                expected,
-            );
-        }
-
-        // Head importance should be sum of head_step from both steps
-        let head_imp = acc.head_importance_scores().unwrap();
-        for i in 0..head_imp.len() {
-            assert!(head_imp[i].is_finite(), "head_imp[{}] not finite", i);
-        }
-    }
-
-    #[test]
-    fn test_accumulate_layer_exact_multiple_of_4() {
-        // 8 tokens: exactly 2 NEON iterations, no scalar tail
-        let max_seq = 8;
-        let cache_seq = 8;
-        let n_heads_q = 4;
-        let stride = max_seq;
-
-        let mut scores = vec![0.0f32; n_heads_q * stride];
-        for h in 0..n_heads_q {
-            for t in 0..cache_seq {
-                scores[h * stride + t] = (h as f32 + 1.0) * (t as f32 + 1.0) * 0.1;
-            }
-        }
-
-        let mut step_ref = vec![0.0f32; max_seq];
-        accumulate_layer_scalar(&mut step_ref, &scores, stride, cache_seq, n_heads_q, 0);
-
-        let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads_q, 1, 0, 0.0);
-        acc.set_active(true);
-        acc.begin_step();
-        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q, 0);
-
-        for t in 0..cache_seq {
-            assert!(
-                (acc.step_importance[t] - step_ref[t]).abs() < 1e-5,
-                "t={}: got {}, expected {}",
-                t,
-                acc.step_importance[t],
-                step_ref[t]
-            );
-        }
-    }
-
-    #[test]
-    fn test_accumulate_layer_fewer_than_4_tokens() {
-        // 3 tokens: no NEON iterations at all, pure scalar tail
-        let max_seq = 8;
-        let cache_seq = 3;
-        let n_heads_q = 2;
-        let stride = max_seq;
-
-        let scores = vec![
-            1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, // head 0
-            4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, // head 1
-        ];
-
-        let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads_q, 1, 0, 0.0);
-        acc.set_active(true);
-        acc.begin_step();
-        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q, 0);
-
-        // sum: [5.0, 7.0, 9.0]
-        assert!((acc.step_importance[0] - 5.0).abs() < 1e-6);
-        assert!((acc.step_importance[1] - 7.0).abs() < 1e-6);
-        assert!((acc.step_importance[2] - 9.0).abs() < 1e-6);
-    }
-
-    /// Verify that NaN scores in accumulate_layer_gqa are handled gracefully.
-    /// NaN in attention scores (from softmax on NaN Q*K^T) should not poison
-    /// head_step_importance or last_layer_head_attn — they should remain at
-    /// their prior values (or 0 if this is the first layer).
-    #[test]
-    fn test_accumulate_gqa_nan_scores_handled() {
-        let max_seq = 8;
-        let n_heads_q = 4;
-        let n_kv_heads = 2;
-        let mut acc = AttentionScoreAccumulator::new_gqa(max_seq, n_heads_q, n_kv_heads, 2, 0, 0.0);
-        acc.set_active(true);
-        acc.begin_step();
-
-        let stride = max_seq;
-        let cache_seq_len = 4;
-
-        // Layer 0: valid scores (softmax-like, sum to ~1.0 per head)
-        let mut scores_l0 = vec![0.0f32; n_heads_q * stride];
-        for h in 0..n_heads_q {
-            scores_l0[h * stride] = 0.4;
-            scores_l0[h * stride + 1] = 0.3;
-            scores_l0[h * stride + 2] = 0.2;
-            scores_l0[h * stride + 3] = 0.1;
-        }
-        acc.accumulate_layer_gqa(&scores_l0, stride, cache_seq_len, n_heads_q, n_kv_heads, 0);
-
-        // Verify layer 0 accumulated correctly
-        assert!(
-            acc.step_importance[0] > 0.0,
-            "flat step_importance[0] should be > 0 after L0"
-        );
-        let idx0 = 0usize; // kv_h=0, t=0 → 0 * max_seq = 0
-        assert!(
-            acc.head_step_importance[idx0] > 0.0,
-            "head_step_importance[0] should be > 0 after L0"
-        );
-        assert!(
-            acc.last_layer_head_attn[idx0] > 0.0,
-            "last_layer_head_attn[0] should be > 0 after L0"
-        );
-
-        // Layer 1: all NaN scores (simulates NaN cascade from Q*K^T)
-        let scores_l1 = vec![f32::NAN; n_heads_q * stride];
-        acc.accumulate_layer_gqa(&scores_l1, stride, cache_seq_len, n_heads_q, n_kv_heads, 0);
-
-        // After NaN layer: flat step_importance should retain L0 values (max(0.4*4, NaN) = 0.4*4)
-        // f32::max(valid, NaN) = valid (IEEE 754)
-        assert!(
-            acc.step_importance[0] > 0.0,
-            "flat step_importance[0] must survive NaN layer: got {}",
-            acc.step_importance[0]
-        );
-        // head_step_importance should retain L0 values (max(valid, NaN) = valid)
-        assert!(
-            acc.head_step_importance[idx0] > 0.0,
-            "head_step_importance[0] must survive NaN layer: got {}",
-            acc.head_step_importance[idx0]
-        );
-        // last_layer_head_attn: NaN guard → 0 (overwritten, not MAX)
-        assert_eq!(
-            acc.last_layer_head_attn[idx0], 0.0,
-            "last_layer_head_attn should be 0 after NaN layer (NaN guard)"
-        );
-
-        // end_step should flush correctly
-        acc.end_step();
-        assert!(
-            acc.importance[0] > 0.0,
-            "cumulative importance[0] should be > 0 after end_step"
-        );
-        let hi = acc.head_importance_scores().unwrap();
-        assert!(
-            hi[idx0] > 0.0,
-            "cumulative head_importance[0] should be > 0 after end_step"
-        );
     }
 }

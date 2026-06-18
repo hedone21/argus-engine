@@ -108,7 +108,7 @@ static CAOTE: KVCacheStageReg = KVCacheStageReg {
     // CAOTE weights its value-aware criticality by importance (a_i), so it is score-based; protect 4
     // attention sinks by default.
     caps: StageCaps {
-        is_score_based: true,
+        reads: &[argus_extension_api::TensorKind::Scores],
         default_protected_prefix: 4,
     },
 };

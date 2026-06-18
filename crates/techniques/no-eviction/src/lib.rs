@@ -73,7 +73,7 @@ mod tests {
     fn registers_into_slice_and_is_noop() {
         let reg = find_stage("none").expect("none registered in KV_CACHE_STAGES");
         assert_eq!(reg.name, "none");
-        assert!(!reg.caps.is_score_based);
+        assert!(reg.caps.reads.is_empty());
         let stage = (reg.make)(StageParams::default());
         assert_eq!(stage.name(), "none");
         // Even far over target, the plan is a no-op (None) — the cache is never pruned.

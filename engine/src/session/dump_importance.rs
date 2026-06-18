@@ -229,6 +229,7 @@ fn run_head_concentration_decode(
     // 실제 greedy는 별도로 측정 필요 없으므로 임의 시작 토큰(prompt 마지막 토큰)으로 대체.
     let mut next_token = *prompt_ids.last().unwrap_or(&1);
 
+    crate::inference::attention_scores::ensure_score_producers_registered()?;
     for step in 0..HEAD_CONC_DECODE_STEPS {
         let start_pos = prompt_len + step;
         if start_pos >= max_seq_len {

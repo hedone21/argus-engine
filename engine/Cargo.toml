@@ -94,6 +94,10 @@ d2o = { path = "../crates/techniques/d2o" }
 # Extracted from the engine core; non-optional + force-linked because `mean_pool` is the default
 # `--importance-formula`, so it must always be resolvable via `find_layer_scorer`.
 layer-importance = { path = "../crates/techniques/layer-importance" }
+# Attention-score producer (forward-time MAX/GQA/CAOTE/decay/SUM policy, observer/score axis Stage C).
+# Extracted from the engine core; non-optional + force-linked because `attn_score` is the default
+# scoring path, so it must always be resolvable via `find_score_producer`.
+attn-score = { path = "../crates/techniques/attn-score" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
