@@ -148,7 +148,7 @@ static H2O_PLUS: KVCacheStageReg = KVCacheStageReg {
     },
     // H2O+ ranks per-head heavy hitters by accumulated importance (score-based); protect 4 sinks.
     caps: StageCaps {
-        is_score_based: true,
+        reads: &[argus_extension_api::TensorKind::Scores],
         default_protected_prefix: 4,
     },
 };
@@ -229,7 +229,7 @@ mod tests {
     fn registers_with_score_based_caps() {
         let reg = find_stage("h2o_plus").expect("h2o_plus registered in KV_CACHE_STAGES");
         assert_eq!(reg.name, "h2o_plus");
-        assert!(reg.caps.is_score_based);
+        assert!(!reg.caps.reads.is_empty());
         assert_eq!(reg.caps.default_protected_prefix, 4);
     }
 

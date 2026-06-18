@@ -114,7 +114,7 @@ static H2O: KVCacheStageReg = KVCacheStageReg {
     make_with_args: |p: StageParams, _args| Box::new(H2o::new(p.keep_ratio, p.protected_prefix)),
     // H2O selects heavy hitters by accumulated importance (score-based); protect 4 sinks by default.
     caps: StageCaps {
-        is_score_based: true,
+        reads: &[argus_extension_api::TensorKind::Scores],
         default_protected_prefix: 4,
     },
 };

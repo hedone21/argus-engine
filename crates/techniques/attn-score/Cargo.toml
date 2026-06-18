@@ -1,0 +1,17 @@
+[package]
+name = "attn-score"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Attention-score producer technique crate — the forward-time score-accumulation policy (per-layer
+# MAX, GQA group averaging, the CAOTE last-layer overwrite, A2SF decay, cross-step SUM, time-norm).
+# Extracted from the engine core (the sliding-window/h2o/layer-importance precedent): depends only on
+# `argus-extension-api` + `linkme` (no engine reference = proof of additive extension cost).
+# Force-linked via one `use attn_score as _;`; the engine resolves it by name through
+# `find_score_producer`. `attn_score` is the default scoring path, so the crate is non-optional.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

@@ -395,6 +395,7 @@ pub fn build_eval_ll_ctx(args: Args) -> Result<EvalLlRunCtx> {
     )?;
 
     let cache_manager = build_eval_cache_manager(&args, &backend, actual_protected_prefix)?;
+    crate::inference::attention_scores::ensure_score_producers_registered()?;
     let score_accumulator = build_eval_score_accumulator(&args, &backend, &model, max_seq_len);
     let skip_config = build_eval_skip_config(&args, &model)?;
 
@@ -472,6 +473,7 @@ pub fn build_ppl_ctx(args: Args) -> Result<PplRunCtx> {
     )?;
 
     let cache_manager = build_eval_cache_manager(&args, &backend, actual_protected_prefix)?;
+    crate::inference::attention_scores::ensure_score_producers_registered()?;
     let score_accumulator = build_eval_score_accumulator(&args, &backend, &model, max_seq_len);
     let skip_config = build_eval_skip_config(&args, &model)?;
 
@@ -662,6 +664,7 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
         vec![0]
     };
     let kivi_score_acc = if args.enable_qcf_experimental {
+        crate::inference::attention_scores::ensure_score_producers_registered()?;
         let mut acc = AttentionScoreAccumulator::new_gqa(
             max_seq_len,
             model.config.num_attention_heads,

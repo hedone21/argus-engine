@@ -186,7 +186,7 @@ mod tests {
     fn registers_into_slice() {
         let reg = find_stage("sliding").expect("sliding registered in KV_CACHE_STAGES");
         assert_eq!(reg.name, "sliding");
-        assert!(!reg.caps.is_score_based, "sliding is score-free");
+        assert!(reg.caps.reads.is_empty(), "sliding is score-free");
     }
 
     #[test]

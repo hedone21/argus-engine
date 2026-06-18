@@ -130,6 +130,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         if crate::kv::eviction::stage_registry::stage_is_score_based(policy) {
             let n_layers = model.config.num_hidden_layers;
             let n_kv_heads = model.config.num_key_value_heads;
+            crate::inference::attention_scores::ensure_score_producers_registered()?;
             let n_heads = model.config.num_attention_heads;
             let mut acc = AttentionScoreAccumulator::new_gqa(
                 max_seq_len,
@@ -380,6 +381,7 @@ pub fn run_experiment_schedule_path(
         if crate::kv::eviction::stage_registry::stage_is_score_based(policy) {
             let n_layers = model.config.num_hidden_layers;
             let n_kv_heads = model.config.num_key_value_heads;
+            crate::inference::attention_scores::ensure_score_producers_registered()?;
             let n_heads = model.config.num_attention_heads;
             let mut acc = AttentionScoreAccumulator::new_gqa(
                 max_seq_len,

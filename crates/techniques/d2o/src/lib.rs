@@ -492,7 +492,7 @@ static D2O: KVCacheStageReg = KVCacheStageReg {
     make_with_args: |p: StageParams, args| Box::new(D2OStage::new(D2OConfig::from_args(p, args))),
     // D2O ranks tokens by accumulated importance (score-based); protect 4 attention sinks by default.
     caps: StageCaps {
-        is_score_based: true,
+        reads: &[argus_extension_api::TensorKind::Scores],
         default_protected_prefix: 4,
     },
 };

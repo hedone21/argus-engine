@@ -322,11 +322,14 @@ pub type StageArgs<'a> = &'a [PluginArg<'a>];
 /// tables, each consumer reads these caps generically through [`stage_caps`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StageCaps {
-    /// Whether `plan()` consumes [`StageCtx::importance`]. When `true` the engine wires an attention
-    /// score accumulator and routes per-token (and, for per-head stages, per-head) scores into the
-    /// stage; when `false` the stage is score-free (sliding/streaming/no-eviction). Replaces the
-    /// scattered `matches!(name, "h2o" | "h2o_plus" | "d2o" | "caote" | "rkv")` capability checks.
-    pub is_score_based: bool,
+    /// The score tensors `plan()` consumes ([`TensorKind`]). A **non-empty** list ⟺ the stage is
+    /// score-based: the engine wires an attention-score accumulator and routes per-token (and, for
+    /// per-head stages, per-head) scores into the stage. **Empty** (`&[]`) = score-free
+    /// (sliding/streaming/no-eviction). Replaces the former `is_score_based: bool` (read via
+    /// [`stage_caps`] as `!reads.is_empty()`) — the per-kind list lets the future buffer-allocation
+    /// handshake match a stage's `reads` against a [`ScoreProducer::produces`], instead of a single
+    /// flag. It also replaces the scattered `matches!(name, "h2o" | "d2o" | ...)` capability checks.
+    pub reads: &'static [TensorKind],
     /// The default `--protected-prefix` to apply when the user omits it. Score-based stages use `4`
     /// (attention sinks — protecting the whole prompt would defeat heavy-hitter selection); `0` means
     /// "no stage-declared default — the engine applies its own fallback" (sliding/streaming/none let
@@ -336,12 +339,12 @@ pub struct StageCaps {
 }
 
 impl StageCaps {
-    /// Score-free defaults — no importance, no stage-declared prefix (`{ false, 0 }`). Used by the
+    /// Score-free defaults — no reads, no stage-declared prefix (`{ &[], 0 }`). Used by the
     /// `register_kv_stage!` macro so macro-registered (and example) plugins compile unchanged: a
-    /// score-free LayerWide technique is the common case, and any stage that needs scores declares
-    /// `is_score_based: true` via a direct-literal [`KVCacheStageReg`].
+    /// score-free LayerWide technique is the common case, and any stage that needs scores declares a
+    /// non-empty `reads` via a direct-literal [`KVCacheStageReg`].
     pub const SCORE_FREE: StageCaps = StageCaps {
-        is_score_based: false,
+        reads: &[],
         default_protected_prefix: 0,
     };
 }
@@ -2348,6 +2351,146 @@ pub fn find_layer_scorer(name: &str) -> Option<&'static LayerScorerReg> {
 /// Names of all registered layer scorers (self-test / diagnostics).
 pub fn registered_layer_scorer_names() -> Vec<&'static str> {
     LAYER_SCORERS.iter().map(|r| r.name).collect()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Score-producer axis (observer/score axis, EPIC 2 Stage C)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Forward-time attention-score production. The engine's `AttentionScoreAccumulator` used to hold the
+// per-layer score-accumulation policy inline (per-layer MAX, GQA group averaging, the CAOTE
+// last-layer overwrite, A2SF decay, cross-step SUM, time-normalization). This axis hosts that policy
+// in a plugin, so the engine core holds no concrete scoring arithmetic — only a delegating shell that
+// preserves the typed `&mut AttentionScoreAccumulator` forward param and forwards each call.
+//
+// Static-linkme only (no cdylib C-ABI): the only consumer (the in-engine decode driver) is in-tree,
+// and every input/output is host `f32` (`scores: &[f32]`, `&[f32]` accessors), so a future cdylib
+// path stays open without breaking the surface. The GPU score path (`GpuScoreAccumulator` / the fused
+// flash-attn score write) is a separate repr(C) ABI gated to a later stage and is NOT this axis.
+
+/// Construction geometry for a [`ScoreProducer`], mirroring the engine accumulator's `new` / `new_gqa`
+/// signatures (the only POD a producer needs at build time). `n_kv_heads == 0` selects the flat
+/// (non-GQA) mode — per-token importance only; `n_kv_heads > 0` additionally tracks per-KV-head
+/// importance and the CAOTE last-layer attention. `time_normalize` is configured after construction
+/// via [`ScoreProducer::set_time_normalize`] (mirroring the engine's prior two-step setup).
+#[derive(Clone, Copy, Debug)]
+pub struct ScoreProducerParams {
+    /// Maximum sequence length (cache capacity); the length of the flat importance buffers.
+    pub max_seq_len: usize,
+    /// Total query heads (kept for parity with the engine's `new`; the built-in producer derives
+    /// per-step head counts from the `accumulate_layer*` arguments and does not read this).
+    pub n_heads: usize,
+    /// KV heads for GQA grouping. `0` = flat mode (no per-head / CAOTE buffers).
+    pub n_kv_heads: usize,
+    /// Total decoder layers (for the `last_n_layers` tracked-layer window).
+    pub total_layers: usize,
+    /// Track only the last N layers (`0` or `>= total_layers` = track all).
+    pub last_n_layers: usize,
+    /// A2SF exponential decay factor per step (`0.0` = no decay; clamped to `[0, 1]`).
+    pub decay: f32,
+}
+
+/// A forward-time attention-score producer: it owns the per-token (and, in GQA mode, per-KV-head)
+/// importance accumulation across a decode step and across steps. The engine drives it with the
+/// per-layer post-softmax scores via [`ScoreProducer::accumulate_layer`] /
+/// [`ScoreProducer::accumulate_layer_gqa`] between [`ScoreProducer::begin_step`] and
+/// [`ScoreProducer::end_step`]; eviction stages then read the accumulated importance. The engine's
+/// `AttentionScoreAccumulator` is a thin delegating shell over this trait — the arithmetic the engine
+/// core used to hold inline.
+pub trait ScoreProducer: Send + Sync {
+    /// Producer name (the registry key, e.g. `"attn_score"`).
+    fn name(&self) -> &str;
+    /// Which score tensors this producer makes available to consumers (the producer half of the
+    /// [`StageCaps::reads`] handshake). The built-in attention-score producer yields
+    /// [`TensorKind::Scores`].
+    fn produces(&self) -> &'static [TensorKind];
+
+    // ── lifecycle / config ──
+    /// Activate or deactivate accumulation. When inactive, `begin_step` / `end_step` are no-ops.
+    fn set_active(&mut self, active: bool);
+    /// Whether accumulation is currently active.
+    fn is_active(&self) -> bool;
+    /// Whether `layer` is within the tracked-layer window (and accumulation is active).
+    fn should_track_layer(&self, layer: usize) -> bool;
+    /// Enable time-normalized importance (`importance[t] / step_count[t]`).
+    fn set_time_normalize(&mut self, enable: bool);
+
+    // ── per-step driver ──
+    /// Begin a decode step: apply decay to cumulative importance and clear the step-local buffers.
+    fn begin_step(&mut self);
+    /// Accumulate one layer's flat per-token scores (non-GQA). `scores` is `[n_heads_q * stride]`;
+    /// per-token scores are summed across heads, then combined across layers with MAX. `score_offset`
+    /// is the cache position of `scores[t = 0]` (`0` global, `kv_start_pos` for sliding-window layers).
+    fn accumulate_layer(
+        &mut self,
+        scores: &[f32],
+        stride: usize,
+        cache_seq_len: usize,
+        n_heads_q: usize,
+        score_offset: usize,
+    );
+    /// GQA-aware accumulation: additionally averages Q-head scores within each KV group (per-KV-head
+    /// importance, MAX across layers) and overwrites the last tracked layer's per-KV-head attention
+    /// (CAOTE).
+    fn accumulate_layer_gqa(
+        &mut self,
+        scores: &[f32],
+        stride: usize,
+        cache_seq_len: usize,
+        n_heads_q: usize,
+        n_kv_heads: usize,
+        score_offset: usize,
+    );
+    /// End a decode step: flush the step-local per-layer-MAX importance into cumulative importance
+    /// (SUM across steps), update step counts, and recompute time-normalized scores if enabled.
+    fn end_step(&mut self);
+
+    // ── GPU bridge ──
+    /// Overwrite cumulative importance with GPU-accumulated scores (after a GPU score sync). `flat` is
+    /// `[max_seq_len]`; `head` is `[n_kv_heads * max_seq_len]` (used only in GQA mode).
+    fn import_gpu_scores(&mut self, flat: &[f32], head: &[f32]);
+    /// Reset all accumulated state (e.g. after eviction).
+    fn reset(&mut self);
+
+    // ── accessors ──
+    /// Per-token importance (time-normalized if enabled, else raw cumulative). `[max_seq_len]`.
+    fn importance_scores(&self) -> &[f32];
+    /// Raw cumulative per-token importance regardless of normalization. `[max_seq_len]`.
+    fn raw_importance_scores(&self) -> &[f32];
+    /// Per-KV-head cumulative importance `[n_kv_heads * max_seq_len]`, or `None` in flat mode.
+    fn head_importance_scores(&self) -> Option<&[f32]>;
+    /// Last tracked layer's per-KV-head attention from the most recent step (CAOTE input)
+    /// `[n_kv_heads * max_seq_len]`, or `None` in flat mode.
+    fn last_step_head_attn(&self) -> Option<&[f32]>;
+    /// Number of KV heads (`0` = flat mode).
+    fn n_kv_heads(&self) -> usize;
+}
+
+/// Registration entry for one score producer — a mirror of [`LayerScorerReg`], static-linkme only.
+pub struct ScoreProducerReg {
+    /// Producer name (the registry key). Unique within the slice.
+    pub name: &'static str,
+    /// The score tensors the producer makes available (mirrors [`ScoreProducer::produces`]); read off
+    /// the registration so the engine can plan the [`StageCaps::reads`] handshake before `make`.
+    pub produces: &'static [TensorKind],
+    /// Factory from the construction geometry.
+    pub make: fn(ScoreProducerParams) -> Box<dyn ScoreProducer>,
+}
+
+/// Global score-producer registration slice — the forward-time producer half of the observer/score
+/// axis (Stage C). The built-in attention-score producer registers via
+/// `#[distributed_slice(SCORE_PRODUCERS)]`.
+#[distributed_slice]
+pub static SCORE_PRODUCERS: [ScoreProducerReg] = [..];
+
+/// Find a registered score producer by name.
+pub fn find_score_producer(name: &str) -> Option<&'static ScoreProducerReg> {
+    SCORE_PRODUCERS.iter().find(|r| r.name == name)
+}
+
+/// Names of all registered score producers (self-test / diagnostics).
+pub fn registered_score_producer_names() -> Vec<&'static str> {
+    SCORE_PRODUCERS.iter().map(|r| r.name).collect()
 }
 
 #[cfg(test)]

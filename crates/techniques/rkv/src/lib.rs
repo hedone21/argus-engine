@@ -321,7 +321,7 @@ static RKV: KVCacheStageReg = KVCacheStageReg {
     // R-KV's fusion Z = λ·I − (1−λ)·R includes the importance term, so it is score-based; protect 4
     // attention sinks by default (same as the other score-based stages).
     caps: StageCaps {
-        is_score_based: true,
+        reads: &[argus_extension_api::TensorKind::Scores],
         default_protected_prefix: 4,
     },
 };
@@ -442,7 +442,7 @@ mod tests {
     fn registers_with_score_based_caps() {
         let reg = find_stage("rkv").expect("rkv registered in KV_CACHE_STAGES");
         assert_eq!(reg.name, "rkv");
-        assert!(reg.caps.is_score_based, "rkv fusion includes importance");
+        assert!(!reg.caps.reads.is_empty(), "rkv fusion includes importance");
         assert_eq!(reg.caps.default_protected_prefix, 4);
     }
 

@@ -68,6 +68,13 @@ use sliding_window as _;
 // default `--importance-formula`, so the crate is non-optional.
 use layer_importance as _;
 
+// Attention-score producer force-link (observer/score axis, EPIC 2 Stage C). The forward-time
+// score-accumulation policy (per-layer MAX / GQA averaging / CAOTE overwrite / A2SF decay / SUM /
+// time-norm) was extracted into the `attn-score` crate; this one line makes its
+// `#[distributed_slice(SCORE_PRODUCERS)]` registration visible to `find_score_producer` (same
+// fat-LTO --gc-sections rationale as above). `attn_score` is the default scoring path → non-optional.
+use attn_score as _;
+
 // R-KV measurement force-link (feature `rkv`). Extracted from the engine core into the `rkv`
 // technique crate (registers "rkv"); feature OFF = unlinked + `eviction rkv` subcommand absent.
 #[cfg(feature = "rkv")]
@@ -510,7 +517,7 @@ pub fn none_backed_policy() -> Box<dyn EvictionPolicy> {
 /// unregistered (incl. dynamic `.so` stages whose caps don't cross the ABI yet) → `false`.
 pub fn stage_is_score_based(name: &str) -> bool {
     argus_extension_api::stage_caps(name)
-        .map(|c| c.is_score_based)
+        .map(|c| !c.reads.is_empty())
         .unwrap_or(false)
 }
 
@@ -544,11 +551,12 @@ pub fn ensure_builtin_stages_registered() -> Result<()> {
                  stage_registry's #[distributed_slice] registration was not linked."
             );
         };
-        if caps.is_score_based != want_score_based {
+        let is_score_based = !caps.reads.is_empty();
+        if is_score_based != want_score_based {
             anyhow::bail!(
                 "built-in KVCacheStage '{name}' declares is_score_based={} but the engine expects {} \
                  — its StageCaps registration is wrong (would mis-route attention scores).",
-                caps.is_score_based,
+                is_score_based,
                 want_score_based
             );
         }
