@@ -188,6 +188,11 @@ pub fn run_qcf_warmup_workflow(
     use crate::qcf::ImportanceCollector;
     use crate::weight::WeightSwapDecider;
 
+    // Fail fast if the built-in LayerScorers were dropped by fat-LTO --gc-sections (observer/score
+    // axis, EPIC 2 Stage B) — a dropped `mean_pool` would otherwise silently degrade the default
+    // importance formula to the 1.0 placeholder. The collector below resolves the scorers by name.
+    crate::qcf::layer_importance::ensure_layer_scorers_registered()?;
+
     let QcfWarmupCtx {
         model,
         backend,

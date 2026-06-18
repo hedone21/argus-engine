@@ -2229,6 +2229,127 @@ pub fn redistribute_value(
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Layer-scorer axis (observer/score axis, EPIC 2 Stage B)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Per-layer importance scoring. The engine's ImportanceCollector used to hold every concrete
+// importance formula inline (mean-pool cosine, ShortGPT-BI per-token cosine), duplicating the
+// technique arithmetic in the engine core. This axis lets each formula live in a technique crate and
+// self-register, so the engine keeps only the streaming harness, the OPR telemetry, and the generic
+// per-layer ctx — no concrete scoring arithmetic.
+//
+// Static-linkme only (no cdylib C-ABI), exactly like the QcfEstimator axis above: every consumer (the
+// QCF warmup workflow / weight-swap decider feed) is in-engine, so there is no out-of-tree `.so` to
+// serve. A future cdylib path stays open — the scorer output is POD (`score` returns `f32` by value),
+// so it would not break the surface.
+//
+// Two lifecycles share the axis. PerLayerStreaming scorers (mean-pool / ShortGPT-BI) run inside the
+// prefill layer loop, one call per (layer, sublayer), over the current layer's activations.
+// OneShotPostWarmup scorers (the DP-LLM / DirectAttn weight-perturbation formulas, not yet migrated)
+// run once after warmup over all layers, reading cached per-layer means and weight subtensors. The
+// `LayerScorerCtx` carries accessors for both; an implementation populates only the half matching its
+// phase (a streaming ctx returns None/0 for the post-warmup accessors, and vice versa).
+
+/// When a [`LayerScorer`] is invoked — decides which [`LayerScorerCtx`] accessors it may rely on.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerScorerPhase {
+    /// Called once per (layer, sublayer) inside the prefill layer loop, over the current layer's
+    /// activations (pooled + raw in/out). Mean-pool and ShortGPT-BI are of this kind.
+    PerLayerStreaming,
+    /// Called once after warmup over all layers, reading cached per-layer means and weight subtensors
+    /// (DP-LLM / DirectAttn). Reserved for a later stage; no built-in scorer uses it yet.
+    OneShotPostWarmup,
+}
+
+/// Read-only per-layer context the engine lends to a [`LayerScorer`]. Every slice is host `f32`.
+///
+/// The accessors split by [`LayerScorerPhase`]:
+/// - **PerLayerStreaming** reads the current layer's activations: `dim`/`seq_len`, the mean-pooled
+///   `pooled_in`/`pooled_out` (`[dim]`), and the raw `raw_in`/`raw_out` (`[seq_len × dim]`).
+/// - **OneShotPostWarmup** reads `n_layers`, the cached `x_mean(layer)`, the F16/quantized weight
+///   `primary_subtensor`/`secondary_subtensor(layer, name)`, and `gqa()`.
+///
+/// A given implementation serves one phase; the other phase's accessors return `None`/`0`/empty.
+pub trait LayerScorerCtx {
+    /// Total decoder layers (OneShotPostWarmup scorers index `[0, n_layers)`). `0` for a streaming ctx.
+    fn n_layers(&self) -> usize;
+    /// Hidden dimension of the current layer's activations.
+    fn dim(&self) -> usize;
+    /// Sequence length of the current pass.
+    fn seq_len(&self) -> usize;
+
+    // ── PerLayerStreaming activations (current layer) ──
+    /// Mean-pooled input `[dim]` before the current layer. Always present for a streaming ctx.
+    fn pooled_in(&self) -> &[f32];
+    /// Mean-pooled output `[dim]` after the current layer. Always present for a streaming ctx.
+    fn pooled_out(&self) -> &[f32];
+    /// Raw input `[seq_len × dim]` before the current layer; `None` when not cached (single mode).
+    fn raw_in(&self) -> Option<&[f32]>;
+    /// Raw output `[seq_len × dim]` after the current layer. Always present for a streaming ctx.
+    fn raw_out(&self) -> &[f32];
+    /// `(before_seq_len, before_dim)` describing `raw_in`'s shape (may differ from `seq_len`/`dim`).
+    fn raw_in_dims(&self) -> (usize, usize);
+
+    // ── OneShotPostWarmup inputs (DP-LLM / DirectAttn) — None/0/empty for a streaming ctx ──
+    /// Cached mean-pooled input `[dim]` for `layer` (post-warmup). `None` for a streaming ctx.
+    fn x_mean(&self, layer: usize) -> Option<&[f32]>;
+    /// F16 weight subtensor `name` for `layer` as `(data, rows, cols)`. `None` if unavailable.
+    fn primary_subtensor(&self, layer: usize, name: &str) -> Option<(&[f32], usize, usize)>;
+    /// Quantized weight subtensor `name` for `layer` (dequantized to f32). `None` if unavailable.
+    fn secondary_subtensor(&self, layer: usize, name: &str) -> Option<(&[f32], usize, usize)>;
+    /// `(n_q_heads, n_kv_heads, head_dim)` GQA geometry for DirectAttn. `(0, 0, 0)` if unknown.
+    fn gqa(&self) -> (usize, usize, usize);
+}
+
+/// A per-layer importance scorer: given the [`LayerScorerCtx`], it produces one layer's importance as
+/// `f32` (higher = more important = costlier to skip). The engine owns the streaming harness, the
+/// per-layer ctx, OPR telemetry, and the `Σ importance` QCF metric; the scorer owns only the concrete
+/// formula — the arithmetic the engine core used to hold inline.
+pub trait LayerScorer: Send + Sync {
+    /// Scorer name (== the `ImportanceFormula::as_str()` selector key, e.g. `"mean_pool"`).
+    fn name(&self) -> &str;
+    /// Which lifecycle this scorer runs in (decides which ctx accessors it may read).
+    fn phase(&self) -> LayerScorerPhase;
+    /// Named weight subtensors the scorer reads (OneShotPostWarmup only) so the engine can pre-resolve
+    /// them to f32 before `score`. Empty for activation-only scorers (mean-pool / ShortGPT-BI).
+    fn reads_subtensors(&self) -> &'static [&'static str];
+    /// Score `layer` using `ctx`. PerLayerStreaming scorers ignore `layer` (the ctx already holds the
+    /// current layer's activations); OneShotPostWarmup scorers index `ctx` by `layer`.
+    fn score(&self, layer: usize, ctx: &dyn LayerScorerCtx) -> f32;
+}
+
+/// Registration entry for one layer scorer — a mirror of [`QcfEstimatorReg`], static-linkme only.
+/// `make` takes the same [`StageParams`] / [`StageArgs`] as the other technique factories (the
+/// built-in scorers ignore both).
+pub struct LayerScorerReg {
+    /// Scorer name (== the `ImportanceFormula::as_str()` selector key). Unique within the slice.
+    pub name: &'static str,
+    /// The lifecycle the scorer runs in.
+    pub phase: LayerScorerPhase,
+    /// Factory from the shared params plus the technique-private blob.
+    pub make: fn(StageParams, StageArgs<'_>) -> Box<dyn LayerScorer>,
+    /// Named weight subtensors the scorer reads (mirrors [`LayerScorer::reads_subtensors`]); the engine
+    /// reads this off the registration before `make` to plan subtensor pre-resolution.
+    pub reads_subtensors: &'static [&'static str],
+}
+
+/// Global layer-scorer registration slice — the producer half of the observer/score axis (Stage B).
+/// Each technique crate contributes its scorers via `#[distributed_slice(LAYER_SCORERS)]`.
+#[distributed_slice]
+pub static LAYER_SCORERS: [LayerScorerReg] = [..];
+
+/// Find a registered layer scorer by name.
+pub fn find_layer_scorer(name: &str) -> Option<&'static LayerScorerReg> {
+    LAYER_SCORERS.iter().find(|r| r.name == name)
+}
+
+/// Names of all registered layer scorers (self-test / diagnostics).
+pub fn registered_layer_scorer_names() -> Vec<&'static str> {
+    LAYER_SCORERS.iter().map(|r| r.name).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
