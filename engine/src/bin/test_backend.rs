@@ -4,10 +4,7 @@ use argus_engine::backend::cpu::CpuBackendAVX2;
 use argus_engine::backend::cpu::{CpuBackend, CpuBackendCommon};
 #[cfg(feature = "opencl")]
 use argus_engine::backend::opencl::OpenCLBackend;
-#[cfg(feature = "opencl")]
-use argus_engine::backend::opencl::get_cl_mem;
-use argus_engine::buffer::{Buffer, DType};
-use argus_engine::kv::quant_window_cache::QuantizedRecentWindowCache;
+use argus_engine::buffer::DType;
 use argus_engine::memory::Memory;
 use argus_engine::memory::galloc::Galloc;
 use argus_engine::quant::{BlockQ4_0, BlockQ4_1, QK4_0, QK4_1};
@@ -33,7 +30,6 @@ enum OpType {
     Softmax,
     RMSNorm,
     RoPE,
-    QuantWindowAttention,
 }
 
 impl std::fmt::Display for OpType {
@@ -60,12 +56,6 @@ fn main() -> anyhow::Result<()> {
     println!("=== LLM RS2 Backend Test Suite (Expanded) ===");
 
     let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
-    // Phase α-W-4 §3.3: OpenCL backend 의 KIVI native attention handle (R4: KIVI
-    // test 가 new_gpu 에 넘길 때 backend 와 동일 ocl 인스턴스의 clone).
-    #[cfg(feature = "opencl")]
-    let mut opencl_quant_attn_handle: Option<
-        Arc<dyn argus_engine::capability::quant_attn::QuantAttnBackend>,
-    > = None;
     for name in &args.backends {
         match name.to_lowercase().as_str() {
             "auto" | "cpu" => backends.push(Arc::new(CpuBackend::new())),
@@ -86,12 +76,7 @@ fn main() -> anyhow::Result<()> {
                 #[cfg(feature = "opencl")]
                 match OpenCLBackend::new() {
                     Ok(b) => {
-                        // Phase α-W-4 §3.3: KIVI native attention handle 을 동일 ocl
-                        // 인스턴스에서 파생해 보관 (R4: new_gpu 의 backend 인자와 같은
-                        // 객체). KIVI test 루프(아래)가 이 handle 을 new_gpu 에 전달.
                         let b = Arc::new(b);
-                        opencl_quant_attn_handle = Some(b.clone()
-                            as Arc<dyn argus_engine::capability::quant_attn::QuantAttnBackend>);
                         backends.push(b as Arc<dyn Backend>);
                     }
                     Err(e) => println!(
@@ -212,25 +197,6 @@ fn main() -> anyhow::Result<()> {
                     n,
                 );
             }
-        }
-    }
-
-    // KIVI Attention oracle tests (GPU-only)
-    for backend in &backends {
-        if backend.name() != "OpenCL" {
-            continue;
-        }
-        println!(
-            "\n--- Running KIVI Attention Oracle Tests for Backend: {} ---",
-            backend.name()
-        );
-        for bits in [2u8, 4, 8] {
-            run_quant_window_attention_test(
-                &mut all_results,
-                backend.clone(),
-                opencl_quant_attn_handle.clone(),
-                bits,
-            );
         }
     }
 
@@ -531,12 +497,6 @@ fn perform_matmul_test(
                 };
                 backend.rope_inplace(&mut r_gpu, 0, 10000.0)?;
             }
-            OpType::QuantWindowAttention => {
-                // KIVI tests are handled by run_quant_window_attention_test(), not here
-                return Err(anyhow::anyhow!(
-                    "KiviAttention not handled in perform_matmul_test"
-                ));
-            }
         }
         backend.synchronize()?;
     }
@@ -737,399 +697,4 @@ fn quantize_q4_1(data: &[f32], n: usize, k: usize) -> Vec<BlockQ4_1> {
         }
     }
     blocks
-}
-
-/// Simple deterministic PRNG for reproducible test data (xorshift32).
-fn xorshift32(state: &mut u32) -> f32 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    *state = x;
-    // Map to [-0.5, 0.5)
-    (x as f32 / u32::MAX as f32) - 0.5
-}
-
-/// Run a KIVI attention oracle test for a specific bit-width.
-///
-/// Creates identical CPU and GPU KiviCaches, fills with the same data
-/// (enough tokens to trigger multiple flushes), then compares:
-///   CPU: get_view() -> naive single-token attention
-///   GPU: attention_gen_kivi() native kernel
-fn run_quant_window_attention_test(
-    results: &mut Vec<TestResult>,
-    backend: Arc<dyn Backend>,
-    quant_attn: Option<Arc<dyn argus_engine::capability::quant_attn::QuantAttnBackend>>,
-    bits: u8,
-) {
-    let kv_heads: usize = 8;
-    let head_dim: usize = 64;
-    let n_heads_q: usize = 32; // GQA ratio = 4
-    let residual_size: usize = 32; // GROUP_SIZE = QKKV
-    let test_tokens: usize = 128; // 4 flushes
-    let max_seq_len: usize = 256;
-
-    let shape_str = format!("Q{}b h{} t{}", bits, kv_heads, test_tokens);
-
-    match perform_quant_window_attention_test(
-        backend.clone(),
-        quant_attn,
-        bits,
-        kv_heads,
-        head_dim,
-        n_heads_q,
-        residual_size,
-        test_tokens,
-        max_seq_len,
-    ) {
-        Ok((error, dur)) => {
-            // Q2 has much higher quantization error, use relaxed threshold
-            let threshold = match bits {
-                2 => 0.15,
-                4 => 0.08,
-                8 => 0.05,
-                _ => 0.05,
-            };
-            let status = if error > threshold { "FAIL" } else { "PASS" };
-            println!(
-                "  KIVI Q{} attention: {} (L2 error = {:.6}, threshold = {:.3})",
-                bits, status, error, threshold
-            );
-            results.push(TestResult {
-                op: OpType::QuantWindowAttention,
-                status: status.to_string(),
-                dtype: format!("Q{}", bits),
-                shape: shape_str,
-                backend: backend.name().to_string(),
-                duration: dur,
-                error,
-            });
-        }
-        Err(e) => {
-            eprintln!("  KIVI Q{} attention: ERROR — {}", bits, e);
-            results.push(TestResult {
-                op: OpType::QuantWindowAttention,
-                status: "ERROR".to_string(),
-                dtype: format!("Q{}", bits),
-                shape: shape_str,
-                backend: backend.name().to_string(),
-                duration: Duration::from_secs(0),
-                error: -1.0,
-            });
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn perform_quant_window_attention_test(
-    backend: Arc<dyn Backend>,
-    quant_attn: Option<Arc<dyn argus_engine::capability::quant_attn::QuantAttnBackend>>,
-    bits: u8,
-    kv_heads: usize,
-    head_dim: usize,
-    n_heads_q: usize,
-    residual_size: usize,
-    test_tokens: usize,
-    max_seq_len: usize,
-) -> anyhow::Result<(f32, Duration)> {
-    #[cfg(not(feature = "opencl"))]
-    {
-        let _ = (
-            backend,
-            quant_attn,
-            bits,
-            kv_heads,
-            head_dim,
-            n_heads_q,
-            residual_size,
-            test_tokens,
-            max_seq_len,
-        );
-        anyhow::bail!("OpenCL feature not enabled");
-    }
-
-    #[cfg(feature = "opencl")]
-    {
-        let ocl = backend
-            .as_any()
-            .downcast_ref::<OpenCLBackend>()
-            .ok_or_else(|| anyhow::anyhow!("Backend is not OpenCL"))?;
-
-        // Check if kernel is available
-        if !ocl.has_kivi_attn_kernel(bits) {
-            anyhow::bail!(
-                "KIVI Q{} attention kernel not available on this device",
-                bits
-            );
-        }
-
-        // Create GPU memory allocator
-        let gpu_memory: Arc<dyn Memory> =
-            Arc::new(argus_engine::backend::opencl::memory::OpenCLMemory::new(
-                ocl.context.clone(),
-                ocl.queue.clone(),
-                false, // device-only buffers
-            ));
-
-        // === Create CPU and GPU caches ===
-        let mut cpu_cache = QuantizedRecentWindowCache::new_with_bits(
-            kv_heads,
-            head_dim,
-            max_seq_len,
-            residual_size,
-            bits,
-        );
-        let mut gpu_cache = QuantizedRecentWindowCache::new_gpu(
-            kv_heads,
-            head_dim,
-            max_seq_len,
-            residual_size,
-            bits,
-            backend.clone(),
-            quant_attn,
-            gpu_memory.clone(),
-        );
-        assert!(gpu_cache.is_gpu(), "GPU cache creation failed");
-
-        // === Generate deterministic test data and fill both caches ===
-        let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-        let mut rng_state: u32 = 42;
-
-        for t in 0..test_tokens {
-            // Generate one token of K/V data: [1, 1, kv_heads, head_dim]
-            let n_elems = kv_heads * head_dim;
-            let mut k_data = vec![0.0f32; n_elems];
-            let mut v_data = vec![0.0f32; n_elems];
-            for i in 0..n_elems {
-                k_data[i] = xorshift32(&mut rng_state) * 0.5;
-                v_data[i] = xorshift32(&mut rng_state) * 0.5;
-            }
-
-            // CPU tensor (for CPU cache update)
-            let cpu_k_buf = Arc::new(argus_engine::memory::host::shared::SharedBuffer::new(
-                n_elems * 4,
-                DType::F32,
-            ));
-            let cpu_v_buf = Arc::new(argus_engine::memory::host::shared::SharedBuffer::new(
-                n_elems * 4,
-                DType::F32,
-            ));
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    k_data.as_ptr(),
-                    cpu_k_buf.as_mut_ptr() as *mut f32,
-                    n_elems,
-                );
-                std::ptr::copy_nonoverlapping(
-                    v_data.as_ptr(),
-                    cpu_v_buf.as_mut_ptr() as *mut f32,
-                    n_elems,
-                );
-            }
-            let cpu_k = Tensor::new(
-                Shape::new(vec![1, 1, kv_heads, head_dim]),
-                cpu_k_buf,
-                cpu_backend.clone(),
-            );
-            let cpu_v = Tensor::new(
-                Shape::new(vec![1, 1, kv_heads, head_dim]),
-                cpu_v_buf,
-                cpu_backend.clone(),
-            );
-            cpu_cache.update(&cpu_k, &cpu_v)?;
-
-            // GPU tensor (for GPU cache update)
-            let gpu_k_buf = gpu_memory.alloc(n_elems * 4, DType::F32)?;
-            let gpu_v_buf = gpu_memory.alloc(n_elems * 4, DType::F32)?;
-            let mut gpu_k_t = Tensor::new(
-                Shape::new(vec![1, 1, kv_heads, head_dim]),
-                gpu_k_buf,
-                backend.clone(),
-            );
-            let mut gpu_v_t = Tensor::new(
-                Shape::new(vec![1, 1, kv_heads, head_dim]),
-                gpu_v_buf,
-                backend.clone(),
-            );
-            // Write data to GPU buffers
-            backend.write_buffer(&mut gpu_k_t, unsafe {
-                std::slice::from_raw_parts(k_data.as_ptr() as *const u8, n_elems * 4)
-            })?;
-            backend.write_buffer(&mut gpu_v_t, unsafe {
-                std::slice::from_raw_parts(v_data.as_ptr() as *const u8, n_elems * 4)
-            })?;
-            gpu_cache.update(&gpu_k_t, &gpu_v_t)?;
-
-            // Note: both CPU and GPU caches auto-flush during update() when residual is full.
-            // Verify positions are in sync
-            if t < 5 || t == test_tokens - 1 {
-                assert_eq!(
-                    cpu_cache.current_pos(),
-                    gpu_cache.current_pos(),
-                    "Position mismatch at token {}: cpu={}, gpu={}",
-                    t,
-                    cpu_cache.current_pos(),
-                    gpu_cache.current_pos()
-                );
-            }
-        }
-
-        let total_tokens = cpu_cache.current_pos();
-        let q_tokens = cpu_cache.q2_tokens;
-        let res_tokens = cpu_cache.res_pos;
-
-        println!(
-            "  KIVI Q{}: total={}, q_tokens={}, res_tokens={}",
-            bits, total_tokens, q_tokens, res_tokens
-        );
-
-        // === Generate random Q vector: [n_heads_q, head_dim] ===
-        let q_elems = n_heads_q * head_dim;
-        let mut q_data = vec![0.0f32; q_elems];
-        for v in q_data.iter_mut() {
-            *v = xorshift32(&mut rng_state) * 0.3;
-        }
-
-        // === CPU reference: get_view() -> naive single-token attention ===
-        let (k_view, v_view) = cpu_cache.get_view();
-        // k_view/v_view shape: [1, total_tokens, kv_heads, head_dim] (SeqMajor)
-        let k_cpu = k_view.as_slice::<f32>();
-        let v_cpu = v_view.as_slice::<f32>();
-
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let gqa_ratio = n_heads_q / kv_heads;
-        let mut cpu_out = vec![0.0f32; q_elems];
-
-        for qh in 0..n_heads_q {
-            let kv_h = qh / gqa_ratio;
-            let q_slice = &q_data[qh * head_dim..(qh + 1) * head_dim];
-
-            // Compute attention scores: Q * K^T / sqrt(d) for each token
-            let mut scores = vec![0.0f32; total_tokens];
-            for t in 0..total_tokens {
-                let mut dot = 0.0f32;
-                for d in 0..head_dim {
-                    // SeqMajor layout: [t * kv_heads * head_dim + kv_h * head_dim + d]
-                    let k_val = k_cpu[t * kv_heads * head_dim + kv_h * head_dim + d];
-                    dot += q_slice[d] * k_val;
-                }
-                scores[t] = dot * scale;
-            }
-
-            // Softmax
-            let max_score = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            let mut sum = 0.0f32;
-            for s in scores.iter_mut() {
-                *s = (*s - max_score).exp();
-                sum += *s;
-            }
-            for s in scores.iter_mut() {
-                *s /= sum;
-            }
-
-            // Weighted sum: scores * V -> out
-            for d in 0..head_dim {
-                let mut val = 0.0f32;
-                for t in 0..total_tokens {
-                    let v_val = v_cpu[t * kv_heads * head_dim + kv_h * head_dim + d];
-                    val += scores[t] * v_val;
-                }
-                cpu_out[qh * head_dim + d] = val;
-            }
-        }
-
-        // === GPU: attention_gen_kivi() ===
-        let gpu_raw = gpu_cache
-            .get_raw_gpu_buffers()
-            .ok_or_else(|| anyhow::anyhow!("No GPU raw buffers (q_tokens=0?)"))?;
-
-        // Upload Q to GPU: shape [1, n_heads_q, head_dim] (single token decode)
-        let q_gpu_buf = gpu_memory.alloc(q_elems * 4, DType::F32)?;
-        let mut q_gpu = Tensor::new(
-            Shape::new(vec![1, n_heads_q, head_dim]),
-            q_gpu_buf,
-            backend.clone(),
-        );
-        backend.write_buffer(&mut q_gpu, unsafe {
-            std::slice::from_raw_parts(q_data.as_ptr() as *const u8, q_elems * 4)
-        })?;
-
-        // Output buffer
-        let out_gpu_buf = gpu_memory.alloc(q_elems * 4, DType::F32)?;
-        let out_gpu = Tensor::new(
-            Shape::new(vec![1, n_heads_q, head_dim]),
-            out_gpu_buf,
-            backend.clone(),
-        );
-
-        // D8: inherent attention_gen_kivi 가 raw cl_mem(`*mut c_void`) 시그니처로
-        // 바뀌어, `&Tensor` 6개에서 cl_mem 을 추출해 넘긴다. `Mem::as_ptr()` 가 이미
-        // `cl_mem`(= `*mut c_void`) 라 캐스트 불요.
-        let q_mem = get_cl_mem(q_gpu.buffer().as_ref())?.as_ptr();
-        let qk_mem = get_cl_mem(gpu_raw.qk_buf.buffer().as_ref())?.as_ptr();
-        let qv_mem = get_cl_mem(gpu_raw.qv_buf.buffer().as_ref())?.as_ptr();
-        let res_k_mem = get_cl_mem(gpu_raw.res_k.buffer().as_ref())?.as_ptr();
-        let res_v_mem = get_cl_mem(gpu_raw.res_v.buffer().as_ref())?.as_ptr();
-        let out_mem = get_cl_mem(out_gpu.buffer().as_ref())?.as_ptr();
-        let start = Instant::now();
-        // SAFETY: cl_mem 6개는 위에서 live GPU 버퍼로부터 추출한 유효 핸들(borrow-only).
-        unsafe {
-            ocl.attention_gen_kivi(
-                q_mem,
-                qk_mem,
-                qv_mem,
-                res_k_mem,
-                res_v_mem,
-                out_mem,
-                n_heads_q,
-                kv_heads,
-                head_dim,
-                gpu_raw.q_tokens,
-                gpu_raw.res_tokens,
-                gpu_raw.res_cap,
-                scale,
-                None, // no scores output
-                bits,
-            )?;
-        }
-        backend.synchronize()?;
-        let dur = start.elapsed();
-
-        // Read GPU output back to CPU
-        let mut gpu_out = vec![0.0f32; q_elems];
-        backend.read_buffer(&out_gpu, unsafe {
-            std::slice::from_raw_parts_mut(gpu_out.as_mut_ptr() as *mut u8, q_elems * 4)
-        })?;
-
-        // === Compare: L2 error (per-element RMSE) ===
-        let mut sq_diff_sum = 0.0f64;
-        let mut ref_sq_sum = 0.0f64;
-        for i in 0..q_elems {
-            let diff = (cpu_out[i] - gpu_out[i]) as f64;
-            sq_diff_sum += diff * diff;
-            ref_sq_sum += (cpu_out[i] as f64) * (cpu_out[i] as f64);
-        }
-        // Relative L2 error = sqrt(sum(diff^2)) / sqrt(sum(ref^2))
-        let l2_error = if ref_sq_sum > 0.0 {
-            (sq_diff_sum / ref_sq_sum).sqrt() as f32
-        } else {
-            (sq_diff_sum / q_elems as f64).sqrt() as f32
-        };
-
-        // Also print per-head max absolute error for diagnosis
-        let mut max_abs_err: f32 = 0.0;
-        for i in 0..q_elems {
-            let abs_err = (cpu_out[i] - gpu_out[i]).abs();
-            max_abs_err = max_abs_err.max(abs_err);
-        }
-        println!(
-            "    rel-L2={:.6}, max-abs-err={:.6}, cpu[0..4]={:?}, gpu[0..4]={:?}",
-            l2_error,
-            max_abs_err,
-            &cpu_out[..4.min(q_elems)],
-            &gpu_out[..4.min(q_elems)],
-        );
-
-        Ok((l2_error, dur))
-    }
 }

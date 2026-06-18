@@ -1535,8 +1535,8 @@ impl QuantizedRecentWindowCache {
                 // Fast path: pass entire input at once.
                 // D8: ABI struct(cl_mem) 시그니처. input/residual `&Tensor` 를 raw
                 // cl_mem 으로 추출해 `QuantAttnGatherArgs` 패킹 → trait 호출 → rc!=0 이면
-                // bail. cl_queue 는 OpenCL 정적 impl 이 `&self.queue` 를 직접 알아
-                // 사용하지 않으므로 null 패킹.
+                // bail. cl_queue 는 엔진 live `cl_command_queue`(Stage E): dlopen plugin 이
+                // 같은 큐에 enqueue 하도록. 내장 OpenCL impl 은 무시(`&self.queue` 사용).
                 use crate::backend::opencl::get_cl_mem;
                 let slab = self.slab.as_ref().unwrap();
                 let gpu_res_k = slab.res_k.as_ref().unwrap();
@@ -1547,7 +1547,7 @@ impl QuantizedRecentWindowCache {
                 let res_k_mem = get_cl_mem(gpu_res_k.buffer().as_ref())?.as_ptr();
                 let res_v_mem = get_cl_mem(gpu_res_v.buffer().as_ref())?.as_ptr();
                 let args_k = crate::backend::QuantAttnGatherArgs {
-                    cl_queue: std::ptr::null_mut(),
+                    cl_queue: backend_arc.cl_command_queue_ptr(),
                     input_mem: new_k_mem,
                     residual_mem: res_k_mem,
                     kv_heads: self.kv_heads,
@@ -1561,7 +1561,7 @@ impl QuantizedRecentWindowCache {
                     anyhow::bail!("KIVI gather_update_quant (K) failed (rc={rc_k})");
                 }
                 let args_v = crate::backend::QuantAttnGatherArgs {
-                    cl_queue: std::ptr::null_mut(),
+                    cl_queue: backend_arc.cl_command_queue_ptr(),
                     input_mem: new_v_mem,
                     residual_mem: res_v_mem,
                     kv_heads: self.kv_heads,
@@ -1857,8 +1857,9 @@ impl QuantizedRecentWindowCache {
             )?;
 
             // Dispatch GPU dequant: fill F16 attention buffers for the assembled path.
-            // Q2: dedicated GPU F16 dequant kernel via `dequant_flush` (cl_queue=null: the OpenCL
-            //     static impl uses its own queue, mirroring the gather_update path above).
+            // Q2: dedicated GPU F16 dequant kernel via `dequant_flush` (cl_queue = engine live
+            //     queue for the dlopen plugin path, Stage E; the in-engine OpenCL impl ignores
+            //     it and uses its own queue, mirroring the gather_update path above).
             // Q4/Q8: no GPU dequant kernel yet — CPU dequant → F16 convert → write_buffer_range.
             if self.bits == 2 {
                 let q2k_mem = get_cl_mem(
@@ -1884,7 +1885,7 @@ impl QuantizedRecentWindowCache {
                 )?
                 .as_ptr();
                 let rc_k = quant_attn_be.dequant_flush(&crate::backend::QuantDequantFlushArgs {
-                    cl_queue: std::ptr::null_mut(),
+                    cl_queue: backend.cl_command_queue_ptr(),
                     q_blocks_mem: q2k_mem,
                     attn_mem: attn_k_mem,
                     kv_heads: self.kv_heads,
@@ -1921,7 +1922,7 @@ impl QuantizedRecentWindowCache {
                 )?
                 .as_ptr();
                 let rc_v = quant_attn_be.dequant_flush(&crate::backend::QuantDequantFlushArgs {
-                    cl_queue: std::ptr::null_mut(),
+                    cl_queue: backend.cl_command_queue_ptr(),
                     q_blocks_mem: q2v_mem,
                     attn_mem: attn_v_mem,
                     kv_heads: self.kv_heads,
@@ -2135,6 +2136,9 @@ impl QuantizedRecentWindowCache {
                         )
                     })?
                     .clone();
+                // Stage E: lend the engine's live queue to the (dlopen) cap plugin so its
+                // scatter kernel enqueues on the same in-order queue; in-engine impl ignores it.
+                let cl_queue = self.slab.as_ref().unwrap().backend.cl_command_queue_ptr();
 
                 let res_k_mem = get_cl_mem(
                     self.slab
@@ -2160,7 +2164,7 @@ impl QuantizedRecentWindowCache {
                 .as_ptr();
                 let rc_k =
                     quant_attn_be.scatter_residual(&crate::backend::QuantScatterResidualArgs {
-                        cl_queue: std::ptr::null_mut(),
+                        cl_queue,
                         res_mem: res_k_mem,
                         attn_mem: attn_k_mem,
                         kv_heads: self.kv_heads,
@@ -2196,7 +2200,7 @@ impl QuantizedRecentWindowCache {
                 .as_ptr();
                 let rc_v =
                     quant_attn_be.scatter_residual(&crate::backend::QuantScatterResidualArgs {
-                        cl_queue: std::ptr::null_mut(),
+                        cl_queue,
                         res_mem: res_v_mem,
                         attn_mem: attn_v_mem,
                         kv_heads: self.kv_heads,
@@ -2458,6 +2462,15 @@ impl QuantizedRecentWindowCache {
     /// Raw GPU buffers for native KIVI fused attention (Some only in GPU mode).
     pub fn get_quant_window_raw_buffers(&self) -> Option<QuantWindowRawBuffers<'_>> {
         self.get_raw_gpu_buffers()
+    }
+
+    /// The quantized-attention capability handle this cache was constructed with
+    /// (FORMAT Phase 2 Stage E). `QuantWindowFormat::attention_into` reads it here
+    /// (instead of `backend.as_quant_attn()`) so the native-attention dispatch and
+    /// gate pull the cap from the SAME `caps.get` handle the flush path uses —
+    /// keeping a single cap source once the KIVI kernels move to a dlopen plugin.
+    pub(crate) fn quant_attn_cap(&self) -> Option<&Arc<dyn QuantAttnBackend>> {
+        self.quant_attn.as_ref()
     }
 
     /// Memory usage in bytes for currently stored KV data.

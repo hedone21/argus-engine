@@ -294,19 +294,6 @@ struct KernelCache {
     kernel_mul_mm_f16_f32: Option<CoreKernel>,
     kernel_mul_mm_q4_0_f32: Option<CoreKernel>,
     kernel_mul_mm_f32_f32: Option<CoreKernel>,
-    // KIVI Q2 kernels (optional — dequantize/scatter for GPU-native KiviCache)
-    kernel_kivi_deq_value_q2: Option<CoreKernel>,
-    kernel_kivi_deq_key_q2: Option<CoreKernel>,
-    kernel_kivi_scatter_residual: Option<CoreKernel>,
-    kernel_kivi_gather_update: Option<CoreKernel>,
-    // KIVI Q2 F16-output variants (dequant/scatter to half buffers)
-    kernel_kivi_deq_value_q2_f16: Option<CoreKernel>,
-    kernel_kivi_deq_key_q2_f16: Option<CoreKernel>,
-    kernel_kivi_scatter_residual_f16: Option<CoreKernel>,
-    // KIVI fused attention kernels (optional — direct Q2/Q4/Q8 attention without F32 dequant)
-    kernel_attn_gen_kivi_q2: Option<CoreKernel>,
-    kernel_attn_gen_kivi_q4: Option<CoreKernel>,
-    kernel_attn_gen_kivi_q8: Option<CoreKernel>,
     // F16 GEMV N_DST=4 variant for large-N matmuls (lm_head, FFN)
     kernel_mul_mat_f16_f32_l4: Option<CoreKernel>,
     // F16 GEMV single-token decode variant (N_DST=1, 64 threads/WG).
@@ -395,10 +382,6 @@ pub struct OpenCLBackend {
     pub gemm_f16_program: Option<Program>,
     pub gemm_q4_0_program: Option<Program>,
     pub gemm_f32_program: Option<Program>,
-
-    // KIVI kernel programs (optional — needed for plan-based KIVI decode)
-    pub kivi_q2_program: Option<Program>,
-    pub kivi_attn_program: Option<Program>,
 
     // Score-only attention program (Q*K^T + softmax, no V multiply)
     pub attention_scores_program: Option<Program>,
@@ -1212,34 +1195,6 @@ impl OpenCLBackend {
             }
         };
 
-        // KIVI Q2 kernels (optional — dequantize/scatter for GPU-native KiviCache)
-        let kivi_q2_src = include_str!("../../kernels/kivi_q2.cl");
-        let kivi_q2_kernels = Program::builder()
-            .devices(device)
-            .src(kivi_q2_src)
-            .cmplr_opt(&cl_opts)
-            .build(&context)
-            .ok();
-        if kivi_q2_kernels.is_some() {
-            log::info!("kivi_q2.cl compiled (KIVI Q2 dequant/scatter kernels)");
-        } else {
-            log::warn!("kivi_q2.cl failed to compile. KIVI Q2 GPU kernels disabled.");
-        }
-
-        // KIVI fused attention kernels (optional — native Q2/Q4/Q8 attention)
-        let kivi_attn_src = include_str!("../../kernels/kivi_attn.cl");
-        let kivi_attn_program = Program::builder()
-            .devices(device)
-            .src(kivi_attn_src)
-            .cmplr_opt(&cl_opts)
-            .build(&context)
-            .ok();
-        if kivi_attn_program.is_some() {
-            log::info!("kivi_attn.cl compiled (KIVI fused attention kernels)");
-        } else {
-            log::warn!("kivi_attn.cl failed to compile. KIVI fused attention disabled.");
-        }
-
         // Score-only attention kernel (Q*K^T + softmax, no V multiply)
         let attn_scores_src = include_str!("../../kernels/attention_scores.cl");
         let attention_scores_program = Program::builder()
@@ -1451,36 +1406,6 @@ impl OpenCLBackend {
             kernel_mul_mm_q4_0_f32: gemm_q4_0_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mm_q4_0_f32_l4_lm").ok()),
-            kernel_kivi_deq_value_q2: kivi_q2_kernels
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "kivi_dequantize_value_q2").ok()),
-            kernel_kivi_deq_key_q2: kivi_q2_kernels
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "kivi_dequantize_key_q2").ok()),
-            kernel_kivi_scatter_residual: kivi_q2_kernels
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "kivi_scatter_residual").ok()),
-            kernel_kivi_gather_update: kivi_q2_kernels
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "kivi_gather_update").ok()),
-            kernel_kivi_deq_value_q2_f16: kivi_q2_kernels
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "kivi_dequantize_value_q2_f16").ok()),
-            kernel_kivi_deq_key_q2_f16: kivi_q2_kernels
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "kivi_dequantize_key_q2_f16").ok()),
-            kernel_kivi_scatter_residual_f16: kivi_q2_kernels
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "kivi_scatter_residual_f16").ok()),
-            kernel_attn_gen_kivi_q2: kivi_attn_program
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "kernel_attn_gen_kivi_q2").ok()),
-            kernel_attn_gen_kivi_q4: kivi_attn_program
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "kernel_attn_gen_kivi_q4").ok()),
-            kernel_attn_gen_kivi_q8: kivi_attn_program
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "kernel_attn_gen_kivi_q8").ok()),
             kernel_mul_mat_f16_f32_l4: f16_l4_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mat_f16_f32_l4").ok()),
@@ -1563,8 +1488,6 @@ impl OpenCLBackend {
             gemm_f16_program,
             gemm_f32_program,
             gemm_q4_0_program,
-            kivi_q2_program: kivi_q2_kernels,
-            kivi_attn_program,
             attention_scores_program,
             cvt_noshuffle_program,
             cvt_noshuffle_fused_program,
@@ -4644,10 +4567,24 @@ impl Backend for OpenCLBackend {
         Self::gpu_score_acc_mut(self).map(|s| s as &mut dyn crate::backend::GpuScoreAccess)
     }
 
-    // §13.8-L S-L-3: QuantAttnBackend trait expose — OpenCL backend
-    // 만 활성. 그 외 backend 는 Backend trait default `None`.
-    fn as_quant_attn(&self) -> Option<&dyn crate::backend::QuantAttnBackend> {
-        Some(self as &dyn crate::backend::QuantAttnBackend)
+    // FORMAT Phase 2 Stage E: lend the live `cl_command_queue` so a
+    // borrowed-context backend-cap plugin enqueues on the SAME in-order queue as
+    // the engine (preserving the serialization the KIVI flush/score-readback path
+    // relies on). The built-in KIVI impl ignores `args.cl_queue` and uses
+    // `&self.queue`, so packing this is a no-op for the in-engine path.
+    fn cl_command_queue_ptr(&self) -> *mut std::ffi::c_void {
+        // `&Queue::as_ptr()` resolves via `ClContextPtr for &Queue` to a
+        // `cl_context`; the explicit `&CommandQueue` target type yields the
+        // `cl_command_queue` handle (cf. `fill_dmabuf_via_swap_queue`).
+        let q_ref: &ocl::core::CommandQueue = &self.queue;
+        q_ref.as_ptr()
+    }
+
+    // FORMAT Phase 2 Stage E: expose the device's nosub property on the Backend
+    // trait so the KIVI FORMAT's native-attention gate reads it from the backend
+    // (byte-identical) instead of the QuantAttn cap, which moves to a plugin.
+    fn is_nosub_device(&self) -> bool {
+        Self::is_nosub(self)
     }
 
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
@@ -6600,565 +6537,8 @@ impl Backend for OpenCLBackend {
     }
 }
 
-// ── KIVI Q2 dispatch functions (OpenCLBackend-specific, not part of Backend trait) ──
+// ── Device capability queries (nosub / flash-decode availability) ──
 impl OpenCLBackend {
-    /// Dequantize Q2 value blocks on GPU (per-token layout).
-    /// `q2_buf`: raw Q2 block data on GPU (uchar buffer)
-    /// `attn_v`: F32 attention V buffer on GPU [max_seq, kv_heads, head_dim]
-    #[allow(clippy::too_many_arguments)]
-    pub fn kivi_dequantize_value_q2(
-        &self,
-        q2_buf: &Tensor,
-        attn_v: &mut Tensor,
-        kv_heads: usize,
-        head_dim: usize,
-        flush_tokens: usize,
-        tok_base: usize,
-        block_offset: usize,
-    ) -> Result<()> {
-        let kernels = unsafe { &*self.kernels.get() };
-        let kernel = kernels
-            .kernel_kivi_deq_value_q2
-            .as_ref()
-            .ok_or_else(|| anyhow!("KIVI Q2 kernel not available"))?;
-
-        let q2_mem = get_cl_mem(q2_buf.buffer().as_ref())?;
-        let attn_v_mem = get_cl_mem(attn_v.buffer().as_ref())?;
-
-        let total_blocks = kv_heads * flush_tokens * (head_dim / 32);
-        let kv_heads_i = kv_heads as i32;
-        let head_dim_i = head_dim as i32;
-        let flush_tokens_i = flush_tokens as i32;
-        let tok_base_i = tok_base as i32;
-        let block_offset_i = block_offset as i32;
-
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q2_mem))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_v_mem))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&head_dim_i))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&flush_tokens_i))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&tok_base_i))?;
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
-
-            let global_work_size: [usize; 3] = [total_blocks, 1, 1];
-            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
-        }
-        Ok(())
-    }
-
-    /// Dequantize Q2 key blocks on GPU (per-channel scatter layout).
-    /// `q2_buf`: raw Q2 block data on GPU (uchar buffer)
-    /// `attn_k`: F32 attention K buffer on GPU [max_seq, kv_heads, head_dim]
-    #[allow(clippy::too_many_arguments)]
-    pub fn kivi_dequantize_key_q2(
-        &self,
-        q2_buf: &Tensor,
-        attn_k: &mut Tensor,
-        kv_heads: usize,
-        head_dim: usize,
-        groups_per_flush: usize,
-        tok_base: usize,
-        block_offset: usize,
-    ) -> Result<()> {
-        let kernels = unsafe { &*self.kernels.get() };
-        let kernel = kernels
-            .kernel_kivi_deq_key_q2
-            .as_ref()
-            .ok_or_else(|| anyhow!("KIVI Q2 kernel not available"))?;
-
-        let q2_mem = get_cl_mem(q2_buf.buffer().as_ref())?;
-        let attn_k_mem = get_cl_mem(attn_k.buffer().as_ref())?;
-
-        let total_blocks = kv_heads * groups_per_flush * head_dim;
-        let kv_heads_i = kv_heads as i32;
-        let head_dim_i = head_dim as i32;
-        let groups_per_flush_i = groups_per_flush as i32;
-        let tok_base_i = tok_base as i32;
-        let block_offset_i = block_offset as i32;
-
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q2_mem))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_k_mem))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&head_dim_i))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&groups_per_flush_i))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&tok_base_i))?;
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
-
-            let global_work_size: [usize; 3] = [total_blocks, 1, 1];
-            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
-        }
-        Ok(())
-    }
-
-    /// Scatter residual F32 buffer [kv_heads, res_cap, head_dim] into SeqMajor
-    /// attention buffer [max_seq, kv_heads, head_dim].
-    #[allow(clippy::too_many_arguments)]
-    pub fn kivi_scatter_residual(
-        &self,
-        residual: &Tensor,
-        attn: &mut Tensor,
-        kv_heads: usize,
-        res_cap: usize,
-        head_dim: usize,
-        res_pos: usize,
-        tok_base: usize,
-    ) -> Result<()> {
-        let kernels = unsafe { &*self.kernels.get() };
-        let kernel = kernels
-            .kernel_kivi_scatter_residual
-            .as_ref()
-            .ok_or_else(|| anyhow!("KIVI Q2 kernel not available"))?;
-
-        let residual_mem = get_cl_mem(residual.buffer().as_ref())?;
-        let attn_mem = get_cl_mem(attn.buffer().as_ref())?;
-
-        let total = kv_heads * res_pos * head_dim;
-        let kv_heads_i = kv_heads as i32;
-        let res_cap_i = res_cap as i32;
-        let head_dim_i = head_dim as i32;
-        let res_pos_i = res_pos as i32;
-        let tok_base_i = tok_base as i32;
-
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(residual_mem))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_mem))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&res_cap_i))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&head_dim_i))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&res_pos_i))?;
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&tok_base_i))?;
-
-            let global_work_size: [usize; 3] = [total, 1, 1];
-            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
-        }
-        Ok(())
-    }
-
-    /// Dequantize Q2 value blocks (per-token) on GPU to the F16 attention buffer.
-    /// cl_mem-based core called by [`Self::kivi_dequantize_value_q2_f16_raw`] (the cap path).
-    #[allow(clippy::too_many_arguments)]
-    fn kivi_dequantize_value_q2_f16_core(
-        &self,
-        q2_mem: &ocl::core::Mem,
-        attn_v_mem: &ocl::core::Mem,
-        kv_heads: usize,
-        head_dim: usize,
-        flush_tokens: usize,
-        tok_base: usize,
-        block_offset: usize,
-    ) -> Result<()> {
-        let kernels = unsafe { &*self.kernels.get() };
-        let kernel = kernels
-            .kernel_kivi_deq_value_q2_f16
-            .as_ref()
-            .ok_or_else(|| anyhow!("KIVI Q2 F16 value dequant kernel not available"))?;
-
-        let total_blocks = kv_heads * flush_tokens * (head_dim / 32);
-        let kv_heads_i = kv_heads as i32;
-        let head_dim_i = head_dim as i32;
-        let flush_tokens_i = flush_tokens as i32;
-        let tok_base_i = tok_base as i32;
-        let block_offset_i = block_offset as i32;
-
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q2_mem))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_v_mem))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&head_dim_i))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&flush_tokens_i))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&tok_base_i))?;
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
-
-            let global_work_size: [usize; 3] = [total_blocks, 1, 1];
-            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
-        }
-        Ok(())
-    }
-
-    /// Borrowed-cl_mem variant of [`Self::kivi_dequantize_value_q2_f16`] for the
-    /// `QuantAttnBackend::dequant_flush` cap path (C5 borrow-only).
-    ///
-    /// # Safety
-    /// `q_blocks_mem`/`attn_mem` must be valid, non-null `cl_mem` of this backend's context,
-    /// live for the duration of the call (borrow-only — the caller retains ownership).
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn kivi_dequantize_value_q2_f16_raw(
-        &self,
-        q_blocks_mem: *mut std::ffi::c_void,
-        attn_mem: *mut std::ffi::c_void,
-        kv_heads: usize,
-        head_dim: usize,
-        flush_tokens: usize,
-        tok_base: usize,
-        block_offset: usize,
-    ) -> Result<()> {
-        let q2_mem = unsafe { Self::borrow_cl_mem(q_blocks_mem) };
-        let attn_v_mem = unsafe { Self::borrow_cl_mem(attn_mem) };
-        self.kivi_dequantize_value_q2_f16_core(
-            &q2_mem,
-            &attn_v_mem,
-            kv_heads,
-            head_dim,
-            flush_tokens,
-            tok_base,
-            block_offset,
-        )
-    }
-
-    /// Dequantize Q2 key blocks (per-channel) on GPU to the F16 attention buffer.
-    /// cl_mem-based core called by [`Self::kivi_dequantize_key_q2_f16_raw`] (the cap path).
-    #[allow(clippy::too_many_arguments)]
-    fn kivi_dequantize_key_q2_f16_core(
-        &self,
-        q2_mem: &ocl::core::Mem,
-        attn_k_mem: &ocl::core::Mem,
-        kv_heads: usize,
-        head_dim: usize,
-        groups_per_flush: usize,
-        tok_base: usize,
-        block_offset: usize,
-    ) -> Result<()> {
-        let kernels = unsafe { &*self.kernels.get() };
-        let kernel = kernels
-            .kernel_kivi_deq_key_q2_f16
-            .as_ref()
-            .ok_or_else(|| anyhow!("KIVI Q2 F16 key dequant kernel not available"))?;
-
-        let total_blocks = kv_heads * groups_per_flush * head_dim;
-        let kv_heads_i = kv_heads as i32;
-        let head_dim_i = head_dim as i32;
-        let groups_per_flush_i = groups_per_flush as i32;
-        let tok_base_i = tok_base as i32;
-        let block_offset_i = block_offset as i32;
-
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q2_mem))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_k_mem))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&head_dim_i))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&groups_per_flush_i))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&tok_base_i))?;
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
-
-            let global_work_size: [usize; 3] = [total_blocks, 1, 1];
-            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
-        }
-        Ok(())
-    }
-
-    /// Borrowed-cl_mem variant of [`Self::kivi_dequantize_key_q2_f16`] for the
-    /// `QuantAttnBackend::dequant_flush` cap path (C5 borrow-only).
-    ///
-    /// # Safety
-    /// `q_blocks_mem`/`attn_mem` must be valid, non-null `cl_mem` of this backend's context,
-    /// live for the duration of the call (borrow-only — the caller retains ownership).
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn kivi_dequantize_key_q2_f16_raw(
-        &self,
-        q_blocks_mem: *mut std::ffi::c_void,
-        attn_mem: *mut std::ffi::c_void,
-        kv_heads: usize,
-        head_dim: usize,
-        groups_per_flush: usize,
-        tok_base: usize,
-        block_offset: usize,
-    ) -> Result<()> {
-        let q2_mem = unsafe { Self::borrow_cl_mem(q_blocks_mem) };
-        let attn_k_mem = unsafe { Self::borrow_cl_mem(attn_mem) };
-        self.kivi_dequantize_key_q2_f16_core(
-            &q2_mem,
-            &attn_k_mem,
-            kv_heads,
-            head_dim,
-            groups_per_flush,
-            tok_base,
-            block_offset,
-        )
-    }
-
-    /// Scatter the F32 residual ring into the F16 attention buffer.
-    /// cl_mem-based core called by [`Self::kivi_scatter_residual_f16_raw`] (the cap path).
-    #[allow(clippy::too_many_arguments)]
-    fn kivi_scatter_residual_f16_core(
-        &self,
-        residual_mem: &ocl::core::Mem,
-        attn_mem: &ocl::core::Mem,
-        kv_heads: usize,
-        res_cap: usize,
-        head_dim: usize,
-        res_pos: usize,
-        tok_base: usize,
-    ) -> Result<()> {
-        let kernels = unsafe { &*self.kernels.get() };
-        let kernel = kernels
-            .kernel_kivi_scatter_residual_f16
-            .as_ref()
-            .ok_or_else(|| anyhow!("KIVI F16 scatter_residual kernel not available"))?;
-
-        let total = kv_heads * res_pos * head_dim;
-        let kv_heads_i = kv_heads as i32;
-        let res_cap_i = res_cap as i32;
-        let head_dim_i = head_dim as i32;
-        let res_pos_i = res_pos as i32;
-        let tok_base_i = tok_base as i32;
-
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(residual_mem))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_mem))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&res_cap_i))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&head_dim_i))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&res_pos_i))?;
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&tok_base_i))?;
-
-            let global_work_size: [usize; 3] = [total, 1, 1];
-            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
-        }
-        Ok(())
-    }
-
-    /// Borrowed-cl_mem variant of [`Self::kivi_scatter_residual_f16`] for the
-    /// `QuantAttnBackend::scatter_residual` cap path (C5 borrow-only).
-    ///
-    /// # Safety
-    /// `res_mem`/`attn_mem` must be valid, non-null `cl_mem` of this backend's context,
-    /// live for the duration of the call (borrow-only — the caller retains ownership).
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn kivi_scatter_residual_f16_raw(
-        &self,
-        res_mem: *mut std::ffi::c_void,
-        attn_mem: *mut std::ffi::c_void,
-        kv_heads: usize,
-        res_cap: usize,
-        head_dim: usize,
-        res_pos: usize,
-        tok_base: usize,
-    ) -> Result<()> {
-        let residual_mem = unsafe { Self::borrow_cl_mem(res_mem) };
-        let attn_mem = unsafe { Self::borrow_cl_mem(attn_mem) };
-        self.kivi_scatter_residual_f16_core(
-            &residual_mem,
-            &attn_mem,
-            kv_heads,
-            res_cap,
-            head_dim,
-            res_pos,
-            tok_base,
-        )
-    }
-
-    /// Wrap a borrowed raw `cl_mem` (`*mut c_void`, from a host-owned buffer)
-    /// into an ocl-core `Mem` for kernel-arg use **without** taking ownership.
-    ///
-    /// SAFETY/C5: `Mem` has a `Drop` impl that calls `clReleaseMemObject`. The
-    /// raw handle is *borrowed* (the engine buffer still owns the refcount), so
-    /// the wrapper is returned inside `ManuallyDrop` and the caller must never
-    /// let it drop — `Deref` yields a `&Mem` for `ArgVal::mem(..)`, refcount
-    /// stays unchanged. `ptr` must be a valid, non-null `cl_mem`.
-    #[inline]
-    unsafe fn borrow_cl_mem(ptr: *mut std::ffi::c_void) -> std::mem::ManuallyDrop<ocl::core::Mem> {
-        // cl_mem == *mut c_void (cl-sys), so the cast is identity.
-        std::mem::ManuallyDrop::new(unsafe {
-            ocl::core::Mem::from_raw_create_ptr(ptr as ocl::ffi::cl_mem)
-        })
-    }
-
-    /// Gather new K/V tokens from SeqMajor input [seq_len, kv_heads, head_dim]
-    /// into head-first residual buffer [kv_heads, res_cap, head_dim].
-    ///
-    /// `input_mem` / `residual_mem` are **borrowed** raw `cl_mem` handles (see
-    /// [`Self::borrow_cl_mem`], C5 borrow-only). The engine buffers retain
-    /// ownership; this fn never releases them.
-    ///
-    /// # Safety
-    /// `input_mem` and `residual_mem` must be valid, non-null `cl_mem` handles
-    /// belonging to this backend's context and live for the duration of the
-    /// call (borrow-only — the caller retains ownership).
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn kivi_gather_update(
-        &self,
-        input_mem: *mut std::ffi::c_void,
-        residual_mem: *mut std::ffi::c_void,
-        kv_heads: usize,
-        res_cap: usize,
-        head_dim: usize,
-        seq_len: usize,
-        res_pos: usize,
-    ) -> Result<()> {
-        let kernels = unsafe { &*self.kernels.get() };
-        let kernel = kernels
-            .kernel_kivi_gather_update
-            .as_ref()
-            .ok_or_else(|| anyhow!("KIVI Q2 kernel not available"))?;
-
-        let input_mem = unsafe { Self::borrow_cl_mem(input_mem) };
-        let residual_mem = unsafe { Self::borrow_cl_mem(residual_mem) };
-
-        let total = seq_len * kv_heads * head_dim;
-        let kv_heads_i = kv_heads as i32;
-        let res_cap_i = res_cap as i32;
-        let head_dim_i = head_dim as i32;
-        let seq_len_i = seq_len as i32;
-        let res_pos_i = res_pos as i32;
-
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(&input_mem))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(&residual_mem))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&res_cap_i))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&head_dim_i))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&seq_len_i))?;
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&res_pos_i))?;
-
-            let global_work_size: [usize; 3] = [total, 1, 1];
-            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
-        }
-        Ok(())
-    }
-
-    /// KIVI fused attention: Q2/Q4/Q8 quantized KV + F32 residual, single kernel.
-    ///
-    /// Eliminates the intermediate F32 dequant buffer by performing on-the-fly
-    /// dequantization inside the attention kernel.
-    ///
-    /// `bits` selects the kernel variant: 2 → Q2, 4 → Q4, 8 → Q8.
-    ///
-    /// `q_mem` / `qk_mem` / `qv_mem` / `res_k_mem` / `res_v_mem` / `out_mem` are
-    /// **borrowed** raw `cl_mem` handles (see [`Self::borrow_cl_mem`], C5
-    /// borrow-only). The engine buffers retain ownership; this fn never
-    /// releases them.
-    ///
-    /// # Safety
-    /// All six `*_mem` arguments must be valid, non-null `cl_mem` handles
-    /// belonging to this backend's context and live for the duration of the
-    /// call (borrow-only — the caller retains ownership).
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn attention_gen_kivi(
-        &self,
-        q_mem: *mut std::ffi::c_void,
-        qk_mem: *mut std::ffi::c_void,
-        qv_mem: *mut std::ffi::c_void,
-        res_k_mem: *mut std::ffi::c_void,
-        res_v_mem: *mut std::ffi::c_void,
-        out_mem: *mut std::ffi::c_void,
-        num_heads_q: usize,
-        num_heads_kv: usize,
-        head_dim: usize,
-        q_tokens: usize,
-        res_tokens: usize,
-        res_cap: usize,
-        scale: f32,
-        scores_out: Option<&mut [f32]>,
-        bits: u8,
-    ) -> Result<()> {
-        let kernels = unsafe { &*self.kernels.get() };
-        let kernel = match bits {
-            2 => kernels
-                .kernel_attn_gen_kivi_q2
-                .as_ref()
-                .ok_or_else(|| anyhow!("KIVI Q2 attention kernel not available"))?,
-            4 => kernels
-                .kernel_attn_gen_kivi_q4
-                .as_ref()
-                .ok_or_else(|| anyhow!("KIVI Q4 attention kernel not available"))?,
-            8 => kernels
-                .kernel_attn_gen_kivi_q8
-                .as_ref()
-                .ok_or_else(|| anyhow!("KIVI Q8 attention kernel not available"))?,
-            _ => return Err(anyhow!("Unsupported KIVI bits: {}", bits)),
-        };
-
-        let q_buf = unsafe { Self::borrow_cl_mem(q_mem) };
-        let qk_mem = unsafe { Self::borrow_cl_mem(qk_mem) };
-        let qv_mem = unsafe { Self::borrow_cl_mem(qv_mem) };
-        let res_k_mem = unsafe { Self::borrow_cl_mem(res_k_mem) };
-        let res_v_mem = unsafe { Self::borrow_cl_mem(res_v_mem) };
-        let o_buf = unsafe { Self::borrow_cl_mem(out_mem) };
-
-        let has_scores = scores_out.is_some() as i32;
-        let total_tokens = q_tokens + res_tokens;
-        let score_stride_val = scores_out
-            .as_ref()
-            .map(|s| (s.len() / num_heads_q) as i32)
-            .unwrap_or(total_tokens as i32);
-
-        // Allocate GPU score buffer if needed, otherwise use dummy
-        let score_buf = if scores_out.is_some() {
-            Some(unsafe {
-                ocl::core::create_buffer::<_, f32>(
-                    self.context.as_core(),
-                    ocl::core::MEM_READ_WRITE | ocl::core::MEM_ALLOC_HOST_PTR,
-                    num_heads_q * score_stride_val as usize,
-                    None,
-                )?
-            })
-        } else {
-            None
-        };
-        let s_buf = score_buf.as_ref().unwrap_or(&self.dummy_score_buf);
-
-        let local_size = 64usize;
-        let local_mem_size = local_size * std::mem::size_of::<f32>();
-
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(&q_buf))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(&qk_mem))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(&qv_mem))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(&res_k_mem))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(&res_v_mem))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::mem(&o_buf))?;
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::mem(s_buf))?;
-            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&(num_heads_q as i32)))?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                8,
-                ocl::core::ArgVal::scalar(&(num_heads_kv as i32)),
-            )?;
-            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
-            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&(q_tokens as i32)))?;
-            ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&(res_tokens as i32)))?;
-            ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&(res_cap as i32)))?;
-            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&scale))?;
-            ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&score_stride_val))?;
-            ocl::core::set_kernel_arg(kernel, 15, ocl::core::ArgVal::scalar(&has_scores))?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                16,
-                ocl::core::ArgVal::local::<f32>(&local_mem_size),
-            )?;
-
-            let global_work_size: [usize; 3] = [num_heads_q * local_size, 1, 1];
-            let local_work_size: [usize; 3] = [local_size, 1, 1];
-
-            self.enqueue_kernel_labeled(
-                kernel,
-                "attention",
-                1,
-                &global_work_size,
-                Some(local_work_size),
-            )?;
-        }
-
-        // Read back scores to CPU if requested
-        if let (Some(scores), Some(buf)) = (scores_out, &score_buf) {
-            unsafe {
-                ocl::core::enqueue_read_buffer(
-                    &self.queue,
-                    buf,
-                    true,
-                    0,
-                    scores,
-                    None::<ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Returns true if this device lacks subgroup support (using nosub fallback kernels).
     /// Native KIVI attention (workgroup reduction) is preferred on these devices since
     /// the standard attention_gen also uses workgroup reduction.
@@ -7179,28 +6559,13 @@ impl OpenCLBackend {
             _ => false,
         }
     }
-
-    /// Check if KIVI fused attention kernel is available for the given bit-width.
-    pub fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
-        let kernels = unsafe { &*self.kernels.get() };
-        match bits {
-            2 => kernels.kernel_attn_gen_kivi_q2.is_some(),
-            4 => kernels.kernel_attn_gen_kivi_q4.is_some(),
-            8 => kernels.kernel_attn_gen_kivi_q8.is_some(),
-            _ => false,
-        }
-    }
 }
 
-// D8(2026-06-10, single-trait): KIVI native attention trait impl — canonical
-// 정의가 `argus-extension-api` 로 이동, ABI struct(`QuantAttnArgs`/`QuantAttnGatherArgs`,
-// cl_mem) 시그니처. trait method 는 args 에서 raw cl_mem 을 꺼내 inherent
-// dispatch(byte-identical 로직) 로 위임하고 `Result` 를 `i32`(0=OK, 음수=err,
-// C3 panic=abort) 로 변환한다. `args.cl_queue` 는 plugin/dlopen 어댑터용 ABI
-// 슬롯 — 엔진 정적 impl 은 `&self.queue`(inherent 내 score readback) 를 직접
-// 알고 있어 사용하지 않는다(host 가 채워준 동일 핸들이라 결과 동일, byte-identical
-// 보존). `as_quant_attn` 이 `Some(&self as &dyn QuantAttnBackend)` 를
-// 반환하므로 caller 는 trait method 만 사용해 downcast 가 사라진다.
+// FORMAT Phase 2 Stage E: the OpenCL backend no longer implements `QuantAttnBackend` — the
+// KIVI kernels moved to the `kivi` plugin. The backend only LENDS its live GPU context/queue
+// so a `--backend-cap` plugin can build and dispatch its own kernels: `with_quant_attn_make_args`
+// below packs the borrowed context/device/build_opts (used by `init.rs` to resolve a named
+// cap), and `cl_command_queue_ptr` (above) lends the live queue per call.
 impl OpenCLBackend {
     /// Build a [`argus_extension_api::QuantAttnMakeArgs`] from this backend's live GPU context and
     /// invoke `f` with it. Used by `--backend-cap <name>` to construct a named quantized
@@ -7218,139 +6583,6 @@ impl OpenCLBackend {
             build_opts: opts.as_ptr(),
         };
         f(&make_args)
-    }
-}
-
-impl crate::backend::QuantAttnBackend for OpenCLBackend {
-    fn has_quant_attn_kernel(&self, bits: u8) -> bool {
-        Self::has_kivi_attn_kernel(self, bits)
-    }
-
-    fn is_nosub_device(&self) -> bool {
-        Self::is_nosub(self)
-    }
-
-    fn attention_gen_quant(&self, args: &crate::backend::QuantAttnArgs) -> i32 {
-        // SAFETY: host(C5) 가 `scores_out`/`scores_len` 을 짝지어 유효 버퍼를
-        // 채워줬다(null=score 없음). cl_mem 핸들은 inherent 가 borrow-only 로 사용.
-        let scores_out: Option<&mut [f32]> = if args.scores_out.is_null() {
-            None
-        } else {
-            Some(unsafe { std::slice::from_raw_parts_mut(args.scores_out, args.scores_len) })
-        };
-        // SAFETY: host(C5) 가 cl_mem 핸들 6개를 유효 buffer 로 채웠다(borrow-only).
-        let r = unsafe {
-            Self::attention_gen_kivi(
-                self,
-                args.q_mem,
-                args.qk_mem,
-                args.qv_mem,
-                args.res_k_mem,
-                args.res_v_mem,
-                args.out_mem,
-                args.num_heads_q,
-                args.num_heads_kv,
-                args.head_dim,
-                args.q_tokens,
-                args.res_tokens,
-                args.res_cap,
-                args.scale,
-                scores_out,
-                args.bits,
-            )
-        };
-        match r {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("[KIVI] attention_gen_kivi failed: {e:#}");
-                -1
-            }
-        }
-    }
-
-    fn gather_update_quant(&self, args: &crate::backend::QuantAttnGatherArgs) -> i32 {
-        // SAFETY: host(C5) 가 input/residual cl_mem 을 유효 buffer 로 채웠다(borrow-only).
-        let r = unsafe {
-            Self::kivi_gather_update(
-                self,
-                args.input_mem,
-                args.residual_mem,
-                args.kv_heads,
-                args.res_cap,
-                args.head_dim,
-                args.seq_len,
-                args.res_pos,
-            )
-        };
-        match r {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("[KIVI] kivi_gather_update failed: {e:#}");
-                -1
-            }
-        }
-    }
-
-    fn dequant_flush(&self, args: &crate::backend::QuantDequantFlushArgs) -> i32 {
-        // SAFETY: host(C5) 가 q_blocks/attn cl_mem 을 유효 buffer 로 채웠다(borrow-only).
-        // `is_key` 가 per-channel key / per-token value 커널을 선택한다.
-        let r = if args.is_key {
-            unsafe {
-                Self::kivi_dequantize_key_q2_f16_raw(
-                    self,
-                    args.q_blocks_mem,
-                    args.attn_mem,
-                    args.kv_heads,
-                    args.head_dim,
-                    args.n_groups_or_tokens,
-                    args.tok_base,
-                    args.block_start,
-                )
-            }
-        } else {
-            unsafe {
-                Self::kivi_dequantize_value_q2_f16_raw(
-                    self,
-                    args.q_blocks_mem,
-                    args.attn_mem,
-                    args.kv_heads,
-                    args.head_dim,
-                    args.n_groups_or_tokens,
-                    args.tok_base,
-                    args.block_start,
-                )
-            }
-        };
-        match r {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("[KIVI] dequant_flush failed: {e:#}");
-                -1
-            }
-        }
-    }
-
-    fn scatter_residual(&self, args: &crate::backend::QuantScatterResidualArgs) -> i32 {
-        // SAFETY: host(C5) 가 res/attn cl_mem 을 유효 buffer 로 채웠다(borrow-only).
-        let r = unsafe {
-            Self::kivi_scatter_residual_f16_raw(
-                self,
-                args.res_mem,
-                args.attn_mem,
-                args.kv_heads,
-                args.res_cap,
-                args.head_dim,
-                args.res_pos,
-                args.tok_base,
-            )
-        };
-        match r {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("[KIVI] scatter_residual failed: {e:#}");
-                -1
-            }
-        }
     }
 }
 
