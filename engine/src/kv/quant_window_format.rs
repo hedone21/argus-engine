@@ -167,13 +167,18 @@ impl KVCacheFormat for QuantWindowFormat {
         // get_quant_window_raw_buffers 가 Some + backend 가 QuantAttnBackend + has_quant_attn_kernel +
         // is_nosub_device(NVIDIA) + 토큰 존재 일 때만. Adreno(subgroup)는 F32 dequant 경로가 더
         // 빠르므로 native 미사용(forward_gen 의 기존 게이팅 보존).
+        // Stage E: the cap is pulled from the cache's own `quant_attn` handle (the
+        // `caps.get` Arc — the dlopen plugin or, pre-Stage-E, the same OpenCLBackend
+        // object) rather than `backend.as_quant_attn()`, and the nosub device
+        // property is read off the backend directly (byte-identical to the prior
+        // `cap.is_nosub_device()` which delegated to `OpenCLBackend::is_nosub`).
         let use_native = backend.is_gpu()
-            && backend
-                .as_quant_attn()
-                .zip(cache.get_quant_window_raw_buffers())
-                .map(|(quant_attn_be, raw)| {
+            && backend.is_nosub_device()
+            && cache
+                .get_quant_window_raw_buffers()
+                .zip(cache.quant_attn_cap())
+                .map(|(raw, quant_attn_be)| {
                     quant_attn_be.has_quant_attn_kernel(raw.bits)
-                        && quant_attn_be.is_nosub_device()
                         && (raw.q_tokens + raw.res_tokens) > 0
                 })
                 .unwrap_or(false);
@@ -245,12 +250,16 @@ impl QuantWindowFormat {
     ) -> Result<()> {
         let n_heads_kv = cache.kv_heads();
         let head_dim = cache.head_dim();
-        let quant_attn_be = backend
-            .as_quant_attn()
-            .expect("attention_native gated on as_quant_attn().is_some()");
+        // Stage E: pull the cap from the cache's `quant_attn` handle (the same Arc
+        // the gate checks), cloned so its borrow of `cache` ends before the
+        // `set_attn_scores` (&mut) below. `backend` now only lends its cl_queue.
+        let quant_attn_be = cache
+            .quant_attn_cap()
+            .expect("attention_native gated on quant_attn_cap().is_some()")
+            .clone();
         let raw = cache
             .get_quant_window_raw_buffers()
-            .expect("attention_native gated on get_kivi_raw_buffers().is_some()");
+            .expect("attention_native gated on get_quant_window_raw_buffers().is_some()");
         let scale = 1.0 / (head_dim as f32).sqrt();
         let total = raw.q_tokens + raw.res_tokens;
 
@@ -262,8 +271,9 @@ impl QuantWindowFormat {
         };
         // D8: ABI struct(cl_mem) 시그니처. `&Tensor` 6개를 raw cl_mem 으로 추출해
         // `QuantAttnArgs` 패킹. score 는 `(ptr, len)` 으로 변환(None → (null, 0)).
-        // cl_queue 는 OpenCL 정적 impl 이 `&self.queue` 를 직접 알아 사용하지 않으므로
-        // null 패킹(plugin/dlopen 어댑터용 ABI 슬롯).
+        // cl_queue 는 엔진의 live `cl_command_queue` 를 넘긴다(Stage E): borrowed-context
+        // dlopen plugin 이 같은 in-order 큐에 enqueue 해야 score readback 순서가 보존된다.
+        // 엔진 내장 OpenCL impl 은 이 슬롯을 무시하고 `&self.queue` 를 직접 쓰므로 무영향.
         use crate::backend::opencl::get_cl_mem;
         // `Mem::as_ptr()` 는 이미 `cl_mem`(= `*mut c_void`) 를 반환하므로 캐스트 불요.
         let q_mem = get_cl_mem(q.buffer().as_ref())?.as_ptr();
@@ -278,7 +288,7 @@ impl QuantWindowFormat {
             (std::ptr::null_mut(), 0)
         };
         let args = crate::backend::QuantAttnArgs {
-            cl_queue: std::ptr::null_mut(),
+            cl_queue: backend.cl_command_queue_ptr(),
             q_mem,
             qk_mem,
             qv_mem,
