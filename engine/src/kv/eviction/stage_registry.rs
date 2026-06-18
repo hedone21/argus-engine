@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use argus_extension_api::{
     KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage, KeepSpec, PlanAbi,
     PluginVTableAbi, StageCtx, StageCtxAbi, StageExportAbi, StageParams, TensorDtype, TensorHandle,
-    TensorKind, TensorShape, WeightedMerge,
+    TensorKind, TensorShape, WeightedMerge, find_qcf_estimator,
 };
 use core::ffi::c_void;
 use std::ffi::CStr;
@@ -546,6 +546,31 @@ pub fn ensure_builtin_stages_registered() -> Result<()> {
             );
         }
     }
+
+    // QCF estimators (observer/score axis, EPIC 2): each eviction technique crate also registers a
+    // QcfEstimator into QCF_ESTIMATORS via the same force-link as the stages above. A missing entry
+    // is the same fat-LTO --gc-sections silent-drop risk — fail fast, checking the declared curve key.
+    for (name, want_curve_key) in [
+        ("sliding", "kv.evict_sliding"),
+        ("streaming", "kv.evict_streaming"),
+        ("h2o", "kv.evict_h2o"),
+        ("d2o", "kv.merge_d2o"),
+    ] {
+        let Some(reg) = find_qcf_estimator(name) else {
+            anyhow::bail!(
+                "QCF estimator '{name}' not registered — suspect linkme fat-LTO --gc-sections \
+                 silent drop of its QCF_ESTIMATORS registration."
+            );
+        };
+        if reg.curve_key != want_curve_key {
+            anyhow::bail!(
+                "QCF estimator '{name}' declares curve_key='{}' but the engine expects \
+                 '{want_curve_key}'.",
+                reg.curve_key
+            );
+        }
+    }
+
     Ok(())
 }
 

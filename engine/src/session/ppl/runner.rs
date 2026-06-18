@@ -1075,8 +1075,9 @@ pub fn run_ppl(
                         && let Some(acc) = score_accumulator.as_ref()
                         && let Some(head_attn) = acc.last_step_head_attn()
                     {
-                        use crate::qcf::{QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
+                        use crate::qcf::{QcfKvParams, VDataSource, compute_qcf_kv};
                         use crate::qcf_types::AggregationMode;
+                        use argus_extension_api::{StageParams, find_qcf_estimator};
                         let target_len = ((before_len as f32) * ratio) as usize;
                         let cache = &kv_caches[0];
                         let v_cpu_bytes: Option<&[u8]> = v_cpu_data.as_deref().map(|s| {
@@ -1088,19 +1089,29 @@ pub fn run_ppl(
                                 )
                             }
                         });
-                        let action = if score_based_eviction {
-                            QcfActionType::EvictH2o {
-                                target_len,
-                                keep_ratio: args.keep_ratio(),
-                                protected_prefix,
-                            }
+                        // Resolve the estimator (h2o when score-based, else sliding) by name; the
+                        // engine no longer enumerates techniques here. PPL eval only ever triggers
+                        // Sliding/H2O — never D2O — so `k_source` stays None.
+                        let (est_name, est_params) = if score_based_eviction {
+                            (
+                                "h2o",
+                                StageParams {
+                                    keep_ratio: args.keep_ratio(),
+                                    protected_prefix,
+                                    ..Default::default()
+                                },
+                            )
                         } else {
-                            QcfActionType::EvictSliding { target_len }
+                            ("sliding", StageParams::default())
                         };
+                        let estimator = (find_qcf_estimator(est_name)
+                            .expect("h2o/sliding QCF estimator registered")
+                            .make)(est_params, &[]);
                         match VDataSource::from_buffer(&cache.v_buffer, v_cpu_bytes) {
                             Some(v_source) => {
                                 let params = QcfKvParams {
-                                    action,
+                                    estimator: &*estimator,
+                                    target_len,
                                     v_source,
                                     // PPL eval site only triggers Sliding/H2O,
                                     // never D2O — `k_source` is unused.

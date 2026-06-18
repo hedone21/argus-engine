@@ -874,7 +874,8 @@ pub struct QcfEstimateContext<'a> {
 pub fn compute_qcf_estimates(
     ctx: &QcfEstimateContext<'_>,
 ) -> std::collections::HashMap<String, f32> {
-    use crate::qcf::{AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
+    use crate::qcf::{AggregationMode, QcfKvParams, VDataSource, compute_qcf_kv};
+    use argus_extension_api::{QCF_ESTIMATORS, StageParams};
     use std::collections::HashMap;
     let mut estimates = HashMap::new();
 
@@ -947,60 +948,43 @@ pub fn compute_qcf_estimates(
                     scores_opt.clone().unwrap_or(fallback_scores);
 
                 if target_len < current_pos {
-                    let mut actions: Vec<(&'static str, QcfActionType, bool)> = vec![
-                        (
-                            "kv.evict_sliding",
-                            QcfActionType::EvictSliding { target_len },
-                            false,
-                        ),
-                        (
-                            "kv.evict_h2o",
-                            QcfActionType::EvictH2o {
-                                target_len,
-                                keep_ratio: 0.5,
-                                protected_prefix,
-                            },
-                            true,
-                        ),
-                        (
-                            "kv.merge_d2o",
-                            QcfActionType::MergeD2o {
-                                target_len,
-                                keep_ratio: 0.5,
-                                protected_prefix,
-                            },
-                            true,
-                        ),
-                    ];
-                    if let Some((sink_size, window_size)) = ctx.streaming_config {
-                        actions.push((
-                            "kv.evict_streaming",
-                            QcfActionType::EvictStreaming {
-                                sink_size,
-                                window_size,
-                            },
-                            false,
-                        ));
-                    }
+                    // Build the shared estimate StageParams once; every registered estimator reads
+                    // the fields it needs (keep_ratio/protected_prefix for h2o/d2o, sink/window for
+                    // streaming). The engine names no technique — it iterates QCF_ESTIMATORS and
+                    // keys the estimate by each estimator's declared `curve_key`.
+                    let (sink_size, streaming_window) = ctx.streaming_config.unwrap_or((0, 0));
+                    let stage_params = StageParams {
+                        keep_ratio,
+                        protected_prefix,
+                        sink_size,
+                        streaming_window,
+                        ..Default::default()
+                    };
+                    let v_bytes_ref: Option<&[u8]> = v_bytes_opt.as_deref();
+                    let k_bytes_ref: Option<&[u8]> = k_bytes_opt.as_deref();
 
-                    // Run each action inside with_cache_mut to borrow v_buffer/k_buffer safely.
-                    // When v_bytes_opt is Some (device-only fallback), pass the byte slices to
+                    // Run each registered estimator inside with_cache_mut to borrow v/k buffers safely.
+                    // When v_bytes_opt is Some (device-only fallback), the byte slices feed
                     // VDataSource::from_buffer so the QCF computation uses host copies.
-                    for (id, action, requires_scores) in actions {
-                        if requires_scores && scores_opt.is_none() {
+                    for reg in QCF_ESTIMATORS {
+                        // Capability gates (no plugin names): per-token scores for h2o/d2o, and a
+                        // streaming (sink, window) config for streaming — matching the former
+                        // hardcoded `requires_scores` / `streaming_config.is_some()` checks.
+                        if reg.requires_scores && scores_opt.is_none() {
                             continue;
                         }
-                        let v_bytes_ref: Option<&[u8]> = v_bytes_opt.as_deref();
-                        let k_bytes_ref: Option<&[u8]> = k_bytes_opt.as_deref();
+                        if reg.requires_streaming_config && ctx.streaming_config.is_none() {
+                            continue;
+                        }
+                        let estimator = (reg.make)(stage_params, &[]);
                         let qcf_opt = ctx.kv_handles[0].with_cache_mut(|cache| {
                             let v_source = VDataSource::from_buffer(&cache.v_buffer, v_bytes_ref)?;
-                            let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
-                                VDataSource::from_buffer(&cache.k_buffer, k_bytes_ref)
-                            } else {
-                                None
-                            };
+                            // K is always offered; only estimators that need it (d2o) read it, and a
+                            // missing K buffer (None) makes read_k fall back to V.
+                            let k_source = VDataSource::from_buffer(&cache.k_buffer, k_bytes_ref);
                             let params = QcfKvParams {
-                                action: action.clone(),
+                                estimator: &*estimator,
+                                target_len,
                                 v_source,
                                 k_source,
                                 attention_scores: &attention_scores_owned,
@@ -1017,7 +1001,7 @@ pub fn compute_qcf_estimates(
                             Some(qcf)
                         });
                         if let Some(qcf) = qcf_opt {
-                            estimates.insert(id.to_string(), qcf);
+                            estimates.insert(reg.curve_key.to_string(), qcf);
                         }
                     }
                 }
@@ -1193,9 +1177,10 @@ mod tests {
     use crate::kv::standard_format::StandardFormat;
     use crate::kv_cache_ops::KVLayout;
     use crate::memory::host::shared::SharedBuffer;
-    use crate::qcf::{AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
+    use crate::qcf::{AggregationMode, QcfKvParams, VDataSource, compute_qcf_kv};
     use crate::shape::Shape;
     use crate::tensor::Tensor;
+    use argus_extension_api::{StageParams, find_qcf_estimator};
 
     use super::{QcfEstimateContext, compute_qcf_estimates};
 
@@ -1265,8 +1250,10 @@ mod tests {
         let src_fallback =
             VDataSource::from_buffer(&t_a, Some(&v_bytes)).expect("cpu_bytes path should succeed");
 
+        let est = (find_qcf_estimator("sliding").unwrap().make)(StageParams::default(), &[]);
         let (qcf_direct, _) = compute_qcf_kv(&QcfKvParams {
-            action: QcfActionType::EvictSliding { target_len },
+            estimator: &*est,
+            target_len,
             v_source: src_direct,
             k_source: None,
             attention_scores: &scores,
@@ -1280,7 +1267,8 @@ mod tests {
             beta: 1.0,
         });
         let (qcf_fallback, _) = compute_qcf_kv(&QcfKvParams {
-            action: QcfActionType::EvictSliding { target_len },
+            estimator: &*est,
+            target_len,
             v_source: src_fallback,
             k_source: None,
             attention_scores: &scores,

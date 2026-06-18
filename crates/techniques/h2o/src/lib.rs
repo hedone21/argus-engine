@@ -15,8 +15,9 @@
 //! keep-list; the engine executes the compaction (plan-returning, D1).
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCaps, StageCtx,
-    StageParams,
+    EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec,
+    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
+    redistribute_value,
 };
 use linkme::distributed_slice;
 
@@ -116,6 +117,100 @@ static H2O: KVCacheStageReg = KVCacheStageReg {
         is_score_based: true,
         default_protected_prefix: 4,
     },
+};
+
+// ── QCF estimator (observer/score axis) ──────────────────────────
+
+/// Identify the H2O-retained token set for the QCF simulation: protected prefix + top-importance
+/// heavy hitters (by `keep_ratio`) + most-recent window. Ported verbatim from the engine's former
+/// `qcf_kv::identify_retained_h2o` so the estimate is bit-identical to the old engine path.
+fn identify_retained_h2o(
+    importance: &[f32],
+    current_pos: usize,
+    target_len: usize,
+    keep_ratio: f32,
+    protected_prefix: usize,
+) -> Vec<usize> {
+    let prefix = protected_prefix.min(current_pos).min(target_len);
+    let available = target_len.saturating_sub(prefix);
+    if available == 0 {
+        return (0..prefix).collect();
+    }
+    let hh_budget = (available as f32 * keep_ratio) as usize;
+    let recent_budget = available.saturating_sub(hh_budget);
+    let recent_start = current_pos.saturating_sub(recent_budget);
+    let mut retained: Vec<usize> = (0..prefix).collect();
+    if recent_start > prefix {
+        let mut evictable: Vec<(usize, f32)> = (prefix..recent_start)
+            .map(|t| {
+                (
+                    t,
+                    if t < importance.len() {
+                        importance[t]
+                    } else {
+                        0.0
+                    },
+                )
+            })
+            .collect();
+        evictable.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        retained.extend(evictable.iter().take(hh_budget).map(|(t, _)| t));
+    }
+    retained.extend(recent_start..current_pos);
+    retained.sort();
+    retained.dedup();
+    retained
+}
+
+/// H2O QCF estimator: prefix + heavy-hitter + recent retained set, then O_after redistribution over
+/// it. Ported verbatim from the engine's former `compute_qcf_kv` `EvictH2o` arm (bit-identical).
+struct H2oEstimator {
+    keep_ratio: f32,
+    protected_prefix: usize,
+}
+
+impl QcfEstimator for H2oEstimator {
+    fn name(&self) -> &str {
+        "h2o"
+    }
+    fn curve_key(&self) -> &'static str {
+        "kv.evict_h2o"
+    }
+    fn o_after(&self, ctx: &dyn EstimatorCtx, kv_head: usize, out: &mut [f32]) -> bool {
+        let current = ctx.current_pos();
+        let target = ctx.target_len();
+        if current <= target {
+            return false;
+        }
+        let mut alpha = vec![0.0f32; current];
+        ctx.alpha_h(kv_head, &mut alpha);
+        let retained = identify_retained_h2o(
+            &alpha,
+            current,
+            target,
+            self.keep_ratio,
+            self.protected_prefix,
+        );
+        redistribute_value(ctx, kv_head, &alpha, &retained, ctx.beta(), out);
+        true
+    }
+}
+
+/// Registration — found via `find_qcf_estimator("h2o")`. `keep_ratio`/`protected_prefix` flow from
+/// the engine-supplied estimate `StageParams` with no actuator-style clamp, to stay bit-identical
+/// with the former engine estimate (which used the raw values). Score-based.
+#[distributed_slice(QCF_ESTIMATORS)]
+static H2O_QCF: QcfEstimatorReg = QcfEstimatorReg {
+    name: "h2o",
+    curve_key: "kv.evict_h2o",
+    make: |p: StageParams, _args: StageArgs<'_>| {
+        Box::new(H2oEstimator {
+            keep_ratio: p.keep_ratio,
+            protected_prefix: p.protected_prefix,
+        })
+    },
+    requires_scores: true,
+    requires_streaming_config: false,
 };
 
 #[cfg(test)]

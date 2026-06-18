@@ -8,11 +8,9 @@ use super::hook::{CacheSnapshot, StepHook};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::{KVCache, max_cache_pos};
-use crate::qcf::{
-    QcfActionType, QcfKvParams, VDataSource, compute_c1, compute_d7, compute_qcf_kv,
-    identify_retained_for_action,
-};
+use crate::qcf::{QcfKvParams, VDataSource, compute_c1, compute_d7, compute_qcf_kv};
 use crate::qcf_types::{AggregationMode, QcfConfig, aggregate_heads};
+use argus_extension_api::{StageParams, find_qcf_estimator};
 
 /// QCF result from the single post-prefill eviction event (eval-ll mode).
 #[derive(Debug, Clone)]
@@ -280,23 +278,25 @@ impl StepHook<KVCache> for EvictionHook {
                     VDataSource::F32(cache.v_buffer.as_slice::<f32>())
                 });
             let target_len = ((before_len as f32) * ratio) as usize;
-            let action = if self.score_based_eviction {
+            // Resolve the estimator by name (d2o/h2o when score-based, else sliding); the engine no
+            // longer enumerates techniques here.
+            let (est_name, est_params) = if self.score_based_eviction {
+                let sp = StageParams {
+                    keep_ratio: self.h2o_keep_ratio,
+                    protected_prefix: self.protected_prefix,
+                    ..Default::default()
+                };
                 if self.is_d2o {
-                    QcfActionType::MergeD2o {
-                        target_len,
-                        keep_ratio: self.h2o_keep_ratio,
-                        protected_prefix: self.protected_prefix,
-                    }
+                    ("d2o", sp)
                 } else {
-                    QcfActionType::EvictH2o {
-                        target_len,
-                        keep_ratio: self.h2o_keep_ratio,
-                        protected_prefix: self.protected_prefix,
-                    }
+                    ("h2o", sp)
                 }
             } else {
-                QcfActionType::EvictSliding { target_len }
+                ("sliding", StageParams::default())
             };
+            let estimator = (find_qcf_estimator(est_name)
+                .expect("eviction QCF estimator registered")
+                .make)(est_params, &[]);
             let attention_scores: Vec<f32> = self
                 .score_accumulator
                 .as_ref()
@@ -307,31 +307,16 @@ impl StepHook<KVCache> for EvictionHook {
                 .score_accumulator
                 .as_ref()
                 .and_then(|acc| acc.last_step_head_attn());
-            // D2O simulator (paper Eq.8) needs K for nearest-neighbour
-            // matching; other actions ignore `k_source`.
-            let k_source = if matches!(action, QcfActionType::MergeD2o { .. }) {
+            // D2O simulator (paper Eq.8) needs K for nearest-neighbour matching; other techniques
+            // ignore `k_source` (their estimators never call read_k).
+            let k_source = if self.is_d2o {
                 VDataSource::from_buffer(&cache.k_buffer, None)
             } else {
                 None
             };
-            // Compute retained set before moving `action` into params (experimental path).
-            // Clone action for re-use in β-amplified measurements.
-            let action_for_beta = if self.experimental_enabled {
-                Some(action.clone())
-            } else {
-                None
-            };
-            let retained_for_topk = if self.experimental_enabled {
-                Some(identify_retained_for_action(
-                    &action,
-                    &attention_scores,
-                    before_len,
-                ))
-            } else {
-                None
-            };
             let params = QcfKvParams {
-                action,
+                estimator: &*estimator,
+                target_len,
                 v_source,
                 k_source,
                 attention_scores: &attention_scores,
@@ -349,10 +334,6 @@ impl StepHook<KVCache> for EvictionHook {
             if self.experimental_enabled {
                 // Schema v3: per-layer worst-head + mean-head over the sample layers.
                 // Layer 0 reuses the `per_head` already computed above.
-                // _ = action_for_beta; _ = retained_for_topk;   // (kept names for diff clarity)
-                let _ = action_for_beta;
-                let _ = retained_for_topk;
-
                 let sample_layers: Vec<usize> = if self.qcf_sample_layers.is_empty() {
                     vec![0]
                 } else {
@@ -403,27 +384,13 @@ impl StepHook<KVCache> for EvictionHook {
                             None
                         };
                         let target_len_l = ((cache_l.current_pos as f32) * ratio) as usize;
-                        let action_l = if self.score_based_eviction {
-                            if self.is_d2o {
-                                QcfActionType::MergeD2o {
-                                    target_len: target_len_l,
-                                    keep_ratio: self.h2o_keep_ratio,
-                                    protected_prefix: self.protected_prefix,
-                                }
-                            } else {
-                                QcfActionType::EvictH2o {
-                                    target_len: target_len_l,
-                                    keep_ratio: self.h2o_keep_ratio,
-                                    protected_prefix: self.protected_prefix,
-                                }
-                            }
-                        } else {
-                            QcfActionType::EvictSliding {
-                                target_len: target_len_l,
-                            }
-                        };
+                        // Same technique as the scalar call above; only target_len differs per layer.
+                        let estimator_l = (find_qcf_estimator(est_name)
+                            .expect("eviction QCF estimator registered")
+                            .make)(est_params, &[]);
                         let params_l = QcfKvParams {
-                            action: action_l,
+                            estimator: &*estimator_l,
+                            target_len: target_len_l,
                             v_source: v_source_l,
                             k_source: k_source_l,
                             attention_scores: &attention_scores,

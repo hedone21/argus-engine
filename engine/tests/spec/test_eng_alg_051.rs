@@ -17,7 +17,8 @@
 //!      (correlated-V, sink-preserving) eviction.
 
 use argus_engine::kv::kv_cache::KVLayout;
-use argus_engine::qcf::{AggregationMode, QcfActionType, QcfKvParams, VDataSource, compute_qcf_kv};
+use argus_engine::qcf::{AggregationMode, QcfKvParams, VDataSource, compute_qcf_kv};
+use argus_extension_api::{QcfEstimator, StageParams, find_qcf_estimator};
 
 const N_KV_HEADS: usize = 8;
 const HEAD_DIM: usize = 64;
@@ -25,9 +26,7 @@ const CAPACITY: usize = 16;
 const CURRENT_POS: usize = 12;
 
 /// Correlated value vectors mimicking real LLM V cache: a dominant low-frequency
-/// direction shared across tokens, with a small per-token phase drift. (Highly
-/// orthogonal synthetic V would inflate QCF beyond [0,1] — the spec's [0,1]
-/// invariant assumes near-convex combinations, which correlated V provides.)
+/// direction shared across tokens, with a small per-token phase drift.
 fn correlated_v() -> Vec<f32> {
     let freq = 0.05f32;
     let mut v = vec![0.0f32; N_KV_HEADS * CAPACITY * HEAD_DIM];
@@ -51,9 +50,15 @@ fn scores_summing_to(target: f32) -> Vec<f32> {
     base.iter().map(|x| x * target / s).collect()
 }
 
-fn make_params<'a>(action: QcfActionType, v: &'a [f32], scores: &'a [f32]) -> QcfKvParams<'a> {
+/// Build a sliding-eviction [`QcfKvParams`] for `target_len`. The sliding estimator is stateless and
+/// parameter-free; we leak it to satisfy the `&dyn` borrow (test-only).
+fn make_params<'a>(target_len: usize, v: &'a [f32], scores: &'a [f32]) -> QcfKvParams<'a> {
+    let est: &'static dyn QcfEstimator = Box::leak((find_qcf_estimator("sliding")
+        .expect("sliding estimator registered")
+        .make)(StageParams::default(), &[]));
     QcfKvParams {
-        action,
+        estimator: est,
+        target_len,
         v_source: VDataSource::F32(v),
         k_source: None,
         attention_scores: scores,
@@ -71,18 +76,9 @@ fn make_params<'a>(action: QcfActionType, v: &'a [f32], scores: &'a [f32]) -> Qc
 #[test]
 fn test_eng_alg_051_identity_action_zero_qcf() {
     // Retain every token (target_len >= current_pos) → QCF must be exactly 0.
-    // Uses the saturation-regime score (Σα ≈ 12) to prove the identity holds
-    // independent of the α-sum scale (the pre-revision raw O_before would give
-    // a non-zero QCF here).
     let v = correlated_v();
     let scores = scores_summing_to(12.0);
-    let params = make_params(
-        QcfActionType::EvictSliding {
-            target_len: CURRENT_POS,
-        },
-        &v,
-        &scores,
-    );
+    let params = make_params(CURRENT_POS, &v, &scores);
     let (qcf, per_head) = compute_qcf_kv(&params);
     assert_eq!(
         qcf, 0.0,
@@ -98,18 +94,12 @@ fn test_eng_alg_051_identity_action_zero_qcf() {
 
 #[test]
 fn test_eng_alg_051_no_saturation_under_accumulated_scores() {
-    // Regression guard against the 0.985 saturation: an unnormalised
-    // accumulated score (Σα ≈ 12) with a realistic correlated-V eviction must
-    // yield a small relative perturbation, NOT a near-1 saturated value.
+    // Regression guard against the 0.985 saturation: an unnormalised accumulated score (Σα ≈ 12)
+    // with a realistic correlated-V eviction must yield a small relative perturbation.
     let v = correlated_v();
     let scores = scores_summing_to(12.0);
 
-    // Sliding eviction retaining 10 of 12 tokens (sink + recent preserved).
-    let (qcf, _) = compute_qcf_kv(&make_params(
-        QcfActionType::EvictSliding { target_len: 10 },
-        &v,
-        &scores,
-    ));
+    let (qcf, _) = compute_qcf_kv(&make_params(10, &v, &scores));
     assert!(
         qcf < 0.5,
         "ENG-ALG-051: accumulated score (Σα≈12) must not saturate; \
@@ -123,23 +113,14 @@ fn test_eng_alg_051_no_saturation_under_accumulated_scores() {
 
 #[test]
 fn test_eng_alg_051_scale_invariant_after_normalisation() {
-    // The O_before normalisation makes QCF invariant to the α-sum scale: the
-    // same attention *distribution* at Σα=1 and Σα=12 must give the same QCF.
-    // (Pre-revision, the raw O_before scaled with Σα and the metric saturated.)
+    // The O_before normalisation makes QCF invariant to the α-sum scale: the same attention
+    // *distribution* at Σα=1 and Σα=12 must give the same QCF.
     let v = correlated_v();
     let scores_unit = scores_summing_to(1.0);
     let scores_accum = scores_summing_to(12.0);
 
-    let (qcf_unit, _) = compute_qcf_kv(&make_params(
-        QcfActionType::EvictSliding { target_len: 10 },
-        &v,
-        &scores_unit,
-    ));
-    let (qcf_accum, _) = compute_qcf_kv(&make_params(
-        QcfActionType::EvictSliding { target_len: 10 },
-        &v,
-        &scores_accum,
-    ));
+    let (qcf_unit, _) = compute_qcf_kv(&make_params(10, &v, &scores_unit));
+    let (qcf_accum, _) = compute_qcf_kv(&make_params(10, &v, &scores_accum));
     assert!(
         (qcf_unit - qcf_accum).abs() < 1e-4,
         "ENG-ALG-051: QCF must be α-sum scale invariant; \

@@ -2095,6 +2095,140 @@ pub fn registered_read_names() -> Vec<&'static str> {
     KV_READ_STAGES.iter().map(|r| r.name).collect()
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// QCF estimator axis (observer/score axis, EPIC 2 Stage A)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Per-technique degradation simulation. The engine's QCF harness used to duplicate every eviction
+// plugin's arithmetic (identify-retained + redistribute / d2o merge) a second time, purely to compute
+// the post-eviction attention output O_after. This axis lets each technique supply its own O_after, so
+// the engine core holds no concrete technique arithmetic — only the generic metric and the lent
+// read primitives.
+//
+// Static-linkme only (no cdylib C-ABI): the only consumers (the engine QCF runtime / eval / ppl
+// paths) are all in-engine, so there is no out-of-tree `.so` consumer to serve. A future cdylib path
+// stays open — every estimator output is POD (`o_after` writes `&mut [f32]`), so it would not break the
+// surface.
+
+/// Read-only per-eviction context the engine lends to a [`QcfEstimator`] so it can build its own
+/// O_after **without touching the production cache**. The engine implements this over a host (D2H)
+/// readback of the KV buffers — GPU caches are cache-incoherent through `as_ptr`, so a host copy is
+/// required — plus the per-head redistribution weights it already computes for O_before. Every vector
+/// is host `f32`.
+pub trait EstimatorCtx {
+    /// Tokens currently resident in the cache (the simulated set is `[0, current_pos)`).
+    fn current_pos(&self) -> usize;
+    /// Post-eviction token budget the estimate simulates (engine-derived, e.g. `current_pos / 2`).
+    fn target_len(&self) -> usize;
+    /// Number of KV heads.
+    fn n_kv_heads(&self) -> usize;
+    /// Per-head dimension — the length of every `read_v` / `read_k` / O_after buffer.
+    fn head_dim(&self) -> usize;
+    /// β exponent for redistributed-attention amplification (`1.0` = standard CAOTE / legacy).
+    fn beta(&self) -> f32;
+    /// Per-head redistribution weights α_h[t] (`out.len() == current_pos`) — the same weights the
+    /// engine uses for O_before (per-head attention with a flat-score fallback). Estimators rank and
+    /// redistribute with these so O_after shares O_before's softmax space.
+    fn alpha_h(&self, kv_head: usize, out: &mut [f32]);
+    /// Read V[kv_head][pos] as host `f32` (`out.len() == head_dim`); out-of-range reads zero-fill.
+    fn read_v(&self, kv_head: usize, pos: usize, out: &mut [f32]);
+    /// Read K[kv_head][pos] as host `f32` (`out.len() == head_dim`). Returns `false` when K is
+    /// unavailable, so the estimator can fall back to V (e.g. d2o's V-based nearest matching).
+    fn read_k(&self, kv_head: usize, pos: usize, out: &mut [f32]) -> bool;
+}
+
+/// A per-technique degradation simulator: given the [`EstimatorCtx`], it builds the post-eviction
+/// attention output O_after for one KV head. The engine's QCF harness owns the metric
+/// (`‖O_before − O_after‖ / ‖O_before‖`, O_before, β, aggregation); the estimator owns only the
+/// technique-specific O_after — the arithmetic the engine used to duplicate per technique.
+pub trait QcfEstimator: Send + Sync {
+    /// Technique name (== the actuator stage name, e.g. `"h2o"`).
+    fn name(&self) -> &str;
+    /// The estimate-map / `DegradationEstimator` curve key (e.g. `"kv.evict_h2o"`).
+    fn curve_key(&self) -> &'static str;
+    /// Build per-head O_after into `out` (`out.len() == ctx.head_dim()`). Returns `false` when the
+    /// technique evicts nothing for the current budget (within-budget no-op); the caller then treats
+    /// O_after == O_before (QCF contribution `0` for that head).
+    fn o_after(&self, ctx: &dyn EstimatorCtx, kv_head: usize, out: &mut [f32]) -> bool;
+}
+
+/// Registration entry for one QCF estimator — a mirror of [`KVCacheStageReg`], static-linkme only.
+/// `make` parses the same [`StageParams`] / [`StageArgs`] as the actuator stage so technique config
+/// (keep_ratio, merge_e, ...) has a single source.
+pub struct QcfEstimatorReg {
+    /// Technique name (== the actuator stage name). Unique within the slice.
+    pub name: &'static str,
+    /// The estimate-map / curve key (e.g. `"kv.evict_h2o"`).
+    pub curve_key: &'static str,
+    /// Factory from the shared estimate parameters plus the technique-private blob.
+    pub make: fn(StageParams, StageArgs<'_>) -> Box<dyn QcfEstimator>,
+    /// Whether the estimate needs per-token attention scores (h2o / d2o). When `true` and the engine
+    /// has no scores, the driver skips this estimator (matching the legacy `requires_scores` gate).
+    pub requires_scores: bool,
+    /// Whether the estimate needs an engine-supplied streaming `(sink, window)` config. When `true`
+    /// and the engine has none, the driver skips this estimator — streaming cannot be dry-run blind.
+    pub requires_streaming_config: bool,
+}
+
+/// Global QCF-estimator registration slice — the producer half of the observer/score axis. Each
+/// eviction technique crate contributes one entry via `#[distributed_slice(QCF_ESTIMATORS)]`.
+#[distributed_slice]
+pub static QCF_ESTIMATORS: [QcfEstimatorReg] = [..];
+
+/// Find a registered QCF estimator by name.
+pub fn find_qcf_estimator(name: &str) -> Option<&'static QcfEstimatorReg> {
+    QCF_ESTIMATORS.iter().find(|r| r.name == name)
+}
+
+/// Names of all registered QCF estimators (self-test / diagnostics).
+pub fn registered_qcf_estimator_names() -> Vec<&'static str> {
+    QCF_ESTIMATORS.iter().map(|r| r.name).collect()
+}
+
+/// Engine-lent primitive: `O_after = Σ_{t∈retained} (α_t^β / Σ_s α_s^β) · V[kv_head][t]`
+/// (β = 1 → the legacy `α_t / Σα` form). Zero-fills `out` first; an all-zero α-sum leaves O_after at
+/// zero. Eviction-only estimators (sliding / h2o / streaming) build their retained set then call this;
+/// d2o redistributes its own merged V instead.
+pub fn redistribute_value(
+    ctx: &dyn EstimatorCtx,
+    kv_head: usize,
+    alpha: &[f32],
+    retained: &[usize],
+    beta: f32,
+    out: &mut [f32],
+) {
+    for x in out.iter_mut() {
+        *x = 0.0;
+    }
+    let head_dim = out.len();
+    let mut v_t = vec![0.0f32; head_dim];
+    if beta == 1.0 {
+        let alpha_sum: f32 = retained.iter().map(|&t| alpha[t]).sum();
+        if alpha_sum <= 0.0 {
+            return;
+        }
+        for &t in retained {
+            ctx.read_v(kv_head, t, &mut v_t);
+            let w = alpha[t] / alpha_sum;
+            for d in 0..head_dim {
+                out[d] += w * v_t[d];
+            }
+        }
+    } else {
+        let alpha_pow_sum: f32 = retained.iter().map(|&t| alpha[t].max(0.0).powf(beta)).sum();
+        if alpha_pow_sum <= 0.0 {
+            return;
+        }
+        for &t in retained {
+            ctx.read_v(kv_head, t, &mut v_t);
+            let w = alpha[t].max(0.0).powf(beta) / alpha_pow_sum;
+            for d in 0..head_dim {
+                out[d] += w * v_t[d];
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
