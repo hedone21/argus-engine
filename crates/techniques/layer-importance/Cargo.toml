@@ -1,0 +1,16 @@
+[package]
+name = "layer-importance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Layer-importance scorer technique crate — the per-layer importance formulas (mean-pool cosine,
+# ShortGPT-BI per-token cosine) that feed the weight-swap decider. Extracted from the engine core
+# (the sliding-window/h2o/d2o precedent): depends only on `argus-extension-api` + `linkme` (no engine
+# reference = proof of additive extension cost). Force-linked via one `use layer_importance as _;`;
+# the engine resolves the scorers by name through `find_layer_scorer`. Activation-only, no weights.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"
