@@ -75,7 +75,4 @@ pub trait EvictionPolicy: Send + Sync {
 // (registers via linkme, force-linked in stage_registry.rs): `streaming` → `streaming-llm`,
 // `h2o` → `h2o`, `d2o` → `d2o`, `sliding` → `sliding-window`, `none` → `no-eviction`,
 // `rkv` → `rkv` (feature-gated). The engine retains only the generic plumbing here.
-pub mod method;
 pub mod stage_registry;
-
-pub use method::EvictMethod;
