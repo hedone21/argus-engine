@@ -10,8 +10,8 @@
 //! q→out 만 보므로 양쪽 다 dtype/codebook/rotation/sparse pattern 을 모른다(impl 이 캡슐화,
 //! `INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`).
 //!
-//! **guard rail: impl 은 여기 금지** (§2.1) — `StandardFormat`/`KIVIFormat` impl 은 `pressure/`
-//! (그들이 감싸는 `KVCache`/`KiviCache` 옆)에 둔다.
+//! **guard rail: impl 은 여기 금지** (§2.1) — `StandardFormat`/`QuantWindowFormat` impl 은 `pressure/`
+//! (그들이 감싸는 `KVCache`/`QuantizedRecentWindowCache` 옆)에 둔다.
 //!
 //! **Phase α-K substep (1)** 신설 — purely additive, host-only. 기존 `KVCacheOps`
 //! 경로(`kv_cache_ops.rs`)와 공존하며, 이제 표준/KIVI/offload forward 가 이 trait 을
@@ -54,7 +54,7 @@ pub struct Merge {
 
 /// KV 캐시의 state 책임을 storage-format-agnostic 하게 제공하는 base trait (§4.1).
 ///
-/// impl: `StandardFormat`(F32/F16/Q4_0) / `KIVIFormat`(Q2 + residual). 새 Format = 새 impl +
+/// impl: `StandardFormat`(F32/F16/Q4_0) / `QuantWindowFormat`(Q2 + residual). 새 Format = 새 impl +
 /// paired attention kernel (`INV-KVCACHELAYER-PAIRED-KERNEL`), base trait·forward 변경 0.
 pub trait KVCacheFormat: Send + Sync {
     // ── geometry (3) ──

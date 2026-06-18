@@ -1,6 +1,6 @@
 //! Quantize handler — reduces KV cache precision to save memory.
 //!
-//! Works with `KiviCache` to dynamically transition quantization bit-width
+//! Works with `QuantizedRecentWindowCache` to dynamically transition quantization bit-width
 //! based on pressure level. Maps pressure levels to target bits:
 //! - Normal: no action (keep current bits)
 //! - Warning: 8-bit

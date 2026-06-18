@@ -9,7 +9,7 @@
 //! Banned list (concrete L1 / L3 types whose presence would couple the
 //! decode loop to a specific backend / domain implementation):
 //! - L1: OpenCLBackend, CudaBackend, CpuBackend, QnnBackend
-//! - L3 pressure: CacheManager, KiviCache, OffloadStore
+//! - L3 pressure: CacheManager, QuantizedRecentWindowCache, OffloadStore
 //! - L3 inference: LlamaModel, TransformerModel
 //! - cross-cutting concrete: ManagerClient
 //!
@@ -34,7 +34,7 @@ const BANNED: &[&str] = &[
     "CpuBackend",
     "QnnBackend",
     "CacheManager",
-    "KiviCache",
+    "QuantizedRecentWindowCache",
     "OffloadStore",
     "LlamaModel",
     "TransformerModel",

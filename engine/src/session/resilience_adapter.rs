@@ -24,7 +24,7 @@ use crate::session::command_dispatcher::{CommandSource, EngineReport};
 /// bit-width query (`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC` — no base-trait
 /// downcast). Instead, a quantized-KV technique exposes its runtime bits through
 /// this sub-trait, and the [`ResilienceAdapter`] holds it generically (no concrete
-/// `KIVIFormat` in its signature). The engine reads it only to fill the heartbeat
+/// `QuantWindowFormat` in its signature). The engine reads it only to fill the heartbeat
 /// `kv_dtype` field; a non-quantized (Standard/Offload) path simply never installs
 /// a handle, so `kv_dtype` stays the default `""` (behaviour unchanged).
 pub trait QuantStageHandle: Send + Sync {
@@ -46,7 +46,7 @@ pub struct ResilienceAdapter {
     /// `None` 이면 partial snapshot(pos=0) — set_kv_handle 미주입 경로.
     kv_handle: Option<Arc<dyn KVCacheFormat>>,
     /// §4.5: heartbeat kv_dtype 를 query 할 quantized-KV handle (layer-0), [`QuantStageHandle`] 뒤로
-    /// 중립화 — 구체 `KIVIFormat` 을 adapter 시그니처에서 제거. `None` 이면 비양자화 경로
+    /// 중립화 — 구체 `QuantWindowFormat` 을 adapter 시그니처에서 제거. `None` 이면 비양자화 경로
     /// (Standard/Offload) → `kv_dtype` 는 default `""` 유지(기존 동작 불변 — 회귀 금지).
     quant_handle: Option<Arc<dyn QuantStageHandle>>,
     /// 설정된 eviction policy 의 canonical 이름 (예: "h2o"). 빈 문자열이면 heartbeat 가

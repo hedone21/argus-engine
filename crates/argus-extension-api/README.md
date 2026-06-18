@@ -13,7 +13,7 @@ surface for all three:
 |------|-------|---------------|------------------------|
 | stage (resident-token adjustment) | [`KVCacheStage`] (evict/merge) or [`KVReadStage`] (query-aware read) | `register_kv_stage!` macro, or `#[distributed_slice(KV_READ_STAGES)]` (read) | `find_stage(name)` / `find_read_stage(name)` |
 | format (storage representation) | [`KVFormat`] | `register_kv_format!` macro | `find_kv_format(name)` |
-| backend-capability (fused GPU kernel) | [`QuantAttnBackend`] | `register_kivi_attention_plugin!` macro | (dynamic backend registry) |
+| backend-capability (fused GPU kernel) | [`QuantAttnBackend`] | `register_quant_attn_plugin!` macro | (dynamic backend registry) |
 
 A technique never references engine types (`KVCache`/`Backend`); it reads cache state through
 the abstractions this crate defines (e.g. [`StageCtx`]) and returns a *plan*. The engine owns

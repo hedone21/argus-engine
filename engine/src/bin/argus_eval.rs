@@ -13,7 +13,7 @@
 //! - `dump qcf` — `--qcf-dump <path>` (modifier — `ll`/`ppl` 에 결합)
 //! - `experiment` — `--experiment-schedule` (정적 directive schedule, `ScheduleCommandSource` 경유)
 //!
-//! KIVI(`--kv-mode kivi`)는 ll/ppl 양쪽에서 지원 — 별 `KiviCache` 경로(§13.6).
+//! KIVI(`--kv-mode kivi`)는 ll/ppl 양쪽에서 지원 — 별 `QuantizedRecentWindowCache` 경로(§13.6).
 //!
 //! ## resilience default-off
 //!
@@ -78,11 +78,11 @@ enum EvalMode {
     /// `--eval-ll` (Standard KV).
     EvalLl,
     /// `--eval-ll --kv-mode kivi`.
-    EvalLlKivi,
+    EvalLlQuantWindow,
     /// `--ppl` (Standard KV).
     Ppl,
     /// `--ppl --kv-mode kivi`.
-    PplKivi,
+    PplQuantWindow,
     /// `--dump-importance`.
     DumpImportance,
     /// `--experiment-schedule` — 정적 schedule 을 `ScheduleCommandSource` 로 실행.
@@ -126,19 +126,19 @@ fn classify_eval_mode(args: &Args) -> anyhow::Result<EvalMode> {
         return Ok(EvalMode::Experiment);
     }
     // site #4: classify by declared cap (`ModeCaps.is_quantized_kv`), not a concrete
-    // `matches!(.., KvMode::Kivi)`. The `EvalMode::*Kivi` variant *names* are
+    // `matches!(.., KvMode::QuantWindow)`. The `EvalMode::*QuantWindow` variant *names* are
     // eval-harness residue (deferred — orthogonal to the selection mechanism).
     let quantized = mode_caps(args.effective_kv_mode()).is_some_and(|c| c.is_quantized_kv);
     if eval_ll_active {
         return Ok(if quantized {
-            EvalMode::EvalLlKivi
+            EvalMode::EvalLlQuantWindow
         } else {
             EvalMode::EvalLl
         });
     }
     if ppl_active {
         return Ok(if quantized {
-            EvalMode::PplKivi
+            EvalMode::PplQuantWindow
         } else {
             EvalMode::Ppl
         });
@@ -154,17 +154,17 @@ fn dispatch_eval(mode: EvalMode, args: Args) -> anyhow::Result<()> {
             let ctx = eval_setup::build_eval_ll_ctx(args)?;
             argus_engine::session::eval::run_eval_ll(ctx)
         }
-        EvalMode::EvalLlKivi => eval_setup::run_eval_ll_kivi(args),
+        EvalMode::EvalLlQuantWindow => eval_setup::run_eval_ll_quant_window(args),
         EvalMode::Ppl => {
             let ctx = eval_setup::build_ppl_ctx(args)?;
             argus_engine::session::ppl::run_ppl_dispatch(ctx)
         }
-        EvalMode::PplKivi => {
+        EvalMode::PplQuantWindow => {
             let ppl_path = args
                 .ppl
                 .clone()
                 .expect("PplKivi mode implies args.ppl.is_some()");
-            eval_setup::run_ppl_kivi(args, &ppl_path)
+            eval_setup::run_ppl_quant_window(args, &ppl_path)
         }
         EvalMode::DumpImportance => {
             let ctx = eval_setup::build_dump_importance_ctx(args)?;
@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn eval_supported_allows_kivi() {
+    fn eval_supported_allows_quant_window() {
         let args = make_args(&["--ppl", "/tmp/ref.txt", "--kv-mode", "kivi"]);
         assert!(eval_supported(&args));
     }
@@ -309,9 +309,12 @@ mod tests {
     }
 
     #[test]
-    fn classify_eval_ll_kivi() {
+    fn classify_eval_ll_quant_window() {
         let args = make_args(&["--eval-ll", "--eval-continuation", "x", "--kv-mode", "kivi"]);
-        assert_eq!(classify_eval_mode(&args).unwrap(), EvalMode::EvalLlKivi);
+        assert_eq!(
+            classify_eval_mode(&args).unwrap(),
+            EvalMode::EvalLlQuantWindow
+        );
     }
 
     #[test]
@@ -321,9 +324,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_ppl_kivi() {
+    fn classify_ppl_quant_window() {
         let args = make_args(&["--ppl", "/tmp/ref.txt", "--kv-mode", "kivi"]);
-        assert_eq!(classify_eval_mode(&args).unwrap(), EvalMode::PplKivi);
+        assert_eq!(classify_eval_mode(&args).unwrap(), EvalMode::PplQuantWindow);
     }
 
     #[test]

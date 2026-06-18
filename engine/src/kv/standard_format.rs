@@ -508,7 +508,7 @@ impl KVCacheFormat for StandardFormat {
         // 하게 처리(default impl=F32/F16, CpuBackend override 가 Q4_0 등 흡수). GPU backend 는
         // 자기 커널로 dispatch(host 미검증 — device 검증은 substep 3c device round).
         //
-        // NOTE: kivi-native(get_kivi_raw_buffers) 분기는 KIVIFormat 소관이라 여기 없음.
+        // NOTE: quant_attn-native(get_quant_window_raw_buffers) 분기는 QuantWindowFormat 소관이라 여기 없음.
         backend.attention_gen(
             q,
             &k_cache,
@@ -814,7 +814,7 @@ fn merge_row_weighted_opaque(
 /// fallback warn 은 happy-path 미진입·수치-무관이라 생략. forward_prefill 무수정(additive fork) —
 /// 중복은 host parity test 로 bit-identical 증명, Step 5(forward_prefill<C> 삭제)에서 자연 해소.
 ///
-/// **Phase α-K ①-e**: `KIVIFormat::attention_into` 의 prefill arm 도 이 free fn 을 재사용한다
+/// **Phase α-K ①-e**: `QuantWindowFormat::attention_into` 의 prefill arm 도 이 free fn 을 재사용한다
 /// (`pub(crate)`). KIVI 는 multi-token prefill native 커널 부재라 dequantized view(`get_view`) +
 /// 본 함수로 처리 — KIVI CPU(SeqMajor F32) / GPU(bits=16 HeadMajor, bits 2/4/8 assembled) 모두
 /// `kv_layout`/`kv_capacity` 인자로 분기되므로 별도 경로 불요.

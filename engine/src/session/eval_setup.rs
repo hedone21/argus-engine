@@ -583,19 +583,19 @@ pub fn build_dump_importance_ctx(args: Args) -> Result<DumpImportanceCtx> {
     })
 }
 
-/// `--eval-ll --kv-mode kivi` 진입 — KiviCache 기반 log-likelihood eval.
+/// `--eval-ll --kv-mode kivi` 진입 — QuantizedRecentWindowCache 기반 log-likelihood eval.
 ///
 /// legacy generate.rs:274-369 재현. `EvalLlRunCtx` 를 경유하지 않고
-/// `run_eval_ll_generic` 을 KiviHook + `Vec<KiviCache>` 로 직접 호출한다.
+/// `run_eval_ll_generic` 을 QuantWindowFlushHook + `Vec<QuantizedRecentWindowCache>` 로 직접 호출한다.
 /// `caps.get::<dyn QuantAttnBackend>()` 를 closure 밖에서 1회 pull —
-/// chat 의 `build_chat_kivi_forward`(session/chat/session.rs, KvModeReg.build) thread-through 미러.
+/// chat 의 `build_chat_quant_window_forward`(session/chat/session.rs, KvModeReg.build) thread-through 미러.
 ///
 /// 빌드부터 run 까지 한 함수에 둔다 (KIVI 는 ctx struct 표면이 없음).
-pub fn run_eval_ll_kivi(args: Args) -> Result<()> {
+pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
     use crate::backend::QuantAttnBackend;
-    use crate::kv::kivi_cache::KiviCache;
+    use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
     use crate::session::cli::parse_qcf_sample_layers;
-    use crate::session::eval::{EvalConfig, KiviHook, run_eval_ll_generic};
+    use crate::session::eval::{EvalConfig, QuantWindowFlushHook, run_eval_ll_generic};
 
     let base = build_eval_base(&args)?;
     let EvalBase {
@@ -621,26 +621,26 @@ pub fn run_eval_ll_kivi(args: Args) -> Result<()> {
         effective_budget: 0,
         kv_budget_ratio: 0.0,
         greedy: args.greedy,
-        kv_type: format!("q{}+f32_residual", args.effective_kivi_bits()),
+        kv_type: format!("q{}+f32_residual", args.effective_quant_window_bits()),
         qcf_mode: args.qcf_mode.clone(),
         vocab_size,
         hidden_size,
     };
     let qcf_config = crate::qcf_types::QcfConfig::default();
-    let kivi_bits = args.effective_kivi_bits();
+    let quant_window_bits = args.effective_quant_window_bits();
 
     // KIVI native attention handle 을 caps 에서 1회 pull (closure 밖). OpenCL 면 Some.
-    let kivi_cap = caps.get::<dyn QuantAttnBackend>();
-    let mut kv_caches: Vec<KiviCache> = (0..num_layers)
+    let quant_attn_cap = caps.get::<dyn QuantAttnBackend>();
+    let mut kv_caches: Vec<QuantizedRecentWindowCache> = (0..num_layers)
         .map(|_| {
-            KiviCache::new_gpu(
+            QuantizedRecentWindowCache::new_gpu(
                 kv_heads,
                 head_dim,
                 max_seq_len,
-                args.effective_kivi_residual_size(),
-                kivi_bits,
+                args.effective_quant_window_residual_size(),
+                quant_window_bits,
                 backend.clone(),
-                kivi_cap.clone(),
+                quant_attn_cap.clone(),
                 memory.clone(),
             )
         })
@@ -676,7 +676,7 @@ pub fn run_eval_ll_kivi(args: Args) -> Result<()> {
         None
     };
 
-    let mut hook = KiviHook::new(
+    let mut hook = QuantWindowFlushHook::new(
         qcf_config,
         args.enable_qcf_experimental,
         kivi_sample_layers,
@@ -697,36 +697,36 @@ pub fn run_eval_ll_kivi(args: Args) -> Result<()> {
     json_val["config"] = serde_json::json!({
         "model": args.model_path,
         "eviction_policy": "kivi",
-        "kivi_bits": args.effective_kivi_bits(),
-        "kivi_residual_size": args.effective_kivi_residual_size(),
+        "kivi_bits": args.effective_quant_window_bits(),
+        "kivi_residual_size": args.effective_quant_window_residual_size(),
         "max_seq_len": max_seq_len,
-        "kv_type": format!("q{}+f32_residual", args.effective_kivi_bits()),
+        "kv_type": format!("q{}+f32_residual", args.effective_quant_window_bits()),
     });
     println!("{}", serde_json::to_string_pretty(&json_val)?);
     Ok(())
 }
 
-/// `--ppl --kv-mode kivi` 진입 — KiviCache 기반 perplexity eval.
+/// `--ppl --kv-mode kivi` 진입 — QuantizedRecentWindowCache 기반 perplexity eval.
 ///
-/// legacy generate.rs:372-389 재현. `run_kivi_ppl` free fn 을 caps 에서 pull 한
+/// legacy generate.rs:372-389 재현. `run_quant_window_ppl` free fn 을 caps 에서 pull 한
 /// KIVI handle 과 함께 직접 호출한다.
-pub fn run_ppl_kivi(args: Args, ppl_path: &str) -> Result<()> {
+pub fn run_ppl_quant_window(args: Args, ppl_path: &str) -> Result<()> {
     use crate::backend::QuantAttnBackend;
 
     let base = build_eval_base(&args)?;
-    let kivi = base.caps.get::<dyn QuantAttnBackend>();
-    crate::session::ppl::run_kivi_ppl(
+    let quant_attn = base.caps.get::<dyn QuantAttnBackend>();
+    crate::session::ppl::run_quant_window_ppl(
         &args,
         &base.model,
         &base.tokenizer,
         &base.backend,
-        kivi,
+        quant_attn,
         &base.memory,
         base.model.config.num_key_value_heads,
         base.model.config.head_dim,
         base.model.config.num_hidden_layers,
         base.max_seq_len,
-        args.effective_kivi_residual_size(),
+        args.effective_quant_window_residual_size(),
         ppl_path,
     )
 }

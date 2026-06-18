@@ -1,12 +1,12 @@
 //! ENG-ALG-020 ~ ENG-ALG-022: KIVI Cache
 //!
-//! KiviCache 기본 동작, bits 전이(transition), 점진적 역양자화(incremental deq).
+//! QuantizedRecentWindowCache 기본 동작, bits 전이(transition), 점진적 역양자화(incremental deq).
 //! KiviCache는 FP32 residual buffer + quantized compressed storage 구조.
 
-use argus_engine::kv::kivi_cache::KiviCache;
+use argus_engine::kv::quant_window_cache::QuantizedRecentWindowCache;
 
 // ══════════════════════════════════════════════════════════════
-// ENG-ALG-020: KiviCache 기본 동작
+// ENG-ALG-020: QuantizedRecentWindowCache 기본 동작
 // ══════════════════════════════════════════════════════════════
 
 #[test]
@@ -16,7 +16,7 @@ fn test_eng_alg_020_kivi_cache_basic() {
     let max_seq = 256;
     let res_size = 32; // residual buffer = 32 tokens
 
-    let cache = KiviCache::new(kv_heads, head_dim, max_seq, res_size);
+    let cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_size);
 
     assert_eq!(cache.current_pos(), 0);
     assert_eq!(cache.kv_heads(), kv_heads);
@@ -27,7 +27,7 @@ fn test_eng_alg_020_kivi_cache_basic() {
 #[test]
 fn test_eng_alg_020_kivi_cache_residual_only() {
     // Residual buffer가 가득 차기 전까지는 quantized storage에 데이터가 없어야 함
-    let cache = KiviCache::new(1, 32, 256, 32);
+    let cache = QuantizedRecentWindowCache::new(1, 32, 256, 32);
     assert_eq!(cache.q2_tokens, 0);
     assert_eq!(cache.res_pos, 0);
 }
@@ -35,7 +35,7 @@ fn test_eng_alg_020_kivi_cache_residual_only() {
 #[test]
 fn test_eng_alg_020_kivi_cache_compression_ratio() {
     // 빈 캐시의 memory_usage는 0이어야 함
-    let cache = KiviCache::new(2, 32, 256, 32);
+    let cache = QuantizedRecentWindowCache::new(2, 32, 256, 32);
     assert_eq!(cache.memory_usage_bytes(), 0);
 }
 
@@ -45,7 +45,7 @@ fn test_eng_alg_020_kivi_cache_compression_ratio() {
 
 #[test]
 fn test_eng_alg_021_kivi_transition_bits_8_to_4_to_2() {
-    let mut cache = KiviCache::new_with_bits(2, 32, 256, 32, 8);
+    let mut cache = QuantizedRecentWindowCache::new_with_bits(2, 32, 256, 32, 8);
     assert_eq!(cache.bits(), 8);
 
     // 8 → 4 전이
@@ -60,7 +60,7 @@ fn test_eng_alg_021_kivi_transition_bits_8_to_4_to_2() {
 #[test]
 fn test_eng_alg_021_kivi_transition_noop() {
     // 같은 bits로의 전이는 무해해야 함
-    let mut cache = KiviCache::new_with_bits(2, 32, 256, 32, 8);
+    let mut cache = QuantizedRecentWindowCache::new_with_bits(2, 32, 256, 32, 8);
     cache.transition_bits(8).unwrap();
     assert_eq!(cache.bits(), 8);
 }
@@ -68,7 +68,7 @@ fn test_eng_alg_021_kivi_transition_noop() {
 #[test]
 fn test_eng_alg_021_kivi_transition_empty() {
     // 빈 캐시에서의 전이
-    let mut cache = KiviCache::new_with_bits(2, 32, 256, 32, 8);
+    let mut cache = QuantizedRecentWindowCache::new_with_bits(2, 32, 256, 32, 8);
     assert_eq!(cache.q2_tokens, 0);
     assert_eq!(cache.res_pos, 0);
 
@@ -87,7 +87,7 @@ fn test_eng_alg_021_kivi_transition_empty() {
 
 #[test]
 fn test_eng_alg_022_kivi_cache_reset_clears_state() {
-    let mut cache = KiviCache::new(2, 32, 256, 32);
+    let mut cache = QuantizedRecentWindowCache::new(2, 32, 256, 32);
     // reset()은 모든 상태를 초기화해야 함
     cache.reset();
     assert_eq!(cache.current_pos(), 0);
@@ -100,6 +100,6 @@ fn test_eng_alg_022_kivi_cache_reset_clears_state() {
 fn test_eng_alg_022_kivi_cache_kv_dtype_is_f32() {
     // KiviCache는 호출자에게 F32를 요구 (내부적으로 양자화 처리)
     use argus_engine::buffer::DType;
-    let cache = KiviCache::new(2, 32, 256, 32);
+    let cache = QuantizedRecentWindowCache::new(2, 32, 256, 32);
     assert_eq!(cache.kv_dtype(), DType::F32);
 }

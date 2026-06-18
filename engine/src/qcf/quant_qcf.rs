@@ -52,7 +52,7 @@ pub fn compute_nmse_block(original: &[f32; QKKV], bits: u8, epsilon: f32) -> f32
 
 /// Compute flush proxy from FP32 residual key/value buffers.
 ///
-/// Called during `KiviCache::flush_residual()` when FP32 originals are about to
+/// Called during `QuantizedRecentWindowCache::flush_residual()` when FP32 originals are about to
 /// be quantized. Computes NMSE separately for K and V, then combines:
 /// `proxy = 0.6 × NMSE_K + 0.4 × NMSE_V` (Key is more sensitive per KIVI Table 2).
 ///
@@ -511,12 +511,12 @@ pub fn compute_flush_aw_vopr(params: &FlushAttentionParams, config: &QcfConfig) 
 /// Stateless KIVI flush proxy 계산기.
 ///
 /// `QcfComputer` trait 의 4 메서드를 본 모듈의 자유 함수 4개로 위임.
-/// pressure/kivi_cache 가 `&dyn QcfComputer` 로 의존하여 L3-pressure →
+/// pressure/quant_window_cache 가 `&dyn QcfComputer` 로 의존하여 L3-pressure →
 /// L3-qcf cross-domain concrete import 를 제거한다.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct KiviQcfComputer;
+pub struct QuantFlushQcfComputer;
 
-impl crate::qcf_computer::QcfComputer for KiviQcfComputer {
+impl crate::qcf_computer::QcfComputer for QuantFlushQcfComputer {
     fn flush_nmse(&self, params: &QuantFlushParams, config: &QcfConfig) -> QcfMetric {
         compute_flush_nmse(params, config)
     }

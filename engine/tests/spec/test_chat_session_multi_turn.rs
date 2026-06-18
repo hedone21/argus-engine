@@ -6,7 +6,7 @@
 //!     (DecodeLoop를 turn마다 build/drop하면 pos가 초기화되어 실패한다.)
 //! G3: `/reset` 후 pos == 0 + score_accumulator.evicted_total == 0.
 //!     Forward::reset_kv가 호출되어 mock step_count가 0으로 복귀한다.
-//! G4: `ensure_capacity`가 Standard(no-cache-manager)/Kivi/Offload 각 모드에서
+//! G4: `ensure_capacity`가 Standard(no-cache-manager)/QuantWindow/Offload 각 모드에서
 //!     overflow 시 Err를 반환하고, 여유 있으면 Ok를 반환한다.
 //!
 //! D5/G1: stats_line 포맷이 generate.rs 원본과 byte-identical한지 검증한다.
@@ -102,7 +102,7 @@ fn make_kivi_session(max_seq_len: usize) -> ChatSession {
         .build();
     ChatSession::new_for_test(
         decode_loop,
-        ChatKvMode::Kivi {
+        ChatKvMode::QuantWindow {
             bits: 4,
             residual_size: 32,
         },
@@ -295,7 +295,7 @@ fn g4b_standard_bails_on_overflow_without_cache_manager() {
     );
 }
 
-/// G4-C: Kivi, pos+additional <= max_seq_len → Ok.
+/// G4-C: QuantWindow, pos+additional <= max_seq_len → Ok.
 #[test]
 fn g4c_kivi_ok_when_sufficient() {
     let mut session = make_kivi_session(10);
@@ -306,7 +306,7 @@ fn g4c_kivi_ok_when_sufficient() {
     );
 }
 
-/// G4-D: Kivi, pos+additional > max_seq_len → Err.
+/// G4-D: QuantWindow, pos+additional > max_seq_len → Err.
 #[test]
 fn g4d_kivi_bails_on_overflow() {
     let mut session = make_kivi_session(10);
@@ -355,7 +355,7 @@ fn g1a_standard_stats_line_format() {
     );
 }
 
-/// G1-B: Kivi 모드 stats_line 포맷 byte-identical.
+/// G1-B: QuantWindow 모드 stats_line 포맷 byte-identical.
 #[test]
 fn g1b_kivi_stats_line_format() {
     let mut session = make_kivi_session(512);

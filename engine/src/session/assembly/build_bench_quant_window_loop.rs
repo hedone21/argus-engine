@@ -3,9 +3,9 @@
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §5.7.7/§5.7.8.
 //!
 //! [`build_bench_loop`](super::build_bench_loop) 의 KIVI 형제다 — Standard `ModelForward`
-//! (`Vec<KVCache>`) 대신 [`KiviForward`](crate::session::forward::KiviForward)(`Vec<KiviCache>`)
-//! 를 조립하고, dispatcher 에 `kivi_handles` 를 주입해 `KvQuantDynamic` directive 가 OneShot
-//! [`KiviQuantStage`](crate::stages::kv::kivi_quant::KiviQuantStage) 로 submit 되게 한다.
+//! (`Vec<KVCache>`) 대신 [`QuantWindowForward`](crate::session::forward::QuantWindowForward)(`Vec<QuantizedRecentWindowCache>`)
+//! 를 조립하고, dispatcher 에 `quant_window_handles` 를 주입해 `KvQuantDynamic` directive 가 OneShot
+//! [`QuantWindowBitTransitionStage`](crate::stages::kv::quant_window_stage::QuantWindowBitTransitionStage) 로 submit 되게 한다.
 //!
 //! **stage 배선 범위 (§5.7.7)**: control 디렉티브(Throttle/SetTargetTbt/Suspend/Resume/
 //! RestoreDefaults) + **KvQuantDynamic** 만 활성. eviction/partition/swap stage 는 KIVI 경로에서
@@ -21,22 +21,22 @@ use crate::inference::sampling::SamplingConfig;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::session::command_dispatcher::CommandDispatcher;
-use crate::session::forward::KiviForward;
-use crate::session::forward::kivi_forward::alloc_kivi_kv_caches;
+use crate::session::forward::QuantWindowForward;
+use crate::session::forward::quant_window_forward::alloc_quant_window_kv_caches;
 use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 
 /// KIVI bench `DecodeLoop` 조립 (AB-2 §5.7.8).
 ///
-/// `build_chat_kivi`(chat/session.rs:491)의 KiviForward 생성 recipe 에 dispatcher/registry/
-/// resilience 배선을 더한다(`build_bench_loop` 의 Standard 배선과 동형이되 KiviQuantStage 만 활성).
+/// `build_chat_kivi`(chat/session.rs:491)의 QuantWindowForward 생성 recipe 에 dispatcher/registry/
+/// resilience 배선을 더한다(`build_bench_loop` 의 Standard 배선과 동형이되 QuantWindowBitTransitionStage 만 활성).
 #[allow(clippy::too_many_arguments)]
-pub fn build_bench_kivi_loop(
+pub fn build_bench_quant_window_loop(
     backend: Arc<dyn Backend>,
     memory: Arc<dyn Memory>,
     model: TransformerModel,
-    kivi: &Option<Arc<dyn QuantAttnBackend>>,
+    quant_attn: &Option<Arc<dyn QuantAttnBackend>>,
     initial_bits: u8,
     residual_size: usize,
     max_seq_len: usize,
@@ -53,8 +53,8 @@ pub fn build_bench_kivi_loop(
         initial_bits, residual_size, num_layers, max_seq_len
     );
 
-    // KIVI cache alloc (R3: OpenCL backend 면 `kivi` 가 Some 필수, init.rs 가 register).
-    let kv_caches = alloc_kivi_kv_caches(
+    // KIVI cache alloc (R3: OpenCL backend 면 `quant_attn` 가 Some 필수, init.rs 가 register).
+    let kv_caches = alloc_quant_window_kv_caches(
         num_layers,
         kv_heads,
         head_dim,
@@ -62,11 +62,11 @@ pub fn build_bench_kivi_loop(
         residual_size,
         initial_bits,
         &backend,
-        kivi,
+        quant_attn,
         &memory,
     );
 
-    let fwd = KiviForward::new(
+    let fwd = QuantWindowForward::new(
         backend,
         memory,
         Arc::new(model),
@@ -76,18 +76,18 @@ pub fn build_bench_kivi_loop(
         max_seq_len,
     )?;
 
-    // §5.7.8: KiviQuantStage 가 transition 할 persistent KIVI handle (register 시점 보유).
-    let kivi_handles = fwd.kivi_caches().to_vec();
+    // §5.7.8: QuantWindowBitTransitionStage 가 transition 할 persistent KIVI handle (register 시점 보유).
+    let quant_window_handles = fwd.quant_window_caches().to_vec();
 
-    // §5.7.6: heartbeat kv_dtype query 용 layer-0 KIVIFormat concrete handle (resilience adapter
+    // §5.7.6: heartbeat kv_dtype query 용 layer-0 QuantWindowFormat concrete handle (resilience adapter
     // 에 주입 — bits query 는 base trait 표면에 없어 KIVI concrete 필요).
-    let kivi_handle = fwd.kivi_caches().first().cloned();
+    let quant_window_handle = fwd.quant_window_caches().first().cloned();
 
     let registry = Arc::new(PipelineRegistry::new());
 
     // §5.7.6/§4.5: resilience adapter 에 KIVI handle 주입 → heartbeat kv_dtype 를 현재 bits 에서
     // query. pos/capacity 는 base `set_kv_handle`, bit-width 는 중립 `set_quant_handle`.
-    let resilience = match (resilience, kivi_handle) {
+    let resilience = match (resilience, quant_window_handle) {
         (Some(mut adapter), Some(h)) => {
             adapter.set_kv_handle(h.clone() as Arc<dyn crate::format::KVCacheFormat>);
             adapter.set_quant_handle(
@@ -115,11 +115,11 @@ pub fn build_bench_kivi_loop(
             None,       // model: swap 미배선.
             None,       // swap_runtime: swap inert.
             None,       // importance.
-            kivi_handles,
+            quant_window_handles,
             // AB-5: QcfEstimate 송출 채널. resilience-on 이면 Some, off 이면 None(inert).
             report_tx_for_dispatcher,
             // §5.9.2 Track B: KIVI 경로는 swap 미배선(model None) → swap directive inert.
-            // 더미 cell (KiviForward 는 ModelForward 와 무관 — hook 미소비).
+            // 더미 cell (QuantWindowForward 는 ModelForward 와 무관 — hook 미소비).
             Arc::new(std::sync::Mutex::new(None)),
             // §5.9.1 Track A: KIVI 경로는 score-based eviction 미지원 → 더미 None cell.
             Arc::new(std::sync::Mutex::new(None)),

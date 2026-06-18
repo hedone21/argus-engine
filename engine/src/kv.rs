@@ -13,12 +13,12 @@ pub mod cache_manager;
 pub mod eviction;
 // Engine-owned GPU buffer set lent to the KV compute capability (FORMAT Phase 2, Stage B).
 pub(crate) mod gpu_kv_buffers;
-pub mod kivi_cache;
-pub mod kivi_format;
 pub mod kv_cache;
 pub mod kv_migrate;
 pub mod offload;
 pub mod offload_format;
+pub mod quant_window_cache;
+pub mod quant_window_format;
 // read 축(KVReadStage) 빌트인 등록 + force-link self-test (Quest).
 pub mod read;
 pub mod standard_format;

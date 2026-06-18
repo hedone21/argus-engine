@@ -7,7 +7,7 @@ use argus_engine::backend::opencl::OpenCLBackend;
 #[cfg(feature = "opencl")]
 use argus_engine::backend::opencl::get_cl_mem;
 use argus_engine::buffer::{Buffer, DType};
-use argus_engine::kv::kivi_cache::KiviCache;
+use argus_engine::kv::quant_window_cache::QuantizedRecentWindowCache;
 use argus_engine::memory::Memory;
 use argus_engine::memory::galloc::Galloc;
 use argus_engine::quant::{BlockQ4_0, BlockQ4_1, QK4_0, QK4_1};
@@ -33,7 +33,7 @@ enum OpType {
     Softmax,
     RMSNorm,
     RoPE,
-    KiviAttention,
+    QuantWindowAttention,
 }
 
 impl std::fmt::Display for OpType {
@@ -63,7 +63,7 @@ fn main() -> anyhow::Result<()> {
     // Phase α-W-4 §3.3: OpenCL backend 의 KIVI native attention handle (R4: KIVI
     // test 가 new_gpu 에 넘길 때 backend 와 동일 ocl 인스턴스의 clone).
     #[cfg(feature = "opencl")]
-    let mut opencl_kivi_handle: Option<
+    let mut opencl_quant_attn_handle: Option<
         Arc<dyn argus_engine::capability::quant_attn::QuantAttnBackend>,
     > = None;
     for name in &args.backends {
@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
                         // 인스턴스에서 파생해 보관 (R4: new_gpu 의 backend 인자와 같은
                         // 객체). KIVI test 루프(아래)가 이 handle 을 new_gpu 에 전달.
                         let b = Arc::new(b);
-                        opencl_kivi_handle = Some(b.clone()
+                        opencl_quant_attn_handle = Some(b.clone()
                             as Arc<dyn argus_engine::capability::quant_attn::QuantAttnBackend>);
                         backends.push(b as Arc<dyn Backend>);
                     }
@@ -225,10 +225,10 @@ fn main() -> anyhow::Result<()> {
             backend.name()
         );
         for bits in [2u8, 4, 8] {
-            run_kivi_attention_test(
+            run_quant_window_attention_test(
                 &mut all_results,
                 backend.clone(),
-                opencl_kivi_handle.clone(),
+                opencl_quant_attn_handle.clone(),
                 bits,
             );
         }
@@ -531,8 +531,8 @@ fn perform_matmul_test(
                 };
                 backend.rope_inplace(&mut r_gpu, 0, 10000.0)?;
             }
-            OpType::KiviAttention => {
-                // KIVI tests are handled by run_kivi_attention_test(), not here
+            OpType::QuantWindowAttention => {
+                // KIVI tests are handled by run_quant_window_attention_test(), not here
                 return Err(anyhow::anyhow!(
                     "KiviAttention not handled in perform_matmul_test"
                 ));
@@ -756,10 +756,10 @@ fn xorshift32(state: &mut u32) -> f32 {
 /// (enough tokens to trigger multiple flushes), then compares:
 ///   CPU: get_view() -> naive single-token attention
 ///   GPU: attention_gen_kivi() native kernel
-fn run_kivi_attention_test(
+fn run_quant_window_attention_test(
     results: &mut Vec<TestResult>,
     backend: Arc<dyn Backend>,
-    kivi: Option<Arc<dyn argus_engine::capability::quant_attn::QuantAttnBackend>>,
+    quant_attn: Option<Arc<dyn argus_engine::capability::quant_attn::QuantAttnBackend>>,
     bits: u8,
 ) {
     let kv_heads: usize = 8;
@@ -771,9 +771,9 @@ fn run_kivi_attention_test(
 
     let shape_str = format!("Q{}b h{} t{}", bits, kv_heads, test_tokens);
 
-    match perform_kivi_attention_test(
+    match perform_quant_window_attention_test(
         backend.clone(),
-        kivi,
+        quant_attn,
         bits,
         kv_heads,
         head_dim,
@@ -796,7 +796,7 @@ fn run_kivi_attention_test(
                 bits, status, error, threshold
             );
             results.push(TestResult {
-                op: OpType::KiviAttention,
+                op: OpType::QuantWindowAttention,
                 status: status.to_string(),
                 dtype: format!("Q{}", bits),
                 shape: shape_str,
@@ -808,7 +808,7 @@ fn run_kivi_attention_test(
         Err(e) => {
             eprintln!("  KIVI Q{} attention: ERROR — {}", bits, e);
             results.push(TestResult {
-                op: OpType::KiviAttention,
+                op: OpType::QuantWindowAttention,
                 status: "ERROR".to_string(),
                 dtype: format!("Q{}", bits),
                 shape: shape_str,
@@ -821,9 +821,9 @@ fn run_kivi_attention_test(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn perform_kivi_attention_test(
+fn perform_quant_window_attention_test(
     backend: Arc<dyn Backend>,
-    kivi: Option<Arc<dyn argus_engine::capability::quant_attn::QuantAttnBackend>>,
+    quant_attn: Option<Arc<dyn argus_engine::capability::quant_attn::QuantAttnBackend>>,
     bits: u8,
     kv_heads: usize,
     head_dim: usize,
@@ -836,7 +836,7 @@ fn perform_kivi_attention_test(
     {
         let _ = (
             backend,
-            kivi,
+            quant_attn,
             bits,
             kv_heads,
             head_dim,
@@ -872,16 +872,21 @@ fn perform_kivi_attention_test(
             ));
 
         // === Create CPU and GPU caches ===
-        let mut cpu_cache =
-            KiviCache::new_with_bits(kv_heads, head_dim, max_seq_len, residual_size, bits);
-        let mut gpu_cache = KiviCache::new_gpu(
+        let mut cpu_cache = QuantizedRecentWindowCache::new_with_bits(
+            kv_heads,
+            head_dim,
+            max_seq_len,
+            residual_size,
+            bits,
+        );
+        let mut gpu_cache = QuantizedRecentWindowCache::new_gpu(
             kv_heads,
             head_dim,
             max_seq_len,
             residual_size,
             bits,
             backend.clone(),
-            kivi,
+            quant_attn,
             gpu_memory.clone(),
         );
         assert!(gpu_cache.is_gpu(), "GPU cache creation failed");

@@ -27,17 +27,17 @@ use crate::shape::Shape;
 use crate::tensor::Tensor;
 use argus_extension_api::KVLayoutDesc;
 
-/// `build_inference_ctx` / `build_kivi_bench_ctx` 공통 prelude 산출물 (AB-2 §5.7.7).
+/// `build_inference_ctx` / `build_quant_window_bench_ctx` 공통 prelude 산출물 (AB-2 §5.7.7).
 ///
 /// init(`SessionInitCtx`) → tokenizer resolve/load → prompt encode → token 까지 공통부.
-/// Standard 는 이 뒤에 `Vec<KVCache>` 할당을, KIVI 는 caps pull + `Vec<KiviCache>` 할당을 한다.
+/// Standard 는 이 뒤에 `Vec<KVCache>` 할당을, KIVI 는 caps pull + `Vec<QuantizedRecentWindowCache>` 할당을 한다.
 pub struct InferencePrelude {
     pub init: SessionInitCtx,
     pub tokenizer: Tokenizer,
     pub tokens: Vec<u32>,
 }
 
-/// `build_inference_ctx` / `build_kivi_bench_ctx` 공통 prelude 조립 (AB-2 §5.7.7).
+/// `build_inference_ctx` / `build_quant_window_bench_ctx` 공통 prelude 조립 (AB-2 §5.7.7).
 ///
 /// plugin dlopen + fat-LTO self-test + `SessionInitCtx::build` + tokenizer/prompt/token 까지.
 /// caps 보존을 위해 `SessionInitCtx` 전체를 [`InferencePrelude`] 로 반환한다(KIVI 는 caps 가
@@ -418,17 +418,17 @@ pub fn alloc_opaque_kv_caches(
 
 /// AB-2 §5.7.7: argus-bench KIVI 분기 컨텍스트.
 ///
-/// Standard [`StandardHappyCtx`] 와 달리 KIVI 는 `Vec<KiviCache>`(typed `KVCache` 아님) + caps
-/// (`QuantAttnBackend` pull) + initial_bits/residual_size 를 보유한다. `build_bench_kivi_loop`
-/// (assembly) 가 이를 소비해 `KiviForward` + `KiviQuantStage` 배선 `DecodeLoop` 를 조립한다.
-pub struct KiviBenchCtx {
+/// Standard [`StandardHappyCtx`] 와 달리 KIVI 는 `Vec<QuantizedRecentWindowCache>`(typed `KVCache` 아님) + caps
+/// (`QuantAttnBackend` pull) + initial_bits/residual_size 를 보유한다. `build_bench_quant_window_loop`
+/// (assembly) 가 이를 소비해 `QuantWindowForward` + `QuantWindowBitTransitionStage` 배선 `DecodeLoop` 를 조립한다.
+pub struct QuantWindowBenchCtx {
     pub args: Args,
     pub backend: Arc<dyn Backend>,
     pub memory: Arc<dyn Memory>,
     pub hardware: Arc<Hardware>,
     pub model: TransformerModel,
-    /// KIVI native attention capability (OpenCL backend 면 `Some` 필수 — alloc_kivi_kv_caches R3).
-    pub kivi: Option<Arc<dyn QuantAttnBackend>>,
+    /// KIVI native attention capability (OpenCL backend 면 `Some` 필수 — alloc_quant_window_kv_caches R3).
+    pub quant_attn: Option<Arc<dyn QuantAttnBackend>>,
     pub tokenizer: Tokenizer,
     pub tokens: Vec<u32>,
     pub max_seq_len: usize,
@@ -444,10 +444,10 @@ pub struct KiviBenchCtx {
 
 /// AB-2 §5.7.7: KIVI bench ctx 조립. v1 KIVI 진입 시맨틱(`generate.rs`(d5ed71d2^) L744-760) 재현.
 ///
-/// `--kv-mode kivi` → initial_bits=`effective_kivi_bits()`, residual=`effective_kivi_residual_size()`.
+/// `--kv-mode kivi` → initial_bits=`effective_quant_window_bits()`, residual=`effective_quant_window_residual_size()`.
 /// `--kv-dynamic-quant`(orphan flag 재배선) → initial_bits=16(F16 등가 진입), residual=
 /// `(max_seq_len/32)*32`. verify YAML baseline 은 `--kv-dynamic-quant` 로 진입한다.
-pub fn build_kivi_bench_ctx(args: Args) -> anyhow::Result<KiviBenchCtx> {
+pub fn build_quant_window_bench_ctx(args: Args) -> anyhow::Result<QuantWindowBenchCtx> {
     let InferencePrelude {
         init,
         tokenizer,
@@ -459,7 +459,7 @@ pub fn build_kivi_bench_ctx(args: Args) -> anyhow::Result<KiviBenchCtx> {
     let sampling_config = init.sampling_config;
     let model = init.model;
     // KIVI native attention capability pull (R3: OpenCL backend 면 Some 필수, init.rs 가 register).
-    let kivi = init.caps.get::<dyn QuantAttnBackend>();
+    let quant_attn = init.caps.get::<dyn QuantAttnBackend>();
 
     let max_seq_len = args.max_seq_len;
     let vocab_size = model.config.vocab_size;
@@ -473,11 +473,11 @@ pub fn build_kivi_bench_ctx(args: Args) -> anyhow::Result<KiviBenchCtx> {
 
     // v1 census 재현: quantized-KV mode → Q2 진입, --kv-dynamic-quant → bits=16 진입.
     // 경로 게이트는 선언 cap(`ModeCaps.is_quantized_kv`)을 읽는다 — 구체 기술 이름 분기 0
-    // (site #6). bits/residual 도출 자체는 kivi-specific 진입부라 여기 머문다(dispatch 아님).
-    let is_kivi_mode = crate::session::mode::mode_caps(args.effective_kv_mode())
+    // (site #6). bits/residual 도출 자체는 quant_attn-specific 진입부라 여기 머문다(dispatch 아님).
+    let is_quantized_kv_mode = crate::session::mode::mode_caps(args.effective_kv_mode())
         .is_some_and(|c| c.is_quantized_kv);
-    let initial_bits: u8 = if is_kivi_mode {
-        args.effective_kivi_bits()
+    let initial_bits: u8 = if is_quantized_kv_mode {
+        args.effective_quant_window_bits()
     } else {
         16
     };
@@ -485,7 +485,7 @@ pub fn build_kivi_bench_ctx(args: Args) -> anyhow::Result<KiviBenchCtx> {
         // bits=16: 전 토큰이 residual 에 잔류(quant flush 없음). QKKV(32) 배수로 내림.
         (max_seq_len / 32) * 32
     } else {
-        args.effective_kivi_residual_size()
+        args.effective_quant_window_residual_size()
     };
 
     let resilience: Option<ResilienceAdapter> = if args.enable_resilience {
@@ -499,13 +499,13 @@ pub fn build_kivi_bench_ctx(args: Args) -> anyhow::Result<KiviBenchCtx> {
         None
     };
 
-    Ok(KiviBenchCtx {
+    Ok(QuantWindowBenchCtx {
         args,
         backend,
         memory,
         hardware,
         model,
-        kivi,
+        quant_attn,
         tokenizer,
         tokens,
         max_seq_len,

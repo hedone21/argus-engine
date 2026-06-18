@@ -5,9 +5,9 @@
 
 use argus_engine::inference::skip_config::SkipConfig;
 use argus_engine::inference::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
-use argus_engine::kv::kivi_cache::KiviCache;
 use argus_engine::kv::kv_cache::{KVCache, KVLayout};
 use argus_engine::kv::offload::store::OffloadStore;
+use argus_engine::kv::quant_window_cache::QuantizedRecentWindowCache;
 use argus_engine::kv::quantize_handler::target_bits_for_pressure;
 use argus_engine::kv::{CachePressureHandler, HandlerContext, PressureLevel, SwapHandler};
 use argus_engine::quant::{BlockKVQ4, BlockKVQ8, QKKV};
@@ -122,7 +122,7 @@ fn test_kivi_q4_q8_roundtrip_error_bounds() {
 fn test_kivi_transition_8_4_2_bounded_error() {
     let kv_heads = 2;
     let head_dim = 64;
-    let mut cache = KiviCache::new_with_bits(kv_heads, head_dim, 256, 32, 8);
+    let mut cache = QuantizedRecentWindowCache::new_with_bits(kv_heads, head_dim, 256, 32, 8);
 
     // Fill 65 tokens → 2 flushes + 1 residual
     for i in 0..65 {
@@ -140,7 +140,7 @@ fn test_kivi_transition_8_4_2_bounded_error() {
     // Cache should still be usable
     let (k, _v) = cache.get_view();
     assert_eq!(k.shape().dims()[1], 65);
-    // (KiviCache::get_view — inherent 0-arg, Phase α-K BC 5-E)
+    // (QuantizedRecentWindowCache::get_view — inherent 0-arg, Phase α-K BC 5-E)
 }
 
 fn make_kivi_input(
@@ -263,7 +263,7 @@ fn test_all_actions_data_flow() {
     let _streaming = sliding_backed_policy(2000, 4);
 
     // C8: KIVI multi-bit
-    let cache = KiviCache::new_with_bits(8, 64, 2048, 32, 4);
+    let cache = QuantizedRecentWindowCache::new_with_bits(8, 64, 2048, 32, 4);
     assert_eq!(cache.bits(), 4);
 
     // W2: DiskStore

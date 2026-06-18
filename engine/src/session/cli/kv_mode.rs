@@ -10,11 +10,11 @@ pub struct KvModeArgs {
 
     /// KIVI quantization bits (kv-mode=kivi 한정)
     #[arg(long = "kivi-bits", default_value_t = 2)]
-    pub kivi_bits: u8,
+    pub quant_window_bits: u8,
 
     /// KIVI residual buffer length (kv-mode=kivi 한정)
     #[arg(long = "kivi-residual-len", default_value_t = 128)]
-    pub kivi_residual_len: usize,
+    pub quant_window_residual_len: usize,
 
     /// Offload storage backend: raw | disk | mmap | tmpfs | ... (kv-mode=offload 한정)
     #[arg(long = "kv-offload-storage", default_value = "mmap")]
@@ -43,8 +43,8 @@ impl Default for KvModeArgs {
     fn default() -> Self {
         Self {
             kv_mode: "standard".to_string(),
-            kivi_bits: 2,
-            kivi_residual_len: 128,
+            quant_window_bits: 2,
+            quant_window_residual_len: 128,
             kv_offload_storage: "mmap".to_string(),
             kv_offload_path: String::new(),
             kv_max_prefetch_depth: 128,

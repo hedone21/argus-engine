@@ -13,8 +13,8 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::format::KVCacheFormat;
-use crate::kv::kivi_format::KIVIFormat;
 use crate::kv::kv_cache::KVCache;
+use crate::kv::quant_window_format::QuantWindowFormat;
 use crate::kv::standard_format::StandardFormat;
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
@@ -845,7 +845,7 @@ pub struct QcfEstimateContext<'a> {
     /// Standard format KV handles (one per layer). Empty → no KV-based estimates.
     pub kv_handles: &'a [Arc<StandardFormat>],
     /// KIVI handles for `kv.quant_dynamic` estimate. Empty → quant estimate skipped.
-    pub kivi_handles: &'a [Arc<KIVIFormat>],
+    pub quant_window_handles: &'a [Arc<QuantWindowFormat>],
     /// Attention score lookup for H2O / D2O / streaming actions. `None` → uniform fallback.
     pub importance: Option<&'a dyn ImportanceLookup>,
     /// (sink_size, window_size) for StreamingLLM dry-run. None = skip.
@@ -1026,10 +1026,10 @@ pub fn compute_qcf_estimates(
     }
 
     // ── 5. KIVI dynamic quantization QCF ──
-    if !ctx.kivi_handles.is_empty() {
+    if !ctx.quant_window_handles.is_empty() {
         let mut total_qcf = 0.0f32;
         let mut count = 0u32;
-        for handle in ctx.kivi_handles {
+        for handle in ctx.quant_window_handles {
             let qcf = handle.with_cache_mut(|c| c.estimate_dryrun_qcf());
             if qcf > 0.0 {
                 total_qcf += qcf;
@@ -1307,7 +1307,7 @@ mod tests {
         let handle = make_standard_format(32, 2, 4, 16);
         let ctx = QcfEstimateContext {
             kv_handles: &[handle],
-            kivi_handles: &[],
+            quant_window_handles: &[],
             importance: None,
             streaming_config: None,
             importance_table: None,
@@ -1339,7 +1339,7 @@ mod tests {
 
         let ctx_with_scores = QcfEstimateContext {
             kv_handles: std::slice::from_ref(&handle),
-            kivi_handles: &[],
+            quant_window_handles: &[],
             importance: None,
             streaming_config: None,
             importance_table: None,
@@ -1359,7 +1359,7 @@ mod tests {
 
         let ctx_no_scores = QcfEstimateContext {
             kv_handles: &[handle],
-            kivi_handles: &[],
+            quant_window_handles: &[],
             importance: None,
             streaming_config: None,
             importance_table: None,
@@ -1384,7 +1384,7 @@ mod tests {
         let handle = make_standard_format(32, 2, 4, 0);
         let ctx = QcfEstimateContext {
             kv_handles: &[handle],
-            kivi_handles: &[],
+            quant_window_handles: &[],
             importance: None,
             streaming_config: None,
             importance_table: None,

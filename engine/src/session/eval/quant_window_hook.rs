@@ -1,26 +1,26 @@
-//! KiviHook: StepHook implementation for KIVI quantization flush metric collection.
+//! QuantWindowFlushHook: StepHook implementation for KIVI quantization flush metric collection.
 //!
 //! Encapsulates the KIVI flush proxy collection logic previously embedded in
-//! `run_kivi_eval_ll` (generate.rs).
+//! `run_quant_window_eval_ll` (generate.rs).
 //!
 //! KIVI does not perform eviction — instead, when the FP32 residual buffer fills,
 //! it batch-quantizes those tokens to Q2 and records the NMSE/OPR degradation as
-//! a `QcfMetric`. KiviHook collects those metrics from `take_flush_proxies()` after
+//! a `QcfMetric`. QuantWindowFlushHook collects those metrics from `take_flush_proxies()` after
 //! each prefill and decode step.
 
 use super::hook::{CacheSnapshot, StepHook};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
-use crate::kv::kivi_cache::KiviCache;
+use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
 
-/// KiviCache snapshot for choice-level restore.
+/// QuantizedRecentWindowCache snapshot for choice-level restore.
 ///
-/// Uses `Clone` because `KiviCache` implements `Clone` and all fields are heap-allocated.
-pub struct KiviCacheSnapshot {
-    caches: Vec<KiviCache>,
+/// Uses `Clone` because `QuantizedRecentWindowCache` implements `Clone` and all fields are heap-allocated.
+pub struct QuantWindowCacheSnapshot {
+    caches: Vec<QuantizedRecentWindowCache>,
 }
 
-impl CacheSnapshot<KiviCache> for KiviCacheSnapshot {
-    fn restore_to(&self, caches: &mut [KiviCache]) {
+impl CacheSnapshot<QuantizedRecentWindowCache> for QuantWindowCacheSnapshot {
+    fn restore_to(&self, caches: &mut [QuantizedRecentWindowCache]) {
         caches.clone_from_slice(&self.caches);
     }
 }
@@ -32,7 +32,7 @@ impl CacheSnapshot<KiviCache> for KiviCacheSnapshot {
 /// Metrics from non-sample layers are drained and discarded.
 ///
 /// Does not perform eviction; `PostStepResult` is always the default (no eviction).
-pub struct KiviHook {
+pub struct QuantWindowFlushHook {
     /// QCF metric collection config (used for aggregation strategy).
     pub qcf_config: crate::qcf_types::QcfConfig,
     /// Whether to compute and dump experimental QCF metrics (ARGUS Step 5).
@@ -56,7 +56,7 @@ pub struct KiviHook {
     per_layer_count: Vec<usize>,
 }
 
-impl KiviHook {
+impl QuantWindowFlushHook {
     pub fn new(
         qcf_config: crate::qcf_types::QcfConfig,
         experimental_enabled: bool,
@@ -80,7 +80,7 @@ impl KiviHook {
     ///
     /// Legacy path (experimental_enabled=false): layer 0 only.
     /// Experimental path: all sample_layers, with per-layer buffers.
-    fn collect_flush_proxies(&mut self, caches: &mut [KiviCache]) {
+    fn collect_flush_proxies(&mut self, caches: &mut [QuantizedRecentWindowCache]) {
         if caches.is_empty() {
             return;
         }
@@ -134,12 +134,12 @@ impl KiviHook {
     }
 }
 
-impl StepHook<KiviCache> for KiviHook {
-    fn post_prefill(&mut self, caches: &mut [KiviCache]) {
+impl StepHook<QuantizedRecentWindowCache> for QuantWindowFlushHook {
+    fn post_prefill(&mut self, caches: &mut [QuantizedRecentWindowCache]) {
         self.collect_flush_proxies(caches);
     }
 
-    fn reset_caches(&mut self, caches: &mut [KiviCache]) {
+    fn reset_caches(&mut self, caches: &mut [QuantizedRecentWindowCache]) {
         for cache in caches.iter_mut() {
             cache.reset();
         }
@@ -158,8 +158,11 @@ impl StepHook<KiviCache> for KiviHook {
         }
     }
 
-    fn snapshot(&self, caches: &[KiviCache]) -> Box<dyn CacheSnapshot<KiviCache>> {
-        Box::new(KiviCacheSnapshot {
+    fn snapshot(
+        &self,
+        caches: &[QuantizedRecentWindowCache],
+    ) -> Box<dyn CacheSnapshot<QuantizedRecentWindowCache>> {
+        Box::new(QuantWindowCacheSnapshot {
             caches: caches.to_vec(),
         })
     }
@@ -168,7 +171,7 @@ impl StepHook<KiviCache> for KiviHook {
         self.score_accumulator.as_mut()
     }
 
-    fn extra_question_fields(&self, caches: &[KiviCache]) -> serde_json::Value {
+    fn extra_question_fields(&self, caches: &[QuantizedRecentWindowCache]) -> serde_json::Value {
         let (q2_tokens, res_pos) = if caches.is_empty() {
             (0, 0)
         } else {
@@ -238,15 +241,15 @@ impl StepHook<KiviCache> for KiviHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kv::kivi_cache::KiviCache;
+    use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
     use crate::qcf_types::QcfConfig;
 
-    fn make_hook() -> KiviHook {
-        KiviHook::new(QcfConfig::default(), false, vec![0], None)
+    fn make_hook() -> QuantWindowFlushHook {
+        QuantWindowFlushHook::new(QcfConfig::default(), false, vec![0], None)
     }
 
-    fn make_hook_experimental(sample_layers: Vec<usize>) -> KiviHook {
-        KiviHook::new(QcfConfig::default(), true, sample_layers, None)
+    fn make_hook_experimental(sample_layers: Vec<usize>) -> QuantWindowFlushHook {
+        QuantWindowFlushHook::new(QcfConfig::default(), true, sample_layers, None)
     }
 
     #[test]
@@ -260,7 +263,7 @@ mod tests {
     #[test]
     fn test_extra_question_fields_with_cache() {
         let hook = make_hook();
-        let cache = KiviCache::new(8, 64, 512, 32);
+        let cache = QuantizedRecentWindowCache::new(8, 64, 512, 32);
         // Initial state: q2_tokens=0, res_pos=0
         let fields = hook.extra_question_fields(&[cache]);
         assert_eq!(fields["kivi_q2_tokens"], 0);
@@ -270,7 +273,7 @@ mod tests {
     #[test]
     fn test_flush_count_tracking_and_reset() {
         let mut hook = make_hook();
-        let cache = KiviCache::new(8, 64, 512, 32);
+        let cache = QuantizedRecentWindowCache::new(8, 64, 512, 32);
 
         assert_eq!(hook.flush_count, 0);
 
@@ -279,7 +282,7 @@ mod tests {
         let fields = hook.extra_question_fields(&[cache]);
         assert_eq!(fields["kivi_flush_count"], 5);
 
-        let cache2 = KiviCache::new(8, 64, 512, 32);
+        let cache2 = QuantizedRecentWindowCache::new(8, 64, 512, 32);
         hook.reset_caches(&mut [cache2]);
         assert_eq!(hook.flush_count, 0);
     }
@@ -295,7 +298,7 @@ mod tests {
         use crate::inference::attention_scores::AttentionScoreAccumulator;
         // new(max_seq_len, n_heads, total_layers, last_n_layers, decay)
         let acc = AttentionScoreAccumulator::new(512, 32, 16, 0, 1.0);
-        let mut hook = KiviHook::new(QcfConfig::default(), false, vec![0], Some(acc));
+        let mut hook = QuantWindowFlushHook::new(QcfConfig::default(), false, vec![0], Some(acc));
         assert!(
             hook.score_accumulator().is_some(),
             "score_accumulator() should return Some when acc is injected"
@@ -320,11 +323,11 @@ mod tests {
     #[test]
     fn test_snapshot_and_restore_single_cache() {
         let hook = make_hook();
-        let original = KiviCache::new(8, 64, 512, 32);
+        let original = QuantizedRecentWindowCache::new(8, 64, 512, 32);
         let snap = hook.snapshot(std::slice::from_ref(&original));
 
         // Modify a second copy then restore.
-        let mut modified = vec![KiviCache::new(8, 64, 512, 32)];
+        let mut modified = vec![QuantizedRecentWindowCache::new(8, 64, 512, 32)];
         snap.restore_to(&mut modified);
         // After restore, q2_tokens and res_pos should match the original.
         assert_eq!(modified[0].q2_tokens, original.q2_tokens);
@@ -335,7 +338,7 @@ mod tests {
     fn test_reset_caches_resets_flush_count() {
         let mut hook = make_hook();
         hook.flush_count = 5;
-        let mut caches = vec![KiviCache::new(8, 64, 512, 32)];
+        let mut caches = vec![QuantizedRecentWindowCache::new(8, 64, 512, 32)];
         hook.reset_caches(&mut caches);
         assert_eq!(hook.flush_count, 0);
     }
@@ -400,7 +403,7 @@ mod tests {
         hook.per_layer_sum[0] = 1.8;
         hook.per_layer_count[0] = 2;
 
-        let mut caches = vec![KiviCache::new(8, 64, 512, 32)];
+        let mut caches = vec![QuantizedRecentWindowCache::new(8, 64, 512, 32)];
         hook.reset_caches(&mut caches);
 
         assert_eq!(hook.per_layer_max[0], 0.0);

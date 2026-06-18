@@ -1,6 +1,6 @@
 //! Generic eval-LL loop: `run_eval_ll_generic<C: EvalCacheKind>`.
 //!
-//! Replaces `run_eval_ll` and `run_kivi_eval_ll` in `generate.rs`.
+//! Replaces `run_eval_ll` and `run_quant_window_eval_ll` in `generate.rs`.
 //! The two modes differ only in their `StepHook` implementations and
 //! `KVCacheOps` type parameters — all other logic is shared here.
 
@@ -29,9 +29,9 @@ use super::output::{EvalConfig, EvalOutput, EvalQuestion};
 /// Run log-likelihood evaluation for a list of multiple-choice questions.
 ///
 /// This is the unified entry point for both eviction (`EvictionHook`) and
-/// KIVI (`KiviHook`) eval modes. The caller provides:
+/// KIVI (`QuantWindowFlushHook`) eval modes. The caller provides:
 ///
-/// - `kv_caches`: per-layer KV cache (either `KVCache` or `KiviCache`)
+/// - `kv_caches`: per-layer KV cache (either `KVCache` or `QuantizedRecentWindowCache`)
 /// - `hook`: cache-management and QCF-collection logic
 /// - `questions`: pre-parsed questions in grouped format
 /// - `eval_config`: loop configuration (budgets, sizes, flags)
@@ -40,7 +40,7 @@ use super::output::{EvalConfig, EvalOutput, EvalQuestion};
 /// # JSON output
 ///
 /// Returns an `EvalOutput` whose `to_json()` matches the format previously
-/// produced by `run_eval_ll` and `run_kivi_eval_ll` exactly.
+/// produced by `run_eval_ll` and `run_quant_window_eval_ll` exactly.
 #[allow(clippy::too_many_arguments)]
 pub fn run_eval_ll_generic<C: EvalCacheKind>(
     model: &TransformerModel,

@@ -685,7 +685,7 @@ pub struct Args {
     pub eval_batch: Option<String>,
 
     /// Enable dynamic KV cache quantization for resilience.
-    /// Starts with bits=16 (F16-equivalent KiviCache) and allows runtime
+    /// Starts with bits=16 (F16-equivalent QuantizedRecentWindowCache) and allows runtime
     /// transition to Q2/Q4/Q8 via kv_quant_dynamic resilience command.
     #[arg(long, default_value_t = false)]
     pub kv_dynamic_quant: bool,
@@ -1347,13 +1347,13 @@ impl Args {
     }
 
     /// KIVI quantization bits.
-    pub fn effective_kivi_bits(&self) -> u8 {
-        self.kv_mode_args.kivi_bits
+    pub fn effective_quant_window_bits(&self) -> u8 {
+        self.kv_mode_args.quant_window_bits
     }
 
     /// KIVI residual buffer size.
-    pub fn effective_kivi_residual_size(&self) -> usize {
-        self.kv_mode_args.kivi_residual_len
+    pub fn effective_quant_window_residual_size(&self) -> usize {
+        self.kv_mode_args.quant_window_residual_len
     }
 
     /// Offload storage backend. Returns `""` unless the active mode owns an offload

@@ -44,7 +44,7 @@ pub struct SessionInitCtx {
 
     /// L2 backend capability 레지스트리 (Phase α-W-4 §3.3). OpenCL backend 면
     /// `QuantAttnBackend` handle 이 등록되어 있고, 그 외(CPU-only/CUDA)는 빈
-    /// registry 다. 소비자(KiviCache 생성 caller)가 construction 시점에 1회
+    /// registry 다. 소비자(QuantizedRecentWindowCache 생성 caller)가 construction 시점에 1회
     /// `caps.get::<dyn QuantAttnBackend>()` pull 한다.
     pub caps: Arc<CapabilityRegistry>,
 
@@ -312,7 +312,7 @@ impl SessionInitCtx {
                 // Phase α-W-4 §3.3: OpenCL backend 는 KIVI native attention capability
                 // 보유 → registry 에 register. R4 불변식: register 하는 Arc 와 아래에서
                 // primary backend 로 쓰는 Arc 는 **동일 ocl 인스턴스의 clone** 이어야 한다
-                // (KiviCache.kivi 와 일반 ops 가 같은 객체를 봐야 함). gpu_concrete 는
+                // (QuantizedRecentWindowCache.quant_attn 와 일반 ops 가 같은 객체를 봐야 함). gpu_concrete 는
                 // 여기까지 단일 인스턴스이므로 clone 으로 두 trait object 를 파생한다.
                 // gpu_score 는 결정 #5 에 따라 register 하지 않는다(소비자 0, β 까지).
                 let mut caps = CapabilityRegistry::new();

@@ -19,7 +19,7 @@ pub struct PostStepResult {
 
 /// Snapshot of KV cache state for choice-level restore.
 ///
-/// Phase α-K ①-c: `C: KVCacheOps` 바운드 제거 — `C` 는 concrete `KVCache`/`KiviCache` 둘뿐이고
+/// Phase α-K ①-c: `C: KVCacheOps` 바운드 제거 — `C` 는 concrete `KVCache`/`QuantizedRecentWindowCache` 둘뿐이고
 /// impl 이 이미 concrete 타입 인자라 바운드 불요. KVCacheOps 폐기(Step 5)의 eval 차단 해소.
 pub trait CacheSnapshot<C>: Send {
     /// Restore caches to the snapshotted state.
@@ -30,7 +30,7 @@ pub trait CacheSnapshot<C>: Send {
 ///
 /// Implementations:
 /// - `EvictionHook` (KVCache): budget-based eviction + CAOTE/attn QCF
-/// - `KiviHook` (KiviCache): flush proxy collection (NMSE + OPR)
+/// - `QuantWindowFlushHook` (QuantizedRecentWindowCache): flush proxy collection (NMSE + OPR)
 pub trait StepHook<C> {
     /// Called after prefill completes. Handles chunked-prefill eviction
     /// residuals or flush proxy collection.
@@ -43,11 +43,11 @@ pub trait StepHook<C> {
     fn snapshot(&self, caches: &[C]) -> Box<dyn CacheSnapshot<C>>;
 
     /// Provide mutable access to the score accumulator (if any).
-    /// EvictionHook returns Some; KiviHook returns None.
+    /// EvictionHook returns Some; QuantWindowFlushHook returns None.
     fn score_accumulator(&mut self) -> Option<&mut AttentionScoreAccumulator>;
 
     /// Update the effective budget (used by ratio-mode per-question budget).
-    /// Default is no-op (e.g., KiviHook ignores budget).
+    /// Default is no-op (e.g., QuantWindowFlushHook ignores budget).
     fn set_effective_budget(&mut self, _budget: usize) {}
 
     /// Returns true if this hook needs a score probe step after prefill.

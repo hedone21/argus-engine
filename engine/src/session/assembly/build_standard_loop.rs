@@ -230,7 +230,7 @@ pub fn build_standard_loop(
             }
             let registry = registry.as_ref().expect("registry: resilience.is_some()");
             // happy/chat 경로는 partition/swap/quant 미구성 (빈 slots + None hardware/model/
-            // swap_runtime + 빈 kivi_handles). report_tx=None (AB-5: happy-path resilience 미배선).
+            // swap_runtime + 빈 quant_window_handles). report_tx=None (AB-5: happy-path resilience 미배선).
             let dispatcher = CommandDispatcher::new(
                 Arc::clone(registry),
                 kv_handles.clone(),

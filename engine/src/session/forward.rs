@@ -5,7 +5,7 @@
 //! standard `KVCache`-backed path that wraps
 //! [`crate::models::transformer::TransformerModel::forward_into`].
 //!
-//! Phase 4-5-a adds [`kivi_forward::KiviForward`] and
+//! Phase 4-5-a adds [`quant_window_forward::QuantWindowForward`] and
 //! [`offload_forward::OffloadForward`] for KIVI-quantized and token-streaming
 //! offload KV cache paths respectively.
 //!
@@ -13,13 +13,13 @@
 //! `session::traits` (slim internal seam, G2-(ii)). [`StepCtx`] lives in
 //! [`crate::inference::sampling`] (shared with [`TokenSampler`]).
 
-pub mod kivi_forward;
 pub mod model_forward;
 pub mod offload_forward;
+pub mod quant_window_forward;
 
-pub use kivi_forward::{KiviForward, alloc_kivi_kv_caches};
 pub use model_forward::{ModelForward, alloc_standard_kv_caches};
 pub use offload_forward::{OffloadForward, alloc_offload_kv_caches};
+pub use quant_window_forward::{QuantWindowForward, alloc_quant_window_kv_caches};
 
 use crate::inference::sampling::StepCtx;
 
@@ -56,7 +56,7 @@ pub trait Forward {
 
     /// Phase 4-5-e: chat `ensure_capacity` / `on_turn_end` 에서 eviction 실행.
     ///
-    /// ModelForward만 override한다. KiviForward / OffloadForward는 default no-op
+    /// ModelForward만 override한다. QuantWindowForward / OffloadForward는 default no-op
     /// 유지 (eviction 미지원).
     ///
     /// - `cache_manager`: eviction 정책을 보유한 CacheManager.

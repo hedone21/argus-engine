@@ -70,7 +70,7 @@ impl Buffer for SharedBuffer {
 ///
 /// Holds an `Arc<SharedBuffer>` to keep the backing memory alive.
 /// `size()` returns only the view length (not the full buffer).
-/// Used by KiviCache `get_view()` to return Tensors that share the
+/// Used by QuantizedRecentWindowCache `get_view()` to return Tensors that share the
 /// pre-allocated attn buffer without memcpy.
 #[derive(Debug)]
 pub struct SharedBufferView {

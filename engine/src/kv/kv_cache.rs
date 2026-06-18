@@ -8,9 +8,9 @@ use anyhow::Result;
 use argus_extension_api::KVLayoutDesc;
 use std::sync::Arc;
 
-// BC re-export: KVLayout, KiviRawBuffers 를 L2(kv_cache_ops)로 격상. KVCacheOps trait 은
+// BC re-export: KVLayout, QuantWindowRawBuffers 를 L2(kv_cache_ops)로 격상. KVCacheOps trait 은
 // 5-F 에서 폐기됨(inherent 전환 완료) — kv_cache_ops.rs 는 이제 layout/raw-buffer 타입 전용.
-pub use crate::kv_cache_ops::{KVLayout, KiviRawBuffers};
+pub use crate::kv_cache_ops::{KVLayout, QuantWindowRawBuffers};
 
 /// Extension trait for KV caches that support prefetch pipelines.
 ///
