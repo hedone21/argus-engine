@@ -113,6 +113,7 @@ dependencies = [
  "h2o",
  "h2o-plus",
  "half",
+ "layer-importance",
  "libc",
  "libloading 0.8.9",
  "linkme",
@@ -1086,6 +1087,14 @@ dependencies = [
  "argus-extension-api",
  "linkme",
  "ocl",
+]
+
+[[package]]
+name = "layer-importance"
+version = "0.1.0"
+dependencies = [
+ "argus-extension-api",
+ "linkme",
 ]
 
 [[package]]

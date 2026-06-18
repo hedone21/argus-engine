@@ -90,6 +90,10 @@ h2o-plus = { path = "../crates/techniques/h2o-plus" }
 # the engine core; non-optional, force-linked. Production builds `d2o::D2OStage` directly with the
 # full CLI config; the linkme registration backs `make_stage("d2o")` + the registry self-test.
 d2o = { path = "../crates/techniques/d2o" }
+# Layer-importance scorers (mean_pool / shortgpt_bi LayerScorer plugins, observer/score axis Stage B).
+# Extracted from the engine core; non-optional + force-linked because `mean_pool` is the default
+# `--importance-formula`, so it must always be resolvable via `find_layer_scorer`.
+layer-importance = { path = "../crates/techniques/layer-importance" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
