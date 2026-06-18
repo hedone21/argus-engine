@@ -61,6 +61,13 @@ use d2o as _;
 use no_eviction as _;
 use sliding_window as _;
 
+// Layer-importance scorers force-link (observer/score axis, EPIC 2 Stage B). The per-layer
+// importance formulas (mean_pool / shortgpt_bi) were extracted into the `layer-importance` crate;
+// this one line makes their `#[distributed_slice(LAYER_SCORERS)]` registration visible to
+// `find_layer_scorer` (same fat-LTO --gc-sections rationale as the stages above). `mean_pool` is the
+// default `--importance-formula`, so the crate is non-optional.
+use layer_importance as _;
+
 // R-KV measurement force-link (feature `rkv`). Extracted from the engine core into the `rkv`
 // technique crate (registers "rkv"); feature OFF = unlinked + `eviction rkv` subcommand absent.
 #[cfg(feature = "rkv")]

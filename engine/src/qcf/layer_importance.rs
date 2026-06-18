@@ -15,6 +15,8 @@ pub type ImportanceWithRaws = (
     Vec<(Vec<f32>, usize, usize)>,
 );
 
+use argus_extension_api::{LayerScorer, LayerScorerCtx, StageParams, find_layer_scorer};
+
 pub use crate::qcf_types::{ImportanceEntry, SubLayer};
 
 /// Pre-computed importance table for all layers.
@@ -160,6 +162,13 @@ pub struct ImportanceCollector {
     /// compare mode or `DirectAttn` primary). One entry per `snapshot_before`
     /// call, chronological order. Stored as `(raw_data, seq_len, dim)`.
     before_snapshots_raw: Vec<(Vec<f32>, usize, usize)>,
+    /// Resolved per-layer-streaming scorers (observer/score axis, EPIC 2 Stage B). The engine holds
+    /// no scoring arithmetic — `record_after` routes the current layer's pooled / raw activations
+    /// through these plugin [`LayerScorer`]s. `mean_pool` is the default formula + 3-way telemetry
+    /// source; `shortgpt_bi` feeds the 3-way telemetry field (and the ShortGptBi-primary selection).
+    /// Both are resolved once in `new_with_formula` (force-linked, so always present).
+    mean_pool_scorer: Box<dyn LayerScorer>,
+    shortgpt_scorer: Box<dyn LayerScorer>,
 }
 
 impl ImportanceCollector {
@@ -181,6 +190,8 @@ impl ImportanceCollector {
             primary_formula: formula,
             x_means: Vec::new(),
             before_snapshots_raw: Vec::new(),
+            mean_pool_scorer: resolve_scorer("mean_pool"),
+            shortgpt_scorer: resolve_scorer("shortgpt_bi"),
         }
     }
 
@@ -248,7 +259,9 @@ impl ImportanceCollector {
         layer_id: usize,
         sublayer: SubLayer,
     ) {
-        // (1) Mean-pool after state — used by MeanPool formula + OPR
+        // (1) Mean-pool the after state. The engine keeps this pooling because the OPR telemetry
+        // below needs the pooled `[dim]` vector, and the mean-pool scorer re-uses the very same
+        // vector through the ctx (bit-identity). Pooling is data shaping, not technique scoring.
         let mut after = vec![0.0f32; dim];
         if seq_len > 0 {
             for pos in 0..seq_len {
@@ -264,53 +277,43 @@ impl ImportanceCollector {
                 *v *= scale;
             }
         }
-        let imp_mean_pool = (1.0 - cosine_similarity(&self.before_snapshot, &after)).max(0.0);
         let opr = residual_norm_ratio(&self.before_snapshot, &after);
 
-        // (2) ShortGPT BI per-token cosine mean (3-way only)
-        let imp_shortgpt_bi: Option<f32> = if self.three_way {
-            let t = self.before_seq_len.min(seq_len);
-            let d = self.before_dim.min(dim);
-            if t == 0 || d == 0 {
-                Some(0.0)
-            } else {
-                let mut sum_cos = 0.0f32;
-                let mut valid_t: u32 = 0;
-                for pos in 0..t {
-                    let off = pos * d;
-                    let be = off + d;
-                    if be > self.before_snapshot_raw.len() || be > x_data.len() {
-                        break;
-                    }
-                    let before_tok = &self.before_snapshot_raw[off..be];
-                    let after_tok = &x_data[off..be];
-                    let mut bm = 0.0f32;
-                    for &b in before_tok.iter().take(d) {
-                        bm += b * b;
-                    }
-                    if bm > 1e-24 {
-                        sum_cos += cosine_similarity(before_tok, after_tok);
-                        valid_t += 1;
-                    }
-                }
-                let v = if valid_t > 0 {
-                    (1.0 - sum_cos / valid_t as f32).max(0.0)
+        // (2) Score via the plugin LayerScorers — the engine holds no scoring arithmetic. The ctx
+        // lends the current layer's pooled (mean_pool) + raw (shortgpt_bi) activations. ShortGPT-BI
+        // is only meaningful when the raw before-snapshot is cached (3-way mode); otherwise it stays
+        // `None` and the primary selection falls back to mean-pool, exactly as before extraction.
+        let imp_mean_pool;
+        let imp_shortgpt_bi: Option<f32>;
+        {
+            let ctx = CollectorScorerCtx {
+                dim,
+                seq_len,
+                pooled_in: &self.before_snapshot,
+                pooled_out: &after,
+                raw_in: if self.three_way {
+                    Some(&self.before_snapshot_raw)
                 } else {
-                    0.0
-                };
-                Some(v)
-            }
-        } else {
-            None
-        };
+                    None
+                },
+                raw_out: x_data,
+                raw_in_dims: (self.before_seq_len, self.before_dim),
+            };
+            imp_mean_pool = self.mean_pool_scorer.score(layer_id, &ctx);
+            imp_shortgpt_bi = if self.three_way {
+                Some(self.shortgpt_scorer.score(layer_id, &ctx))
+            } else {
+                None
+            };
+        }
 
-        // (3) Primary importance selection
+        // (3) Primary importance selection. The engine owns only the routing — which scorer's value
+        // fills `importance` — plus the ShortGptBi→mean-pool fallback and the DP-LLM/DirectAttn
+        // placeholder (their real signal is computed post-warmup in `noise_table`, so importance
+        // stays a constant here to keep the swap_key composition well-defined for all variants).
         let importance = match self.primary_formula {
             super::ImportanceFormula::MeanPool => imp_mean_pool,
             super::ImportanceFormula::ShortGptBi => imp_shortgpt_bi.unwrap_or(imp_mean_pool),
-            // DP-LLM variants + DirectAttn: real signal is computed post-warmup
-            // in `noise_table`. Importance stays a constant placeholder here so
-            // the swap_key composition is well-defined for all variants.
             super::ImportanceFormula::DpllmProxy
             | super::ImportanceFormula::DpllmMulti
             | super::ImportanceFormula::DpllmAbs
@@ -434,67 +437,101 @@ fn residual_norm_ratio(before: &[f32], after: &[f32]) -> f32 {
     }
 }
 
-/// Cosine similarity between two float slices.
-///
-/// Returns 0.0 if either vector has zero magnitude.
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let len = a.len().min(b.len());
-    if len == 0 {
-        return 0.0;
-    }
+/// The engine-built [`LayerScorerCtx`] for the per-layer-streaming path: it lends the current layer's
+/// pooled and raw activations to a [`LayerScorer`]. The OneShotPostWarmup accessors
+/// (`n_layers`/`x_mean`/`primary_subtensor`/`secondary_subtensor`/`gqa`) return `None`/`0`/empty —
+/// they belong to the post-warmup DP-LLM lifecycle, not this streaming ctx.
+struct CollectorScorerCtx<'a> {
+    dim: usize,
+    seq_len: usize,
+    pooled_in: &'a [f32],
+    pooled_out: &'a [f32],
+    raw_in: Option<&'a [f32]>,
+    raw_out: &'a [f32],
+    raw_in_dims: (usize, usize),
+}
 
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-
-    for i in 0..len {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
+impl LayerScorerCtx for CollectorScorerCtx<'_> {
+    fn n_layers(&self) -> usize {
+        0
     }
-
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < 1e-12 {
-        0.0
-    } else {
-        (dot / denom).clamp(-1.0, 1.0)
+    fn dim(&self) -> usize {
+        self.dim
     }
+    fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+    fn pooled_in(&self) -> &[f32] {
+        self.pooled_in
+    }
+    fn pooled_out(&self) -> &[f32] {
+        self.pooled_out
+    }
+    fn raw_in(&self) -> Option<&[f32]> {
+        self.raw_in
+    }
+    fn raw_out(&self) -> &[f32] {
+        self.raw_out
+    }
+    fn raw_in_dims(&self) -> (usize, usize) {
+        self.raw_in_dims
+    }
+    fn x_mean(&self, _layer: usize) -> Option<&[f32]> {
+        None
+    }
+    fn primary_subtensor(&self, _layer: usize, _name: &str) -> Option<(&[f32], usize, usize)> {
+        None
+    }
+    fn secondary_subtensor(&self, _layer: usize, _name: &str) -> Option<(&[f32], usize, usize)> {
+        None
+    }
+    fn gqa(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
+}
+
+/// Resolve a built-in [`LayerScorer`] by name, or panic with a force-link hint. The built-in scorers
+/// (`mean_pool`/`shortgpt_bi`) live in the `layer-importance` crate, force-linked in
+/// `kv::eviction::stage_registry`; a miss means a fat-LTO `--gc-sections` silent drop. The warmup path
+/// calls [`ensure_layer_scorers_registered`] first, so this panic is a backstop for the few collector
+/// sites that build directly (eval / dump) rather than the normal failure mode.
+fn resolve_scorer(name: &str) -> Box<dyn LayerScorer> {
+    let reg = find_layer_scorer(name).unwrap_or_else(|| {
+        panic!(
+            "LayerScorer '{name}' not registered — suspect linkme fat-LTO --gc-sections silent drop \
+             of the layer-importance crate (force-linked in kv::eviction::stage_registry)."
+        )
+    });
+    (reg.make)(StageParams::default(), &[])
+}
+
+/// Assert the built-in PerLayerStreaming [`LayerScorer`]s (`mean_pool` / `shortgpt_bi`) are registered
+/// — called once on the QCF warmup path before any collector is built. fat-LTO `--gc-sections` can
+/// silently drop the `layer-importance` crate's `#[distributed_slice]` registration; without this
+/// guard a dropped `mean_pool` would make the default importance formula silently degrade to the `1.0`
+/// placeholder (every layer equally important → wrong swap decisions) instead of failing fast. Mirrors
+/// `kv::eviction::stage_registry::ensure_builtin_stages_registered`.
+pub fn ensure_layer_scorers_registered() -> anyhow::Result<()> {
+    for name in ["mean_pool", "shortgpt_bi"] {
+        let Some(reg) = find_layer_scorer(name) else {
+            anyhow::bail!(
+                "built-in LayerScorer '{name}' not registered — suspect linkme fat-LTO --gc-sections \
+                 silent drop of the layer-importance crate (force-linked in kv::eviction::stage_registry)."
+            );
+        };
+        if reg.phase != argus_extension_api::LayerScorerPhase::PerLayerStreaming {
+            anyhow::bail!(
+                "built-in LayerScorer '{name}' must be PerLayerStreaming but declares {:?}.",
+                reg.phase
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_cosine_similarity_identical() {
-        let a = vec![1.0, 2.0, 3.0];
-        let cos = cosine_similarity(&a, &a);
-        assert!((cos - 1.0).abs() < 1e-6, "identical vectors: cos={cos}");
-    }
-
-    #[test]
-    fn test_cosine_similarity_orthogonal() {
-        let a = vec![1.0, 0.0];
-        let b = vec![0.0, 1.0];
-        let cos = cosine_similarity(&a, &b);
-        assert!(cos.abs() < 1e-6, "orthogonal: cos={cos}");
-    }
-
-    #[test]
-    fn test_cosine_similarity_opposite() {
-        let a = vec![1.0, 2.0, 3.0];
-        let b = vec![-1.0, -2.0, -3.0];
-        let cos = cosine_similarity(&a, &b);
-        assert!((cos - (-1.0)).abs() < 1e-6, "opposite: cos={cos}");
-    }
-
-    #[test]
-    fn test_cosine_similarity_zero_vector() {
-        let a = vec![1.0, 2.0];
-        let b = vec![0.0, 0.0];
-        let cos = cosine_similarity(&a, &b);
-        assert_eq!(cos, 0.0);
-    }
 
     #[test]
     fn test_importance_table_empty_skip() {
