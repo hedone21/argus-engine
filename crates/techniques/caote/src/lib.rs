@@ -105,10 +105,17 @@ static CAOTE: KVCacheStageReg = KVCacheStageReg {
     make: |_params: StageParams| Box::new(Caote),
     // caote takes no technique-private args — drop the blob.
     make_with_args: |_params: StageParams, _args| Box::new(Caote),
-    // CAOTE weights its value-aware criticality by importance (a_i), so it is score-based; protect 4
-    // attention sinks by default.
+    // CAOTE weights criticality by the attention weight a_i when available
+    // (ctx.attn_weight / has_attn_weights => AttnWeights) and reads cached V
+    // (ctx.dequant_v => Value), falling back to flat importance (Scores). Declare
+    // all three so the buffer-allocation handshake can wire each; it is score-based
+    // (non-empty reads). Protect 4 attention sinks by default.
     caps: StageCaps {
-        reads: &[argus_extension_api::TensorKind::Scores],
+        reads: &[
+            argus_extension_api::TensorKind::Scores,
+            argus_extension_api::TensorKind::Value,
+            argus_extension_api::TensorKind::AttnWeights,
+        ],
         default_protected_prefix: 4,
     },
 };
