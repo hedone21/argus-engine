@@ -4,7 +4,6 @@
 //! for the 8 action pool algorithms (W1-W3, C1, C4-C6, C8).
 
 use argus_engine::inference::skip_config::SkipConfig;
-use argus_engine::inference::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
 use argus_engine::kv::kv_cache::{KVCache, KVLayout};
 use argus_engine::kv::offload::store::OffloadStore;
 use argus_engine::kv::quant_window_cache::QuantizedRecentWindowCache;
@@ -231,29 +230,6 @@ fn test_skip_config_validate_boundary() {
 }
 
 #[test]
-fn test_speculative_verify_and_rollback() {
-    // Draft produces 5 tokens, verifier accepts first 3
-    let draft = vec![10, 20, 30, 40, 50];
-    let target = vec![10, 20, 30, 99, 50]; // mismatch at index 3
-
-    let result = verify_greedy(&draft, &target);
-    assert_eq!(result.accepted_count, 3);
-    assert_eq!(result.corrected_token, Some(99));
-
-    // Rollback KV positions: 5 drafted, 3 accepted → rollback 2
-    let mut positions = vec![105, 105, 105, 105]; // 16 layers, all at 105
-    rollback_kv_positions(&mut positions, 3, 5);
-    assert_eq!(positions, vec![103, 103, 103, 103]);
-}
-
-#[test]
-fn test_matchness_computation() {
-    assert!((SkipOptimizer::matchness(&[1, 2, 3], &[1, 2, 3]) - 1.0).abs() < 1e-5);
-    assert!((SkipOptimizer::matchness(&[1, 9, 3], &[1, 2, 3]) - 2.0 / 3.0).abs() < 1e-5);
-    assert!((SkipOptimizer::matchness(&[], &[]) - 0.0).abs() < 1e-5);
-}
-
-#[test]
 fn test_all_actions_data_flow() {
     // Smoke test: verify each action's data structures can be created,
     // configured, and invoked without crash.
@@ -278,10 +254,9 @@ fn test_all_actions_data_flow() {
     // W2: SwapHandler
     let _swap = SwapHandler::new(0.5);
 
-    // C1: SkipConfig + Speculative
+    // C1: SkipConfig
     let skip = SkipConfig::uniform_init(16, 0.3);
     assert!(skip.validate(16));
-    let _spec = argus_engine::inference::speculative::SpeculativeConfig::new(skip, 25, 0.8);
 
     // C8: target_bits_for_pressure pressure mapping
     assert_eq!(target_bits_for_pressure(PressureLevel::Emergency), Some(2));
