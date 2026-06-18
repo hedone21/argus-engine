@@ -1684,6 +1684,323 @@ macro_rules! register_quant_attn_plugin {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// CACHE category — stateful quantized-KV cache construction (FORMAT Phase 2, Stage C).
+// A second backend-cap category alongside ATTENTION. It rides the SAME envelope
+// (`BackendCapVTableAbi {name, category, vtable}` / `register_backend_caps_v2` /
+// `BACKEND_CAP_ABI_VERSION`) — only the `category` tag is new. The CACHE vtable owns
+// the cache *construction + lifecycle* (a stateful per-layer quantized cache: residual
+// ring + cold quantized store), distinct from ATTENTION which is the stateless fused
+// dequant+attention compute. Allocation invariant (mirror of QuantAttn): the engine
+// pre-allocates every GPU buffer at `max_seq_len` upfront and lends `cl_mem`; the plugin
+// owns layout policy + kernels, never bytes. There is no allocator callback into the
+// engine (an engine alloc after a cached OpenCL Plan caches `cl_mem` would stale the
+// Plan → garbage/crash), so this ABI carries only borrowed `cl_mem` and POD scalars.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Capability category tag — CACHE (stateful quantized-KV cache construction, e.g. KIVI).
+/// [`BackendCapVTableAbi::category`]. The host's category bridge casts the `vtable` pointer
+/// to [`QuantCacheVTable`] when `category == BACKEND_CAP_CATEGORY_CACHE` (D7). A fresh value
+/// (ATTENTION=1 is taken) — a new category is a new host `match` arm = host recompile (C1).
+pub const BACKEND_CAP_CATEGORY_CACHE: u32 = 2;
+
+/// Closed layout vocabulary for the assembled K/V view the engine wraps in a tensor.
+/// Keeps this ABI from naming the engine's `KVLayout`. `HeadMajor` = `[tokens, kv_heads,
+/// head_dim]` (GPU assembled), `SeqMajor` = `[kv_heads, tokens, head_dim]` (CPU/residual).
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ViewLayoutTag {
+    /// `[tokens, kv_heads, head_dim]`.
+    HeadMajor = 0,
+    /// `[kv_heads, tokens, head_dim]`.
+    SeqMajor = 1,
+}
+
+/// Arguments for creating a quantized-KV cache instance (one per transformer layer). Bare-C
+/// GPU handles borrowed-for-make (the plugin builds its kernels once, mirror of
+/// [`QuantAttnMakeArgs`]) plus the cache geometry the engine passes typed today. The engine
+/// pre-allocates at `max_seq_len` (Plan-safe); the plugin allocates nothing. No engine type.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QuantCacheMakeArgs {
+    /// `cl_context` raw handle (owned by the host backend, borrow-for-make). Null in CPU mode.
+    pub cl_ctx: *mut c_void,
+    /// `cl_device_id` raw handle. Null in CPU mode.
+    pub device: *mut c_void,
+    /// `cl_command_queue` raw handle (lent). Null in CPU mode.
+    pub cl_queue: *mut c_void,
+    /// Null-terminated OpenCL build options (host `build_cl_opts(device)`, Adreno C7). May be null.
+    pub build_opts: *const c_char,
+    /// Number of KV heads (GQA).
+    pub kv_heads: usize,
+    /// Per-head dimension.
+    pub head_dim: usize,
+    /// Maximum sequence length — the engine pre-allocs every buffer at this upfront (Plan-safe).
+    pub max_seq_len: usize,
+    /// FP residual-ring capacity (tokens kept unquantized before a flush).
+    pub residual_size: usize,
+    /// Quantization bit-width (2/4/8, or 16 = unquantized FP fallback).
+    pub bits: u8,
+}
+
+/// Arguments for writing a new K/V step into the cache (D6). All GPU resources are
+/// **borrow-for-call** (C5: no retain). One handle is one layer, so no layer index.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QuantCacheUpdateArgs {
+    /// `cl_command_queue` raw handle (lent). May be null (impl uses its own queue).
+    pub cl_queue: *mut c_void,
+    /// New-token key `cl_mem` (engine-marshalled from its tensor). Null in CPU mode.
+    pub k_in_mem: *mut c_void,
+    /// New-token value `cl_mem`.
+    pub v_in_mem: *mut c_void,
+    /// Number of new tokens written (1 = decode, >1 = prefill batch).
+    pub seq_len: usize,
+}
+
+/// Out-parameter the plugin fills with the `cl_mem` of its assembled K/V view; the engine
+/// wraps each in a tensor (the underlying buffer is engine-owned → zero-alloc reuse) and
+/// runs standard attention on it. Mirrors `KiviCache::get_view` for the GPU regime.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QuantCacheViewOut {
+    /// Assembled key view `cl_mem` (engine-owned buffer the plugin wrote into).
+    pub k_mem: *mut c_void,
+    /// Assembled value view `cl_mem`.
+    pub v_mem: *mut c_void,
+    /// Valid token count in the view.
+    pub tokens: usize,
+    /// View layout ([`ViewLayoutTag`] as `u32`).
+    pub layout: u32,
+}
+
+/// Out-parameter the plugin fills with the raw quantized + residual `cl_mem` set the ATTENTION
+/// cap (`attention_gen_quant`) consumes directly on the fused-native path — four separate
+/// buffers, NOT one assembled view. Mirrors `KiviCache::get_kivi_raw_buffers`. The vtable fn
+/// returns `false` (and leaves this untouched) when there is no native-consumable set (CPU /
+/// bits=16 / empty).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QuantCacheRawBuffersOut {
+    /// Quantized key blocks `cl_mem`.
+    pub qk_mem: *mut c_void,
+    /// Quantized value blocks `cl_mem`.
+    pub qv_mem: *mut c_void,
+    /// FP residual key ring `cl_mem`.
+    pub res_k_mem: *mut c_void,
+    /// FP residual value ring `cl_mem`.
+    pub res_v_mem: *mut c_void,
+    /// Quantized-token count.
+    pub q_tokens: usize,
+    /// Residual (unquantized) token count.
+    pub res_tokens: usize,
+    /// Residual-ring capacity.
+    pub res_cap: usize,
+    /// Quantization bit-width of the blocks.
+    pub bits: u8,
+}
+
+/// Canonical capability trait for the CACHE category (D8 single-trait, mirror of
+/// [`QuantAttnBackend`]). Owned by argus-extension-api → the host dlopen adapter and the
+/// plugin `.so` both implement it. Takes ABI POD (`cl_mem` as `*mut c_void`, never `&Tensor`)
+/// so the plugin references no engine type. Work fns return `i32` (0=OK, negative=err;
+/// panic=abort discipline). `make`/`drop` live in [`QuantCacheVTable`] (lifecycle, not trait).
+pub trait QuantCacheBackend: Send + Sync {
+    /// Number of valid tokens currently in the cache.
+    fn current_pos(&self) -> usize;
+    /// Physical buffer capacity in tokens.
+    fn capacity(&self) -> usize;
+    /// Current quantization bit-width (2/4/8/16).
+    fn current_bits(&self) -> u8;
+    /// Write a new K/V step. `cl_mem` lives in [`QuantCacheUpdateArgs`], borrow-for-call (C5).
+    fn update(&self, args: &QuantCacheUpdateArgs) -> i32;
+    /// Flush the residual ring into the quantized store if it is full (idempotent no-op if not).
+    fn flush_if_full(&self) -> i32;
+    /// Fill `out` with the assembled K/V view `cl_mem`; the engine wraps it in tensors.
+    fn assemble_view(&self, out: &mut QuantCacheViewOut) -> i32;
+    /// Fill `out` with the raw quantized + residual `cl_mem` set for the fused-native attention
+    /// path; return `false` (leaving `out` untouched) when no native set exists (CPU/16/empty).
+    fn get_raw_buffers(&self, out: &mut QuantCacheRawBuffersOut) -> bool;
+    /// Transition the quantization bit-width at runtime (F16↔Q2/Q4/Q8). Same-bits = no-op.
+    fn transition_bits(&self, target_bits: u8) -> i32;
+}
+
+/// Static (force-link) quantized-KV cache registration entry — the CACHE-category counterpart
+/// of [`QuantAttnReg`] (D8). `make` builds the kernels once from the host GPU context.
+/// The built-in engine KIVI does **not** register here (its construction needs engine
+/// `Backend`/`Memory` handles a POD `make` cannot carry — that lives engine-side); this slice
+/// is populated by out-of-tree cache plugins.
+pub struct QuantCacheReg {
+    /// Canonical capability name. Unique within the slice.
+    pub name: &'static str,
+    /// Cache instance factory (builds the kernels once using the host GPU context, D4).
+    pub make: fn(&QuantCacheMakeArgs) -> Box<dyn QuantCacheBackend>,
+}
+
+/// Global static registration slice for quantized-KV cache capabilities (linkme). Contributed
+/// to by `register_quant_cache_plugin!`. Separate from the dynamic dlopen path
+/// ([`PLUGIN_BACKEND_CAP_VTABLES`]) — the host merges them for source-agnostic lookup.
+#[distributed_slice]
+pub static QUANT_CACHE_REGS: [QuantCacheReg] = [..];
+
+/// Looks up a statically registered quantized-KV cache capability by name.
+pub fn find_quant_cache(name: &str) -> Option<&'static QuantCacheReg> {
+    QUANT_CACHE_REGS.iter().find(|r| r.name == name)
+}
+
+/// All statically registered quantized-KV cache capability names (diagnostics / smoke test).
+pub fn registered_quant_cache_names() -> Vec<&'static str> {
+    QUANT_CACHE_REGS.iter().map(|r| r.name).collect()
+}
+
+/// CACHE category C-ABI vtable (D7) — the table [`BackendCapVTableAbi::vtable`] points to when
+/// `category == BACKEND_CAP_CATEGORY_CACHE`. `make`/`drop` live here (make's args are the
+/// per-category [`QuantCacheMakeArgs`], so they cannot go in the common header).
+#[repr(C)]
+pub struct QuantCacheVTable {
+    /// [`QuantCacheMakeArgs`] → opaque plugin handle (one-time kernel build, D4).
+    pub make: unsafe extern "C" fn(*const QuantCacheMakeArgs) -> *mut c_void,
+    /// handle → valid token count.
+    pub current_pos: unsafe extern "C" fn(*mut c_void) -> usize,
+    /// handle → physical capacity (tokens).
+    pub capacity: unsafe extern "C" fn(*mut c_void) -> usize,
+    /// handle → current bit-width.
+    pub current_bits: unsafe extern "C" fn(*mut c_void) -> u8,
+    /// handle + [`QuantCacheUpdateArgs`] → i32 (0=OK, negative=err). Per-token hot path.
+    pub update: unsafe extern "C" fn(*mut c_void, *const QuantCacheUpdateArgs) -> i32,
+    /// handle → i32. Flush the residual ring if full.
+    pub flush_if_full: unsafe extern "C" fn(*mut c_void) -> i32,
+    /// handle + [`QuantCacheViewOut`] out-param → i32. Assemble the dequantized view.
+    pub assemble_view: unsafe extern "C" fn(*mut c_void, *mut QuantCacheViewOut) -> i32,
+    /// handle + [`QuantCacheRawBuffersOut`] out-param → bool. Raw set for the native path.
+    pub get_raw_buffers: unsafe extern "C" fn(*mut c_void, *mut QuantCacheRawBuffersOut) -> bool,
+    /// handle + target bits → i32. Runtime bit-width transition.
+    pub transition_bits: unsafe extern "C" fn(*mut c_void, u8) -> i32,
+    /// Release the handle (called once by the host when the capability is dropped).
+    pub drop: unsafe extern "C" fn(*mut c_void),
+}
+
+// SAFETY: the vtable is immutable and fn-ptrs are inherently Send+Sync. Required to declare a distributed_slice element static.
+unsafe impl Sync for QuantCacheVTable {}
+
+/// dual-wiring macro (D8) that registers a quantized-KV cache capability plugin both statically
+/// (rlib → linkme [`QUANT_CACHE_REGS`] name survival) and dynamically (cdylib → C-ABI
+/// [`QuantCacheVTable`] + envelope entry tagged [`BACKEND_CAP_CATEGORY_CACHE`]). Exact shape of
+/// [`register_quant_attn_plugin!`]. `$make` = `fn(&QuantCacheMakeArgs) -> Box<dyn QuantCacheBackend>`.
+#[macro_export]
+macro_rules! register_quant_cache_plugin {
+    ($name:literal, $make:expr) => {
+        // ── Static path (rlib → linkme QUANT_CACHE_REGS, name survives under force-link). Ungated. ──
+        const _: () = {
+            #[$crate::distributed_slice($crate::QUANT_CACHE_REGS)]
+            static __CACHE_REG: $crate::QuantCacheReg = $crate::QuantCacheReg {
+                name: $name,
+                make: $make,
+            };
+        };
+
+        // ── Dynamic path (cdylib → QuantCacheVTable + envelope entry). Gated by plugin-cdylib. ──
+        #[cfg(feature = "plugin-cdylib")]
+        const _: () = {
+            // handle = Box<Box<dyn QuantCacheBackend>> (thin ptr). All thunks share this representation.
+            type __Handle = ::std::boxed::Box<dyn $crate::QuantCacheBackend>;
+
+            unsafe extern "C" fn __make(
+                p: *const $crate::QuantCacheMakeArgs,
+            ) -> *mut ::core::ffi::c_void {
+                // SAFETY: the host passes a valid QuantCacheMakeArgs pointer (D4). It is a Copy POD.
+                let args: &$crate::QuantCacheMakeArgs = unsafe { &*p };
+                let make_fn: fn(&$crate::QuantCacheMakeArgs) -> __Handle = $make;
+                let be: __Handle = make_fn(args);
+                ::std::boxed::Box::into_raw(::std::boxed::Box::new(be)) as *mut ::core::ffi::c_void
+            }
+
+            unsafe extern "C" fn __current_pos(h: *mut ::core::ffi::c_void) -> usize {
+                // SAFETY: h is the Box<Box<dyn>> created by __make.
+                let be: &dyn $crate::QuantCacheBackend = unsafe { &**(h as *const __Handle) };
+                be.current_pos()
+            }
+
+            unsafe extern "C" fn __capacity(h: *mut ::core::ffi::c_void) -> usize {
+                // SAFETY: same as above.
+                let be: &dyn $crate::QuantCacheBackend = unsafe { &**(h as *const __Handle) };
+                be.capacity()
+            }
+
+            unsafe extern "C" fn __current_bits(h: *mut ::core::ffi::c_void) -> u8 {
+                // SAFETY: same as above.
+                let be: &dyn $crate::QuantCacheBackend = unsafe { &**(h as *const __Handle) };
+                be.current_bits()
+            }
+
+            unsafe extern "C" fn __update(
+                h: *mut ::core::ffi::c_void,
+                a: *const $crate::QuantCacheUpdateArgs,
+            ) -> i32 {
+                // SAFETY: h is the Box<Box<dyn>> created by __make; a is a valid QuantCacheUpdateArgs (C5).
+                let be: &dyn $crate::QuantCacheBackend = unsafe { &**(h as *const __Handle) };
+                be.update(unsafe { &*a })
+            }
+
+            unsafe extern "C" fn __flush_if_full(h: *mut ::core::ffi::c_void) -> i32 {
+                // SAFETY: same as above.
+                let be: &dyn $crate::QuantCacheBackend = unsafe { &**(h as *const __Handle) };
+                be.flush_if_full()
+            }
+
+            unsafe extern "C" fn __assemble_view(
+                h: *mut ::core::ffi::c_void,
+                o: *mut $crate::QuantCacheViewOut,
+            ) -> i32 {
+                // SAFETY: h is the Box<Box<dyn>> created by __make; o is a valid out-param the host owns.
+                let be: &dyn $crate::QuantCacheBackend = unsafe { &**(h as *const __Handle) };
+                be.assemble_view(unsafe { &mut *o })
+            }
+
+            unsafe extern "C" fn __get_raw_buffers(
+                h: *mut ::core::ffi::c_void,
+                o: *mut $crate::QuantCacheRawBuffersOut,
+            ) -> bool {
+                // SAFETY: same as above; o is a valid out-param the host owns.
+                let be: &dyn $crate::QuantCacheBackend = unsafe { &**(h as *const __Handle) };
+                be.get_raw_buffers(unsafe { &mut *o })
+            }
+
+            unsafe extern "C" fn __transition_bits(h: *mut ::core::ffi::c_void, bits: u8) -> i32 {
+                // SAFETY: same as above.
+                let be: &dyn $crate::QuantCacheBackend = unsafe { &**(h as *const __Handle) };
+                be.transition_bits(bits)
+            }
+
+            unsafe extern "C" fn __drop(h: *mut ::core::ffi::c_void) {
+                // SAFETY: h is the Box<Box<dyn>> created by __make; the host calls this exactly once.
+                drop(unsafe { ::std::boxed::Box::from_raw(h as *mut __Handle) });
+            }
+
+            static __VTABLE: $crate::QuantCacheVTable = $crate::QuantCacheVTable {
+                make: __make,
+                current_pos: __current_pos,
+                capacity: __capacity,
+                current_bits: __current_bits,
+                update: __update,
+                flush_if_full: __flush_if_full,
+                assemble_view: __assemble_view,
+                get_raw_buffers: __get_raw_buffers,
+                transition_bits: __transition_bits,
+                drop: __drop,
+            };
+
+            // Contributes the envelope entry to PLUGIN_BACKEND_CAP_VTABLES (const-block isolation = accumulation). Not the entry point.
+            #[$crate::distributed_slice($crate::PLUGIN_BACKEND_CAP_VTABLES)]
+            static __ENTRY: $crate::BackendCapVTableAbi = $crate::BackendCapVTableAbi {
+                name: ::core::concat!($name, "\0").as_ptr() as *const ::core::ffi::c_char,
+                category: $crate::BACKEND_CAP_CATEGORY_CACHE,
+                vtable: &__VTABLE as *const $crate::QuantCacheVTable as *const ::core::ffi::c_void,
+            };
+        };
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // KV read-plan surface — the 4th plan-returning plugin surface, deciding "what to read".
 // A parallel mirror copy of KVCacheStage (eviction) / WeightStage (dispatch) / KVFormat.
 // ════════════════════════════════════════════════════════════════════════════
@@ -2352,6 +2669,165 @@ mod tests {
         };
         assert_eq!(be.dequant_flush(&dq), -1);
         assert_eq!(be.scatter_residual(&sc), -1);
+    }
+
+    /// FORMAT Phase 2, Stage C — CACHE backend-cap category: a fresh category tag, stable
+    /// `repr(C)` layouts for the four POD arg/out structs, and a `QuantCacheBackend` trait
+    /// round-trip (no GPU). The CACHE vtable rides the SAME `BACKEND_CAP_ABI_VERSION=2` envelope.
+    #[test]
+    fn backend_cap_cache_category_surface() {
+        // A distinct category tag — the host's category bridge keys on this.
+        assert_eq!(BACKEND_CAP_CATEGORY_CACHE, 2);
+        assert_ne!(BACKEND_CAP_CATEGORY_CACHE, BACKEND_CAP_CATEGORY_ATTENTION);
+
+        // repr(C) layout stability — guards against silent field drift across the `.so` boundary.
+        assert_eq!(core::mem::size_of::<QuantCacheMakeArgs>(), 72);
+        assert_eq!(core::mem::align_of::<QuantCacheMakeArgs>(), 8);
+        assert_eq!(core::mem::size_of::<QuantCacheUpdateArgs>(), 32);
+        assert_eq!(core::mem::align_of::<QuantCacheUpdateArgs>(), 8);
+        assert_eq!(core::mem::size_of::<QuantCacheViewOut>(), 32);
+        assert_eq!(core::mem::align_of::<QuantCacheViewOut>(), 8);
+        assert_eq!(core::mem::size_of::<QuantCacheRawBuffersOut>(), 64);
+        assert_eq!(core::mem::align_of::<QuantCacheRawBuffersOut>(), 8);
+
+        // Closed layout vocab — stable discriminants across the boundary.
+        assert_eq!(ViewLayoutTag::HeadMajor as u32, 0);
+        assert_eq!(ViewLayoutTag::SeqMajor as u32, 1);
+
+        // Trait round-trip with a synthetic in-memory cache (proves the surface is usable without a GPU).
+        struct FakeCache {
+            pos: usize,
+        }
+        impl QuantCacheBackend for FakeCache {
+            fn current_pos(&self) -> usize {
+                self.pos
+            }
+            fn capacity(&self) -> usize {
+                256
+            }
+            fn current_bits(&self) -> u8 {
+                2
+            }
+            fn update(&self, args: &QuantCacheUpdateArgs) -> i32 {
+                args.seq_len as i32
+            }
+            fn flush_if_full(&self) -> i32 {
+                0
+            }
+            fn assemble_view(&self, out: &mut QuantCacheViewOut) -> i32 {
+                out.tokens = self.pos;
+                out.layout = ViewLayoutTag::HeadMajor as u32;
+                0
+            }
+            fn get_raw_buffers(&self, _out: &mut QuantCacheRawBuffersOut) -> bool {
+                false
+            }
+            fn transition_bits(&self, _target_bits: u8) -> i32 {
+                0
+            }
+        }
+        let c = FakeCache { pos: 7 };
+        assert_eq!(c.current_pos(), 7);
+        assert_eq!(c.capacity(), 256);
+        assert_eq!(c.current_bits(), 2);
+        let upd = QuantCacheUpdateArgs {
+            cl_queue: core::ptr::null_mut(),
+            k_in_mem: core::ptr::null_mut(),
+            v_in_mem: core::ptr::null_mut(),
+            seq_len: 3,
+        };
+        assert_eq!(c.update(&upd), 3);
+        assert_eq!(c.flush_if_full(), 0);
+        let mut view = QuantCacheViewOut {
+            k_mem: core::ptr::null_mut(),
+            v_mem: core::ptr::null_mut(),
+            tokens: 0,
+            layout: ViewLayoutTag::SeqMajor as u32,
+        };
+        assert_eq!(c.assemble_view(&mut view), 0);
+        assert_eq!(view.tokens, 7);
+        assert_eq!(view.layout, ViewLayoutTag::HeadMajor as u32);
+        let mut raw = QuantCacheRawBuffersOut {
+            qk_mem: core::ptr::null_mut(),
+            qv_mem: core::ptr::null_mut(),
+            res_k_mem: core::ptr::null_mut(),
+            res_v_mem: core::ptr::null_mut(),
+            q_tokens: 0,
+            res_tokens: 0,
+            res_cap: 0,
+            bits: 0,
+        };
+        assert!(!c.get_raw_buffers(&mut raw));
+        assert_eq!(c.transition_bits(4), 0);
+
+        // No built-in registers in QUANT_CACHE_REGS at Stage C (the engine KIVI is engine-typed).
+        assert!(find_quant_cache("nonexistent-cache").is_none());
+    }
+
+    // Multiple invocations — register_quant_cache_plugin! twice in one crate (const-block isolation).
+    crate::register_quant_cache_plugin!("rt_qc_a", |_a| Box::new(StaticFakeCache));
+    crate::register_quant_cache_plugin!("rt_qc_b", |_a| Box::new(StaticFakeCache));
+
+    /// No-op cache for the static-registration round-trip.
+    struct StaticFakeCache;
+    impl QuantCacheBackend for StaticFakeCache {
+        fn current_pos(&self) -> usize {
+            0
+        }
+        fn capacity(&self) -> usize {
+            0
+        }
+        fn current_bits(&self) -> u8 {
+            16
+        }
+        fn update(&self, _args: &QuantCacheUpdateArgs) -> i32 {
+            0
+        }
+        fn flush_if_full(&self) -> i32 {
+            0
+        }
+        fn assemble_view(&self, _out: &mut QuantCacheViewOut) -> i32 {
+            0
+        }
+        fn get_raw_buffers(&self, _out: &mut QuantCacheRawBuffersOut) -> bool {
+            false
+        }
+        fn transition_bits(&self, _target_bits: u8) -> i32 {
+            0
+        }
+    }
+
+    /// Static path: both `register_quant_cache_plugin!` invocations land in QUANT_CACHE_REGS.
+    #[test]
+    fn register_quant_cache_multicall_static() {
+        assert!(find_quant_cache("rt_qc_a").is_some(), "rt_qc_a static reg");
+        assert!(find_quant_cache("rt_qc_b").is_some(), "rt_qc_b static reg");
+        let names = registered_quant_cache_names();
+        assert!(names.contains(&"rt_qc_a") && names.contains(&"rt_qc_b"));
+    }
+
+    /// Dynamic path (plugin-cdylib): both invocations accumulate a CACHE-tagged envelope entry
+    /// into the shared PLUGIN_BACKEND_CAP_VTABLES (the same slice ATTENTION uses, keyed by category).
+    #[cfg(feature = "plugin-cdylib")]
+    #[test]
+    fn register_quant_cache_multicall_dynamic() {
+        let cache_names: Vec<&str> = PLUGIN_BACKEND_CAP_VTABLES
+            .iter()
+            .filter(|vt| vt.category == BACKEND_CAP_CATEGORY_CACHE)
+            .map(|vt| {
+                unsafe { core::ffi::CStr::from_ptr(vt.name) }
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            cache_names.contains(&"rt_qc_a"),
+            "rt_qc_a CACHE envelope entry: {cache_names:?}"
+        );
+        assert!(
+            cache_names.contains(&"rt_qc_b"),
+            "rt_qc_b CACHE envelope entry: {cache_names:?}"
+        );
     }
 
     /// StageExportAbi isomorphic round-trip (symmetric across both axes).
