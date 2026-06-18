@@ -40,8 +40,8 @@ fn explicit_kivi_parses() {
     // `--kv-mode kivi` must still resolve against the registry, with quantized caps.
     assert!(resolve_kv_mode("kivi").is_some());
     assert!(mode_caps("kivi").unwrap().is_quantized_kv);
-    assert_eq!(args.kv_mode_args.kivi_bits, 4);
-    assert_eq!(args.kv_mode_args.kivi_residual_len, 64);
+    assert_eq!(args.kv_mode_args.quant_window_bits, 4);
+    assert_eq!(args.kv_mode_args.quant_window_residual_len, 64);
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn effective_kivi_bits_reads_new_field() {
         "--kivi-bits",
         "4",
     ]);
-    assert_eq!(args.effective_kivi_bits(), 4);
+    assert_eq!(args.effective_quant_window_bits(), 4);
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn effective_kivi_residual_size_reads_new_field() {
         "--kivi-residual-len",
         "64",
     ]);
-    assert_eq!(args.effective_kivi_residual_size(), 64);
+    assert_eq!(args.effective_quant_window_residual_size(), 64);
 }
 
 #[test]

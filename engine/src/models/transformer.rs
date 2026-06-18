@@ -3350,16 +3350,16 @@ mod tests {
         );
     }
 
-    /// 미지원 format(KIVIFormat) 은 `as_selective_read()==None` → 엔진 full read 폴백 경로.
+    /// 미지원 format(QuantWindowFormat) 은 `as_selective_read()==None` → 엔진 full read 폴백 경로.
     /// seam 라우팅 match arm 의 guard(`as_selective_read().is_some()`)가 false → full read 직행.
     #[test]
     fn unsupported_format_falls_back_to_full_read() {
-        use crate::kv::kivi_cache::KiviCache;
-        use crate::kv::kivi_format::KIVIFormat;
-        // KIVIFormat 은 as_selective_read override 없음 → base trait default None.
+        use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
+        use crate::kv::quant_window_format::QuantWindowFormat;
+        // QuantWindowFormat 은 as_selective_read override 없음 → base trait default None.
         // (head_dim/residual_size 는 QKKV=32 의 배수 제약)
-        let kivi = KIVIFormat::new(0, KiviCache::new(1, 32, 64, 32));
-        let cap = (&kivi as &dyn crate::format::KVCacheFormat).as_selective_read();
+        let fmt = QuantWindowFormat::new(0, QuantizedRecentWindowCache::new(1, 32, 64, 32));
+        let cap = (&fmt as &dyn crate::format::KVCacheFormat).as_selective_read();
         assert!(
             cap.is_none(),
             "KIVIFormat 은 SelectiveRead 미구현 → as_selective_read()==None → full read 폴백"

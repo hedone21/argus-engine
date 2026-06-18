@@ -11,7 +11,7 @@
 //!
 //! **단일 trait(D8) 결과**: [`QuantAttnBackend`] 가 이미 ABI-shaped(cl_mem [`QuantAttnArgs`])라 host
 //! 어댑터 [`struct@DynQuantAttnBackend`] 는 args 를 vtable fn-ptr 로 그대로 전달할 뿐 — `&Tensor` 다리는
-//! 소비자(`kivi_format`/`kivi_cache`)가 한 번 수행한다(static·dynamic 공유).
+//! 소비자(`quant_window_format`/`quant_window_cache`)가 한 번 수행한다(static·dynamic 공유).
 
 use std::ffi::CStr;
 use std::path::Path;

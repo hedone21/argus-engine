@@ -24,7 +24,7 @@ use argus_shared::{EngineCapability, EngineCommand, EngineMessage, QcfEstimate, 
 use crate::hardware::Hardware;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::kv::cache_manager::CacheManager;
-use crate::kv::kivi_format::KIVIFormat;
+use crate::kv::quant_window_format::QuantWindowFormat;
 use crate::kv::standard_format::StandardFormat;
 use crate::models::transformer::TransformerModel;
 use crate::models::weights::LayerSlot;
@@ -32,8 +32,8 @@ use crate::qcf_collector::ImportanceLookup;
 use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::swap_runtime::EngineSwapRuntime;
 use crate::stages::kv::eviction::EvictionStage;
-use crate::stages::kv::kivi_quant::KiviQuantStage;
 use crate::stages::kv::offload::OffloadStage;
+use crate::stages::kv::quant_window_stage::QuantWindowBitTransitionStage;
 use crate::stages::weight::partition::PartitionStage;
 use crate::stages::weight::weight_recall::WeightRecallStage;
 use crate::stages::weight::weight_swap::WeightSwapStage;
@@ -74,7 +74,7 @@ pub trait EngineReport {
 ///
 /// **과도기 필드(layer_skip)** 는 대응 Stage 미구현이라 deprecated 로 잔존한다(G1).
 /// **partition 은 AB-4 에서 OneShot `PartitionStage`, swap 은 AB-6 에서 OneShot `WeightSwapStage`,
-/// quant 는 AB-2 에서 OneShot `KiviQuantStage`, offload/recall 은 AB-3 에서 OneShot `OffloadStage`
+/// quant 는 AB-2 에서 OneShot `QuantWindowBitTransitionStage`, offload/recall 은 AB-3 에서 OneShot `OffloadStage`
 /// 로 이전됨** — 삭제된 필드: `partition_ratio`/`swap_weights`/`kv_quant_bits`/`offload_ratio`/
 /// `recall_offload` (§5.5/§5.6/§5.7/§5.10).
 #[derive(Debug, Clone, Default)]
@@ -145,9 +145,9 @@ pub struct CommandDispatcher {
     /// `submit_evict` 에서 EvictionStage 생성 시 score_cell 전달(scored 경로 선택).
     /// score-based 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미(QCF uniform fallback 유지).
     score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
-    /// ① KiviQuantStage 가 transition 할 KIVI handle (register 시점 보유, AB-2 §5.7.8). 비어 있으면
+    /// ① QuantWindowBitTransitionStage 가 transition 할 KIVI handle (register 시점 보유, AB-2 §5.7.8). 비어 있으면
     /// KvQuantDynamic directive 가 와도 submit 안 함(미구성 — non-KIVI: Standard/Offload).
-    kivi_handles: Vec<Arc<KIVIFormat>>,
+    quant_window_handles: Vec<Arc<QuantWindowFormat>>,
     /// AB-5 §5.8.2: RequestQcf dispatch 시 QcfEstimate 를 manager 로 송출하는 채널.
     /// `None` 이면 미배선(resilience-off / host 단위테스트) → RequestQcf 가 무송출(inert).
     report_tx: Option<std::sync::mpsc::Sender<EngineMessage>>,
@@ -190,9 +190,9 @@ impl CommandDispatcher {
         model: Option<Arc<TransformerModel>>,
         swap_runtime: Option<Arc<EngineSwapRuntime>>,
         importance: Option<Arc<dyn ImportanceLookup>>,
-        // AB-2 §5.7.8: KiviQuantStage 가 transition 할 KIVI handle. Standard/Offload 경로는 빈 Vec
+        // AB-2 §5.7.8: QuantWindowBitTransitionStage 가 transition 할 KIVI handle. Standard/Offload 경로는 빈 Vec
         // → KvQuantDynamic directive 무시 (inert — evict CM=None 동형).
-        kivi_handles: Vec<Arc<KIVIFormat>>,
+        quant_window_handles: Vec<Arc<QuantWindowFormat>>,
         // AB-5 §5.8.2: RequestQcf dispatch 시 QcfEstimate 를 송출할 채널. None → inert.
         report_tx: Option<std::sync::mpsc::Sender<EngineMessage>>,
         // §5.9.2 Track B: WeightSwapStage 에 넘길 layer-boundary hook cell (ModelForward 공유).
@@ -210,7 +210,7 @@ impl CommandDispatcher {
             model,
             swap_runtime,
             importance,
-            kivi_handles,
+            quant_window_handles,
             report_tx,
             hook_cell,
             score_cell,
@@ -326,7 +326,7 @@ impl CommandDispatcher {
             EngineCommand::KvOffload { ratio } => {
                 self.submit_offload(ratio.clamp(0.0, 1.0));
             }
-            // ── ① quant → OneShot KiviQuantStage submit (AB-2 §5.7.3) ──
+            // ── ① quant → OneShot QuantWindowBitTransitionStage submit (AB-2 §5.7.3) ──
             EngineCommand::KvQuantDynamic { target_bits } => {
                 self.submit_kv_quant(*target_bits);
             }
@@ -386,21 +386,22 @@ impl CommandDispatcher {
         self.registry.submit(Arc::new(stage));
     }
 
-    /// ① KvQuantDynamic directive 1건을 OneShot `KiviQuantStage` 로 submit (AB-2 §5.7.3).
+    /// ① KvQuantDynamic directive 1건을 OneShot `QuantWindowBitTransitionStage` 로 submit (AB-2 §5.7.3).
     ///
     /// sticky last-applied 게이트: 같은 bits 면 재submit 0(transition_bits 자체 no-op 이기도 하나
-    /// loop 진입 차단 = 비용 절감), 값 변경 시 재적용(새 OneShot → transition). `kivi_handles` 가
+    /// loop 진입 차단 = 비용 절감), 값 변경 시 재적용(새 OneShot → transition). `quant_window_handles` 가
     /// 비면 미구성(non-KIVI: Standard/Offload) — directive 무시(evict CM=None 동형). partition 의
     /// `last_partition_ratio` 게이트와 동형(evict bool armed 복사 금지 — 값 비교 게이트).
     fn submit_kv_quant(&mut self, target_bits: u8) {
         if self.last_quant_bits == Some(target_bits) {
             return; // 값 무변경 → 재submit 0 (sticky 핵심 — partition last-applied 동형).
         }
-        if self.kivi_handles.is_empty() {
+        if self.quant_window_handles.is_empty() {
             return; // 미구성 (non-KIVI: Standard/Offload — KIVI handle 부재).
         }
         self.last_quant_bits = Some(target_bits);
-        let stage = KiviQuantStage::one_shot(self.kivi_handles.clone(), target_bits);
+        let stage =
+            QuantWindowBitTransitionStage::one_shot(self.quant_window_handles.clone(), target_bits);
         self.registry.submit(Arc::new(stage));
     }
 
@@ -501,11 +502,11 @@ impl CommandDispatcher {
         };
         let ctx = crate::session::qcf_runtime::QcfEstimateContext {
             kv_handles: &self.kv_handles,
-            kivi_handles: &self.kivi_handles,
+            quant_window_handles: &self.quant_window_handles,
             importance: self.importance.as_deref(),
             streaming_config: None,
             importance_table: None,
-            num_layers: self.kv_handles.len().max(self.kivi_handles.len()),
+            num_layers: self.kv_handles.len().max(self.quant_window_handles.len()),
             // §5.9.1 Track A: active score 면 token_scores 전달(h2o/d2o QCF 언블록).
             // None 이면 기존 uniform fallback 유지(QCF_kv ⊥ QCF_weight 분리 보존).
             token_scores: token_scores_owned.as_deref(),
@@ -619,7 +620,7 @@ mod tests {
         let registry = Arc::new(PipelineRegistry::new());
         let handle = make_handle(N_TOKENS);
         let cm = make_cm();
-        // partition/swap/quant 미구성 (빈 slots + None hardware/model/swap_runtime + 빈 kivi_handles):
+        // partition/swap/quant 미구성 (빈 slots + None hardware/model/swap_runtime + 빈 quant_window_handles):
         // evict 전용 dispatcher. report_tx=None (AB-5 단위테스트는 미배선).
         let d = CommandDispatcher::new(
             Arc::clone(&registry),
@@ -810,18 +811,18 @@ mod tests {
         (d, registry)
     }
 
-    // ── AB-2: kivi_handles 를 구성한 dispatcher helper (CPU KiviCache) ──
+    // ── AB-2: quant_window_handles 를 구성한 dispatcher helper (CPU QuantizedRecentWindowCache) ──
 
     fn make_quant_dispatcher() -> (CommandDispatcher, Arc<PipelineRegistry>) {
-        use crate::kv::kivi_cache::KiviCache;
-        use crate::kv::kivi_format::KIVIFormat;
+        use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
+        use crate::kv::quant_window_format::QuantWindowFormat;
         let registry = Arc::new(PipelineRegistry::new());
-        // CPU KiviCache(bits=16 initial — --kv-dynamic-quant 진입 동형). head_dim/residual = QKKV 배수.
-        let kivi_handles: Vec<Arc<KIVIFormat>> = (0..2)
+        // CPU QuantizedRecentWindowCache(bits=16 initial — --kv-dynamic-quant 진입 동형). head_dim/residual = QKKV 배수.
+        let quant_window_handles: Vec<Arc<QuantWindowFormat>> = (0..2)
             .map(|i| {
-                Arc::new(KIVIFormat::new(
+                Arc::new(QuantWindowFormat::new(
                     i,
-                    KiviCache::new_with_bits(1, 32, 128, 32, 16),
+                    QuantizedRecentWindowCache::new_with_bits(1, 32, 128, 32, 16),
                 ))
             })
             .collect();
@@ -834,7 +835,7 @@ mod tests {
             None,
             None,
             None,
-            kivi_handles,
+            quant_window_handles,
             None,                       // report_tx: AB-5
             Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
             Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
@@ -1027,15 +1028,15 @@ mod tests {
 
     // ── AB-2: quant OneShot submit + sticky last-applied 게이트 (§5.7.9 승계) ──
 
-    /// quant 미구성(빈 kivi_handles) dispatcher 는 KvQuantDynamic 을 무시 (non-KIVI 경로).
+    /// quant 미구성(빈 quant_window_handles) dispatcher 는 KvQuantDynamic 을 무시 (non-KIVI 경로).
     #[test]
     fn quant_unconfigured_ignores_directive() {
-        let (mut d, registry, _h) = make_dispatcher(); // 빈 kivi_handles
+        let (mut d, registry, _h) = make_dispatcher(); // 빈 quant_window_handles
         d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 4 }]);
         assert_eq!(registry.len(), 0, "quant 미구성 → directive 무시");
     }
 
-    /// 새 bits → OneShot KiviQuantStage 1개 submit. 같은 bits 반복/빈 batch → 재submit 0,
+    /// 새 bits → OneShot QuantWindowBitTransitionStage 1개 submit. 같은 bits 반복/빈 batch → 재submit 0,
     /// 값 변경 → 재submit (partition `last_partition_ratio` 게이트 동형). RestoreDefaults 후 재무장.
     /// **16bit 복원 submit 부재** 단언(partition `submit_partition_full` 과 비대칭).
     #[test]

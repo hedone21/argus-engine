@@ -11,7 +11,7 @@
 //!
 //! ## GPU mode
 //!
-//! When constructed with `new_gpu()`, KiviCache allocates persistent GPU buffers for
+//! When constructed with `new_gpu()`, QuantizedRecentWindowCache allocates persistent GPU buffers for
 //! residual and attention data. The hot path (update, get_view) runs GPU kernels.
 //! The cold path (quantize during flush) still runs on CPU since it is infrequent.
 //! CPU-only mode is fully preserved for backward compatibility.
@@ -22,7 +22,7 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
 use crate::capability::quant_attn::QuantAttnBackend;
 use crate::kv::gpu_kv_buffers::GpuKvBuffers;
-use crate::kv_cache_ops::{KVLayout, KiviRawBuffers};
+use crate::kv_cache_ops::{KVLayout, QuantWindowRawBuffers};
 use crate::memory::Memory;
 use crate::memory::host::shared::{SharedBuffer, SharedBufferView};
 use crate::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
@@ -158,7 +158,7 @@ impl QuantizedBlocks {
 /// S-3b-4: `qcf_computer: Box<dyn QcfComputer>` 는 trait method
 /// `clone_box()` 기반 `impl Clone for Box<dyn QcfComputer>` 으로 Clone 지원.
 #[derive(Clone)]
-pub struct KiviCache {
+pub struct QuantizedRecentWindowCache {
     /// Current quantization bit-width (2, 4, or 8).
     bits: u8,
 
@@ -212,7 +212,7 @@ pub struct KiviCache {
     /// (R4: slab.backend 와 동일 ocl 인스턴스의 clone). COMPUTE capability —
     /// buffer ownership 인 `slab` 과 별개로 보관(Stage C 에서 vtable/handle 은
     /// DynQuantCache 가 slab 과 나란히 소유).
-    kivi: Option<Arc<dyn QuantAttnBackend>>,
+    quant_attn: Option<Arc<dyn QuantAttnBackend>>,
     /// Engine-owned GPU buffer set (residual/attn/Q-block + backend/memory).
     /// `Some` ↔ GPU mode enabled (the slab's `backend` is the GPU-mode sentinel;
     /// `is_gpu() == slab.is_some()`). The individual buffer `Option<Tensor>`
@@ -220,18 +220,18 @@ pub struct KiviCache {
     slab: Option<GpuKvBuffers>,
     /// Number of Q2 key blocks written to `slab.q2k`. Write-progress logic state
     /// (mutated independently of buffer (re)allocation; touched by `reset()` even
-    /// in CPU mode) — kept on `KiviCache`, NOT in the slab.
+    /// in CPU mode) — kept on `QuantizedRecentWindowCache`, NOT in the slab.
     gpu_q2k_blocks: usize,
     /// Number of Q2 value blocks written to `slab.q2v`. Logic state (see above).
     gpu_q2v_blocks: usize,
 
     /// QCF flush proxy 계산기 (L2 trait dispatch, S-3b-4 γ-2).
-    /// Default = `KiviQcfComputer` (stateless). caller 가 다른 구현체를
+    /// Default = `QuantFlushQcfComputer` (stateless). caller 가 다른 구현체를
     /// 주입하려면 `set_qcf_computer` 사용.
     qcf_computer: Box<dyn crate::qcf_computer::QcfComputer>,
 }
 
-impl KiviCache {
+impl QuantizedRecentWindowCache {
     // ── SharedBuffer ↔ f32 slice helpers ─────────────────────────────────────
 
     /// Return the attn_k_buf contents as a `&mut [f32]` slice.
@@ -258,7 +258,7 @@ impl KiviCache {
         unsafe { std::slice::from_raw_parts_mut(self.attn_v_buf.as_mut_ptr() as *mut f32, len) }
     }
 
-    /// Create a new KiviCache with specified bit-width.
+    /// Create a new QuantizedRecentWindowCache with specified bit-width.
     ///
     /// - `kv_heads`: number of KV heads
     /// - `head_dim`: dimension per head (must be a multiple of QKKV)
@@ -324,16 +324,16 @@ impl KiviCache {
             awqe_enabled: false,
             last_attn_scores: None,
             // GPU fields — None in CPU-only mode
-            kivi: None,
+            quant_attn: None,
             slab: None,
             gpu_q2k_blocks: 0,
             gpu_q2v_blocks: 0,
             // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cross-L3 default qcf computer (cold-path one-time init, S-3b-4 trail)
-            qcf_computer: Box::<crate::qcf::KiviQcfComputer>::default(),
+            qcf_computer: Box::<crate::qcf::QuantFlushQcfComputer>::default(),
         }
     }
 
-    /// Create a new KiviCache with default 2-bit quantization.
+    /// Create a new QuantizedRecentWindowCache with default 2-bit quantization.
     pub fn new(kv_heads: usize, head_dim: usize, max_seq_len: usize, residual_size: usize) -> Self {
         Self::new_with_bits(kv_heads, head_dim, max_seq_len, residual_size, 2)
     }
@@ -360,12 +360,12 @@ impl KiviCache {
         self.q2_tokens + self.res_pos
     }
 
-    /// Create a GPU-native KiviCache.
+    /// Create a GPU-native QuantizedRecentWindowCache.
     ///
     /// When `backend` is an OpenCL backend, allocates persistent GPU buffers for
     /// residual and attention data. Falls back to CPU-only mode if GPU allocation fails.
     ///
-    /// `kivi` 는 KIVI native attention capability handle (Phase α-W-4 §3.3). caller 가
+    /// `quant_attn` 는 KIVI native attention capability handle (Phase α-W-4 §3.3). caller 가
     /// `caps.get::<dyn QuantAttnBackend>()` 로 pull 해 전달한다. R3 불변식: OpenCL
     /// backend 로 GPU 모드 진입 시 반드시 `Some` (init.rs 가 OpenCL 에 register). R4
     /// 불변식: `backend` 와 동일 ocl 인스턴스의 clone.
@@ -377,7 +377,7 @@ impl KiviCache {
         residual_size: usize,
         bits: u8,
         backend: Arc<dyn Backend>,
-        kivi: Option<Arc<dyn QuantAttnBackend>>,
+        quant_attn: Option<Arc<dyn QuantAttnBackend>>,
         memory: Arc<dyn Memory>,
     ) -> Self {
         let mut cache = Self::new_with_bits(kv_heads, head_dim, max_seq_len, residual_size, bits);
@@ -514,7 +514,7 @@ impl KiviCache {
                     return cache;
                 }
 
-                cache.kivi = kivi;
+                cache.quant_attn = quant_attn;
                 cache.slab = Some(GpuKvBuffers {
                     backend,
                     memory,
@@ -707,12 +707,12 @@ impl KiviCache {
     ///
     /// Returns `None` if GPU mode is not active, no quantized tokens exist, or
     /// the quantization mode is unquantized (bits=16).
-    pub fn get_raw_gpu_buffers(&self) -> Option<KiviRawBuffers<'_>> {
+    pub fn get_raw_gpu_buffers(&self) -> Option<QuantWindowRawBuffers<'_>> {
         if !self.is_gpu() || self.bits == 16 {
             return None;
         }
         let s = self.slab.as_ref()?;
-        Some(KiviRawBuffers {
+        Some(QuantWindowRawBuffers {
             qk_buf: s.q2k.as_ref()?,
             qv_buf: s.q2v.as_ref()?,
             res_k: s.res_k.as_ref()?,
@@ -1508,8 +1508,8 @@ impl KiviCache {
         // (Phase α-W-4 §3.3). R3: GPU 모드면 OpenCL backend 라 caller 가 Some 보장.
         // owned clone 으로 self 의 mutable borrow(gpu_res_k/flush_residual_gpu)와
         // 충돌 회피 (기존 backend_arc 패턴과 동일).
-        let kivi_be = self
-            .kivi
+        let quant_attn_be = self
+            .quant_attn
             .as_ref()
             .ok_or_else(|| {
                 anyhow::anyhow!("KIVI GPU mode but kivi handle missing (registry not registered?)")
@@ -1556,7 +1556,7 @@ impl KiviCache {
                     seq_len: batch,
                     res_pos: self.res_pos,
                 };
-                let rc_k = kivi_be.gather_update_quant(&args_k);
+                let rc_k = quant_attn_be.gather_update_quant(&args_k);
                 if rc_k != 0 {
                     anyhow::bail!("KIVI gather_update_quant (K) failed (rc={rc_k})");
                 }
@@ -1570,7 +1570,7 @@ impl KiviCache {
                     seq_len: batch,
                     res_pos: self.res_pos,
                 };
-                let rc_v = kivi_be.gather_update_quant(&args_v);
+                let rc_v = quant_attn_be.gather_update_quant(&args_v);
                 if rc_v != 0 {
                     anyhow::bail!("KIVI gather_update_quant (V) failed (rc={rc_v})");
                 }
@@ -1833,8 +1833,8 @@ impl KiviCache {
             // (mirrors the gather_update fast-path above). The KIVI Q2 dequant kernels are
             // reached via the `QuantAttnBackend` cap trait — no concrete-OpenCLBackend downcast.
             let backend = self.slab.as_ref().unwrap().backend.clone();
-            let kivi_be = self
-                .kivi
+            let quant_attn_be = self
+                .quant_attn
                 .as_ref()
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -1883,7 +1883,7 @@ impl KiviCache {
                         .as_ref(),
                 )?
                 .as_ptr();
-                let rc_k = kivi_be.dequant_flush(&crate::backend::QuantDequantFlushArgs {
+                let rc_k = quant_attn_be.dequant_flush(&crate::backend::QuantDequantFlushArgs {
                     cl_queue: std::ptr::null_mut(),
                     q_blocks_mem: q2k_mem,
                     attn_mem: attn_k_mem,
@@ -1920,7 +1920,7 @@ impl KiviCache {
                         .as_ref(),
                 )?
                 .as_ptr();
-                let rc_v = kivi_be.dequant_flush(&crate::backend::QuantDequantFlushArgs {
+                let rc_v = quant_attn_be.dequant_flush(&crate::backend::QuantDequantFlushArgs {
                     cl_queue: std::ptr::null_mut(),
                     q_blocks_mem: q2v_mem,
                     attn_mem: attn_v_mem,
@@ -2126,8 +2126,8 @@ impl KiviCache {
             if self.res_pos > 0 {
                 // Scatter the F32 residual ring into the F16 attention buffers via the
                 // `QuantAttnBackend` cap trait — no concrete-OpenCLBackend downcast.
-                let kivi_be = self
-                    .kivi
+                let quant_attn_be = self
+                    .quant_attn
                     .as_ref()
                     .ok_or_else(|| {
                         anyhow::anyhow!(
@@ -2158,16 +2158,17 @@ impl KiviCache {
                         .as_ref(),
                 )?
                 .as_ptr();
-                let rc_k = kivi_be.scatter_residual(&crate::backend::QuantScatterResidualArgs {
-                    cl_queue: std::ptr::null_mut(),
-                    res_mem: res_k_mem,
-                    attn_mem: attn_k_mem,
-                    kv_heads: self.kv_heads,
-                    res_cap: self.res_cap,
-                    head_dim: self.head_dim,
-                    res_pos: self.res_pos,
-                    tok_base: self.q2_tokens,
-                });
+                let rc_k =
+                    quant_attn_be.scatter_residual(&crate::backend::QuantScatterResidualArgs {
+                        cl_queue: std::ptr::null_mut(),
+                        res_mem: res_k_mem,
+                        attn_mem: attn_k_mem,
+                        kv_heads: self.kv_heads,
+                        res_cap: self.res_cap,
+                        head_dim: self.head_dim,
+                        res_pos: self.res_pos,
+                        tok_base: self.q2_tokens,
+                    });
                 if rc_k != 0 {
                     anyhow::bail!("KIVI scatter_residual (K) failed (rc={rc_k})");
                 }
@@ -2193,16 +2194,17 @@ impl KiviCache {
                         .as_ref(),
                 )?
                 .as_ptr();
-                let rc_v = kivi_be.scatter_residual(&crate::backend::QuantScatterResidualArgs {
-                    cl_queue: std::ptr::null_mut(),
-                    res_mem: res_v_mem,
-                    attn_mem: attn_v_mem,
-                    kv_heads: self.kv_heads,
-                    res_cap: self.res_cap,
-                    head_dim: self.head_dim,
-                    res_pos: self.res_pos,
-                    tok_base: self.q2_tokens,
-                });
+                let rc_v =
+                    quant_attn_be.scatter_residual(&crate::backend::QuantScatterResidualArgs {
+                        cl_queue: std::ptr::null_mut(),
+                        res_mem: res_v_mem,
+                        attn_mem: attn_v_mem,
+                        kv_heads: self.kv_heads,
+                        res_cap: self.res_cap,
+                        head_dim: self.head_dim,
+                        res_pos: self.res_pos,
+                        tok_base: self.q2_tokens,
+                    });
                 if rc_v != 0 {
                     anyhow::bail!("KIVI scatter_residual (V) failed (rc={rc_v})");
                 }
@@ -2282,8 +2284,8 @@ impl KiviCache {
 
     // ── KVCacheOps primitives moved to inherent (Phase α-K BC 5-E) ───────────
     // KVCacheOps trait 은 5-F 까지 생존하되, 본문은 inherent 로 이전하고 trait 메서드는
-    // 이 inherent 를 위임 호출한다(byte-identical, 단일 본문). fmt 경로(KIVIFormat/fmt_bridge/
-    // KiviForward)가 trait 경유 없이 직접 호출하도록 한다.
+    // 이 inherent 를 위임 호출한다(byte-identical, 단일 본문). fmt 경로(QuantWindowFormat/fmt_bridge/
+    // QuantWindowForward)가 trait 경유 없이 직접 호출하도록 한다.
 
     /// Number of valid tokens currently in the cache (q2_tokens + res_pos).
     pub fn current_pos(&self) -> usize {
@@ -2378,7 +2380,7 @@ impl KiviCache {
     /// K/V tensors for attention covering `[0..current_pos]` (dequantized assembly).
     ///
     /// `&mut self` — internal buffer assembly (KIVI dequantization). 충돌 없는 동명 inherent
-    /// (KVCache 와 달리 KiviCache 는 기존 `get_view` inherent 부재).
+    /// (KVCache 와 달리 QuantizedRecentWindowCache 는 기존 `get_view` inherent 부재).
     pub fn get_view(&mut self) -> (Tensor, Tensor) {
         // GPU path: return tensors backed by GPU attention buffers
         if self.is_gpu() {
@@ -2454,7 +2456,7 @@ impl KiviCache {
     }
 
     /// Raw GPU buffers for native KIVI fused attention (Some only in GPU mode).
-    pub fn get_kivi_raw_buffers(&self) -> Option<KiviRawBuffers<'_>> {
+    pub fn get_quant_window_raw_buffers(&self) -> Option<QuantWindowRawBuffers<'_>> {
         self.get_raw_gpu_buffers()
     }
 
@@ -2504,7 +2506,7 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         assert_eq!(cache.current_pos(), 0);
         assert_eq!(cache.kv_dtype(), DType::F32);
         assert_eq!(cache.layout(), KVLayout::SeqMajor);
@@ -2525,7 +2527,7 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
 
         // Fill 16 tokens (within residual capacity)
         for i in 0..16 {
@@ -2559,7 +2561,7 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
 
         // Fill exactly res_cap tokens to trigger flush on the next insert
         for i in 0..res_cap {
@@ -2587,7 +2589,7 @@ mod tests {
         let max_seq = 128;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
 
         // Values: sequential so we can verify round-trip
         let mut all_k = Vec::new();
@@ -2651,7 +2653,7 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
 
         // Add 8 tokens at once (prefill-like)
         let k = make_input_tensor(8, kv_heads, head_dim, 1.0);
@@ -2668,7 +2670,7 @@ mod tests {
         let max_seq = 64;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
 
         // Fill to max
         for _ in 0..64 {
@@ -2691,7 +2693,7 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32;
 
-        let cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         assert_eq!(cache.memory_usage_bytes(), 0);
     }
 
@@ -2702,7 +2704,7 @@ mod tests {
         let max_seq = 512;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
 
         // Fill 128 tokens: flush at 33,65,97 → 96 Q2 + 32 residual
         for _ in 0..128 {
@@ -2737,7 +2739,7 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
 
         // Fill 64 tokens → 2 flushes (at token 32 and 64)
         for i in 0..65 {
@@ -2787,7 +2789,7 @@ mod tests {
         let max_seq = 256;
         let res_cap = 64; // larger residual to test groups_per_flush > 1
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         let initial_k_cap = cache.qk.capacity_bytes();
         let initial_v_cap = cache.qv.capacity_bytes();
 
@@ -2952,7 +2954,7 @@ mod tests {
         let kivi_v: Vec<f32>;
         let kivi_mem: usize;
         {
-            let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, 32);
+            let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, 32);
 
             // Prefill
             let off = 0;
@@ -3062,14 +3064,14 @@ mod tests {
 
     #[test]
     fn test_kivi_new_with_bits_q4() {
-        let cache = KiviCache::new_with_bits(2, 64, 256, 32, 4);
+        let cache = QuantizedRecentWindowCache::new_with_bits(2, 64, 256, 32, 4);
         assert_eq!(cache.bits(), 4);
         assert_eq!(cache.current_pos(), 0);
     }
 
     #[test]
     fn test_kivi_new_with_bits_q8() {
-        let cache = KiviCache::new_with_bits(2, 64, 256, 32, 8);
+        let cache = QuantizedRecentWindowCache::new_with_bits(2, 64, 256, 32, 8);
         assert_eq!(cache.bits(), 8);
     }
 
@@ -3080,7 +3082,8 @@ mod tests {
         let max_seq = 128;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, res_cap, 4);
+        let mut cache =
+            QuantizedRecentWindowCache::new_with_bits(kv_heads, head_dim, max_seq, res_cap, 4);
 
         let mut all_k = Vec::new();
         for i in 0..33 {
@@ -3119,7 +3122,8 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, res_cap, 8);
+        let mut cache =
+            QuantizedRecentWindowCache::new_with_bits(kv_heads, head_dim, max_seq, res_cap, 8);
 
         // Fill 65 tokens → 2 flushes (flush at 32, 64) + 1 residual
         for i in 0..65 {
@@ -3181,7 +3185,7 @@ mod tests {
 
     #[test]
     fn test_kivi_transition_noop() {
-        let mut cache = KiviCache::new_with_bits(1, 32, 128, 32, 4);
+        let mut cache = QuantizedRecentWindowCache::new_with_bits(1, 32, 128, 32, 4);
         // Fill 32 tokens
         for _ in 0..33 {
             let k = make_input_tensor(1, 1, 32, 0.5);
@@ -3195,7 +3199,7 @@ mod tests {
 
     #[test]
     fn test_kivi_transition_empty() {
-        let mut cache = KiviCache::new_with_bits(1, 32, 128, 32, 8);
+        let mut cache = QuantizedRecentWindowCache::new_with_bits(1, 32, 128, 32, 8);
         // No tokens — transition should just switch format
         cache.transition_bits(2).unwrap();
         assert_eq!(cache.bits(), 2);
@@ -3208,7 +3212,7 @@ mod tests {
         // Flush #1 fires on token index 32 (before inserting it, res_pos==32).
         // Flush #2 fires on token index 65 (before inserting it, res_pos==32 again).
         // So we need 65+1=66 tokens to observe 2 flushes.
-        let mut cache = KiviCache::new(1, 32, 256, 32);
+        let mut cache = QuantizedRecentWindowCache::new(1, 32, 256, 32);
 
         // Insert 66 tokens → 2 flushes should have occurred
         for i in 0..66 {
@@ -3244,7 +3248,7 @@ mod tests {
     #[test]
     fn test_take_flush_proxies_empty_when_no_flush() {
         // residual_size=32 → no flush until 32 tokens are inserted
-        let mut cache = KiviCache::new(1, 32, 256, 32);
+        let mut cache = QuantizedRecentWindowCache::new(1, 32, 256, 32);
 
         // Insert only 16 tokens (< residual_size) → no flush
         for i in 0..16 {
@@ -3262,7 +3266,7 @@ mod tests {
 
     #[test]
     fn test_reset_clears_flush_proxies() {
-        let mut cache = KiviCache::new(1, 32, 256, 32);
+        let mut cache = QuantizedRecentWindowCache::new(1, 32, 256, 32);
 
         // Flush fires when res_pos reaches res_cap before inserting the 33rd token.
         for i in 0..33 {
@@ -3287,7 +3291,7 @@ mod tests {
     /// `new()` / `new_with_bits()` must always create CPU-mode caches.
     #[test]
     fn test_cpu_mode_is_default() {
-        let cache = KiviCache::new(2, 64, 256, 32);
+        let cache = QuantizedRecentWindowCache::new(2, 64, 256, 32);
         assert!(!cache.is_gpu(), "new() must return CPU-mode cache");
         // CPU mode == no GPU buffer slab (slab is the GPU-mode sentinel).
         assert!(cache.slab.is_none());
@@ -3299,7 +3303,8 @@ mod tests {
         use crate::memory::galloc::Galloc;
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
-        let cache = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
+        let cache =
+            QuantizedRecentWindowCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
         // CpuBackend.name() != "OpenCL" → must fall back to CPU mode
         assert!(
             !cache.is_gpu(),
@@ -3310,7 +3315,7 @@ mod tests {
     /// `reset()` must clear GPU position counters.
     #[test]
     fn test_reset_clears_gpu_counters() {
-        let mut cache = KiviCache::new(2, 64, 256, 32);
+        let mut cache = QuantizedRecentWindowCache::new(2, 64, 256, 32);
         // Manually poke GPU counters to non-zero values (simulating partial GPU use)
         cache.gpu_q2k_blocks = 42;
         cache.gpu_q2v_blocks = 17;
@@ -3327,7 +3332,7 @@ mod tests {
         let max_seq = 128;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         // Fill 33 tokens → triggers one flush
         for i in 0..33 {
             let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.05);
@@ -3349,7 +3354,7 @@ mod tests {
     /// Test 10: awqe_enabled=false → set_attn_scores is no-op, last_attn_scores stays None.
     #[test]
     fn test_kivi_awqe_disabled_no_scores_stored() {
-        let mut cache = KiviCache::new(1, 32, 256, 32);
+        let mut cache = QuantizedRecentWindowCache::new(1, 32, 256, 32);
         assert!(!cache.awqe_enabled);
 
         // Call set_attn_scores with some data
@@ -3372,7 +3377,7 @@ mod tests {
         let n_heads_q = 1;
         let max_seq = 256;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         cache.set_awqe_enabled(true);
 
         // valid_len must cover flush tokens (q2_tokens=0 .. flush_tokens=32)
@@ -3422,7 +3427,7 @@ mod tests {
         let res_cap = 32;
         let max_seq = 256;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         cache.set_awqe_enabled(true);
 
         // Do NOT call set_attn_scores
@@ -3455,7 +3460,7 @@ mod tests {
     /// 폐기 — 본문이 위임하던 inherent is_awqe_enabled 를 직접 검증).
     #[test]
     fn test_kivi_needs_attn_scores() {
-        let mut cache = KiviCache::new(1, 32, 256, 32);
+        let mut cache = QuantizedRecentWindowCache::new(1, 32, 256, 32);
 
         // Default: false
         assert!(
@@ -3488,7 +3493,8 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32; // ignored for bits=16
 
-        let cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, res_cap, 16);
+        let cache =
+            QuantizedRecentWindowCache::new_with_bits(kv_heads, head_dim, max_seq, res_cap, 16);
         assert_eq!(cache.bits(), 16);
         assert_eq!(
             cache.res_cap, max_seq,
@@ -3505,7 +3511,8 @@ mod tests {
         let head_dim = 32;
         let max_seq = 128;
 
-        let mut cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 16);
+        let mut cache =
+            QuantizedRecentWindowCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 16);
 
         // Insert 100 tokens — well beyond a normal residual_size=32 flush threshold
         for i in 0..100 {
@@ -3527,7 +3534,8 @@ mod tests {
         let head_dim = 32;
         let max_seq = 128;
 
-        let mut cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 16);
+        let mut cache =
+            QuantizedRecentWindowCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 16);
 
         let mut all_k = Vec::new();
         for i in 0..50 {
@@ -3556,7 +3564,8 @@ mod tests {
         let head_dim = 32;
         let max_seq = 256;
 
-        let mut cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 2);
+        let mut cache =
+            QuantizedRecentWindowCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 2);
 
         // Insert 65 tokens → 2 flushes (32+32) + 1 residual
         let mut all_k = Vec::new();
@@ -3604,7 +3613,8 @@ mod tests {
         let head_dim = 32;
         let max_seq = 256;
 
-        let mut cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 16);
+        let mut cache =
+            QuantizedRecentWindowCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 16);
 
         // Insert 65 tokens in unquantized mode
         for i in 0..65 {
@@ -3629,7 +3639,7 @@ mod tests {
     /// Transition 16 → 16 is a no-op.
     #[test]
     fn test_kivi_transition_16_noop() {
-        let mut cache = KiviCache::new_with_bits(1, 32, 128, 32, 16);
+        let mut cache = QuantizedRecentWindowCache::new_with_bits(1, 32, 128, 32, 16);
         for i in 0..10 {
             let k = make_input_tensor(1, 1, 32, i as f32 * 0.1);
             let v = make_input_tensor(1, 1, 32, i as f32 * 0.1);
@@ -3645,26 +3655,26 @@ mod tests {
 
     #[test]
     fn test_dryrun_qcf_bits16_returns_zero() {
-        let cache = KiviCache::new_with_bits(2, 64, 256, 32, 16);
+        let cache = QuantizedRecentWindowCache::new_with_bits(2, 64, 256, 32, 16);
         assert_eq!(cache.estimate_dryrun_qcf(), 0.0);
     }
 
     #[test]
     fn test_dryrun_qcf_empty_cache_returns_bits_proxy() {
         // Empty Q2 cache (no residual data) returns bits-based proxy
-        let cache = KiviCache::new(2, 64, 256, 32);
+        let cache = QuantizedRecentWindowCache::new(2, 64, 256, 32);
         assert!((cache.estimate_dryrun_qcf() - 0.30).abs() < 1e-6);
     }
 
     #[test]
     fn test_dryrun_qcf_q4_empty_returns_proxy() {
-        let cache = KiviCache::new_with_bits(2, 64, 256, 32, 4);
+        let cache = QuantizedRecentWindowCache::new_with_bits(2, 64, 256, 32, 4);
         assert!((cache.estimate_dryrun_qcf() - 0.10).abs() < 1e-6);
     }
 
     #[test]
     fn test_dryrun_qcf_q8_empty_returns_proxy() {
-        let cache = KiviCache::new_with_bits(2, 64, 256, 32, 8);
+        let cache = QuantizedRecentWindowCache::new_with_bits(2, 64, 256, 32, 8);
         assert!((cache.estimate_dryrun_qcf() - 0.03).abs() < 1e-6);
     }
 
@@ -3672,7 +3682,7 @@ mod tests {
     fn test_dryrun_qcf_with_residual_data_computes_nmse() {
         let kv_heads = 2;
         let head_dim = 64;
-        let mut cache = KiviCache::new(kv_heads, head_dim, 256, 32);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, 256, 32);
         // Fill 32 tokens (full residual buffer, triggering NMSE path)
         for i in 0..32 {
             let k = make_input_tensor(1, kv_heads, head_dim, (i + 1) as f32 * 0.5);
@@ -3697,11 +3707,11 @@ mod tests {
     fn test_dryrun_qcf_full_residual_computes_actual_nmse() {
         let kv_heads = 1;
         let head_dim = 32;
-        let _cache = KiviCache::new(kv_heads, head_dim, 128, 32);
+        let _cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, 128, 32);
         // Fill exactly 32 tokens without flushing (the 32nd token triggers flush
         // during update, but estimate_dryrun_qcf is read-only and uses current res data).
         // We need to have 32 tokens in residual for NMSE. Use bits=4 and 64-token residual.
-        let mut cache4 = KiviCache::new_with_bits(kv_heads, head_dim, 128, 64, 4);
+        let mut cache4 = QuantizedRecentWindowCache::new_with_bits(kv_heads, head_dim, 128, 64, 4);
         for i in 0..32 {
             let k = make_input_tensor(1, kv_heads, head_dim, (i + 1) as f32 * 0.7);
             let v = make_input_tensor(1, kv_heads, head_dim, (i + 1) as f32 * 0.4);
@@ -3718,7 +3728,7 @@ mod tests {
 
     #[test]
     fn test_raw_gpu_buffers_none_for_cpu_mode() {
-        let cache = KiviCache::new(8, 64, 2048, 64);
+        let cache = QuantizedRecentWindowCache::new(8, 64, 2048, 64);
         assert!(
             cache.get_raw_gpu_buffers().is_none(),
             "CPU-only cache should return None"
@@ -3727,7 +3737,7 @@ mod tests {
 
     #[test]
     fn test_raw_gpu_buffers_none_for_bits16() {
-        let cache = KiviCache::new_with_bits(8, 64, 2048, 64, 16);
+        let cache = QuantizedRecentWindowCache::new_with_bits(8, 64, 2048, 64, 16);
         assert!(
             cache.get_raw_gpu_buffers().is_none(),
             "bits=16 (unquantized) should return None"
@@ -3735,14 +3745,14 @@ mod tests {
     }
 
     // (5-F: test_get_kivi_raw_buffers_trait_default_none 삭제 — KVCacheOps trait 폐기로
-    //  KVCache 엔 get_kivi_raw_buffers 메서드 자체가 없음. KiviCache inherent 만 잔존.)
+    //  KVCache 엔 get_quant_window_raw_buffers 메서드 자체가 없음. QuantizedRecentWindowCache inherent 만 잔존.)
 
     #[test]
     fn test_kivi_raw_buffers_trait_none_for_cpu() {
-        // KiviCache in CPU mode should also return None via the trait method
-        let cache = KiviCache::new(8, 64, 2048, 64);
+        // QuantizedRecentWindowCache in CPU mode should also return None via the trait method
+        let cache = QuantizedRecentWindowCache::new(8, 64, 2048, 64);
         assert!(
-            cache.get_kivi_raw_buffers().is_none(),
+            cache.get_quant_window_raw_buffers().is_none(),
             "CPU-only KiviCache trait method should return None"
         );
     }
@@ -3758,7 +3768,8 @@ mod tests {
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
 
         // new_gpu with non-OpenCL backend falls back to CPU mode
-        let cache_cpu = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
+        let cache_cpu =
+            QuantizedRecentWindowCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
         assert!(!cache_cpu.is_gpu());
         // CPU mode: attn_k_buf/attn_v_buf should be fully allocated
         let attn_cap = cache_cpu.attn_k_buf.size() + cache_cpu.attn_v_buf.size();
@@ -3786,7 +3797,7 @@ mod tests {
         let res_cap = 32;
 
         // CPU mode: flush fills qk/qv
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         assert_eq!((cache.qk.memory_bytes() + cache.qv.memory_bytes()), 0);
         for i in 0..33 {
             let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1);
@@ -3812,7 +3823,7 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         let mut all_k = Vec::new();
         for i in 0..65 {
             let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.03);
@@ -3846,7 +3857,7 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         let size_before = cache.attn_k_buf.size();
         cache.reset();
         let size_after = cache.attn_k_buf.size();
@@ -3871,7 +3882,7 @@ mod tests {
         let res_cap = 32;
 
         // CPU-only cache: gpu_attn_cap == 0
-        let cache_cpu = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let cache_cpu = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         assert_eq!(
             cache_cpu.gpu_attn_capacity(),
             0,
@@ -3881,7 +3892,7 @@ mod tests {
         // new_gpu with non-OpenCL backend: falls back to CPU mode
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
-        let cache_fallback = KiviCache::new_gpu(
+        let cache_fallback = QuantizedRecentWindowCache::new_gpu(
             kv_heads,
             head_dim,
             max_seq,
@@ -3920,7 +3931,7 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         // CPU mode: gpu_attn_cap stays 0 regardless of flush
         for i in 0..33 {
             let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1);
@@ -3950,7 +3961,7 @@ mod tests {
         let max_seq = 256;
         let res_cap = 32;
 
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
         let mut all_k = Vec::new();
         // Insert 65 tokens: triggers 2 flushes (32 + 32) + 1 residual
         for i in 0..65 {
@@ -3995,7 +4006,7 @@ mod tests {
         let head_dim = 64;
         let max_seq = 256;
         let res_cap = 32;
-        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
 
         // Insert 65 tokens to trigger at least one flush (res_cap=32 → flush at 32)
         for i in 0..65 {
@@ -4056,7 +4067,8 @@ mod tests {
         use crate::memory::galloc::Galloc;
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
-        let cache = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
+        let cache =
+            QuantizedRecentWindowCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
         // CPU fallback: no GPU buffer slab at all (so no F16 attn buffers).
         assert!(
             cache.slab.is_none(),

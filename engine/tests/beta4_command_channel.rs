@@ -292,18 +292,18 @@ fn partition_directive_submits_one_shot_stage() {
     assert_eq!(registry.len(), 2, "ratio 변경 → 새 OneShot submit");
 }
 
-/// AB-2: KvQuantDynamic directive → OneShot KiviQuantStage submit 거동 검증.
+/// AB-2: KvQuantDynamic directive → OneShot QuantWindowBitTransitionStage submit 거동 검증.
 ///
 /// v1 의 `kv_quant_bits` 필드 carry(LoopControl 값 비교)를 대체하는 submit-시맨틱 게이트 (§5.7.9
-/// 과도기 등가 테스트 승계). 검증 포인트(§5.7): kivi_handles 비면 inert(directive 무시) /
+/// 과도기 등가 테스트 승계). 검증 포인트(§5.7): quant_window_handles 비면 inert(directive 무시) /
 /// sticky last-applied(같은 bits 재directive 미증가, 값 변경 재증가) / RestoreDefaults 는
 /// `last_quant_bits` clear 만(16bit 복원 submit 없음 — partition `submit_partition_full` 과 비대칭).
 #[test]
 fn quant_directive_submits_one_shot_stage() {
-    use argus_engine::kv::kivi_cache::KiviCache;
-    use argus_engine::kv::kivi_format::KIVIFormat;
+    use argus_engine::kv::quant_window_cache::QuantizedRecentWindowCache;
+    use argus_engine::kv::quant_window_format::QuantWindowFormat;
 
-    // (A) inert: kivi_handles 비면 KvQuantDynamic 무시 (non-KIVI: Standard/Offload 경로).
+    // (A) inert: quant_window_handles 비면 KvQuantDynamic 무시 (non-KIVI: Standard/Offload 경로).
     let registry_inert = Arc::new(PipelineRegistry::new());
     let mut disp_inert = CommandDispatcher::new(
         Arc::clone(&registry_inert),
@@ -314,7 +314,7 @@ fn quant_directive_submits_one_shot_stage() {
         None,
         None,
         None,
-        Vec::new(),                 // 빈 kivi_handles → inert
+        Vec::new(),                 // 빈 quant_window_handles → inert
         None,                       // report_tx: AB-5
         Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
         Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
@@ -326,13 +326,13 @@ fn quant_directive_submits_one_shot_stage() {
         "kivi_handles 비면 inert — directive 무시"
     );
 
-    // (B) configured: CPU KiviCache(bits=16 initial -- --kv-dynamic-quant 진입 동형).
+    // (B) configured: CPU QuantizedRecentWindowCache(bits=16 initial -- --kv-dynamic-quant 진입 동형).
     // head_dim/residual = QKKV 배수.
-    let kivi_handles: Vec<Arc<KIVIFormat>> = (0..2)
+    let quant_window_handles: Vec<Arc<QuantWindowFormat>> = (0..2)
         .map(|i| {
-            Arc::new(KIVIFormat::new(
+            Arc::new(QuantWindowFormat::new(
                 i,
-                KiviCache::new_with_bits(1, 32, 128, 32, 16),
+                QuantizedRecentWindowCache::new_with_bits(1, 32, 128, 32, 16),
             ))
         })
         .collect();
@@ -346,7 +346,7 @@ fn quant_directive_submits_one_shot_stage() {
         None,
         None,
         None,
-        kivi_handles,
+        quant_window_handles,
         None,                       // report_tx: AB-5
         Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
         Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)

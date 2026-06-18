@@ -1,4 +1,4 @@
-//! Phase 4-C-2: `run_ppl_dispatch` + `run_ppl` + `run_kivi_ppl` —
+//! Phase 4-C-2: `run_ppl_dispatch` + `run_ppl` + `run_quant_window_ppl` —
 //! `bin/generate.rs::main()`의 PPL 분기 + 두 free fn 본문 외과적 이동.
 
 use std::sync::Arc;
@@ -13,8 +13,8 @@ use crate::capability::quant_attn::QuantAttnBackend;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::{self};
 use crate::kv::cache_manager::CacheManager;
-use crate::kv::kivi_cache::KiviCache;
 use crate::kv::kv_cache::KVCache;
+use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
 use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
@@ -237,14 +237,14 @@ pub fn run_ppl_dispatch(ctx: PplRunCtx) -> Result<()> {
 // ─── Phase 4-C-2: PPL evaluation free fns (lift from bin/generate.rs) ───
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_kivi_ppl(
+pub fn run_quant_window_ppl(
     args: &Args,
     model: &TransformerModel,
     tokenizer: &Tokenizer,
     backend: &Arc<dyn Backend>,
     // Phase α-W-4 §3.3: KIVI native attention handle (caller 가 caps 에서 pull).
     // OpenCL backend 면 Some, 그 외 None.
-    kivi: Option<Arc<dyn QuantAttnBackend>>,
+    quant_attn: Option<Arc<dyn QuantAttnBackend>>,
     memory: &Arc<dyn Memory>,
     kv_heads: usize,
     head_dim: usize,
@@ -283,17 +283,17 @@ pub fn run_kivi_ppl(
         eval_tokens, residual_size, max_seq_len
     );
 
-    // ── 2. Create KiviCache per layer ──
-    let mut kv_caches: Vec<KiviCache> = (0..num_layers)
+    // ── 2. Create QuantizedRecentWindowCache per layer ──
+    let mut kv_caches: Vec<QuantizedRecentWindowCache> = (0..num_layers)
         .map(|_| {
-            KiviCache::new_gpu(
+            QuantizedRecentWindowCache::new_gpu(
                 kv_heads,
                 head_dim,
                 max_seq_len,
                 residual_size,
                 2,
                 backend.clone(),
-                kivi.clone(),
+                quant_attn.clone(),
                 memory.clone(),
             )
         })
@@ -363,16 +363,16 @@ pub fn run_kivi_ppl(
             backend.clone(),
         );
 
-        // Phase α-K ①-e: run_kivi_ppl prefill flip — `KiviCache::forward_fmt_roundtrip` 로 forward 1회
-        // 동안만 `Vec<KiviCache>` → `Arc<KIVIFormat>` wrap → `forward_into` → concrete 복귀
-        // (①-c eval 미러). multi-token prefill 은 KIVIFormat::attention_into 의 신규 prefill arm
-        // (seq_len>1 → `prefill_attention` 재사용, kivi_format.rs:106)을 경유 — OLD forward_prefill<C>
-        // 의 KIVI 경로(get_view → flash)와 bit-identical. AWQE 는 run_kivi_ppl 미활성
+        // Phase α-K ①-e: run_quant_window_ppl prefill flip — `QuantizedRecentWindowCache::forward_fmt_roundtrip` 로 forward 1회
+        // 동안만 `Vec<QuantizedRecentWindowCache>` → `Arc<QuantWindowFormat>` wrap → `forward_into` → concrete 복귀
+        // (①-c eval 미러). multi-token prefill 은 QuantWindowFormat::attention_into 의 신규 prefill arm
+        // (seq_len>1 → `prefill_attention` 재사용, quant_window_format.rs:106)을 경유 — OLD forward_prefill<C>
+        // 의 KIVI 경로(get_view → flash)와 bit-identical. AWQE 는 run_quant_window_ppl 미활성
         // (set_awqe_enabled 미호출)이라 `cache_self_need_scores`=false(forward_gen.rs:409 OR 항 = false);
         // prefill 은 score 누적 안 하므로 어차피 무관. roundtrip 종료 후 take_flush_proxies/q2_tokens/
         // res_pos 접근은 concrete Vec 복귀 후라 borrow 충돌 없음.
         let cache_self_need_scores = kv_caches.first().is_some_and(|c| c.needs_scores());
-        KiviCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
+        QuantizedRecentWindowCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
             model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &input_tensor,
                 start_pos: 0,
@@ -452,12 +452,12 @@ pub fn run_kivi_ppl(
             std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
         })?;
 
-        // Phase α-K ①-e: run_kivi_ppl decode flip — forward_fmt_roundtrip + forward_into.
-        // decode(seq_len=1)는 KIVIFormat::attention_into 의 decode arm(attention_native / F32-view
+        // Phase α-K ①-e: run_quant_window_ppl decode flip — forward_fmt_roundtrip + forward_into.
+        // decode(seq_len=1)는 QuantWindowFormat::attention_into 의 decode arm(attention_native / F32-view
         // fallback)을 경유 — ①-c eval KIVI 와 동일 경로(host nll Δ~1e-6=★2 carve-out bit-identical
         // 검증됨). `cache_self_need_scores` 는 AWQE 미활성으로 false(decode 의 need_scores OR 항).
         let cache_self_need_scores = kv_caches.first().is_some_and(|c| c.needs_scores());
-        KiviCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
+        QuantizedRecentWindowCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
             model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &gen_input_gpu,
                 start_pos: i,

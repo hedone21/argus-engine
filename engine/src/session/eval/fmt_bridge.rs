@@ -2,14 +2,14 @@
 //!
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §9.1-BC1' (line 794), Strategy A.
 //!
-//! eval 은 concrete `Vec<KVCache>`(EvictionHook) / `Vec<KiviCache>`(KiviHook) 를 **계속 소유**하되,
+//! eval 은 concrete `Vec<KVCache>`(EvictionHook) / `Vec<QuantizedRecentWindowCache>`(QuantWindowFlushHook) 를 **계속 소유**하되,
 //! forward 1회 동안만 `Arc<dyn KVCacheFormat>` 로 wrap 하여 `forward_into` 에 위임한다(round-trip).
 //! hook/snapshot/eviction 은 forward 와 interleave 하지 않으므로(forward → post_prefill/snapshot/
 //! restore 시퀀셜) round-trip 후 복귀한 concrete slice 를 그대로 받는다 → hook impl 무수정.
 //!
 //! `KVCacheOps` 바운드 제거: `run_eval_ll_generic<C: KVCacheOps>` → `<C: EvalCacheKind>`. EvalCacheKind 는
-//! `KVCacheOps` 를 상속하지 않는다(★반증3 회피). 단 `EvalCacheKind for KiviCache` 의 `cur_pos`/
-//! `needs_scores` 위임은 `KiviCache::current_pos`(=`total_tokens()` private fn)·`needs_attn_scores`
+//! `KVCacheOps` 를 상속하지 않는다(★반증3 회피). 단 `EvalCacheKind for QuantizedRecentWindowCache` 의 `cur_pos`/
+//! `needs_scores` 위임은 `QuantizedRecentWindowCache::current_pos`(=`total_tokens()` private fn)·`needs_attn_scores`
 //! (`awqe_enabled` private 필드)를 호출해야 해 `KVCacheOps` 경유가 불가피하다 — **①-c 수용 잔여**
 //! (Step 5 에서 KVCacheOps→inherent 이전 시 정리). KVCache 측은 `current_pos`/`high_water_pos` 가
 //! pub 필드라 trait 불요.
@@ -19,9 +19,9 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::format::KVCacheFormat;
-use crate::kv::kivi_cache::KiviCache;
-use crate::kv::kivi_format::KIVIFormat;
 use crate::kv::kv_cache::KVCache;
+use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
+use crate::kv::quant_window_format::QuantWindowFormat;
 use crate::kv::standard_format::StandardFormat;
 
 /// eval 의 cache 다형성을 `KVCacheOps` 바운드 없이 추상화 (Phase α-K ①-c).
@@ -94,16 +94,16 @@ impl EvalCacheKind for KVCache {
     }
 }
 
-impl EvalCacheKind for KiviCache {
+impl EvalCacheKind for QuantizedRecentWindowCache {
     fn forward_fmt_roundtrip(
         caches: &mut Vec<Self>,
         run: impl FnOnce(&[Arc<dyn KVCacheFormat>]) -> Result<()>,
     ) -> Result<()> {
         let taken = std::mem::take(caches);
-        let kfs: Vec<Arc<KIVIFormat>> = taken
+        let kfs: Vec<Arc<QuantWindowFormat>> = taken
             .into_iter()
             .enumerate()
-            .map(|(i, c)| Arc::new(KIVIFormat::new(i, c)))
+            .map(|(i, c)| Arc::new(QuantWindowFormat::new(i, c)))
             .collect();
         let dyn_slice: Vec<Arc<dyn KVCacheFormat>> = kfs
             .iter()
@@ -124,16 +124,16 @@ impl EvalCacheKind for KiviCache {
     }
 
     fn cur_pos(&self) -> usize {
-        // Phase α-K BC 5-E: KiviCache inherent `current_pos`(=total_tokens()) 직접 호출 (①-c 수용 잔여 해소).
+        // Phase α-K BC 5-E: QuantizedRecentWindowCache inherent `current_pos`(=total_tokens()) 직접 호출 (①-c 수용 잔여 해소).
         self.current_pos()
     }
 
     fn set_cur_pos(&mut self, _pos: usize) {
-        // KiviCache position 은 q2_tokens + res_pos 에서 파생 — no-op (kivi_cache.rs:2242).
+        // QuantizedRecentWindowCache position 은 q2_tokens + res_pos 에서 파생 — no-op (quant_window_cache.rs:2242).
     }
 
     fn needs_scores(&self) -> bool {
-        // Phase α-K BC 5-E: KiviCache inherent `is_awqe_enabled`(=awqe_enabled) 직접 호출 (①-c 수용 잔여 해소).
+        // Phase α-K BC 5-E: QuantizedRecentWindowCache inherent `is_awqe_enabled`(=awqe_enabled) 직접 호출 (①-c 수용 잔여 해소).
         self.is_awqe_enabled()
     }
 }

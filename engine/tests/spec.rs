@@ -320,7 +320,7 @@ mod test_inv_decode_stage_004_005_006_007;
 // ── Phase 4-5-d: ChatSession multi-turn + /reset + ensure_capacity + stats_line ──
 // G2: multi-turn KV pos 누적 보존 (DecodeLoop turn 사이 owned 재사용)
 // G3: /reset — pos=0, evicted_total=0, Forward::reset_kv 호출
-// G4: ensure_capacity — Standard/Kivi/Offload 모드별 overflow bail
+// G4: ensure_capacity — Standard/QuantWindow/Offload 모드별 overflow bail
 // G1/D5: stats_line 포맷 byte-identical
 #[path = "spec/test_chat_session_multi_turn.rs"]
 mod test_chat_session_multi_turn;

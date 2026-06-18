@@ -8,7 +8,7 @@
 //!
 //! stats_line 포맷 (D5, G1 enforce):
 //! - Standard: `kv_pos={kv_pos}/{max_seq_len} policy={policy_name} evicted_total={evicted_total}`
-//! - Kivi: `kv_pos={kv_pos}/{max_seq_len} mode=kivi bits={bits} residual={residual_size}`
+//! - QuantWindow: `kv_pos={kv_pos}/{max_seq_len} mode=kivi bits={bits} residual={residual_size}`
 //! - Offload: `kv_pos={kv_pos}/{max_seq_len} mode=offload store={mode} prefetch_depth={max_prefetch_depth}`
 
 use std::sync::{Arc, Mutex};
@@ -32,7 +32,8 @@ use crate::session::command_dispatcher::CommandDispatcher;
 use crate::session::decode_loop::DecodeLoop;
 use crate::session::decode_loop::{DecodeResult, HasForward};
 use crate::session::forward::{
-    KiviForward, ModelForward, OffloadForward, alloc_kivi_kv_caches, alloc_offload_kv_caches,
+    ModelForward, OffloadForward, QuantWindowForward, alloc_offload_kv_caches,
+    alloc_quant_window_kv_caches,
 };
 use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::resilience_adapter::ResilienceAdapter;
@@ -55,10 +56,10 @@ pub struct ChatKvModeStandard {
 ///
 /// stats_line 포맷 + ensure_capacity 동작이 분기된다.
 /// Standard만 eviction(CacheManager)을 자체 관리한다.
-/// Kivi/Offload는 overflow 시 bail (eviction 미지원).
+/// QuantWindow/Offload는 overflow 시 bail (eviction 미지원).
 pub enum ChatKvMode {
     Standard(Box<ChatKvModeStandard>),
-    Kivi {
+    QuantWindow {
         bits: u8,
         residual_size: usize,
     },
@@ -186,7 +187,7 @@ pub(crate) fn finish_chat_loop(
                 None, // model (no weight swap)
                 None, // swap_runtime
                 None, // importance
-                Vec::new(), // kivi_handles (manager quant inert — chat-managed)
+                Vec::new(), // quant_window_handles (manager quant inert — chat-managed)
                 None, // report_tx
                 Arc::new(Mutex::new(None)), // hook_cell dummy
                 Arc::new(Mutex::new(None)), // score_cell dummy
@@ -259,7 +260,7 @@ impl ChatSession {
     /// turn 시작 전 KV capacity 보장.
     ///
     /// - Standard: CacheManager::force_evict → 재확인. 여전히 부족하면 bail.
-    /// - Kivi/Offload: pos + additional > max_seq_len이면 bail (eviction 미지원).
+    /// - QuantWindow/Offload: pos + additional > max_seq_len이면 bail (eviction 미지원).
     pub fn ensure_capacity(&mut self, additional: usize) -> Result<()> {
         match &self.kv_mode {
             ChatKvMode::Standard(s) => {
@@ -336,7 +337,7 @@ impl ChatSession {
                     );
                 }
             }
-            ChatKvMode::Kivi { .. } | ChatKvMode::Offload { .. } => {
+            ChatKvMode::QuantWindow { .. } | ChatKvMode::Offload { .. } => {
                 if self.pos + additional > self.max_seq_len {
                     anyhow::bail!(
                         "context would exceed max_seq_len={} (pos={}, incoming_reserve={}). \
@@ -429,7 +430,7 @@ impl ChatSession {
                     self.pos, self.max_seq_len, s.policy_name, s.evicted_total
                 )
             }
-            ChatKvMode::Kivi {
+            ChatKvMode::QuantWindow {
                 bits,
                 residual_size,
             } => {
@@ -574,21 +575,21 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
 }
 
 /// "kivi" mode forward-build (KvModeReg.build) — KIVI-private 구성 일체
-/// (alloc_kivi_kv_caches / KiviForward::new / bits·residual / caps.get::<QuantAttnBackend>())가
+/// (alloc_quant_window_kv_caches / QuantWindowForward::new / bits·residual / caps.get::<QuantAttnBackend>())가
 /// 여기로 이동했다. dispatch 지점은 더는 "kivi" 를 NAME 하지 않는다.
-pub(crate) fn build_chat_kivi_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeBuild> {
+pub(crate) fn build_chat_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeBuild> {
     let max_seq_len = ctx.max_seq_len;
-    let bits = ctx.args.effective_kivi_bits();
-    let residual_size = ctx.args.effective_kivi_residual_size();
-    // §4.3: cap pull moved into the kivi closure (gated by `needs_quant_attn`).
-    let kivi = ctx.caps.get::<dyn QuantAttnBackend>();
+    let bits = ctx.args.effective_quant_window_bits();
+    let residual_size = ctx.args.effective_quant_window_residual_size();
+    // §4.3: cap pull moved into the quant_attn closure (gated by `needs_quant_attn`).
+    let quant_attn = ctx.caps.get::<dyn QuantAttnBackend>();
 
     eprintln!(
         "[Chat/KIVI] bits={}, residual_size={}, max_seq_len={}",
         bits, residual_size, max_seq_len
     );
 
-    let kv_caches = alloc_kivi_kv_caches(
+    let kv_caches = alloc_quant_window_kv_caches(
         ctx.num_layers,
         ctx.kv_heads,
         ctx.head_dim,
@@ -596,11 +597,11 @@ pub(crate) fn build_chat_kivi_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeB
         residual_size,
         bits,
         &ctx.backend,
-        &kivi,
+        &quant_attn,
         &ctx.memory,
     );
 
-    let fwd = KiviForward::new(
+    let fwd = QuantWindowForward::new(
         ctx.backend,
         ctx.memory,
         ctx.model,
@@ -611,10 +612,12 @@ pub(crate) fn build_chat_kivi_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeB
     )?;
 
     // §4.5: pos/capacity via base `kv_handle`, bit-width via the neutral `quant_handle`.
-    let kivi_handle = fwd.kivi_caches().first().cloned();
-    let kv_handle = kivi_handle.clone().map(|h| h as Arc<dyn KVCacheFormat>);
-    let quant_handle =
-        kivi_handle.map(|h| h as Arc<dyn crate::session::resilience_adapter::QuantStageHandle>);
+    let quant_window_handle = fwd.quant_window_caches().first().cloned();
+    let kv_handle = quant_window_handle
+        .clone()
+        .map(|h| h as Arc<dyn KVCacheFormat>);
+    let quant_handle = quant_window_handle
+        .map(|h| h as Arc<dyn crate::session::resilience_adapter::QuantStageHandle>);
 
     Ok(ChatModeBuild {
         forward: Box::new(fwd),
@@ -622,7 +625,7 @@ pub(crate) fn build_chat_kivi_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeB
         kv_handle,
         quant_handle,
         eviction_policy: String::new(), // KIVI: no in-loop eviction policy.
-        kv_mode: ChatKvMode::Kivi {
+        kv_mode: ChatKvMode::QuantWindow {
             bits,
             residual_size,
         },
@@ -995,7 +998,7 @@ mod tests {
         let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let mut session = ChatSession {
             decode_loop,
-            kv_mode: ChatKvMode::Kivi {
+            kv_mode: ChatKvMode::QuantWindow {
                 bits: 4,
                 residual_size: 32,
             },
@@ -1012,7 +1015,7 @@ mod tests {
 
     // ─── G4: ensure_capacity 분기 ─────────────────────────────────────────
 
-    /// G4: Kivi 모드에서 pos + additional > max_seq_len이면 bail.
+    /// G4: QuantWindow 모드에서 pos + additional > max_seq_len이면 bail.
     #[test]
     fn g4_kivi_ensure_capacity_bails_on_overflow() {
         let fwd = MockSeqForward {
@@ -1027,7 +1030,7 @@ mod tests {
         let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let mut session = ChatSession {
             decode_loop,
-            kv_mode: ChatKvMode::Kivi {
+            kv_mode: ChatKvMode::QuantWindow {
                 bits: 4,
                 residual_size: 32,
             },
@@ -1203,7 +1206,7 @@ mod tests {
         let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let session = ChatSession {
             decode_loop,
-            kv_mode: ChatKvMode::Kivi {
+            kv_mode: ChatKvMode::QuantWindow {
                 bits: 4,
                 residual_size: 32,
             },

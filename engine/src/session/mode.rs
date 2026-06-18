@@ -4,7 +4,7 @@
 //! 설계 SSOT: `docs/design/format-axis-mode-knob-declaration.md` (A′ — Minimal
 //! Mirror + build-fn-ptr seam).
 //!
-//! 엔진 코어는 더 이상 `KvMode::Kivi` 같은 **구체 기술 정체성에 match 하지 않는다**.
+//! 엔진 코어는 더 이상 `KvMode::QuantWindow` 같은 **구체 기술 정체성에 match 하지 않는다**.
 //! `--kv-mode <name>` 는 런타임 문자열이 되어 이 레지스트리 [`KV_MODES`] 에 대해 resolve
 //! 된다(STAGE 축의 `find_stage`/`KV_CACHE_STAGES` 와 동형). 6개 dispatch 지점은 이름 대신
 //! [`mode_caps`] 의 선언 bool([`ModeCaps`])을 읽고, chat 빌더는 [`KvModeReg::build`] fn-ptr
@@ -32,13 +32,13 @@ use crate::session::resilience_adapter::QuantStageHandle;
 /// mode (off the [`KvModeReg`], not via a trait method — the decision precedes
 /// `build`). The FORMAT-axis analog of `StageCaps`. This is the surface that lets
 /// the engine CLI/chat/eval/bench paths stay free of any concrete KV-technique
-/// name: instead of `matches!(name, KvMode::Kivi | KvMode::Offload)` they read
+/// name: instead of `matches!(name, KvMode::QuantWindow | KvMode::Offload)` they read
 /// these caps generically through [`mode_caps`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModeCaps {
     /// Whether this mode runs a quantized-KV pipeline (bench/eval pick the
     /// quantized runner, bin_setup gates the bits/residual derivation). Replaces
-    /// `matches!(.., KvMode::Kivi)` at the bench-select + bin_setup sites.
+    /// `matches!(.., KvMode::QuantWindow)` at the bench-select + bin_setup sites.
     pub is_quantized_kv: bool,
     /// Whether this mode owns an offload cache container. Replaces
     /// `matches!(.., KvMode::Offload)` at the init.rs conflict check.
@@ -49,7 +49,7 @@ pub struct ModeCaps {
     pub supports_eviction: bool,
     /// Whether this mode pulls the `QuantAttnBackend` capability when building
     /// (generalizes the `caps.get::<dyn QuantAttnBackend>()` pull that used to fire
-    /// only on the KIVI arm). The kivi build closure consumes it; other modes ignore.
+    /// only on the KIVI arm). The quant_attn build closure consumes it; other modes ignore.
     pub needs_quant_attn: bool,
 }
 
@@ -63,7 +63,7 @@ pub struct ModeBuildCtx<'a> {
     /// CPU backend (Standard path needs it for `ModelForward`). Resolved by caller.
     pub cpu_backend: Arc<dyn Backend>,
     pub model: Arc<TransformerModel>,
-    /// Backend capability registry — the kivi build closure pulls
+    /// Backend capability registry — the quant_attn build closure pulls
     /// `caps.get::<dyn QuantAttnBackend>()` from here (gated by `needs_quant_attn`).
     pub caps: &'a CapabilityRegistry,
     pub kv_heads: usize,
@@ -77,7 +77,7 @@ pub struct ModeBuildCtx<'a> {
 /// `ChatSession` assembly threads (resilience heartbeat handle, eviction policy
 /// name, and the `ChatKvMode` stats-line payload).
 pub struct ChatModeBuild {
-    /// The whole-pipeline forward (`ModelForward` / `KiviForward` / `OffloadForward`).
+    /// The whole-pipeline forward (`ModelForward` / `QuantWindowForward` / `OffloadForward`).
     pub forward: Box<dyn Forward>,
     /// Standard-format KV handles for the resilience `CommandDispatcher` (eviction
     /// inert in chat — out-of-loop CacheManager handles it). Empty for quantized/
@@ -181,7 +181,7 @@ pub fn resolve_kv_mode_checked(name: &str) -> Result<&'static KvModeReg> {
 // `build_chat_offload`)의 forward-구성 본문을 *그대로* 들고 와 `Box<dyn Forward>` (+
 // 핸들/라벨)를 반환한다. mode-agnostic 한 ChatSession 조립(registry/sampler/finish_chat_loop)
 // 은 `chat/build.rs` 가 이 build 결과 *둘레*에서 수행한다. KIVI-private 구성
-// (alloc_kivi_kv_caches / KiviForward::new / bits·residual / caps.get::<QuantAttnBackend>())
+// (alloc_quant_window_kv_caches / QuantWindowForward::new / bits·residual / caps.get::<QuantAttnBackend>())
 // 은 전부 "kivi" 클로저 *안*으로 이동했다 — dispatch 지점이 더는 "kivi" 를 NAME 하지 않는다.
 
 #[distributed_slice(KV_MODES)]
@@ -197,7 +197,7 @@ static STANDARD_MODE: KvModeReg = KvModeReg {
 };
 
 #[distributed_slice(KV_MODES)]
-static KIVI_MODE: KvModeReg = KvModeReg {
+static QUANT_WINDOW_MODE: KvModeReg = KvModeReg {
     name: "kivi",
     caps: ModeCaps {
         is_quantized_kv: true,
@@ -205,7 +205,7 @@ static KIVI_MODE: KvModeReg = KvModeReg {
         supports_eviction: false,
         needs_quant_attn: true,
     },
-    build: build_kivi_forward,
+    build: build_quant_window_forward,
 };
 
 #[distributed_slice(KV_MODES)]
@@ -227,10 +227,10 @@ fn build_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeBuild> {
     crate::session::chat::session::build_chat_standard_forward(ctx)
 }
 
-/// "kivi" build closure — KIVI-private 구성 일체(alloc_kivi_kv_caches / KiviForward::new /
+/// "kivi" build closure — KIVI-private 구성 일체(alloc_quant_window_kv_caches / QuantWindowForward::new /
 /// bits·residual / caps.get::<QuantAttnBackend>())가 여기로 이동했다.
-fn build_kivi_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeBuild> {
-    crate::session::chat::session::build_chat_kivi_forward(ctx)
+fn build_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeBuild> {
+    crate::session::chat::session::build_chat_quant_window_forward(ctx)
 }
 
 /// "offload" build closure — `OffloadForward` + offload cache container.

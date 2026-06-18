@@ -16,14 +16,16 @@
 //! - AB-6: weight-swap 8종 SwapStage glue.
 
 use anyhow::bail;
-use argus_engine::session::bin_setup::{build_inference_ctx, build_kivi_bench_ctx};
+use argus_engine::session::bin_setup::{build_inference_ctx, build_quant_window_bench_ctx};
 use argus_engine::session::cli::Args;
-use argus_engine::session::experiment_run::{run_experiment_path, run_kivi_experiment_path};
+use argus_engine::session::experiment_run::{
+    run_experiment_path, run_quant_window_experiment_path,
+};
 use argus_engine::session::mode::{mode_caps, resolve_kv_mode_checked};
 use clap::Parser;
 
 /// Whether the requested `--kv-mode` runs a quantized-KV pipeline (reads declared
-/// `ModeCaps` — no concrete-technique name). Replaces `matches!(.., KvMode::Kivi)`.
+/// `ModeCaps` — no concrete-technique name). Replaces `matches!(.., KvMode::QuantWindow)`.
 fn is_quantized_kv_mode(args: &Args) -> bool {
     mode_caps(args.effective_kv_mode()).is_some_and(|c| c.is_quantized_kv)
 }
@@ -69,11 +71,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     // AB-2: quantized-KV dynamic-quant 분기. quantized-KV mode(`ModeCaps.is_quantized_kv`)
-    // 또는 `--kv-dynamic-quant`(orphan flag 재배선) 진입 시 KiviForward + KiviQuantStage 경로.
+    // 또는 `--kv-dynamic-quant`(orphan flag 재배선) 진입 시 QuantWindowForward + QuantWindowBitTransitionStage 경로.
     // 비양자화(Standard)는 ModelForward 경로. `--kv-dynamic-quant` 는 mode 가 아니므로 명시적 OR.
     if is_quantized_kv_mode(&args) || args.kv_dynamic_quant {
-        let ctx = build_kivi_bench_ctx(args)?;
-        return run_kivi_experiment_path(ctx);
+        let ctx = build_quant_window_bench_ctx(args)?;
+        return run_quant_window_experiment_path(ctx);
     }
 
     let ctx = build_inference_ctx(args)?;
@@ -126,7 +128,7 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
             "argus-bench AB-0: --qcf-dump moved to argus-eval (--qcf-dump with --eval-ll or --ppl)"
         );
     }
-    // AB-2: quantized-KV mode 해제 (KiviForward + KiviQuantStage 배선 완료). Offload(AB-3)는 bail 유지.
+    // AB-2: quantized-KV mode 해제 (QuantWindowForward + QuantWindowBitTransitionStage 배선 완료). Offload(AB-3)는 bail 유지.
     if is_offload_mode(args) {
         bail!("argus-bench AB-3: --kv-mode Offload lands in AB-3");
     }

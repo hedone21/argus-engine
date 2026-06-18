@@ -13,10 +13,10 @@
 //! / role→token map is needed because the buffer roles are a fixed set.
 //!
 //! Field placement: only **buffer ownership** lives here. Compute capability
-//! (`kivi: Arc<dyn QuantAttnBackend>`) and write-progress logic state
-//! (`gpu_q2k_blocks`/`gpu_q2v_blocks`) stay on `KiviCache` — they are not
+//! (`quant_attn: Arc<dyn QuantAttnBackend>`) and write-progress logic state
+//! (`gpu_q2k_blocks`/`gpu_q2v_blocks`) stay on `QuantizedRecentWindowCache` — they are not
 //! storage. The CPU-side residual `Vec<f32>` / `SharedBuffer` fields are
-//! distinct and also stay on `KiviCache` (GPU mode reuses the CPU residual for
+//! distinct and also stay on `QuantizedRecentWindowCache` (GPU mode reuses the CPU residual for
 //! the quantize cold path).
 //!
 //! Borrow note: access buffer fields through **field paths** off a single

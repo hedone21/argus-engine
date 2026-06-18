@@ -18,10 +18,10 @@ use crate::experiment::{JsonlWriter, SummaryRecord, SystemSampler, TokenRecord};
 use crate::inference::sampling::{self, SamplingConfig};
 use crate::session::DecodeLoop;
 use crate::session::assembly::{
-    SwapWiringConfig, build_bench_kivi_loop, build_bench_loop, build_local_pressure_source,
+    SwapWiringConfig, build_bench_loop, build_bench_quant_window_loop, build_local_pressure_source,
     build_resilience_cache_manager,
 };
-use crate::session::bin_setup::KiviBenchCtx;
+use crate::session::bin_setup::QuantWindowBenchCtx;
 use crate::session::cli::Args;
 use crate::session::decode_loop::StopReason;
 use crate::session::experiment::ScheduleCommandSource;
@@ -29,17 +29,17 @@ use crate::session::standard_happy::StandardHappyCtx;
 
 /// AB-2 §5.7.7: KIVI bench 경로 — `run_experiment_path` 의 KIVI 형제.
 ///
-/// `build_bench_kivi_loop` 로 `KiviForward` + `KiviQuantStage` 배선 `DecodeLoop` 를 조립한 뒤,
+/// `build_bench_quant_window_loop` 로 `QuantWindowForward` + `QuantWindowBitTransitionStage` 배선 `DecodeLoop` 를 조립한 뒤,
 /// Standard 경로와 동일한 prefill→sample→run→summary 공통부([`run_decode_loop_experiment`])를 탄다.
 /// eviction/swap/partition 미배선(§5.7.7) — `cache_manager`/`pressure_source` 무주입.
-pub fn run_kivi_experiment_path(ctx: KiviBenchCtx) -> anyhow::Result<()> {
-    let KiviBenchCtx {
+pub fn run_quant_window_experiment_path(ctx: QuantWindowBenchCtx) -> anyhow::Result<()> {
+    let QuantWindowBenchCtx {
         args,
         backend,
         memory,
         hardware: _,
         model,
-        kivi,
+        quant_attn,
         tokenizer,
         tokens,
         max_seq_len,
@@ -57,11 +57,11 @@ pub fn run_kivi_experiment_path(ctx: KiviBenchCtx) -> anyhow::Result<()> {
         initial_bits,
     );
 
-    let decode_loop = build_bench_kivi_loop(
+    let decode_loop = build_bench_quant_window_loop(
         backend,
         memory,
         model,
-        &kivi,
+        &quant_attn,
         initial_bits,
         residual_size,
         max_seq_len,
@@ -185,7 +185,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
     )
 }
 
-/// AB-2 §5.7.7: prefill→sample→run→summary 공통부 (`run_experiment_path` / `run_kivi_experiment_path`
+/// AB-2 §5.7.7: prefill→sample→run→summary 공통부 (`run_experiment_path` / `run_quant_window_experiment_path`
 /// 공유). 조립된 `DecodeLoop` 를 받아 generation + JSONL/summary 산출까지 수행한다.
 #[allow(clippy::too_many_arguments)]
 fn run_decode_loop_experiment(

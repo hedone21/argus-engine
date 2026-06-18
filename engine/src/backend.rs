@@ -1298,7 +1298,7 @@ pub trait Backend: Send + Sync {
     }
 
     /// §13.8-L S-L-3: KIVI native attention dispatch hook. OpenCL backend
-    /// 만 활성, 그 외 backend 는 default `None`. forward_gen.rs / kivi_cache.rs
+    /// 만 활성, 그 외 backend 는 default `None`. forward_gen.rs / quant_window_cache.rs
     /// 의 hot-path `OpenCLBackend` downcast 가 본 trait method 호출로
     /// 축약된다.
     fn as_quant_attn(&self) -> Option<&dyn QuantAttnBackend> {
