@@ -116,8 +116,8 @@ pub const EXT_RPCMEM_ALLOCATOR: &str = "rpcmem_allocator";
 // Phase α-W-4 에서 두 trait 의 정의 본체를 `capability/` 서브모듈로 물리 이동했다.
 // 기존 import path(`crate::backend::QuantAttnBackend` 등)를 보존하기 위해
 // 여기서 re-export 한다 (byte-identical). `Backend` god-trait 의
-// `as_quant_attn`/`gpu_score_acc`/`gpu_score_acc_mut` default 메서드는 본
-// re-export 된 trait 를 그대로 참조한다.
+// `gpu_score_acc`/`gpu_score_acc_mut` default 메서드는 본 re-export 된
+// trait 를 그대로 참조한다.
 pub use crate::capability::gpu_score::GpuScoreAccess;
 pub use crate::capability::quant_attn::{
     QuantAttnArgs, QuantAttnBackend, QuantAttnGatherArgs, QuantDequantFlushArgs,
@@ -1294,14 +1294,6 @@ pub trait Backend: Send + Sync {
     /// (`UnsafeCell`-backed). single-threaded 추론 가정.
     #[allow(clippy::mut_from_ref)]
     fn gpu_score_acc_mut(&self) -> Option<&mut dyn GpuScoreAccess> {
-        None
-    }
-
-    /// §13.8-L S-L-3: KIVI native attention dispatch hook. OpenCL backend
-    /// 만 활성, 그 외 backend 는 default `None`. forward_gen.rs / quant_window_cache.rs
-    /// 의 hot-path `OpenCLBackend` downcast 가 본 trait method 호출로
-    /// 축약된다.
-    fn as_quant_attn(&self) -> Option<&dyn QuantAttnBackend> {
         None
     }
 

@@ -5,4 +5,3 @@ pub mod attention_scores;
 pub mod query_stats;
 pub mod sampling;
 pub mod skip_config;
-pub mod speculative;

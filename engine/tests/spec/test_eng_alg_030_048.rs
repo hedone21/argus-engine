@@ -56,25 +56,6 @@ fn test_eng_alg_030_c03_validate_last_layer_skip() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ENG-ALG-030: speculative perturb (SkipOptimizer::perturb)
-// ══════════════════════════════════════════════════════════════
-
-#[test]
-fn test_eng_alg_030_perturb_respects_boundaries() {
-    use argus_engine::inference::speculative::SkipOptimizer;
-
-    let base = SkipConfig::uniform_init(16, 0.3);
-    let perturbed = SkipOptimizer::perturb(&base, 16, 42);
-
-    // 경계 레이어 보호 확인
-    assert!(!perturbed.skip_attn(0));
-    assert!(!perturbed.skip_mlp(0));
-    assert!(!perturbed.skip_attn(15));
-    assert!(!perturbed.skip_mlp(15));
-    assert!(perturbed.validate(16));
-}
-
-// ══════════════════════════════════════════════════════════════
 // ENG-ALG-032: ImportanceTable QCF — 레이어 중요도 기반 skip cost
 // ══════════════════════════════════════════════════════════════
 
