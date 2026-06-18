@@ -309,36 +309,33 @@ impl SessionInitCtx {
                         rpcmem_alloc,
                     ),
                 );
-                // Phase α-W-4 §3.3: OpenCL backend 는 KIVI native attention capability
-                // 보유 → registry 에 register. R4 불변식: register 하는 Arc 와 아래에서
-                // primary backend 로 쓰는 Arc 는 **동일 ocl 인스턴스의 clone** 이어야 한다
-                // (QuantizedRecentWindowCache.quant_attn 와 일반 ops 가 같은 객체를 봐야 함). gpu_concrete 는
-                // 여기까지 단일 인스턴스이므로 clone 으로 두 trait object 를 파생한다.
+                // Stage E: the engine ships NO built-in QuantAttn cap — the OpenCL KIVI kernels
+                // moved to the `kivi` plugin. Only `--backend-cap <name>` registers a cap (the
+                // resolved plugin, built from the live GPU context). With no flag, no cap is
+                // registered; GPU KIVI then requires `--backend-cap kivi_abi --load-plugin
+                // <kivi>.so`, and `QuantizedRecentWindowCache`'s own GPU path surfaces the missing
+                // cap (the engine core names no technique). R4 불변식: the resolved cap is built
+                // from `gpu_concrete`'s context via `with_quant_attn_make_args`, so it shares the
+                // same ocl instance the primary backend (and the cache) uses.
                 // gpu_score 는 결정 #5 에 따라 register 하지 않는다(소비자 0, β 까지).
                 let mut caps = CapabilityRegistry::new();
-                match args.backend_cap.as_deref() {
-                    Some(name) => {
-                        // --backend-cap <name>: resolve a named KIVI attention capability
-                        // (static QUANT_ATTN_REGS first, then dynamic --load-plugin) using
-                        // the live GPU context, and register it in place of the built-in impl.
-                        let cap = gpu_concrete
-                            .with_quant_attn_make_args(|make_args| {
-                                crate::capability::dynamic_backend_registry::resolve_quant_attn_capability(
-                                    name, make_args,
-                                )
-                            })
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "Unknown --backend-cap '{name}' (not found in static \
-                                     QUANT_ATTN_REGS or dynamic registration — check --load-plugin)"
-                                )
-                            })?;
-                        caps.register::<dyn crate::backend::QuantAttnBackend>(cap);
-                    }
-                    // Default: the engine's built-in OpenCL KIVI attention impl (unchanged).
-                    None => {
-                        caps.register::<dyn crate::backend::QuantAttnBackend>(gpu_concrete.clone());
-                    }
+                if let Some(name) = args.backend_cap.as_deref() {
+                    // --backend-cap <name>: resolve a named quantized-attention capability
+                    // (static QUANT_ATTN_REGS first, then dynamic --load-plugin) using the live
+                    // GPU context, and register it.
+                    let cap = gpu_concrete
+                        .with_quant_attn_make_args(|make_args| {
+                            crate::capability::dynamic_backend_registry::resolve_quant_attn_capability(
+                                name, make_args,
+                            )
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Unknown --backend-cap '{name}' (not found in static \
+                                 QUANT_ATTN_REGS or dynamic registration — check --load-plugin)"
+                            )
+                        })?;
+                    caps.register::<dyn crate::backend::QuantAttnBackend>(cap);
                 }
                 let gpu: Arc<dyn Backend> = gpu_concrete;
                 // GPU is primary; keep a ref as secondary for SwitchHw round-trip

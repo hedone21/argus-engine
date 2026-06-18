@@ -1305,6 +1305,29 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Raw OpenCL `cl_command_queue` handle (FORMAT Phase 2 Stage E). A
+    /// borrowed-context backend-cap plugin (which has no `self.queue` of its
+    /// own) must enqueue its kernels on the engine's live command queue so they
+    /// stay serialized with surrounding engine ops over shared `cl_mem`; this
+    /// accessor lends that raw handle so the call sites can pack it into the
+    /// `QuantAttn*Args.cl_queue` ABI slot. OpenCL backend only; others return
+    /// null. (The built-in OpenCL impl ignores the slot and uses `self.queue`
+    /// directly, so populating it is a no-op for the in-engine path.)
+    fn cl_command_queue_ptr(&self) -> *mut std::ffi::c_void {
+        std::ptr::null_mut()
+    }
+
+    /// Whether this backend's device uses the sub-group-less (nosub) attention
+    /// path (FORMAT Phase 2 Stage E). The KIVI FORMAT gates its native fused
+    /// attention on this device property (it is consistent with the standard
+    /// `attention_gen` work-group reduction the nosub path also uses). Previously
+    /// read off the QuantAttn cap; now a backend-owned device property so it stays
+    /// byte-identical once the KIVI compute moves to a dlopen plugin. OpenCL
+    /// returns its `f16_is_nosub`; others default `false`.
+    fn is_nosub_device(&self) -> bool {
+        false
+    }
+
     /// Cold-path backend-specific extension lookup (string-keyed downcast).
     ///
     /// `downcast_ref::<OpenCLBackend>()` 등 outer-module downcast 를
