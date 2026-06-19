@@ -240,12 +240,10 @@ fn build_eval_score_accumulator(
     model: &TransformerModel,
     max_seq_len: usize,
 ) -> Option<AttentionScoreAccumulator> {
-    let qcf_mode = match args.qcf_mode.as_str() {
-        "caote" => crate::qcf::QcfMode::Caote,
-        "both" => crate::qcf::QcfMode::Both,
-        _ => crate::qcf::QcfMode::Attn,
-    };
-    let needs_caote = qcf_mode.has_caote();
+    // `--qcf-mode caote|both` forces the score accumulator + GQA even with no eviction policy.
+    // The CAOTE QcfMode variant was name-only residue (no distinct arithmetic), so gate on the CLI
+    // string directly (B1-2).
+    let needs_caote = matches!(args.qcf_mode.as_str(), "caote" | "both");
     let needs_score_based = stage_is_score_based(args.eviction_policy());
     let has_eviction_policy = args.eviction_policy() != "none";
     let needs_accumulator =
@@ -757,7 +755,7 @@ mod tests {
     /// sliding + 미지정 → prompt 전체 보호.
     #[test]
     fn protected_prefix_sliding_defaults_to_prompt_len() {
-        let args = parse_args(&["--eval-ll", "eviction", "sliding"]);
+        let args = parse_args(&["--eval-ll", "eviction", "plugin", "--name", "sliding"]);
         assert_eq!(args.eviction_policy(), "sliding");
         assert_eq!(eval_protected_prefix(&args, 50), 50);
     }
@@ -765,9 +763,9 @@ mod tests {
     /// h2o/h2o_plus/d2o + 미지정 → 4 (attention sinks only).
     #[test]
     fn protected_prefix_score_based_defaults_to_4() {
-        // clap subcommand 는 kebab-case(`h2o-plus`), canonical policy_name 은 snake_case(`h2o_plus`).
-        for (subcmd, policy) in [("h2o", "h2o"), ("h2o-plus", "h2o_plus"), ("d2o", "d2o")] {
-            let args = parse_args(&["--eval-ll", "eviction", subcmd]);
+        // Stages are now selected generically by registry name (snake_case `h2o_plus`).
+        for policy in ["h2o", "h2o_plus", "d2o"] {
+            let args = parse_args(&["--eval-ll", "eviction", "plugin", "--name", policy]);
             assert_eq!(args.eviction_policy(), policy);
             assert_eq!(
                 eval_protected_prefix(&args, 100),
@@ -780,7 +778,15 @@ mod tests {
     /// --protected-prefix 명시 시 정책과 무관하게 그 값.
     #[test]
     fn protected_prefix_explicit_overrides_default() {
-        let args = parse_args(&["--eval-ll", "--protected-prefix", "12", "eviction", "h2o"]);
+        let args = parse_args(&[
+            "--eval-ll",
+            "--protected-prefix",
+            "12",
+            "eviction",
+            "plugin",
+            "--name",
+            "h2o",
+        ]);
         assert_eq!(eval_protected_prefix(&args, 100), 12);
     }
 }

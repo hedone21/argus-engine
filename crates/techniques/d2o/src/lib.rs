@@ -499,6 +499,7 @@ static D2O: KVCacheStageReg = KVCacheStageReg {
             argus_extension_api::TensorKind::Key,
         ],
         default_protected_prefix: 4,
+        produces_merge_plan: true,
     },
 };
 

@@ -537,34 +537,36 @@ pub fn stage_default_protected_prefix(name: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// 빌트인 LayerWide 기법(sliding/streaming/h2o)이 `KV_CACHE_STAGES` 에 등록됐는지 단언한다 — eviction
-/// CacheManager build 진입 시 1회 호출. fat-LTO `--gc-sections` 가 linkme 등록을 silent
-/// drop 하면 누락 기법에 대해 `Err` 로 fail-fast 한다(release 에서 정책 이름 미해석 → 조용한 폴백 방지).
+/// Whether the named stage's `plan()` may emit a weighted-merge plan (à la D2O). The generic lookup
+/// the eval/QCF path uses instead of the `eviction_policy() == "d2o"` name match — it selects a
+/// merge-compensation estimator + K readback. Reads the plugin's declared [`StageCaps`]. Unknown →
+/// `false` (pure-drop).
+pub fn stage_produces_merge_plan(name: &str) -> bool {
+    argus_extension_api::stage_caps(name)
+        .map(|c| c.produces_merge_plan)
+        .unwrap_or(false)
+}
+
+/// 모든 force-link 된 빌트인 stage 크레이트가 `KV_CACHE_STAGES` 에 등록됐는지 단언한다 — eviction
+/// CacheManager build 진입 시 1회 호출. fat-LTO `--gc-sections` 가 force-link 된 크레이트의 linkme
+/// 등록을 silent drop 하면 `stage_caps` 가 그 이름을 더 못 풀어 `Err` 로 fail-fast 한다(release 에서
+/// 정책 이름 미해석 → 조용한 폴백 방지). caps 의 의미(is_score_based/protected_prefix/produces_merge_plan)
+/// 는 plugin 이 단독 소유하므로 여기서 재선언하지 않는다 — 등록 존재(resolution)만 검증한다.
 pub fn ensure_builtin_stages_registered() -> Result<()> {
-    // (name, expected is_score_based). The caps assertion fail-fasts if a built-in/plugin author
-    // forgets to declare `is_score_based` (the registry path defaults a macro-registered stage to
-    // score-free) — otherwise that stage would silently lose the attention-score accumulator at
-    // runtime instead of failing at startup.
-    for (name, want_score_based) in [
-        ("sliding", false),
-        ("streaming", false),
-        ("h2o", true),
-        ("h2o_plus", true),
-        ("d2o", true),
-    ] {
-        let Some(caps) = argus_extension_api::stage_caps(name) else {
+    // The force-linked built-in stage crate names (the `use X as _;` block above). This list is the
+    // fail-fast ANCHOR: it can't be derived from the registry, because the registry is exactly what
+    // we verify — if fat-LTO `--gc-sections` drops a crate, `stage_caps` stops resolving its name
+    // and we bail. It does NOT re-declare any plugin's caps (those are read from the registry by
+    // `stage_is_score_based` / `stage_default_protected_prefix` / `stage_produces_merge_plan` and
+    // owned solely by the plugin). Mirrors `ensure_score_producers_registered` /
+    // `ensure_layer_scorers_registered`, which likewise keep a hardcoded name list + assert only
+    // resolution.
+    for name in ["sliding", "streaming", "h2o", "h2o_plus", "d2o"] {
+        if argus_extension_api::stage_caps(name).is_none() {
             anyhow::bail!(
-                "built-in KVCacheStage '{name}' not registered — suspect linkme fat-LTO --gc-sections silent drop\
-                 stage_registry's #[distributed_slice] registration was not linked."
-            );
-        };
-        let is_score_based = !caps.reads.is_empty();
-        if is_score_based != want_score_based {
-            anyhow::bail!(
-                "built-in KVCacheStage '{name}' declares is_score_based={} but the engine expects {} \
-                 — its StageCaps registration is wrong (would mis-route attention scores).",
-                is_score_based,
-                want_score_based
+                "built-in KVCacheStage '{name}' not registered — suspect linkme fat-LTO \
+                 --gc-sections silent drop of its force-linked crate (the #[distributed_slice] \
+                 registration in the stage crate was not linked; see the `use X as _;` force-links)."
             );
         }
     }

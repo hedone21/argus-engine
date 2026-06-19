@@ -243,6 +243,8 @@ mod tests {
             "--qcf-dump",
             "/tmp/q.json",
             "eviction",
+            "plugin",
+            "--name",
             "h2o",
         ]);
         assert!(eval_supported(&args));
@@ -295,6 +297,8 @@ mod tests {
             "--qcf-dump",
             "/tmp/q.json",
             "eviction",
+            "plugin",
+            "--name",
             "sliding",
         ]);
         assert!(reject_unsupported_modes_eval(&args).is_ok());

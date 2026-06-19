@@ -117,6 +117,7 @@ static CAOTE: KVCacheStageReg = KVCacheStageReg {
             argus_extension_api::TensorKind::AttnWeights,
         ],
         default_protected_prefix: 4,
+        produces_merge_plan: false,
     },
 };
 

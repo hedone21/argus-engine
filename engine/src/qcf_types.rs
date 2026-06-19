@@ -127,8 +127,6 @@ pub struct QcfMetric {
 pub enum QcfMode {
     /// Attention × V-norm ratio (original proxy).
     Attn,
-    /// CAOTE-based eviction error (softmax redistribution + value direction).
-    Caote,
     /// Compute both variants.
     Both,
 }
@@ -136,10 +134,6 @@ pub enum QcfMode {
 impl QcfMode {
     pub fn has_attn(self) -> bool {
         matches!(self, QcfMode::Attn | QcfMode::Both)
-    }
-
-    pub fn has_caote(self) -> bool {
-        matches!(self, QcfMode::Caote | QcfMode::Both)
     }
 }
 

@@ -336,16 +336,22 @@ pub struct StageCaps {
     /// the engine pick the recency/prompt-length default). Replaces the `match name { ... => 4 }`
     /// prefix tables.
     pub default_protected_prefix: usize,
+    /// `true` ⟺ `plan()` may emit a non-empty `merges` vector (weighted KV merge, à la D2O's
+    /// Eq.11). The eval/QCF path reads this to pick a merge-compensation estimator + K readback
+    /// instead of a pure-drop estimator. Replaces the engine-side `eviction_policy() == "d2o"` name
+    /// match (the last STAGE-axis technique-name leak in eval).
+    pub produces_merge_plan: bool,
 }
 
 impl StageCaps {
-    /// Score-free defaults — no reads, no stage-declared prefix (`{ &[], 0 }`). Used by the
-    /// `register_kv_stage!` macro so macro-registered (and example) plugins compile unchanged: a
-    /// score-free LayerWide technique is the common case, and any stage that needs scores declares a
-    /// non-empty `reads` via a direct-literal [`KVCacheStageReg`].
+    /// Score-free defaults — no reads, no stage-declared prefix, drop-only (`{ &[], 0, false }`).
+    /// Used by the `register_kv_stage!` macro so macro-registered (and example) plugins compile
+    /// unchanged: a score-free drop-only LayerWide technique is the common case, and any stage that
+    /// needs scores / emits merges declares them via a direct-literal [`KVCacheStageReg`].
     pub const SCORE_FREE: StageCaps = StageCaps {
         reads: &[],
         default_protected_prefix: 0,
+        produces_merge_plan: false,
     };
 }
 

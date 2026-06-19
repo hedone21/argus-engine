@@ -119,19 +119,10 @@ fn test_inv_017_qcf_metric_produced_after_lossy_record() {
 fn test_inv_004_qcf_mode_attn() {
     let mode = QcfMode::Attn;
     assert!(mode.has_attn());
-    assert!(!mode.has_caote());
-}
-
-#[test]
-fn test_inv_004_qcf_mode_caote() {
-    let mode = QcfMode::Caote;
-    assert!(!mode.has_attn());
-    assert!(mode.has_caote());
 }
 
 #[test]
 fn test_inv_004_qcf_mode_both() {
     let mode = QcfMode::Both;
     assert!(mode.has_attn());
-    assert!(mode.has_caote());
 }

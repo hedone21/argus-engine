@@ -150,7 +150,7 @@ pub struct EvictionHook {
     /// H2O keep ratio (fraction of non-prefix tokens kept as heavy hitters).
     pub h2o_keep_ratio: f32,
     /// Whether to use D2O merge compensation (vs. plain H2O eviction) for QCF-CAOTE.
-    pub is_d2o: bool,
+    pub produces_merge_plan: bool,
     /// KV cache dtype string for QCF gating (only "f32" collects QCF).
     pub kv_type: String,
     /// Backend reference for GPU buffer read/write in snapshot/restore.
@@ -182,7 +182,7 @@ impl EvictionHook {
         protected_prefix: usize,
         score_based_eviction: bool,
         h2o_keep_ratio: f32,
-        is_d2o: bool,
+        produces_merge_plan: bool,
         kv_type: String,
         backend: std::sync::Arc<dyn crate::backend::Backend>,
         experimental_enabled: bool,
@@ -196,7 +196,7 @@ impl EvictionHook {
             protected_prefix,
             score_based_eviction,
             h2o_keep_ratio,
-            is_d2o,
+            produces_merge_plan,
             kv_type,
             backend,
             experimental_enabled,
@@ -286,7 +286,7 @@ impl StepHook<KVCache> for EvictionHook {
                     protected_prefix: self.protected_prefix,
                     ..Default::default()
                 };
-                if self.is_d2o {
+                if self.produces_merge_plan {
                     ("d2o", sp)
                 } else {
                     ("h2o", sp)
@@ -309,7 +309,7 @@ impl StepHook<KVCache> for EvictionHook {
                 .and_then(|acc| acc.last_step_head_attn());
             // D2O simulator (paper Eq.8) needs K for nearest-neighbour matching; other techniques
             // ignore `k_source` (their estimators never call read_k).
-            let k_source = if self.is_d2o {
+            let k_source = if self.produces_merge_plan {
                 VDataSource::from_buffer(&cache.k_buffer, None)
             } else {
                 None
@@ -378,7 +378,7 @@ impl StepHook<KVCache> for EvictionHook {
                             Some(vs) => vs,
                             None => VDataSource::F32(cache_l.v_buffer.as_slice::<f32>()),
                         };
-                        let k_source_l = if self.is_d2o {
+                        let k_source_l = if self.produces_merge_plan {
                             VDataSource::from_buffer(&cache_l.k_buffer, None)
                         } else {
                             None
@@ -599,7 +599,7 @@ impl StepHook<KVCache> for EvictionHook {
             "protected_prefix": self.protected_prefix,
             "score_based_eviction": self.score_based_eviction,
             "h2o_keep_ratio": self.h2o_keep_ratio,
-            "is_d2o": self.is_d2o,
+            "is_d2o": self.produces_merge_plan,
             "kv_type": self.kv_type,
             "experimental_enabled": self.experimental_enabled,
         })
@@ -630,7 +630,11 @@ mod tests {
         make_hook_with_d2o(budget, score_based, false)
     }
 
-    fn make_hook_with_d2o(budget: usize, score_based: bool, is_d2o: bool) -> EvictionHook {
+    fn make_hook_with_d2o(
+        budget: usize,
+        score_based: bool,
+        produces_merge_plan: bool,
+    ) -> EvictionHook {
         let policy = none_backed_policy();
         let monitor = Box::new(AlwaysOkMonitor);
         let manager = CacheManager::new(policy, monitor, 0, 1.0);
@@ -646,7 +650,7 @@ mod tests {
             0,
             score_based,
             0.5,
-            is_d2o,
+            produces_merge_plan,
             "f32".to_string(),
             crate::backend::cpu::cpu_singleton(),
             false,

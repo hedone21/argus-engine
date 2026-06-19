@@ -116,6 +116,7 @@ static H2O: KVCacheStageReg = KVCacheStageReg {
     caps: StageCaps {
         reads: &[argus_extension_api::TensorKind::Scores],
         default_protected_prefix: 4,
+        produces_merge_plan: false,
     },
 };
 
