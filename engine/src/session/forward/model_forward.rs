@@ -627,6 +627,7 @@ impl Forward for ModelForward {
         &mut self,
         cache_manager: &crate::kv::cache_manager::CacheManager,
         scores: Option<&[f32]>,
+        last_attn: Option<&[f32]>,
         force: bool,
         target_ratio: f32,
     ) -> anyhow::Result<(usize, usize)> {
@@ -647,12 +648,17 @@ impl Forward for ModelForward {
             // evict 결과를 캡처 → `?` 전파를 rewrap 이후로 미뤄 placeholder 잔존 방지(잔여위험 1).
             let evict_result = if force {
                 match scores {
-                    Some(sc) => cache_manager.force_evict_with_scores(&mut temp, target_ratio, sc),
+                    Some(sc) => cache_manager.force_evict_with_scores(
+                        &mut temp,
+                        target_ratio,
+                        sc,
+                        last_attn,
+                    ),
                     None => cache_manager.force_evict(&mut temp, target_ratio),
                 }
             } else {
                 match scores {
-                    Some(sc) => cache_manager.maybe_evict_with_scores(&mut temp, sc),
+                    Some(sc) => cache_manager.maybe_evict_with_scores(&mut temp, sc, last_attn),
                     None => cache_manager.maybe_evict(&mut temp),
                 }
             };
@@ -672,14 +678,19 @@ impl Forward for ModelForward {
 
         let result = if force {
             match scores {
-                Some(sc) => {
-                    cache_manager.force_evict_with_scores(&mut self.kv_caches, target_ratio, sc)?
-                }
+                Some(sc) => cache_manager.force_evict_with_scores(
+                    &mut self.kv_caches,
+                    target_ratio,
+                    sc,
+                    last_attn,
+                )?,
                 None => cache_manager.force_evict(&mut self.kv_caches, target_ratio)?,
             }
         } else {
             match scores {
-                Some(sc) => cache_manager.maybe_evict_with_scores(&mut self.kv_caches, sc)?,
+                Some(sc) => {
+                    cache_manager.maybe_evict_with_scores(&mut self.kv_caches, sc, last_attn)?
+                }
                 None => cache_manager.maybe_evict(&mut self.kv_caches)?,
             }
         };

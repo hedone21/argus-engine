@@ -464,14 +464,12 @@ impl StepHook<KVCache> for EvictionHook {
                 .as_ref()
                 .is_some_and(|acc| acc.is_active());
             if active {
-                let scores = self
-                    .score_accumulator
-                    .as_ref()
-                    .unwrap()
-                    .importance_scores()
-                    .to_vec();
+                let acc = self.score_accumulator.as_ref().unwrap();
+                let scores = acc.importance_scores().to_vec();
+                // CAOTE a_i: last-layer last-step per-head attention (value-aware policies).
+                let attn = acc.last_step_head_attn().map(|s| s.to_vec());
                 self.cache_manager
-                    .force_evict_with_scores(caches, ratio, &scores)
+                    .force_evict_with_scores(caches, ratio, &scores, attn.as_deref())
             } else {
                 self.cache_manager.force_evict(caches, ratio)
             }

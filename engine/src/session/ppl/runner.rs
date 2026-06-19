@@ -1056,7 +1056,14 @@ pub fn run_ppl(
                     if let Some(acc) = score_accumulator.as_ref() {
                         if acc.is_active() {
                             let scores = acc.importance_scores().to_vec();
-                            cache_manager.force_evict_with_scores(kv_caches, ratio, &scores)?
+                            // CAOTE a_i: last-layer last-step per-head attention (value-aware policies).
+                            let attn = acc.last_step_head_attn().map(|s| s.to_vec());
+                            cache_manager.force_evict_with_scores(
+                                kv_caches,
+                                ratio,
+                                &scores,
+                                attn.as_deref(),
+                            )?
                         } else {
                             cache_manager.force_evict(kv_caches, ratio)?
                         }

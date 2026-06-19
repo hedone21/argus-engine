@@ -143,18 +143,22 @@ impl EvictionStage {
     /// force_evict_with_scores 로 H2O/D2O 정밀 token 선택(eval EvictionHook 동형).
     /// eviction 성공 직후 acc.reset() — KV geometry 변경 후 stale score 방지(§5.9.1 landmine 해소).
     fn run_eviction(&self) -> anyhow::Result<()> {
-        // §5.9.1 Track A: score 추출 (lock 짧게 — 복사 후 즉시 해제).
-        let scores_opt: Option<Vec<f32>> = if let Some(cell) = self.score_cell.as_ref() {
-            let guard = cell
-                .lock()
-                .expect("EvictionStage score_cell Mutex poisoned");
-            guard
-                .as_ref()
-                .filter(|acc| acc.is_active())
-                .map(|acc| acc.importance_scores().to_vec())
-        } else {
-            None
-        };
+        // §5.9.1 Track A: score (+ CAOTE a_i) 추출 (lock 짧게 — 복사 후 즉시 해제).
+        let (scores_opt, attn_opt): (Option<Vec<f32>>, Option<Vec<f32>>) =
+            if let Some(cell) = self.score_cell.as_ref() {
+                let guard = cell
+                    .lock()
+                    .expect("EvictionStage score_cell Mutex poisoned");
+                match guard.as_ref().filter(|acc| acc.is_active()) {
+                    Some(acc) => (
+                        Some(acc.importance_scores().to_vec()),
+                        acc.last_step_head_attn().map(|s| s.to_vec()),
+                    ),
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
 
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
         let result = {
@@ -163,7 +167,12 @@ impl EvictionStage {
                 .lock()
                 .expect("EvictionStage CacheManager Mutex poisoned");
             if let Some(ref scores) = scores_opt {
-                cm.force_evict_with_scores(&mut temp, self.target_ratio, scores)
+                cm.force_evict_with_scores(
+                    &mut temp,
+                    self.target_ratio,
+                    scores,
+                    attn_opt.as_deref(),
+                )
             } else {
                 cm.force_evict(&mut temp, self.target_ratio)
             }

@@ -383,13 +383,16 @@ impl StageBackedPolicy {
         cache: &mut KVCache,
         target_len: usize,
         importance: Option<&[f32]>,
+        last_attn: Option<&[f32]>,
         layer_idx: usize,
         n_layers: usize,
     ) -> Result<()> {
         let plan = {
+            // last_attn(AttnWeights, CAOTE a_i): production eviction 경로가 score accumulator 의
+            // last_step_head_attn 을 공급할 때 Some — value-aware 기법(caote)이 ctx.attn_weight 로 읽는다.
             // QueryStats(MQ-4 e2e seam)는 production eviction 경로에서 미공급(None) — score-active
             // 측정 하네스가 별도로 공급한다(dump_importance.rs).
-            let ctx = KVStageCtx::new(cache, target_len, importance, None, None, None)
+            let ctx = KVStageCtx::new(cache, target_len, importance, None, last_attn, None)
                 .with_layer(layer_idx, n_layers);
             self.stage.plan(&ctx)
         };
@@ -408,7 +411,7 @@ impl EvictionPolicy for StageBackedPolicy {
     }
 
     fn evict(&self, cache: &mut KVCache, target_len: usize) -> Result<()> {
-        self.run(cache, target_len, None, 0, 1)
+        self.run(cache, target_len, None, None, 0, 1)
     }
 
     fn evict_with_scores(
@@ -417,20 +420,24 @@ impl EvictionPolicy for StageBackedPolicy {
         target_len: usize,
         importance: &[f32],
     ) -> Result<()> {
-        self.run(cache, target_len, Some(importance), 0, 1)
+        self.run(cache, target_len, Some(importance), None, 0, 1)
     }
 
-    /// Per-layer eviction: thread the real `(layer_idx, n_layers)` into the stage ctx so per-layer
-    /// techniques (d2o `protected_layers` / last-layer protection) see which layer they handle.
+    /// Per-layer eviction: thread the real `(layer_idx, n_layers)` + the optional `last_attn`
+    /// (CAOTE's `a_i`) into the stage ctx so per-layer / value-aware techniques (d2o
+    /// `protected_layers` / last-layer protection, caote attention-weighted criticality) see them.
     fn evict_layer(
         &self,
         cache: &mut KVCache,
         target_len: usize,
         importance: Option<&[f32]>,
+        last_attn: Option<&[f32]>,
         layer_idx: usize,
         n_layers: usize,
     ) -> Result<()> {
-        self.run(cache, target_len, importance, layer_idx, n_layers)
+        self.run(
+            cache, target_len, importance, last_attn, layer_idx, n_layers,
+        )
     }
 
     /// Per-KV-head eviction (stage ⑤ / F5): route the per-head accumulated importance

@@ -27,8 +27,14 @@ pub struct EvictionResult {
 pub enum ScoreContext<'a> {
     /// No importance scores available.
     None,
-    /// Flat per-token importance scores.
-    Flat { importance: &'a [f32] },
+    /// Flat per-token importance scores, plus an optional last-layer last-step
+    /// per-(kv_head,pos) attention slice (`[n_kv_heads * max_seq_len]`, row-major) for
+    /// value-aware techniques (CAOTE's `a_i`). `None` when no AttnWeights producer is active —
+    /// the stage then falls back to flat `importance`.
+    Flat {
+        importance: &'a [f32],
+        last_attn: Option<&'a [f32]>,
+    },
     /// Per-KV-head importance scores (GQA-aware).
     PerHead {
         flat: &'a [f32],
@@ -254,14 +260,17 @@ impl CacheManager {
             );
         }
 
-        let (importance, head_importance, n_kv_heads) = match scores {
-            ScoreContext::None => (None, None, 0),
-            ScoreContext::Flat { importance } => (Some(importance), None, 0),
+        let (importance, head_importance, n_kv_heads, last_attn) = match scores {
+            ScoreContext::None => (None, None, 0, None),
+            ScoreContext::Flat {
+                importance,
+                last_attn,
+            } => (Some(importance), None, 0, last_attn),
             ScoreContext::PerHead {
                 flat,
                 head,
                 n_kv_heads,
-            } => (Some(flat), Some(head), n_kv_heads),
+            } => (Some(flat), Some(head), n_kv_heads, None),
         };
 
         let mut ctx = HandlerContext {
@@ -269,6 +278,7 @@ impl CacheManager {
             importance,
             head_importance,
             n_kv_heads,
+            last_attn,
             pressure_level: pressure,
             mem_available,
             target_ratio: force_target_ratio,
@@ -317,8 +327,17 @@ impl CacheManager {
         &self,
         caches: &mut [KVCache],
         importance: &[f32],
+        last_attn: Option<&[f32]>,
     ) -> Result<EvictionResult> {
-        self.execute_dispatch(caches, ScoreContext::Flat { importance }, false, None)
+        self.execute_dispatch(
+            caches,
+            ScoreContext::Flat {
+                importance,
+                last_attn,
+            },
+            false,
+            None,
+        )
     }
 
     /// Check memory pressure and evict using per-KV-head importance scores.
@@ -360,10 +379,14 @@ impl CacheManager {
         caches: &mut [KVCache],
         target_ratio: f32,
         importance: &[f32],
+        last_attn: Option<&[f32]>,
     ) -> Result<EvictionResult> {
         self.execute_dispatch(
             caches,
-            ScoreContext::Flat { importance },
+            ScoreContext::Flat {
+                importance,
+                last_attn,
+            },
             true,
             Some(target_ratio),
         )
@@ -452,14 +475,17 @@ impl CacheManager {
             target_len,
         );
 
-        let (importance, head_importance, n_kv_heads) = match &scores {
-            ScoreContext::None => (None, None, 0),
-            ScoreContext::Flat { importance } => (Some(*importance), None, 0),
+        let (importance, head_importance, n_kv_heads, last_attn) = match &scores {
+            ScoreContext::None => (None, None, 0, None),
+            ScoreContext::Flat {
+                importance,
+                last_attn,
+            } => (Some(*importance), None, 0, *last_attn),
             ScoreContext::PerHead {
                 flat,
                 head,
                 n_kv_heads,
-            } => (Some(*flat), Some(*head), *n_kv_heads),
+            } => (Some(*flat), Some(*head), *n_kv_heads, None),
         };
 
         let n_layers = caches.len();
@@ -469,12 +495,23 @@ impl CacheManager {
                     // Per-head (h2o_plus) — not a layer-aware stage; keep the dedicated path.
                     policy.evict_with_head_scores(cache, target_len, flat, head_imp, n_kv_heads)?;
                 } else {
-                    policy.evict_layer(cache, target_len, Some(flat), layer_idx, n_layers)?;
+                    // last_attn does not vary by layer (last-layer last-step approximation),
+                    // so the same slice is threaded into every layer's plan.
+                    policy.evict_layer(
+                        cache,
+                        target_len,
+                        Some(flat),
+                        last_attn,
+                        layer_idx,
+                        n_layers,
+                    )?;
                 }
             } else {
                 // flat-score or score-free: route through the per-layer entry so a layer-aware
                 // adapter (StageBackedPolicy → d2o) sees the real (layer_idx, n_layers).
-                policy.evict_layer(cache, target_len, importance, layer_idx, n_layers)?;
+                policy.evict_layer(
+                    cache, target_len, importance, last_attn, layer_idx, n_layers,
+                )?;
             }
         }
 
@@ -681,7 +718,7 @@ mod tests {
         importance[30] = 8.0;
 
         let result = cm
-            .maybe_evict_with_scores(&mut caches, &importance)
+            .maybe_evict_with_scores(&mut caches, &importance, None)
             .unwrap();
         assert!(result.evicted);
         // All layers should have the same position
@@ -705,7 +742,7 @@ mod tests {
         let importance = vec![1.0f32; 100];
 
         let result = cm
-            .maybe_evict_with_scores(&mut caches, &importance)
+            .maybe_evict_with_scores(&mut caches, &importance, None)
             .unwrap();
         assert!(!result.evicted);
         assert_eq!(caches[0].current_pos, 50);
@@ -761,7 +798,7 @@ mod tests {
         importance[30] = 8.0;
 
         let result = cm
-            .force_evict_with_scores(&mut caches, 0.3, &importance)
+            .force_evict_with_scores(&mut caches, 0.3, &importance, None)
             .unwrap();
         assert!(result.evicted);
         let pos = caches[0].current_pos;
@@ -948,7 +985,7 @@ mod tests {
         importance[20] = 9.0;
 
         let result = cm
-            .force_evict_with_scores(&mut caches, 0.3, &importance)
+            .force_evict_with_scores(&mut caches, 0.3, &importance, None)
             .unwrap();
         assert!(result.evicted);
         assert!(caches[0].current_pos < 100);
@@ -986,7 +1023,7 @@ mod tests {
         }
 
         let result = cm
-            .maybe_evict_with_scores(&mut caches, &importance)
+            .maybe_evict_with_scores(&mut caches, &importance, None)
             .unwrap();
         assert!(result.evicted);
         let pos = caches[0].current_pos;

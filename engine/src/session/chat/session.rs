@@ -298,6 +298,20 @@ impl ChatSession {
                         } else {
                             None
                         };
+                    // CAOTE a_i: last-layer last-step per-head attention (value-aware policies).
+                    let attn_vec: Option<Vec<f32>> = if let ChatKvMode::Standard(s) = &self.kv_mode
+                    {
+                        if score_based {
+                            s.score_accumulator
+                                .as_ref()
+                                .filter(|a| a.is_active())
+                                .and_then(|a| a.last_step_head_attn().map(|s| s.to_vec()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     let cm = if let ChatKvMode::Standard(s) = &self.kv_mode {
                         let cm_ref = s.cache_manager.as_ref().expect("checked above");
                         // SAFETY: cm_ref는 self.kv_mode 안에 있고, forward_mut()은
@@ -312,6 +326,7 @@ impl ChatSession {
                     self.decode_loop.forward_mut().try_evict(
                         cm,
                         scores_vec.as_deref(),
+                        attn_vec.as_deref(),
                         true,
                         target_ratio,
                     )?
@@ -388,6 +403,20 @@ impl ChatSession {
             None
         };
 
+        // CAOTE a_i: last-layer last-step per-head attention (value-aware policies).
+        let attn_vec: Option<Vec<f32>> = if let ChatKvMode::Standard(s) = &self.kv_mode {
+            if score_based {
+                s.score_accumulator
+                    .as_ref()
+                    .filter(|a| a.is_active())
+                    .and_then(|a| a.last_step_head_attn().map(|s| s.to_vec()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let cm_ptr: *const CacheManager = if let ChatKvMode::Standard(s) = &self.kv_mode {
             match s.cache_manager.as_ref() {
                 Some(cm) => cm as *const CacheManager,
@@ -404,6 +433,7 @@ impl ChatSession {
         let (removed, new_pos) = self.decode_loop.forward_mut().try_evict(
             cm,
             scores_vec.as_deref(),
+            attn_vec.as_deref(),
             at_pressure,
             target_ratio,
         )?;
@@ -1124,6 +1154,7 @@ mod tests {
                 &mut self,
                 _cm: &CacheManager,
                 _scores: Option<&[f32]>,
+                _last_attn: Option<&[f32]>,
                 _force: bool,
                 _target_ratio: f32,
             ) -> anyhow::Result<(usize, usize)> {
