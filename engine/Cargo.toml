@@ -163,7 +163,9 @@ example-keep-recent = { path = "../crates/techniques/example-keep-recent" }
 
 [features]
 default = ["opencl", "profile"]
-opencl = ["ocl"]
+# The engine's OpenCL backend; forwards to the `attn-score` plugin so it builds its GPU score-reduce
+# half (`ScoreReduceBackend` / `score_reduce.cl`) — the GPU twin of the CPU score producer.
+opencl = ["ocl", "attn-score/opencl"]
 profile = []
 # CAOTE value-aware eviction plugin install. When on, the caote crate is linked
 # and the `eviction caote` subcommand becomes available.

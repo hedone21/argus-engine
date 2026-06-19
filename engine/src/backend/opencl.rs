@@ -1789,9 +1789,11 @@ impl OpenCLBackend {
 
     /// Initialize the GPU-side attention score accumulator.
     ///
-    /// Compiles `score_reduce.cl` and allocates persistent GPU buffers for
-    /// score accumulation. If compilation fails, the accumulator is not
-    /// created (graceful degradation — falls back to CPU score path).
+    /// Resolves the `attn_score` GPU score-reduce policy from the technique registry (which compiles
+    /// its own `score_reduce.cl` from this backend's borrowed context) and allocates the persistent
+    /// score buffers. If the reducer is unregistered or its kernel fails to compile, this returns an
+    /// error and the accumulator is not created (graceful degradation — the caller falls back to the
+    /// per-token CPU score-readback path).
     ///
     /// Must be called before the decode loop starts.
     pub fn init_gpu_score_acc(
@@ -1802,11 +1804,31 @@ impl OpenCLBackend {
         max_seq_len: usize,
         decay: f32,
     ) -> Result<()> {
+        if n_kv_heads > 16 {
+            anyhow::bail!(
+                "GpuScoreAccumulator: n_kv_heads={n_kv_heads} exceeds the fused reduce kernel limit \
+                 of 16 (step_head_local[16] in attn-score's score_reduce.cl)"
+            );
+        }
+        // Resolve the GPU score-reduce POLICY from the technique registry (the force-linked
+        // `attn-score` plugin); it compiles its own `score_reduce.cl` from this backend's borrowed
+        // context. The engine core no longer holds the reduce kernel — only the score buffers.
+        let reducer = self.with_score_reduce_make_args(|make_args| {
+            argus_extension_api::find_score_reducer("attn_score")
+                .ok_or_else(|| {
+                    anyhow!(
+                        "ScoreReduceBackend 'attn_score' not registered — suspect linkme fat-LTO \
+                         --gc-sections silent drop; ensure the `use attn_score as _;` force-link"
+                    )
+                })
+                .and_then(|reg| {
+                    (reg.make)(make_args).map_err(|e| anyhow!("attn_score reduce make failed: {e}"))
+                })
+        })?;
         let acc = gpu_score::GpuScoreAccumulator::new(
             self.queue.as_core(),
             self.context.as_core(),
-            self.device.as_core(),
-            &self.cl_opts,
+            reducer,
             n_layers,
             n_heads_q,
             n_kv_heads,
@@ -6580,6 +6602,24 @@ impl OpenCLBackend {
         let make_args = argus_extension_api::QuantAttnMakeArgs {
             cl_ctx: <&Context as ClContextPtr>::as_ptr(&&self.context),
             device: <Device as ClDeviceIdPtr>::as_ptr(&self.device),
+            build_opts: opts.as_ptr(),
+        };
+        f(&make_args)
+    }
+
+    /// Build a [`argus_extension_api::ScoreReduceMakeArgs`] from this backend's live GPU context and
+    /// invoke `f` with it. Used by `init_gpu_score_acc` to construct the `attn_score` GPU score
+    /// reducer via `find_score_reducer`. Borrow-for-make: the `build_opts` C string is owned only for
+    /// the duration of `f` (a Copy POD whose pointer must not escape `f`). Mirror of
+    /// [`with_quant_attn_make_args`](Self::with_quant_attn_make_args) for the observer/score axis.
+    pub fn with_score_reduce_make_args<R>(
+        &self,
+        f: impl FnOnce(&argus_extension_api::ScoreReduceMakeArgs) -> R,
+    ) -> R {
+        let opts = std::ffi::CString::new(self.cl_opts.clone()).unwrap_or_default();
+        let make_args = argus_extension_api::ScoreReduceMakeArgs {
+            cl_context: <&Context as ClContextPtr>::as_ptr(&&self.context),
+            cl_device: <Device as ClDeviceIdPtr>::as_ptr(&self.device),
             build_opts: opts.as_ptr(),
         };
         f(&make_args)

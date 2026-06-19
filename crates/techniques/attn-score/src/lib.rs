@@ -16,6 +16,12 @@ use argus_extension_api::{
 };
 use linkme::distributed_slice;
 
+// GPU half of the observer/score axis (EPIC 2 Stage E): the `ScoreReduceBackend` that owns
+// `score_reduce.cl`. Compiled into the same crate (force-linked alongside the CPU producer) and
+// gated on `opencl`, since it pulls in `ocl`.
+#[cfg(feature = "opencl")]
+mod gpu_reduce;
+
 /// The built-in attention-score producer. Accumulates per-token attention importance scores across
 /// layers (and, in GQA mode, per-KV-head importance + the CAOTE last-layer attention).
 ///

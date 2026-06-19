@@ -15,3 +15,12 @@ publish = false
 [dependencies]
 argus-extension-api = { path = "../../argus-extension-api" }
 linkme = "0.3"
+# EPIC 2 Stage E: under the `opencl` feature the crate also hosts the GPU half of the score axis
+# (`ScoreReduceBackend`), compiling `score_reduce.cl` from the host's borrowed cl_context in make()
+# and dispatching on the lent cl_command_queue. Pinned to the engine's 0.19 for a single
+# workspace-unified ocl/cl-sys. The engine forwards its own `opencl` feature here.
+ocl = { version = "0.19", optional = true }
+
+[features]
+# Enables the GPU score-reduce backend (`gpu_reduce`). Off for the pure-CPU producer build.
+opencl = ["dep:ocl"]
