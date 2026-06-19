@@ -8,8 +8,10 @@
 //! swap = precision F16→Q4_0 (`LayerDirective.precision`); dispatch 는 항상
 //! `Full` 이다 — precision(format 축) ⊥ dispatch(stage/hardware 축) 직교(R1).
 //!
-//! production 호출부 배선은 Seam B/MW-D 단계의 일이라, 본 모듈은 어댑터 + 등록
-//! + self-test fn 정의 + 단위테스트까지만 둔다(호출부 배선 금지).
+//! production 호출부 배선은 EPIC 3 B3-0 에서 완료됐다 — `WeightSwapStage::commit` 이
+//! `find_weight_stage("swap")` 로 레이어 선택을 라우팅하고, `ensure_builtin_weight_stages_registered`
+//! 는 build_bench_loop 의 has_secondary(swap 구성) 경로에서 live 호출된다. 본 모듈은 어댑터 +
+//! 등록 + self-test fn(= seam vs 옛 inline decider 등가 anchor) + 단위테스트.
 
 use argus_extension_api::{
     LayerDirective, LayerDispatch, TensorDtype, WEIGHT_STAGES, WeightDispatchPlan, WeightStage,
@@ -97,8 +99,9 @@ impl WeightStage for WeightSwapDeciderAsStage {
 /// 거울). fat-LTO `--gc-sections` 가 linkme 등록을 silent drop 하면 `Err` 로
 /// fail-fast 한다.
 ///
-/// production 호출부 배선은 Seam B/MW-D 단계의 일이라, 본 단계에선 정의 +
-/// 단위테스트만 둔다(호출부 배선 금지).
+/// EPIC 3 B3-0: build_bench_loop 의 has_secondary(swap 구성) 경로에서 live 호출된다
+/// (KV 거울이 build_resilience_cache_manager 에서 호출되는 것과 동형) — `WeightSwapStage::commit`
+/// 의 `find_weight_stage("swap").expect(..)` 가 decode-time 패닉이 되기 전에 fail-fast 한다.
 pub fn ensure_builtin_weight_stages_registered() -> anyhow::Result<()> {
     for name in ["swap"] {
         if argus_extension_api::find_weight_stage(name).is_none() {
@@ -197,6 +200,50 @@ mod tests {
         for d in &plan.per_layer {
             assert!(matches!(d.dispatch, LayerDispatch::Full));
             assert_eq!(d.precision, Some(TensorDtype::Q4_0));
+        }
+    }
+
+    /// B3-0 위험(HIGH): live commit 은 `read_allow_boundary_env()` 를 1회 읽어
+    /// `WeightStageParams.allow_boundary_layers` 로 주입한다(plan() 내부 env 재독 금지). 어댑터가
+    /// 그 flag 를 decider 로 정확히 threading 하는지 true/false 양쪽에서 검증한다 — 동일 flag 의
+    /// 직접 decider 와 selected_layers 가 **순서까지** bit-identical(Vec== 는 order-sensitive).
+    #[test]
+    fn stage_plan_threads_allow_boundary_both_ways() {
+        // 경계 레이어(0, 3)가 high importance → allow_boundary flag 가 선택을 가른다.
+        let importance = vec![0.9f32, 0.2, 0.3, 0.8];
+        let noise = vec![0.1f32, 0.1, 0.1, 0.1];
+        for allow_boundary in [false, true] {
+            let ctx = MockWeightCtx {
+                n_layers: 4,
+                budget: 2,
+                importance: Some(importance.clone()),
+                noise: Some(noise.clone()),
+                swapped: Vec::new(),
+            };
+            let stage = WeightSwapDeciderAsStage::new(WeightStageParams {
+                allow_boundary_layers: allow_boundary,
+            });
+            let stage_layers: Vec<usize> = stage
+                .plan(&ctx)
+                .map(|p| p.per_layer.iter().map(|d| d.layer).collect())
+                .unwrap_or_default();
+
+            let currently_swapped: Vec<usize> = Vec::new();
+            let decider = WeightSwapDecider {
+                importance: Some(&importance),
+                noise: Some(&noise),
+                n_decoder_layers: 4,
+                currently_swapped: &currently_swapped,
+                allow_boundary_layers: allow_boundary,
+                algorithm: SwapAlgorithm::ImportanceAware,
+            };
+            let direct = decider.decide(2);
+
+            assert_eq!(
+                stage_layers, direct.selected_layers,
+                "allow_boundary={allow_boundary}: stage plan 의 layer 집합(순서 포함)이 동일 \
+                 flag 의 decider.decide(budget) 와 bit-identical 이어야 한다"
+            );
         }
     }
 

@@ -288,6 +288,11 @@ pub fn build_bench_loop(
     // dispatcher 가 swap directive 무시.
     let swap_runtime: Option<Arc<crate::session::swap_runtime::EngineSwapRuntime>> =
         if has_secondary {
+            // EPIC 3 B3-0: WeightSwapStage::commit 이 레이어 선택을 find_weight_stage("swap")
+            // seam 으로 라우팅한다. fat-LTO --gc-sections 가 빌트인 "swap" 등록을 silent drop 하면
+            // 그 .expect() 가 decode-time 패닉이 되므로, seam 이 실제 소비되는 has_secondary 경로
+            // 에서만 construction-time 으로 fail-fast 한다(happy/chat 경로엔 미배선 = 무영향).
+            crate::weight::stage_registry::ensure_builtin_weight_stages_registered()?;
             let report_tx = resilience.as_ref().map(|a| a.report_sender());
             let async_dispatcher =
                 Arc::new(crate::weight::AsyncSwapDispatcher::new(backend_arc.clone()));
