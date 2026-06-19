@@ -1,0 +1,17 @@
+[package]
+name = "weight-swap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# WeightSwap DECIDER technique crate — importance × ε bottom-k weight-swap layer selection.
+# Extracted from the engine core (EPIC 3 B3-3; the h2o/layer-importance/attn-score precedent): a
+# weight-axis extension depending only on `argus-extension-api` + `linkme`. Owns the ranking decider
+# (`WeightSwapDecider`) + the `WeightStage` adapter and registers under `"swap"` via
+# `#[distributed_slice(WEIGHT_STAGES)]`. The swap EXECUTOR stays engine-owned (plan/executor split, D1).
+# Force-linked via `use weight_swap as _;`.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

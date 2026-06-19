@@ -90,6 +90,10 @@ h2o-plus = { path = "../crates/techniques/h2o-plus" }
 # the engine core; non-optional, force-linked. Production builds `d2o::D2OStage` directly with the
 # full CLI config; the linkme registration backs `make_stage("d2o")` + the registry self-test.
 d2o = { path = "../crates/techniques/d2o" }
+# WeightSwap DECIDER (importance × ε bottom-k weight-swap layer selection, WEIGHT axis). Extracted from
+# the engine core (EPIC 3 B3-3); non-optional + force-linked so `find_weight_stage("swap")` resolves the
+# plugin and the engine `compute_qcf_weight_swap` wrapper can delegate to `weight_swap::compute_qcf_swap_internal`.
+weight-swap = { path = "../crates/techniques/weight-swap" }
 # Layer-importance scorers (mean_pool / shortgpt_bi LayerScorer plugins, observer/score axis Stage B).
 # Extracted from the engine core; non-optional + force-linked because `mean_pool` is the default
 # `--importance-formula`, so it must always be resolvable via `find_layer_scorer`.
