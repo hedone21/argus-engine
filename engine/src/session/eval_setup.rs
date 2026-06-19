@@ -277,10 +277,15 @@ fn build_eval_score_accumulator(
     acc.set_time_normalize(!args.h2o_raw_scores());
 
     // OpenCL backend 면 GPU-side accumulator 초기화 — per-token GPU→CPU readback 제거.
+    // Caps-driven arming: only arm the GPU score path when the eviction policy actually consumes
+    // scores (`StageCaps.reads` non-empty). A score-free policy (sliding/streaming) or a
+    // measurement-only `--qcf-mode caote`/`--enable-resilience` build still gets the CPU accumulator
+    // above, but never writes/reduces GPU scores it would never read.
     #[cfg(feature = "opencl")]
-    if let Some(ocl_be) = backend
-        .as_any()
-        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+    if needs_score_based
+        && let Some(ocl_be) = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
     {
         match ocl_be.init_gpu_score_acc(
             model.config.num_hidden_layers,

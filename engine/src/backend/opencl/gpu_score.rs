@@ -24,7 +24,7 @@
 //! 4. `reset()` clears cumulative buffers after eviction.
 
 use anyhow::Result;
-use ocl::core::Kernel as CoreKernel;
+use argus_extension_api::{ScoreReduceArgs, ScoreReduceBackend};
 
 use crate::backend::GpuScoreAccess;
 
@@ -79,8 +79,9 @@ pub struct GpuScoreAccumulator {
     /// Cumulative per-KV-head importance: `[n_kv_heads * max_seq_len]`.
     head_importance: ocl::core::Mem,
 
-    // --- Cached kernels ---
-    kernel_fused_reduce: CoreKernel,
+    // --- Reduce policy (the GPU score POLICY — per-layer MAX + GQA averaging + A2SF decay —
+    // owned by the `attn-score` plugin; the engine core holds no GPU scoring arithmetic). ---
+    reducer: Box<dyn ScoreReduceBackend>,
 
     // --- Config ---
     n_layers: usize,
@@ -106,10 +107,12 @@ unsafe impl Send for GpuScoreAccumulator {}
 unsafe impl Sync for GpuScoreAccumulator {}
 
 impl GpuScoreAccumulator {
-    /// Create a new GPU score accumulator.
+    /// Create a new GPU score accumulator over an already-resolved reduce policy.
     ///
-    /// Compiles the score_reduce.cl kernel and allocates persistent GPU buffers.
-    /// Returns an error if kernel compilation or buffer allocation fails.
+    /// Allocates the persistent GPU buffers and zero-initializes them. The reduce kernel itself is
+    /// owned by `reducer` (the `attn-score` plugin compiled it from the host's borrowed context in
+    /// `OpenCLBackend::init_gpu_score_acc`); the engine core holds no GPU scoring arithmetic.
+    /// `n_kv_heads > 16` is gated by the caller before the reducer is built.
     ///
     /// `n_layers` controls the per-layer partitioning of `score_buf`. Memory
     /// footprint for Qwen2.5-1.5B (n_layers=28, n_heads_q=12, max_seq=2048):
@@ -118,32 +121,17 @@ impl GpuScoreAccumulator {
     pub fn new(
         queue: &ocl::core::CommandQueue,
         context: &ocl::core::Context,
-        device: &ocl::core::DeviceId,
-        cl_opts: &str,
+        reducer: Box<dyn ScoreReduceBackend>,
         n_layers: usize,
         n_heads_q: usize,
         n_kv_heads: usize,
         max_seq_len: usize,
         decay: f32,
     ) -> Result<Self> {
-        if n_kv_heads > 16 {
-            anyhow::bail!(
-                "GpuScoreAccumulator: n_kv_heads={} exceeds fused kernel limit of 16; \
-                 increase step_head_local[] size in score_reduce.cl if needed",
-                n_kv_heads
-            );
-        }
-
-        let src = include_str!("../../../kernels/score_reduce.cl");
-        let program = ocl::core::create_build_program(
-            context,
-            &[std::ffi::CString::new(src)?],
-            Some(&[*device]),
-            &std::ffi::CString::new(cl_opts)?,
-        )
-        .map_err(|e| anyhow::anyhow!("score_reduce.cl compilation failed: {}", e))?;
-
-        let kernel_fused_reduce = ocl::core::create_kernel(&program, "kernel_score_fused_reduce")?;
+        debug_assert!(
+            n_kv_heads <= 16,
+            "n_kv_heads={n_kv_heads} exceeds the fused kernel limit of 16 (caller must gate)"
+        );
 
         let score_stride = max_seq_len;
         let score_buf_size = n_layers * n_heads_q * score_stride;
@@ -209,7 +197,7 @@ impl GpuScoreAccumulator {
             score_buf,
             importance,
             head_importance,
-            kernel_fused_reduce,
+            reducer,
             n_layers,
             n_heads_q,
             n_kv_heads,
@@ -293,56 +281,25 @@ impl GpuScoreAccumulator {
             return Ok(());
         }
 
-        let kernel = &self.kernel_fused_reduce;
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(&self.score_buf))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(&self.importance))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(&self.head_importance))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&self.decay_factor))?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                4,
-                ocl::core::ArgVal::scalar(&(self.n_layers as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                5,
-                ocl::core::ArgVal::scalar(&(self.n_heads_q as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                6,
-                ocl::core::ArgVal::scalar(&(self.n_kv_heads as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                7,
-                ocl::core::ArgVal::scalar(&(cache_seq_len as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                8,
-                ocl::core::ArgVal::scalar(&(self.score_stride as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                9,
-                ocl::core::ArgVal::scalar(&(self.max_seq_len as i32)),
-            )?;
-
-            let gws = [Self::round_up(cache_seq_len, 64), 1, 1];
-            let lws = [64, 1, 1];
-
-            ocl::core::enqueue_kernel(
-                queue,
-                kernel,
-                1,
-                None,
-                &gws,
-                Some(lws),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+        // Lend the engine-owned buffers + the live queue borrow-for-call; the plugin's reducer owns
+        // the kernel and the policy (MAX / GQA / decay). All handles borrowed, never released here.
+        // `cl_command_queue` / `cl_mem` are `*mut c_void` in this cl-sys; no cast needed.
+        let args = ScoreReduceArgs {
+            cl_queue: queue.as_ptr(),
+            score_buf: self.score_buf.as_ptr(),
+            importance: self.importance.as_ptr(),
+            head_importance: self.head_importance.as_ptr(),
+            decay_factor: self.decay_factor,
+            n_layers: self.n_layers,
+            n_heads_q: self.n_heads_q,
+            n_kv_heads: self.n_kv_heads,
+            cache_seq_len,
+            score_stride: self.score_stride,
+            max_seq_len: self.max_seq_len,
+        };
+        let ret = self.reducer.reduce(&args);
+        if ret != 0 {
+            anyhow::bail!("attn_score GPU reduce failed: code {ret}");
         }
 
         self.steps_accumulated += 1;
@@ -433,27 +390,10 @@ impl GpuScoreAccumulator {
     pub fn steps_accumulated(&self) -> usize {
         self.steps_accumulated
     }
-
-    // --- Internal helpers ---
-
-    #[inline]
-    fn round_up(n: usize, multiple: usize) -> usize {
-        n.div_ceil(multiple) * multiple
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn test_round_up() {
-        assert_eq!(GpuScoreAccumulator::round_up(1, 64), 64);
-        assert_eq!(GpuScoreAccumulator::round_up(64, 64), 64);
-        assert_eq!(GpuScoreAccumulator::round_up(65, 64), 128);
-        assert_eq!(GpuScoreAccumulator::round_up(0, 64), 0);
-    }
-
     #[test]
     #[allow(clippy::float_equality_without_abs)]
     fn test_decay_factor_clamping() {

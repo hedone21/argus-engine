@@ -2377,8 +2377,9 @@ pub fn registered_layer_scorer_names() -> Vec<&'static str> {
 //
 // Static-linkme only (no cdylib C-ABI): the only consumer (the in-engine decode driver) is in-tree,
 // and every input/output is host `f32` (`scores: &[f32]`, `&[f32]` accessors), so a future cdylib
-// path stays open without breaking the surface. The GPU score path (`GpuScoreAccumulator` / the fused
-// flash-attn score write) is a separate repr(C) ABI gated to a later stage and is NOT this axis.
+// path stays open without breaking the surface. The GPU half of this axis is `ScoreReduceBackend`
+// below (Stage E) — repr(C) POD args (so a cdylib path stays open) but the same static-linkme
+// registration, since its sole consumer is the in-tree default GPU scoring path.
 
 /// Construction geometry for a [`ScoreProducer`], mirroring the engine accumulator's `new` / `new_gqa`
 /// signatures (the only POD a producer needs at build time). `n_kv_heads == 0` selects the flat
@@ -2503,6 +2504,114 @@ pub fn find_score_producer(name: &str) -> Option<&'static ScoreProducerReg> {
 /// Names of all registered score producers (self-test / diagnostics).
 pub fn registered_score_producer_names() -> Vec<&'static str> {
     SCORE_PRODUCERS.iter().map(|r| r.name).collect()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// OBSERVER/SCORE axis — (b) GPU half: ScoreReduceBackend (EPIC 2 Stage E)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The GPU twin of the forward-time score policy. The attention decode kernel writes raw,
+// policy-neutral post-softmax weights into a `[n_layers, n_heads_q, score_stride]` score buffer
+// (that WRITE stays welded into the engine's flash/legacy attention kernels — it cannot be
+// intercepted mid-kernel). The per-token REDUCE that folds those weights into cumulative importance
+// — per-layer MAX, GQA group averaging, A2SF exponential decay — is the H2O-family score POLICY, and
+// this trait hosts it in the technique plugin so the engine core holds no GPU scoring policy (the CPU
+// twin already moved to `ScoreProducer` in Stage C).
+//
+// repr(C) POD args (GPU handles as `*mut c_void`) keep a future cdylib path open with no ABI
+// re-break, but registration is static-linkme only: the sole consumer (the in-engine OpenCL
+// `GpuScoreAccumulator`) is in-tree and the default scoring path, so a cdylib loader (a SCORE
+// backend-cap category) would be a speculative abstraction with no out-of-tree consumer — the same
+// static-only rule the CPU score/estimator/scorer halves follow. The plugin compiles its own reduce
+// kernel from the host's borrowed `cl_context` (the FORMAT Phase 2 Stage E precedent) and dispatches
+// on the lent `cl_command_queue`; the engine retains buffer ownership and lends the three score
+// buffers borrow-for-call.
+
+/// GPU context handles lent to a [`ScoreReduceBackend`] factory at construction (repr(C) POD). All
+/// pointers are borrowed for the `make` call only; the backend must build its kernel from a retained
+/// copy of the context and must not retain `build_opts`.
+#[repr(C)]
+pub struct ScoreReduceMakeArgs {
+    /// `cl_context` the engine's score buffers live in. Borrowed for the call.
+    pub cl_context: *mut c_void,
+    /// `cl_device_id` to build the reduce program for. Borrowed for the call.
+    pub cl_device: *mut c_void,
+    /// Host build options (the engine's exact `build_cl_opts(device)`), or null for empty. The
+    /// backend MUST use these verbatim so the compiled kernel matches the engine's numerics.
+    pub build_opts: *const c_char,
+}
+
+/// Per-decode-step reduce dispatch arguments (repr(C) POD), mirroring the engine's score buffers and
+/// the reduce kernel's scalar signature. All `cl_mem` / `cl_command_queue` handles are engine-owned
+/// and borrowed for the call only (the backend must NOT release them).
+#[repr(C)]
+pub struct ScoreReduceArgs {
+    /// `cl_command_queue` to enqueue the reduce on (the engine's inference queue). Borrowed.
+    pub cl_queue: *mut c_void,
+    /// `cl_mem` of the per-token score buffer `[n_layers, n_heads_q, score_stride]` the attention
+    /// kernel wrote this step. Read-only input. Borrowed.
+    pub score_buf: *mut c_void,
+    /// `cl_mem` of the cumulative flat importance `[max_seq_len]`, updated in place. Borrowed.
+    pub importance: *mut c_void,
+    /// `cl_mem` of the cumulative per-KV-head importance `[n_kv_heads * max_seq_len]`, updated in
+    /// place. Borrowed.
+    pub head_importance: *mut c_void,
+    /// Cumulative decay applied before adding this step's contribution (`1.0 - decay`, pre-clamped to
+    /// `[0, 1]` by the engine — the policy's decay knob, opaque to the kernel dispatch).
+    pub decay_factor: f32,
+    /// Decoder layer count (the partition count of `score_buf`).
+    pub n_layers: usize,
+    /// Query heads per layer.
+    pub n_heads_q: usize,
+    /// KV heads (GQA groups); `<= 16` for the fused kernel's stack array.
+    pub n_kv_heads: usize,
+    /// Valid cache length this step (work-items `0..cache_seq_len`).
+    pub cache_seq_len: usize,
+    /// Row stride of `score_buf` (`== max_seq_len`).
+    pub score_stride: usize,
+    /// Capacity stride of the cumulative buffers (`== max_seq_len`).
+    pub max_seq_len: usize,
+}
+
+/// A GPU attention-score reducer: owns a compiled reduce kernel and folds one decode step's per-layer
+/// post-softmax weights (in `score_buf`) into the cumulative `importance` / `head_importance` buffers
+/// entirely on the device. The engine drives one [`reduce`](ScoreReduceBackend::reduce) per decode
+/// token at end-of-step and reads the cumulative buffers back only at eviction time. This is the GPU
+/// half of the observer/score axis — the score POLICY (MAX / GQA / decay) the engine core no longer
+/// holds.
+pub trait ScoreReduceBackend: Send + Sync {
+    /// Reducer name (the registry key, e.g. `"attn_score"` — matched to the [`ScoreProducer`]).
+    fn name(&self) -> &str;
+    /// Dispatch the per-token fused reduce on `args.cl_queue`. Returns `0` on success, a negative code
+    /// on failure (the engine logs and continues — cumulative importance is unchanged for the step).
+    /// Must not panic across the call (panic = abort discipline).
+    fn reduce(&self, args: &ScoreReduceArgs) -> i32;
+}
+
+/// Registration entry for one GPU score reducer — a mirror of [`ScoreProducerReg`], static-linkme
+/// only. `make` compiles the reduce kernel from the lent context and returns the reducer, or an error
+/// string on compile/setup failure (the engine then falls back to the per-token CPU readback).
+pub struct ScoreReduceReg {
+    /// Reducer name (the registry key). Unique within the slice; matched to the producer name.
+    pub name: &'static str,
+    /// Factory from the lent GPU context. Borrows `args` for the call only.
+    pub make: fn(&ScoreReduceMakeArgs) -> Result<Box<dyn ScoreReduceBackend>, String>,
+}
+
+/// Global GPU score-reducer registration slice — the GPU producer half of the observer/score axis
+/// (Stage E). The built-in attention-score reducer registers via `#[distributed_slice(SCORE_REDUCERS)]`
+/// under the `opencl` feature.
+#[distributed_slice]
+pub static SCORE_REDUCERS: [ScoreReduceReg] = [..];
+
+/// Find a registered GPU score reducer by name.
+pub fn find_score_reducer(name: &str) -> Option<&'static ScoreReduceReg> {
+    SCORE_REDUCERS.iter().find(|r| r.name == name)
+}
+
+/// Names of all registered GPU score reducers (self-test / diagnostics).
+pub fn registered_score_reducer_names() -> Vec<&'static str> {
+    SCORE_REDUCERS.iter().map(|r| r.name).collect()
 }
 
 #[cfg(test)]

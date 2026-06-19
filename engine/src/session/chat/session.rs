@@ -836,12 +836,15 @@ fn build_chat_eviction_internal(
     acc.set_active(true);
     acc.set_time_normalize(!args.h2o_raw_scores());
 
-    // GPU-side accumulator init (OpenCL only)
+    // GPU-side accumulator init (OpenCL only). Caps-driven arming: only when the policy consumes
+    // scores (`score_based`); a score-free policy still runs eviction but never reads importance, so
+    // arming the GPU score path for it would write/reduce scores that are never read.
     #[cfg(feature = "opencl")]
-    if let Some(ocl_be) = ctx
-        .backend
-        .as_any()
-        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+    if score_based
+        && let Some(ocl_be) = ctx
+            .backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
     {
         let _ = ocl_be.init_gpu_score_acc(
             ctx.model.config.num_hidden_layers,
