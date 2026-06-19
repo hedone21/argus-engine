@@ -108,7 +108,7 @@ pub struct QcfKvParams<'a> {
     pub layout: KVLayout,
     pub aggregation: AggregationMode,
     /// β exponent for redistributed-attention amplification (ARGUS QCF #6).
-    /// Standard CAOTE = β=1.0; β > 1 emphasises high-attention tokens in sparse
+    /// Baseline = β=1.0; β > 1 emphasises high-attention tokens in sparse
     /// distributions. Default: 1.0 (no amplification, bit-identical to legacy).
     pub beta: f32,
 }
@@ -502,11 +502,11 @@ mod tests {
         vec![1.0 / n as f32; n]
     }
 
-    /// Build a HeadMajor V/K buffer with **directional diversity** for D2O.
+    /// Build a HeadMajor V/K buffer with **directional diversity** for weighted-merge.
     ///
     /// `make_v_data` gives every token the same direction (V(h,t,d) ∝ (d+1)),
-    /// so cosine similarity is uniformly 1.0 and D2O's nearest-token merge can
-    /// not discriminate. For D2O to beat H2O the data must satisfy two
+    /// so cosine similarity is uniformly 1.0 and weighted-merge's nearest-token merge can
+    /// not discriminate. For weighted-merge to beat heavy-hitter the data must satisfy two
     /// conditions: directional diversity (distinct token directions) and
     /// nearest alignment (an evicted token has a same-direction retained twin).
     /// Tokens 1 and 2 form class B (the heavy hitter + its mergeable twin); all
@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_h2o_vs_sliding() {
-        // H2O should have QCF <= Sliding at same target_len when importance and V norms correlate.
+        // heavy-hitter should have QCF <= Sliding at same target_len when importance and V norms correlate.
         let n_kv_heads = 1;
         let head_dim = 4;
         let capacity = 32;
@@ -729,7 +729,7 @@ mod tests {
 
         assert!(
             qcf_h2o <= qcf_sliding + 1e-6,
-            "H2O ({qcf_h2o}) should have QCF <= Sliding ({qcf_sliding}) \
+            "heavy-hitter ({qcf_h2o}) should have QCF <= Sliding ({qcf_sliding}) \
              when important tokens have large V norms"
         );
     }
@@ -872,9 +872,9 @@ mod tests {
 
     #[test]
     fn test_d2o_less_than_h2o() {
-        // D2O additively merges each evicted token into its cosine-nearest retained token (paper
-        // Eq.11), partially restoring the evicted direction, so with directional diversity +
-        // nearest alignment D2O's QCF is ≤ H2O's. (d2o retained set re-baselined to plan() per
+        // weighted-merge additively merges each evicted token into its cosine-nearest retained token
+        // (magnitude-preserving merge), partially restoring the evicted direction, so with directional diversity +
+        // nearest alignment weighted-merge's QCF is ≤ heavy-hitter's. (d2o retained set re-baselined to plan() per
         // EPIC 2 Stage A decision #2; the relational property is unaffected.)
         let n_kv_heads = 2;
         let head_dim = 32;
@@ -925,13 +925,16 @@ mod tests {
 
         assert!(
             qcf_d2o < qcf_h2o,
-            "D2O ({qcf_d2o}) should have lower QCF than H2O ({qcf_h2o})"
+            "weighted-merge ({qcf_d2o}) should have lower QCF than heavy-hitter ({qcf_h2o})"
         );
-        assert!(qcf_h2o > 0.0, "H2O QCF should be positive, got {qcf_h2o}");
+        assert!(
+            qcf_h2o > 0.0,
+            "heavy-hitter QCF should be positive, got {qcf_h2o}"
+        );
         for h in 0..n_kv_heads {
             assert!(
                 ph_d2o[h] <= ph_h2o[h] + 1e-6,
-                "head {h}: D2O ({}) should have QCF <= H2O ({})",
+                "head {h}: weighted-merge ({}) should have QCF <= heavy-hitter ({})",
                 ph_d2o[h],
                 ph_h2o[h]
             );
@@ -967,7 +970,7 @@ mod tests {
         );
         assert!(
             qcf.abs() < 1e-6,
-            "D2O with no eviction should give QCF=0, got {qcf}"
+            "weighted-merge with no eviction should give QCF=0, got {qcf}"
         );
     }
 
@@ -1041,7 +1044,7 @@ mod tests {
 
     #[test]
     fn test_d2o_weight_grouping_bounded() {
-        // Eq.11 weights sum to 1 by construction (magnitude preserving), so the merged-V
+        // the merge weights sum to 1 by construction (magnitude preserving), so the merged-V
         // redistribution keeps QCF in [0, 1]. (Post-rebaseline the retained set is the plan()
         // 3-partition clamp, so the former "single retained token" reconstruction no longer
         // applies; we assert the convex-hull bound instead.)
@@ -1071,7 +1074,7 @@ mod tests {
         );
         assert!(
             (0.0..=1.0 + 1e-4).contains(&qcf),
-            "D2O merge QCF should be bounded in [0, 1], got {qcf}"
+            "weighted-merge merge QCF should be bounded in [0, 1], got {qcf}"
         );
     }
 

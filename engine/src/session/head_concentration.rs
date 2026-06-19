@@ -1,4 +1,4 @@
-//! head importance 분산 측정 — Ada-KV(arXiv 2407.11550) 전제 검증 (P2c).
+//! head importance 분산 측정 — per-head budget 할당 전제 검증 (P2c).
 //!
 //! per-KV-head attention concentration C_h = 상위 5% 토큰이 차지하는 attention 질량.
 //! GQA mode에서 `last_step_head_attn()` 출력 `[n_kv_heads * seq_len]`을 입력으로 받아
@@ -105,7 +105,7 @@ impl ConcentrationAccumulator {
     }
 
     /// max C_h / min C_h 비율(스칼라)을 계산한다.
-    /// Ada-KV 판정 임계: <2배 → 항목 6 보류, ≥5배 → 개봉 후보.
+    /// per-head budget 판정 임계: <2배 → 항목 6 보류, ≥5배 → 개봉 후보.
     pub fn max_min_ratio(mean: &[f32]) -> f32 {
         let valid: Vec<f32> = mean.iter().copied().filter(|&v| v.is_finite()).collect();
         if valid.is_empty() {

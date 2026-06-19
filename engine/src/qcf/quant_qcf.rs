@@ -1,4 +1,4 @@
-//! Quantization proxy: estimates NMSE from KIVI flush operations.
+//! Quantization proxy: estimates NMSE from quant-window flush operations.
 //!
 //! NMSE = MSE(X, X') / Var(X) where X' = dequantize(quantize(X)).
 //! Computed inline during residual buffer flush when FP32 originals are available.
@@ -54,7 +54,7 @@ pub fn compute_nmse_block(original: &[f32; QKKV], bits: u8, epsilon: f32) -> f32
 ///
 /// Called during `QuantizedRecentWindowCache::flush_residual()` when FP32 originals are about to
 /// be quantized. Computes NMSE separately for K and V, then combines:
-/// `proxy = 0.6 × NMSE_K + 0.4 × NMSE_V` (Key is more sensitive per KIVI Table 2).
+/// `proxy = 0.6 × NMSE_K + 0.4 × NMSE_V` (Key is weighted more heavily as it is more error-sensitive).
 ///
 /// Layout: `res_k`/`res_v` are `[kv_heads][flush_tokens][head_dim]` contiguous.
 pub fn compute_flush_nmse(params: &QuantFlushParams, config: &QcfConfig) -> QcfMetric {
@@ -160,7 +160,7 @@ pub fn compute_flush_nmse(params: &QuantFlushParams, config: &QcfConfig) -> QcfM
     }
 }
 
-/// Compute KIVI OPR (Output Perturbation Ratio) for V cache quantization.
+/// Compute OPR (Output Perturbation Ratio) for V cache quantization.
 ///
 /// OPR = ||Σ ΔV|| / ||Σ V_orig|| per head, where ΔV = V_quant - V_orig.
 /// V_quant is obtained via quantize → dequantize round-trip.
@@ -508,7 +508,7 @@ pub fn compute_flush_aw_vopr(params: &FlushAttentionParams, config: &QcfConfig) 
 
 // ── QcfComputer trait impl (S-3b-4 trait inversion) ─────────────────
 
-/// Stateless KIVI flush proxy 계산기.
+/// Stateless quant-window flush proxy 계산기.
 ///
 /// `QcfComputer` trait 의 4 메서드를 본 모듈의 자유 함수 4개로 위임.
 /// pressure/quant_window_cache 가 `&dyn QcfComputer` 로 의존하여 L3-pressure →

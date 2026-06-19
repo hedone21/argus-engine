@@ -1,15 +1,15 @@
-//! argus-bench AB-2: KIVI dynamic-quant 지원 [`DecodeLoop`] 조립자.
+//! argus-bench AB-2: quant-window dynamic-quant 지원 [`DecodeLoop`] 조립자.
 //!
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §5.7.7/§5.7.8.
 //!
-//! [`build_bench_loop`](super::build_bench_loop) 의 KIVI 형제다 — Standard `ModelForward`
+//! [`build_bench_loop`](super::build_bench_loop) 의 quant-window 형제다 — Standard `ModelForward`
 //! (`Vec<KVCache>`) 대신 [`QuantWindowForward`](crate::session::forward::QuantWindowForward)(`Vec<QuantizedRecentWindowCache>`)
 //! 를 조립하고, dispatcher 에 `quant_window_handles` 를 주입해 `KvQuantDynamic` directive 가 OneShot
 //! [`QuantWindowBitTransitionStage`](crate::stages::kv::quant_window_stage::QuantWindowBitTransitionStage) 로 submit 되게 한다.
 //!
 //! **stage 배선 범위 (§5.7.7)**: control 디렉티브(Throttle/SetTargetTbt/Suspend/Resume/
-//! RestoreDefaults) + **KvQuantDynamic** 만 활성. eviction/partition/swap stage 는 KIVI 경로에서
-//! **미배선**(빈 handle/None — inert). v1 등가: KIVI 경로는 eviction 미지원(`on_kv_prune` no-op, D4).
+//! RestoreDefaults) + **KvQuantDynamic** 만 활성. eviction/partition/swap stage 는 quant-window 경로에서
+//! **미배선**(빈 handle/None — inert). v1 등가: quant-window 경로는 eviction 미지원(`on_kv_prune` no-op, D4).
 
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 
-/// KIVI bench `DecodeLoop` 조립 (AB-2 §5.7.8).
+/// quant-window bench `DecodeLoop` 조립 (AB-2 §5.7.8).
 ///
 /// `build_chat_kivi`(chat/session.rs:491)의 QuantWindowForward 생성 recipe 에 dispatcher/registry/
 /// resilience 배선을 더한다(`build_bench_loop` 의 Standard 배선과 동형이되 QuantWindowBitTransitionStage 만 활성).
@@ -49,11 +49,11 @@ pub fn build_bench_quant_window_loop(
     let num_layers = model.config.num_hidden_layers;
 
     eprintln!(
-        "[DecodeLoop/KIVI] bits={}, residual_size={}, layers={}, max_seq_len={}",
+        "[DecodeLoop/quant-window] bits={}, residual_size={}, layers={}, max_seq_len={}",
         initial_bits, residual_size, num_layers, max_seq_len
     );
 
-    // KIVI cache alloc (R3: OpenCL backend 면 `quant_attn` 가 Some 필수, init.rs 가 register).
+    // quant-window cache alloc (R3: OpenCL backend 면 `quant_attn` 가 Some 필수, init.rs 가 register).
     let kv_caches = alloc_quant_window_kv_caches(
         num_layers,
         kv_heads,
@@ -76,16 +76,16 @@ pub fn build_bench_quant_window_loop(
         max_seq_len,
     )?;
 
-    // §5.7.8: QuantWindowBitTransitionStage 가 transition 할 persistent KIVI handle (register 시점 보유).
+    // §5.7.8: QuantWindowBitTransitionStage 가 transition 할 persistent quant-window handle (register 시점 보유).
     let quant_window_handles = fwd.quant_window_caches().to_vec();
 
     // §5.7.6: heartbeat kv_dtype query 용 layer-0 QuantWindowFormat concrete handle (resilience adapter
-    // 에 주입 — bits query 는 base trait 표면에 없어 KIVI concrete 필요).
+    // 에 주입 — bits query 는 base trait 표면에 없어 quant-window concrete 필요).
     let quant_window_handle = fwd.quant_window_caches().first().cloned();
 
     let registry = Arc::new(PipelineRegistry::new());
 
-    // §5.7.6/§4.5: resilience adapter 에 KIVI handle 주입 → heartbeat kv_dtype 를 현재 bits 에서
+    // §5.7.6/§4.5: resilience adapter 에 quant-window handle 주입 → heartbeat kv_dtype 를 현재 bits 에서
     // query. pos/capacity 는 base `set_kv_handle`, bit-width 는 중립 `set_quant_handle`.
     let resilience = match (resilience, quant_window_handle) {
         (Some(mut adapter), Some(h)) => {
@@ -108,7 +108,7 @@ pub fn build_bench_quant_window_loop(
     let dispatcher = resilience.is_some().then(|| {
         CommandDispatcher::new(
             Arc::clone(&registry),
-            Vec::new(), // kv_handles: KIVI 경로 eviction 미지원 (StandardFormat 부재).
+            Vec::new(), // kv_handles: quant-window 경로 eviction 미지원 (StandardFormat 부재).
             None,       // cache_manager: eviction inert.
             Vec::new(), // layer_slots: partition 미배선.
             None,       // hardware: partition inert.
@@ -118,10 +118,10 @@ pub fn build_bench_quant_window_loop(
             quant_window_handles,
             // AB-5: QcfEstimate 송출 채널. resilience-on 이면 Some, off 이면 None(inert).
             report_tx_for_dispatcher,
-            // §5.9.2 Track B: KIVI 경로는 swap 미배선(model None) → swap directive inert.
+            // §5.9.2 Track B: quant-window 경로는 swap 미배선(model None) → swap directive inert.
             // 더미 cell (QuantWindowForward 는 ModelForward 와 무관 — hook 미소비).
             Arc::new(std::sync::Mutex::new(None)),
-            // §5.9.1 Track A: KIVI 경로는 score-based eviction 미지원 → 더미 None cell.
+            // §5.9.1 Track A: quant-window 경로는 score-based eviction 미지원 → 더미 None cell.
             Arc::new(std::sync::Mutex::new(None)),
         )
     });

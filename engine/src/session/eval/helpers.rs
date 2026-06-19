@@ -1,7 +1,7 @@
 //! Phase 4-B: eval-ll question loader + warmup text builder.
 //!
 //! `bin/generate.rs`에서 이동. lift-and-shift: 본문 변경 없음.
-//! `argus_engine::X` → `crate::X` 만 적용. pub 노출하여 main()의 KIVI eval-ll
+//! `argus_engine::X` → `crate::X` 만 적용. pub 노출하여 main()의 quant-window eval-ll
 //! path (l.246)에서도 호출 가능.
 
 use crate::session::cli::Args;

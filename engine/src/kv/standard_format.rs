@@ -125,7 +125,7 @@ impl StandardFormat {
     /// Unwrap-Evict-Rewrap (UER) seam (Phase α-K BC (3d)): inner `KVCache` 를 일시적으로 꺼낸다.
     ///
     /// chat 멀티턴 eviction 이 `CacheManager::force_evict(&mut [KVCache])`(연속 슬라이스 요구,
-    /// D2O cross-layer 정확성)를 **OLD 경로 그대로** 재사용하도록, fmt_caches 의 inner cache 들을
+    /// weighted-merge cross-layer 정확성)를 **OLD 경로 그대로** 재사용하도록, fmt_caches 의 inner cache 들을
     /// 연속 `Vec<KVCache>` 로 모으는 용도. `put_inner` 와 페어 호출(단일 lock 구간 sequential).
     /// cast scratch(`k_cast`/`v_cast`)는 guard 에 남아 보존된다(다음 write 재사용). Arc 는 보존
     /// (into_inner 의 try_unwrap 과 달리 self 미소비) — listener phase 무관.
@@ -530,7 +530,7 @@ impl KVCacheFormat for StandardFormat {
 
 /// (M4-b) [`WeightedMerge`](가중치 baked) 를 `&mut KVCache` 에 in-place 적용한다.
 ///
-/// d2o 의 former in-place layer-wide scatter-reduce(이제 `d2o` 플러그인의 Eq.11 가중 merge 가 산출)와
+/// 구 in-place layer-wide scatter-reduce(이제 가중 merge plugin 의 가중 merge 가 산출)와
 /// **bit-identical** 산술이다 — per `WeightedMerge` per head `acc = into_weight·into[d] + Σ w·from[d]`(`into` 먼저, `from` 은 list
 /// 순서). K 는 `k_buffer.dtype()`, V 는 `v_buffer.dtype()` 로 독립 디스패치(F32/F16/Q4_0). 위치는
 /// compact 적용 직전(pre-compact) 논리 좌표. Q4_0 merge 활성.
@@ -799,7 +799,7 @@ fn merge_row_weighted_opaque(
         into_f[d] = acc;
     }
     encode_via_descriptor(desc, &into_f, &mut buf[into_off..into_off + bph])
-        .expect("opaque D2O merge re-encode (q4_0 family descriptor)");
+        .expect("opaque weighted-merge merge re-encode (q4_0 family descriptor)");
 }
 
 /// prefill multi-token causal attention (C-1, §9.1-BC1 / ①-b).
@@ -815,8 +815,8 @@ fn merge_row_weighted_opaque(
 /// 중복은 host parity test 로 bit-identical 증명, Step 5(forward_prefill<C> 삭제)에서 자연 해소.
 ///
 /// **Phase α-K ①-e**: `QuantWindowFormat::attention_into` 의 prefill arm 도 이 free fn 을 재사용한다
-/// (`pub(crate)`). KIVI 는 multi-token prefill native 커널 부재라 dequantized view(`get_view`) +
-/// 본 함수로 처리 — KIVI CPU(SeqMajor F32) / GPU(bits=16 HeadMajor, bits 2/4/8 assembled) 모두
+/// (`pub(crate)`). quant-window 는 multi-token prefill native 커널 부재라 dequantized view(`get_view`) +
+/// 본 함수로 처리 — quant-window CPU(SeqMajor F32) / GPU(bits=16 HeadMajor, bits 2/4/8 assembled) 모두
 /// `kv_layout`/`kv_capacity` 인자로 분기되므로 별도 경로 불요.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_attention(
@@ -1588,7 +1588,7 @@ impl SelectiveRead for StandardFormat {
         // read stage 는 budget(target_len) 을 읽지 않는다(읽기 범위 결정 ≠ keep budget). importance/
         // scores 미공급(None) — read stage 는 `tensor(Key)`/`tensor(Value)` 로 자기 page 메타를
         // incremental 갱신한다(D5). query_stats 는 read-stage 가 wants_query_stats 일 때 디코드 루프가
-        // `QueryStatsAccumulator::layer_stats` 를 공급(quest Expected-Attention), 아니면 None.
+        // `QueryStatsAccumulator::layer_stats` 를 공급(read stage 의 future-attention), 아니면 None.
         let ctx = KVStageCtx::new(&guard.cache, 0, None, None, None, query_stats);
         rs.read_plan(&ctx)
     }
@@ -1996,7 +1996,7 @@ mod tests {
         );
     }
 
-    /// Stage 3 GATE: opaque `apply_weighted_merges`(D2O descriptor-generic merge)가 동일
+    /// Stage 3 GATE: opaque `apply_weighted_merges`(weighted-merge descriptor-generic merge)가 동일
     /// 데이터의 q4_0 round-trip(dequant→weighted sum→requantize→dequant) 과 **bit-identical**.
     /// into=0 ← from=[(1,0.3),(2,0.2)], into_w=0.5. K/V 독립 검증. (구 merge_row_weighted_q4 와 동형.)
     #[test]

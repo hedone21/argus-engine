@@ -28,7 +28,7 @@ use crate::buffer::DType;
 use crate::kv::dequant::{dequantize_k, dequantize_v};
 use crate::kv::kv_cache::KVCache;
 
-// CAOTE production 활성화. feature `caote` ON 시 caote crate 를 force-link 한다 —
+// value-aware production 활성화. feature `caote` ON 시 caote crate 를 force-link 한다 —
 // dep 선언만으로는 미참조 rlib 이 링크 제외돼 `#[distributed_slice]` 등록이 누락되기 때문이다.
 // 이 1줄이 production 바이너리에서 `find_stage("caote")` 를 가시화한다(session score_based
 // 경유 value-aware 동작). feature OFF = 미링크 + `eviction caote` 서브커맨드 부재(clap reject).
@@ -40,15 +40,15 @@ use caote as _;
 // this one line makes `find_stage("streaming")` visible (the `#[distributed_slice]` registration).
 use streaming_llm as _;
 
-// H2O production force-link. Extracted from the engine core into the `h2o` technique crate;
+// heavy-hitter production force-link. Extracted from the engine core into the `h2o` technique crate;
 // makes `find_stage("h2o")` visible (same force-link rationale as streaming above).
 use ::h2o as _;
 
-// H2O+ production force-link. Extracted from the engine core into the `h2o-plus` technique crate
+// heavy-hitter+ production force-link. Extracted from the engine core into the `h2o-plus` technique crate
 // (the first PerHead-plan stage); makes `find_stage("h2o_plus")` visible.
 use h2o_plus as _;
 
-// D2O production force-link. Extracted from the engine core into the `d2o` technique crate
+// weighted-merge production force-link. Extracted from the engine core into the `d2o` technique crate
 // (registers "d2o", a WeightedMerge-producing stage); makes `find_stage("d2o")` visible. Production
 // resolves it via `make_stage_with_args("d2o", &params, &blob)` (eval_setup/build_bench_loop/chat),
 // with the d2o-private knobs in the StageArgs blob; the registration must survive fat-LTO.
@@ -69,7 +69,7 @@ use sliding_window as _;
 use layer_importance as _;
 
 // Attention-score producer force-link (observer/score axis, EPIC 2 Stage C). The forward-time
-// score-accumulation policy (per-layer MAX / GQA averaging / CAOTE overwrite / A2SF decay / SUM /
+// score-accumulation policy (per-layer MAX / GQA averaging / value-aware overwrite / forgetting-factor decay / SUM /
 // time-norm) was extracted into the `attn-score` crate; this one line makes its
 // `#[distributed_slice(SCORE_PRODUCERS)]` registration visible to `find_score_producer` (same
 // fat-LTO --gc-sections rationale as above). `attn_score` is the default scoring path → non-optional.
@@ -166,7 +166,7 @@ impl TensorHandle for KeyHandle<'_> {
     }
 }
 
-/// `tensor(Value)` 핸들 — raw V 를 `dequantize_v` 정본으로 읽는다(CAOTE 의 v_i).
+/// `tensor(Value)` 핸들 — raw V 를 `dequantize_v` 정본으로 읽는다(value-aware 의 v_i).
 struct ValueHandle<'a> {
     cache: &'a KVCache,
 }
@@ -250,7 +250,7 @@ impl TensorHandle for QueryStatsHandle<'_> {
 /// 모든 텐서/스코어 읽기는 [`StageCtx::tensor`] 단일 경로로 흐른다: Key/Value 핸들은 항상,
 /// Scores/AttnWeights 는 `new()` 에 슬라이스가 공급될 때만 `Some`. flat `importance()` 만 zero-copy 직접
 /// 노출(D1 예외). builtin LayerWide(sliding/streaming/h2o) + d2o(tensor(Key))는 production 에서 구동,
-/// Scores/AttnWeights 공급은 현재 host 테스트(CAOTE) 경로 — production eviction-hook threading 은 CLI
+/// Scores/AttnWeights 공급은 현재 host 테스트(value-aware) 경로 — production eviction-hook threading 은 CLI
 /// 배선(D-3 deferred)과 함께 후속.
 pub(crate) struct KVStageCtx<'a> {
     cache: &'a KVCache,
@@ -271,7 +271,7 @@ pub(crate) struct KVStageCtx<'a> {
 }
 
 impl<'a> KVStageCtx<'a> {
-    /// 엔진 eviction 경로(+ d2o 동등성/CAOTE host 테스트)가 `&KVCache` 위로 ctx 를 만든다.
+    /// 엔진 eviction 경로(+ d2o 동등성/value-aware host 테스트)가 `&KVCache` 위로 ctx 를 만든다.
     /// `head_scores`/`last_attn`: per-(kv_head,pos) `[n_kv_heads*max_seq]`. `None`=미공급(`tensor()`→None).
     /// `query_stats`: 단일-layer Q running mean/var `[n_kv_heads*2*head_dim]`.
     /// `None`=미공급(`tensor(QueryStats)`→None) — production builtins 는 None(score-active e2e seam 한정).
@@ -388,7 +388,7 @@ impl StageBackedPolicy {
         n_layers: usize,
     ) -> Result<()> {
         let plan = {
-            // last_attn(AttnWeights, CAOTE a_i): production eviction 경로가 score accumulator 의
+            // last_attn(AttnWeights, value-aware a_i): production eviction 경로가 score accumulator 의
             // last_step_head_attn 을 공급할 때 Some — value-aware 기법(caote)이 ctx.attn_weight 로 읽는다.
             // QueryStats(MQ-4 e2e seam)는 production eviction 경로에서 미공급(None) — score-active
             // 측정 하네스가 별도로 공급한다(dump_importance.rs).
@@ -424,7 +424,7 @@ impl EvictionPolicy for StageBackedPolicy {
     }
 
     /// Per-layer eviction: thread the real `(layer_idx, n_layers)` + the optional `last_attn`
-    /// (CAOTE's `a_i`) into the stage ctx so per-layer / value-aware techniques (d2o
+    /// (value-aware's `a_i`) into the stage ctx so per-layer / value-aware techniques (d2o
     /// `protected_layers` / last-layer protection, caote attention-weighted criticality) see them.
     fn evict_layer(
         &self,
@@ -476,7 +476,7 @@ impl EvictionPolicy for StageBackedPolicy {
 }
 
 /// Test helper: build the out-of-tree `h2o` stage wrapped as a legacy [`EvictionPolicy`]
-/// (`StageBackedPolicy`). Used by CacheManager / EvictionHandler tests after H2O was extracted
+/// (`StageBackedPolicy`). Used by CacheManager / EvictionHandler tests after heavy-hitter was extracted
 /// to the `h2o` plugin crate — production resolves "h2o" the same way (make_stage → plugin).
 #[cfg(test)]
 pub(crate) fn h2o_backed_policy(
@@ -537,7 +537,7 @@ pub fn stage_default_protected_prefix(name: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Whether the named stage's `plan()` may emit a weighted-merge plan (à la D2O). The generic lookup
+/// Whether the named stage's `plan()` may emit a weighted-merge plan (à la weighted-merge). The generic lookup
 /// the eval/QCF path uses instead of the `eviction_policy() == "d2o"` name match — it selects a
 /// merge-compensation estimator + K readback. Reads the plugin's declared [`StageCaps`]. Unknown →
 /// `false` (pure-drop).
@@ -1053,7 +1053,7 @@ mod tests {
     // 참조 1줄**(`use <crate> as _;`)이 designated 지점에 필요하다. 즉 확장 비용 = dep 1줄 + force-link
     // 1줄(둘 다 기계적, 기존 로직 수정 0 → OCP 유지). 상세: (M3 정정).
     use example_keep_recent as _;
-    // CAOTE 의 force-link 는 production(module-level `#[cfg(feature = "caote")] use caote as _`)
+    // value-aware 의 force-link 는 production(module-level `#[cfg(feature = "caote")] use caote as _`)
     // 가 담당한다 — `--features caote` 테스트 시 그 cfg 가 활성이라 별도 test-only force-link 불필요.
 
     #[test]
@@ -1069,7 +1069,7 @@ mod tests {
     #[cfg(feature = "caote")]
     #[test]
     fn caote_stage_visible_and_value_aware_executes() {
-        // (M-F) CAOTE crate 의 cross-crate 등록 + KVStageCtx(V 공급)로 value-aware plan 산출 →
+        // (M-F) value-aware crate 의 cross-crate 등록 + KVStageCtx(V 공급)로 value-aware plan 산출 →
         // execute_kv_plan 실행. mk() 가 토큰별 distinct V 를 채우므로 criticality(‖v_i−o_h‖)가 V 에
         // 의존 → 기법이 [`StageCtx::tensor`]`(Value)` 로 V 를 직접 읽어 자체 metric 을 계산함을 증명.
         let reg = find_stage("caote").expect("caote 등록이 엔진에서 보여야 한다");
@@ -1096,7 +1096,7 @@ mod tests {
                 assert!(k.windows(2).all(|w| w[0] < w[1]), "ascending keep");
                 assert!(k.iter().all(|&p| p < 8), "유효 위치");
             }
-            KeepSpec::PerHead(_) => panic!("v1 CAOTE 는 LayerWide"),
+            KeepSpec::PerHead(_) => panic!("v1 value-aware 는 LayerWide"),
         }
         assert!(plan.merges.is_empty());
         execute_kv_plan(&mut c, &plan).unwrap();
@@ -1280,7 +1280,7 @@ mod tests {
     #[test]
     fn d2o_stage_executes_full_mechanism_all_dtypes() {
         // End-to-end production path for the extracted `d2o` plugin: real KVStageCtx (raw K via the
-        // KeyHandle → dequantize_k) → D2OStage::plan (cosine-nearest + Eq.11 WeightedMerges) →
+        // KeyHandle → dequantize_k) → D2OStage::plan (cosine-nearest + WeightedMerges) →
         // execute_kv_plan (apply_weighted_merges + compact). Proves the plan flows through the
         // engine merge executor + compaction on real F32/F16/Q4_0 buffers without panic, and
         // compacts to the partition keep size (prefix + HH + recent = target_len).

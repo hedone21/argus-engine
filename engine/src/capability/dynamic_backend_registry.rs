@@ -177,7 +177,7 @@ pub fn dynamic_registered_backend_cap_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 이름으로 KIVI ATTENTION capability 인스턴스를 만든다 — **정적 우선 → 동적 fallback**(D3, category 다리 D7).
+/// 이름으로 quant-window ATTENTION capability 인스턴스를 만든다 — **정적 우선 → 동적 fallback**(D3, category 다리 D7).
 /// `make_args`(host GPU context)로 커널을 1회 빌드한다(D4). 정적/동적 모두 miss 면 `None`(graceful unknown).
 /// host 의 `--kivi-impl <name>` 데이터 선언 바인딩(D1) 해석 진입점.
 pub fn resolve_quant_attn_capability(
@@ -222,7 +222,7 @@ pub fn resolve_quant_attn_capability(
     }
 }
 
-/// 동적 plugin KIVI ATTENTION capability 의 host 측 어댑터 — C [`QuantAttnVTable`] 마샬링으로
+/// 동적 plugin quant-window ATTENTION capability 의 host 측 어댑터 — C [`QuantAttnVTable`] 마샬링으로
 /// [`QuantAttnBackend`] 를 구현(D8). 단일 trait 이 이미 ABI-shaped(cl_mem args)라 args 를 vtable
 /// fn-ptr 로 그대로 전달(Format `DynFormat` 거울이나 work-fn 2개 추가).
 struct DynQuantAttnBackend {
@@ -284,10 +284,10 @@ impl QuantAttnBackend for DynQuantAttnBackend {
 // 인 동적 엔트리). 단일 trait [`QuantCacheBackend`] 가 이미 ABI-shaped(cl_mem POD)라 host 어댑터
 // [`struct@DynQuantCacheBackend`] 는 args 를 vtable fn-ptr 로 그대로 전달한다.
 //
-// NOTE (Stage C): 엔진 내장 KIVI 는 이 경로로 구성되지 않는다 — 내장 KIVI 구성은 엔진
+// NOTE (Stage C): 엔진 내장 quant-window 는 이 경로로 구성되지 않는다 — 내장 quant-window 구성은 엔진
 // `Backend`/`Memory` 핸들을 필요로 해 POD `make` 가 담을 수 없으므로 engine-side 경로가 따로
 // 만든다(kivi_forward). 따라서 Stage C 에선 정적 슬라이스가 비어 있고 이 리졸버는 out-of-tree
-// 캐시 plugin(.so) 만 해석한다 — Stage E 에서 KIVI 가 plugin 으로 이동하면 라이브가 된다.
+// 캐시 plugin(.so) 만 해석한다 — Stage E 에서 quant-window 가 plugin 으로 이동하면 라이브가 된다.
 // ════════════════════════════════════════════════════════════════════════════
 
 /// 이름으로 quantized-KV 캐시 capability(CACHE 카테고리) 인스턴스를 만든다 — **정적 우선 → 동적

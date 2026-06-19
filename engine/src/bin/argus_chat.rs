@@ -2,7 +2,7 @@
 //!
 //! Serves `POST /v1/chat/completions` (streaming + non-streaming) over HTTP,
 //! backed by the multi-turn [`ChatSession`](argus_engine::session::chat::session::ChatSession).
-//! Supports all three KV modes (Standard / KIVI / Offload, via `--kv-mode`) and
+//! Supports all three KV modes (Standard / quant-window / Offload, via `--kv-mode`) and
 //! integrates production resilience (manager IPC) into the decode loop —
 //! throttle / suspend / target-TBT directives + per-token heartbeats apply during
 //! generation, exactly as the standard happy path.

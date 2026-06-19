@@ -116,7 +116,7 @@ impl EvalCacheKind for QuantizedRecentWindowCache {
             .map(|a| {
                 Arc::try_unwrap(a)
                     .ok()
-                    .expect("transient KIVIFormat has external Arc clone")
+                    .expect("transient QuantWindowFormat has external Arc clone")
                     .into_inner()
             })
             .collect();

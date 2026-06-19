@@ -4591,8 +4591,8 @@ impl Backend for OpenCLBackend {
 
     // FORMAT Phase 2 Stage E: lend the live `cl_command_queue` so a
     // borrowed-context backend-cap plugin enqueues on the SAME in-order queue as
-    // the engine (preserving the serialization the KIVI flush/score-readback path
-    // relies on). The built-in KIVI impl ignores `args.cl_queue` and uses
+    // the engine (preserving the serialization the quant-window flush/score-readback path
+    // relies on). The built-in quant-window impl ignores `args.cl_queue` and uses
     // `&self.queue`, so packing this is a no-op for the in-engine path.
     fn cl_command_queue_ptr(&self) -> *mut std::ffi::c_void {
         // `&Queue::as_ptr()` resolves via `ClContextPtr for &Queue` to a
@@ -4603,7 +4603,7 @@ impl Backend for OpenCLBackend {
     }
 
     // FORMAT Phase 2 Stage E: expose the device's nosub property on the Backend
-    // trait so the KIVI FORMAT's native-attention gate reads it from the backend
+    // trait so the quant-window FORMAT's native-attention gate reads it from the backend
     // (byte-identical) instead of the QuantAttn cap, which moves to a plugin.
     fn is_nosub_device(&self) -> bool {
         Self::is_nosub(self)
@@ -6562,7 +6562,7 @@ impl Backend for OpenCLBackend {
 // ── Device capability queries (nosub / flash-decode availability) ──
 impl OpenCLBackend {
     /// Returns true if this device lacks subgroup support (using nosub fallback kernels).
-    /// Native KIVI attention (workgroup reduction) is preferred on these devices since
+    /// Native quant-window attention (workgroup reduction) is preferred on these devices since
     /// the standard attention_gen also uses workgroup reduction.
     pub fn is_nosub(&self) -> bool {
         let kernels = unsafe { &*self.kernels.get() };
@@ -6584,7 +6584,7 @@ impl OpenCLBackend {
 }
 
 // FORMAT Phase 2 Stage E: the OpenCL backend no longer implements `QuantAttnBackend` — the
-// KIVI kernels moved to the `kivi` plugin. The backend only LENDS its live GPU context/queue
+// quant-window kernels moved to the `kivi` plugin. The backend only LENDS its live GPU context/queue
 // so a `--backend-cap` plugin can build and dispatch its own kernels: `with_quant_attn_make_args`
 // below packs the borrowed context/device/build_opts (used by `init.rs` to resolve a named
 // cap), and `cl_command_queue_ptr` (above) lends the live queue per call.

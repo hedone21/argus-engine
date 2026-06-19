@@ -405,7 +405,7 @@ fn dequantize_q4_0_blocks(raw: &[u8], numel: usize) -> Vec<f32> {
     out
 }
 
-/// Layer-wise input-aware quantization perturbation (DP-LLM proxy, NeurIPS 2025 inspired).
+/// Layer-wise input-aware quantization perturbation (weight-perturbation proxy).
 ///
 /// For each layer `i`, compute
 ///
@@ -607,7 +607,7 @@ pub fn compute_input_aware_epsilon_absolute(
 ///
 /// where  `ε_rel(W, x) = ‖(W_F16 − W_Q4) · x‖ / ‖W_F16 · x‖`.
 ///
-/// Decomposes the runtime QCF/caote attention-output perturbation
+/// Decomposes the runtime QCF/value-aware attention-output perturbation
 /// `‖ΔO‖ / ‖O‖` into two static weight-space factors.  Layers with
 /// either factor unavailable yield `NaN`.
 pub fn compute_input_aware_epsilon_qcf(

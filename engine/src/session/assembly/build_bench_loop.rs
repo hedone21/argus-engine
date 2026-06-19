@@ -52,7 +52,7 @@ pub struct SwapWiringConfig {
 ///
 /// - AB-1 eviction: score-free `force_evict`(verify eviction 시나리오는
 ///   `functional_only`) — [`AttentionScoreAccumulator`](crate::inference::attention_scores::AttentionScoreAccumulator)
-///   미장착, H2O 는 score 부재 시 recency degrade(chat 과 동일).
+///   미장착, heavy-hitter 는 score 부재 시 recency degrade(chat 과 동일).
 /// - AB-3 KvOffload: `--swap-dir` 지정 시 `enable_swap` 으로 SwapHandler 등록.
 ///   eviction=none + swap-dir 만 있는 경우 [`NoEvictionPolicy`] CacheManager 위에
 ///   swap 만 활성(offload/recall directive 가 cm.offload/recall 호출).
@@ -334,7 +334,7 @@ pub fn build_bench_loop(
             swap_model_handle,
             swap_runtime,
             None, // importance: argus-bench 는 score accumulator 미장착 → uniform fallback.
-            // AB-2: Standard 경로는 KIVI handle 부재 → 빈 Vec (KvQuantDynamic directive inert).
+            // AB-2: Standard 경로는 quant-window handle 부재 → 빈 Vec (KvQuantDynamic directive inert).
             Vec::new(),
             // AB-5: QcfEstimate 송출 채널. resilience-on 이면 Some, off 이면 None(inert).
             report_tx_for_dispatcher,

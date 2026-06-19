@@ -145,8 +145,8 @@ pub struct CommandDispatcher {
     /// `submit_evict` 에서 EvictionStage 생성 시 score_cell 전달(scored 경로 선택).
     /// score-based 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미(QCF uniform fallback 유지).
     score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
-    /// ① QuantWindowBitTransitionStage 가 transition 할 KIVI handle (register 시점 보유, AB-2 §5.7.8). 비어 있으면
-    /// KvQuantDynamic directive 가 와도 submit 안 함(미구성 — non-KIVI: Standard/Offload).
+    /// ① QuantWindowBitTransitionStage 가 transition 할 quant-window handle (register 시점 보유, AB-2 §5.7.8). 비어 있으면
+    /// KvQuantDynamic directive 가 와도 submit 안 함(미구성 — non-quant-window: Standard/Offload).
     quant_window_handles: Vec<Arc<QuantWindowFormat>>,
     /// AB-5 §5.8.2: RequestQcf dispatch 시 QcfEstimate 를 manager 로 송출하는 채널.
     /// `None` 이면 미배선(resilience-off / host 단위테스트) → RequestQcf 가 무송출(inert).
@@ -190,7 +190,7 @@ impl CommandDispatcher {
         model: Option<Arc<TransformerModel>>,
         swap_runtime: Option<Arc<EngineSwapRuntime>>,
         importance: Option<Arc<dyn ImportanceLookup>>,
-        // AB-2 §5.7.8: QuantWindowBitTransitionStage 가 transition 할 KIVI handle. Standard/Offload 경로는 빈 Vec
+        // AB-2 §5.7.8: QuantWindowBitTransitionStage 가 transition 할 quant-window handle. Standard/Offload 경로는 빈 Vec
         // → KvQuantDynamic directive 무시 (inert — evict CM=None 동형).
         quant_window_handles: Vec<Arc<QuantWindowFormat>>,
         // AB-5 §5.8.2: RequestQcf dispatch 시 QcfEstimate 를 송출할 채널. None → inert.
@@ -390,14 +390,14 @@ impl CommandDispatcher {
     ///
     /// sticky last-applied 게이트: 같은 bits 면 재submit 0(transition_bits 자체 no-op 이기도 하나
     /// loop 진입 차단 = 비용 절감), 값 변경 시 재적용(새 OneShot → transition). `quant_window_handles` 가
-    /// 비면 미구성(non-KIVI: Standard/Offload) — directive 무시(evict CM=None 동형). partition 의
+    /// 비면 미구성(non-quant-window: Standard/Offload) — directive 무시(evict CM=None 동형). partition 의
     /// `last_partition_ratio` 게이트와 동형(evict bool armed 복사 금지 — 값 비교 게이트).
     fn submit_kv_quant(&mut self, target_bits: u8) {
         if self.last_quant_bits == Some(target_bits) {
             return; // 값 무변경 → 재submit 0 (sticky 핵심 — partition last-applied 동형).
         }
         if self.quant_window_handles.is_empty() {
-            return; // 미구성 (non-KIVI: Standard/Offload — KIVI handle 부재).
+            return; // 미구성 (non-quant-window: Standard/Offload — quant-window handle 부재).
         }
         self.last_quant_bits = Some(target_bits);
         let stage =
@@ -1028,7 +1028,7 @@ mod tests {
 
     // ── AB-2: quant OneShot submit + sticky last-applied 게이트 (§5.7.9 승계) ──
 
-    /// quant 미구성(빈 quant_window_handles) dispatcher 는 KvQuantDynamic 을 무시 (non-KIVI 경로).
+    /// quant 미구성(빈 quant_window_handles) dispatcher 는 KvQuantDynamic 을 무시 (non-quant-window 경로).
     #[test]
     fn quant_unconfigured_ignores_directive() {
         let (mut d, registry, _h) = make_dispatcher(); // 빈 quant_window_handles

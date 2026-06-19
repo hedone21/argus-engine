@@ -29,7 +29,7 @@ pub enum ScoreContext<'a> {
     None,
     /// Flat per-token importance scores, plus an optional last-layer last-step
     /// per-(kv_head,pos) attention slice (`[n_kv_heads * max_seq_len]`, row-major) for
-    /// value-aware techniques (CAOTE's `a_i`). `None` when no AttnWeights producer is active —
+    /// value-aware techniques (the `a_i` slice). `None` when no AttnWeights producer is active —
     /// the stage then falls back to flat `importance`.
     Flat {
         importance: &'a [f32],
@@ -372,7 +372,7 @@ impl CacheManager {
 
     /// Force eviction with importance scores, bypassing should_evict() and memory checks.
     ///
-    /// Used when eviction is triggered externally for score-aware policies like H2O.
+    /// Used when eviction is triggered externally for score-aware policies like heavy-hitter.
     /// Runs at `Emergency` pressure level with scores.
     pub fn force_evict_with_scores(
         &self,
@@ -394,7 +394,7 @@ impl CacheManager {
 
     /// Force eviction with per-KV-head importance scores.
     ///
-    /// Used when H2O+ (GQA-aware) policy needs per-head eviction.
+    /// Used when heavy-hitter+ (GQA-aware) policy needs per-head eviction.
     /// Runs at `Emergency` pressure level with head scores.
     pub fn force_evict_with_head_scores(
         &self,
@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn test_force_evict_bypasses_should_evict() {
-        // H2O's should_evict() always returns false, but force_evict must still work.
+        // heavy-hitter's should_evict() always returns false, but force_evict must still work.
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
         use crate::kv::eviction::stage_registry::h2o_backed_policy;
 

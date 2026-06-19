@@ -111,7 +111,7 @@ pub const EXT_OPENCL_SECONDARY: &str = "opencl_secondary";
 /// 후 clone 하여 사용한다.
 pub const EXT_RPCMEM_ALLOCATOR: &str = "rpcmem_allocator";
 
-// §13.8-L S-L-3/S-L-2 — KIVI native attention / GPU score accumulator 추상화.
+// §13.8-L S-L-3/S-L-2 — quant-window native attention / GPU score accumulator 추상화.
 //
 // Phase α-W-4 에서 두 trait 의 정의 본체를 `capability/` 서브모듈로 물리 이동했다.
 // 기존 import path(`crate::backend::QuantAttnBackend` 등)를 보존하기 위해
@@ -1310,11 +1310,11 @@ pub trait Backend: Send + Sync {
     }
 
     /// Whether this backend's device uses the sub-group-less (nosub) attention
-    /// path (FORMAT Phase 2 Stage E). The KIVI FORMAT gates its native fused
+    /// path (FORMAT Phase 2 Stage E). The quant-window FORMAT gates its native fused
     /// attention on this device property (it is consistent with the standard
     /// `attention_gen` work-group reduction the nosub path also uses). Previously
     /// read off the QuantAttn cap; now a backend-owned device property so it stays
-    /// byte-identical once the KIVI compute moves to a dlopen plugin. OpenCL
+    /// byte-identical once the quant-window compute moves to a dlopen plugin. OpenCL
     /// returns its `f16_is_nosub`; others default `false`.
     fn is_nosub_device(&self) -> bool {
         false
@@ -1326,7 +1326,7 @@ pub trait Backend: Send + Sync {
     /// trait method 한 군데로 통일. Hot path (forward/decode loop) 진입
     /// 금지 — `Any` downcast 비용 + lookup branch 가 매 layer 호출에
     ///누적된다. Sprint scope = qnn_oppkg swap path / secondary_mmap loader
-    /// / transformer loader 의 4건. KIVI / forward downcast 는 별도.
+    /// / transformer loader 의 4건. quant-window / forward downcast 는 별도.
     ///
     /// 반환값을 사용할 때는 호출지에서 `downcast_ref::<...>()` 으로
     /// 구체 타입을 꺼낸다. 등록되지 않은 key 는 `None` 반환.

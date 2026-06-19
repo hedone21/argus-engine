@@ -20,7 +20,7 @@ use crate::qcf_types::{ImportanceEntry, SubLayer};
 pub trait ImportanceCollect: Send {
     /// Layer forward 진입 직전에 hidden state 입력을 snapshot.
     ///
-    /// MeanPool / DirectAttn / ShortGptBi 등 공식이 이 snapshot 을
+    /// MeanPool / DirectAttn / per-token-cosine 등 공식이 이 snapshot 을
     /// `record_after` 에서 cosine-similarity 비교의 base 로 사용한다.
     fn snapshot_before(&mut self, x: &[f32], seq_len: usize, dim: usize);
 

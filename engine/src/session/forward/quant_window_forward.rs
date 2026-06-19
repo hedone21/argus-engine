@@ -1,7 +1,7 @@
-//! KIVI-quantized KV cache용 Forward 구현체 (Phase 4-5-a).
+//! quant-window-quantized KV cache용 Forward 구현체 (Phase 4-5-a).
 //!
 //! Phase 4-3 [`ModelForward`] 패턴을 복제하되 plan path를 제외한다.
-//! KIVI 고유의 `Vec<QuantizedRecentWindowCache>` + `forward_into` 경로를 `Forward` trait으로 래핑.
+//! quant-window 고유의 `Vec<QuantizedRecentWindowCache>` + `forward_into` 경로를 `Forward` trait으로 래핑.
 //!
 //! chat REPL 통합은 Phase 4-5-d `ChatSession`에서 수행. 본 파일은 컴파일
 //! 가능한 Forward 구현체를 제공하는 것이 목표.
@@ -26,18 +26,18 @@ use crate::session::forward::Forward;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
-/// KIVI 양자화 KV cache를 사용하는 Forward 구현체.
+/// quant-window 양자화 KV cache를 사용하는 Forward 구현체.
 ///
 /// AB-2 §5.7.1 (A안): persistent `Vec<Arc<QuantWindowFormat>>` 를 보유하며(ModelForward `fmt_caches`
 /// 동형 — `new()` 1회 wrap), `TransformerModel::forward_into`를 직접 호출한다. QuantWindowBitTransitionStage 가
 /// register 시점 이 handle 을 clone 해 `transition_bits` 를 적용한다(INV-STAGE-LAYER-HANDLE).
-/// plan path는 KIVI 경로에서 미사용이므로 포함하지 않는다.
+/// plan path는 quant-window 경로에서 미사용이므로 포함하지 않는다.
 pub struct QuantWindowForward {
     backend: Arc<dyn Backend>,
     cpu_backend: Arc<dyn Backend>,
     memory: Arc<dyn Memory>,
     model: Arc<TransformerModel>,
-    /// AB-2 §5.7.1 (A안): persistent KIVI handle (전 prefill/step 동안 보존). enumerate 순서 ==
+    /// AB-2 §5.7.1 (A안): persistent quant-window handle (전 prefill/step 동안 보존). enumerate 순서 ==
     /// layer idx. `new()` 에서 1회 wrap 하고, prefill/step 은 보유 Arc clone 으로 dyn fmts 만 구성.
     quant_window_caches: Vec<Arc<QuantWindowFormat>>,
 
@@ -92,7 +92,7 @@ impl QuantWindowForward {
         let logits_decode = alloc_logits(memory.as_ref(), backend.clone(), vocab_size)?;
         let logits_prefill_last = alloc_logits(memory.as_ref(), backend.clone(), vocab_size)?;
 
-        // AB-2 §5.7.1 (A안): KIVI cache 를 persistent Arc handle 로 1회 wrap (ModelForward
+        // AB-2 §5.7.1 (A안): quant-window cache 를 persistent Arc handle 로 1회 wrap (ModelForward
         // `ensure_fmt_wrapped` 동형). enumerate 순서 == layer idx. 이후 prefill/step 은 보유 Arc
         // clone 으로 dyn fmts 만 구성한다(per-step mem::take + try_unwrap 댄스 제거).
         let quant_window_caches: Vec<Arc<QuantWindowFormat>> = kv_caches
@@ -118,7 +118,7 @@ impl QuantWindowForward {
         })
     }
 
-    /// AB-2 §5.7.1/§5.7.8: persistent KIVI handle 슬라이스 (dispatcher/QuantWindowBitTransitionStage 가
+    /// AB-2 §5.7.1/§5.7.8: persistent quant-window handle 슬라이스 (dispatcher/QuantWindowBitTransitionStage 가
     /// register 시점 `.to_vec()` 으로 clone 보유 — `ModelForward::fmt_caches()` 동형).
     pub fn quant_window_caches(&self) -> &[Arc<QuantWindowFormat>] {
         &self.quant_window_caches
@@ -164,7 +164,7 @@ impl Forward for QuantWindowForward {
         }
         let input_tensor = self.build_input_tensor(tokens)?;
 
-        // AB-2 §5.7.1 (A안): persistent KIVI handle 의 Arc clone 으로 dyn fmts 구성 (transient
+        // AB-2 §5.7.1 (A안): persistent quant-window handle 의 Arc clone 으로 dyn fmts 구성 (transient
         // mem::take + try_unwrap 댄스 제거 — handle 영속이라 panic 위험 소멸). AWQE need_scores 는
         // layer-0 handle 에 with_cache_mut 으로 query (concrete `is_awqe_enabled` 위임).
         let need_scores = self
@@ -213,7 +213,7 @@ impl Forward for QuantWindowForward {
         let bytes = token.to_ne_bytes();
         self.backend.write_buffer(&mut self.decode_input, &bytes)?;
 
-        // AB-2 §5.7.1 (A안): persistent KIVI handle 의 Arc clone 으로 dyn fmts 구성 (transient
+        // AB-2 §5.7.1 (A안): persistent quant-window handle 의 Arc clone 으로 dyn fmts 구성 (transient
         // 댄스 제거). need_scores 는 layer-0 handle query.
         let need_scores = self
             .quant_window_caches
@@ -306,7 +306,7 @@ fn alloc_logits(
 /// GPU 백엔드가 OpenCL일 때 `QuantizedRecentWindowCache::new_gpu`를 사용하고, 그 외에는
 /// CPU 모드 `QuantizedRecentWindowCache::new_with_bits`를 사용한다.
 ///
-/// `quant_attn` 는 KIVI native attention capability handle (Phase α-W-4 §3.3). caller 가
+/// `quant_attn` 는 quant-window native attention capability handle (Phase α-W-4 §3.3). caller 가
 /// `caps.get::<dyn QuantAttnBackend>()` 로 pull 해 전달한다. R3 불변식: OpenCL
 /// backend 면 반드시 `Some` (init.rs 가 OpenCL 에 register).
 #[allow(clippy::too_many_arguments)]
@@ -355,7 +355,7 @@ pub fn alloc_quant_window_kv_caches(
 mod tests {
     use super::*;
 
-    /// `alloc_quant_window_kv_caches`가 요청한 수만큼 KiviCache를 반환하는지 검증한다.
+    /// `alloc_quant_window_kv_caches`가 요청한 수만큼 QuantizedRecentWindowCache를 반환하는지 검증한다.
     /// 실제 모델 없이 cache 생성 경로만 검증한다.
     #[test]
     fn test_alloc_kivi_kv_caches_count() {
@@ -382,11 +382,11 @@ mod tests {
         assert_eq!(
             caches.len(),
             4,
-            "num_layers개의 KiviCache가 생성되어야 한다"
+            "num_layers개의 QuantizedRecentWindowCache가 생성되어야 한다"
         );
     }
 
-    /// 각 KiviCache의 bits 설정이 요청한 값과 일치하는지 검증한다.
+    /// 각 QuantizedRecentWindowCache의 bits 설정이 요청한 값과 일치하는지 검증한다.
     #[test]
     fn test_alloc_kivi_kv_caches_bits() {
         use crate::backend::cpu::CpuBackend;
@@ -413,7 +413,7 @@ mod tests {
                 assert_eq!(
                     cache.bits(),
                     bits,
-                    "bits={} 설정이 KiviCache에 반영되어야 한다",
+                    "bits={} 설정이 QuantizedRecentWindowCache에 반영되어야 한다",
                     bits
                 );
             }

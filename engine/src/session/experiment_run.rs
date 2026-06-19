@@ -27,7 +27,7 @@ use crate::session::decode_loop::StopReason;
 use crate::session::experiment::ScheduleCommandSource;
 use crate::session::standard_happy::StandardHappyCtx;
 
-/// AB-2 §5.7.7: KIVI bench 경로 — `run_experiment_path` 의 KIVI 형제.
+/// AB-2 §5.7.7: quant-window bench 경로 — `run_experiment_path` 의 quant-window 형제.
 ///
 /// `build_bench_quant_window_loop` 로 `QuantWindowForward` + `QuantWindowBitTransitionStage` 배선 `DecodeLoop` 를 조립한 뒤,
 /// Standard 경로와 동일한 prefill→sample→run→summary 공통부([`run_decode_loop_experiment`])를 탄다.
@@ -51,7 +51,7 @@ pub fn run_quant_window_experiment_path(ctx: QuantWindowBenchCtx) -> anyhow::Res
     } = ctx;
 
     eprintln!(
-        "[argus-bench] KIVI experiment path → DecodeLoop+KiviForward (tokens={}, budget={}, bits={})",
+        "[argus-bench] quant-window experiment path → DecodeLoop+KiviForward (tokens={}, budget={}, bits={})",
         tokens.len(),
         args.num_tokens,
         initial_bits,

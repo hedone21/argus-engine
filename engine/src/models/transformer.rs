@@ -259,12 +259,12 @@ pub struct OffloadForwardArgs<'a, C> {
     /// for each prefill call. Essential on NVIDIA OpenCL where repeated
     /// alloc/free cycles accumulate deferred-release pressure (→ CL_OUT_OF_RESOURCES).
     pub prefill_workspace: Option<&'a mut crate::layers::workspace::PrefillWorkspace>,
-    /// Optional attention score accumulator for H2O-style eviction.
+    /// Optional attention score accumulator for heavy-hitter-style eviction.
     /// When active, post-softmax scores are captured from tracked layers.
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
     /// Optional per-op profiler.
     pub profiler: Option<&'a mut dyn crate::instrument::OpInstrument>,
-    /// Optional SWIFT skip configuration for layer skipping.
+    /// Optional skip configuration for layer skipping.
     pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
     /// Optional importance collector for Layer Skip QCF.
     /// When provided during prefill, captures per-layer cosine similarity.
@@ -309,20 +309,20 @@ pub struct TransformerModelForwardArgs<'a> {
     /// prefill 한정: true 면 마지막 토큰 hidden 만 lm_head (logits_out=[1,1,vocab]).
     /// decode(seq_len=1)에선 무관. forward_into 의 `logits_last_only`(transformer.rs:1960) 미러.
     pub logits_last_only: bool,
-    /// H2O-style eviction score accumulator (Phase α-K ①-c — eval flip). `Some` 이면 decode 마다
+    /// heavy-hitter-style eviction score accumulator (Phase α-K ①-c — eval flip). `Some` 이면 decode 마다
     /// post-softmax score 를 누적(`forward_into:1894-1922` 미러). production(ModelForward)은 항상 `None`.
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
-    /// Expected Attention Q running mean/var 누적기 (QueryStats). `Some` 이면 decode
+    /// Q running mean/var 누적기 (QueryStats, future-attention 추정용). `Some` 이면 decode
     /// 마다 활성 layer 의 RoPE-적용 Q(`ws.q`)를 GQA 환원해 누적(score 누적 seam 인접 1지점). score
     /// 비활성 happy path 는 `None`(MQ-4 hot-path 게이트 — `Option::is_some` 분기 1회 외 비용 0).
     /// production(ModelForward)은 항상 `None`; score-active 측정 하네스만 `Some`.
     pub query_stats_accumulator:
         Option<&'a mut crate::inference::query_stats::QueryStatsAccumulator>,
-    /// SWIFT layer-skip 설정 (Phase α-K ①-c). production 은 항상 `None`.
+    /// layer-skip 설정 (Phase α-K ①-c). production 은 항상 `None`.
     pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
     /// Layer Skip QCF importance collector — prefill 2-pass 전용 (Phase α-K ①-c). production 은 `None`.
     pub importance_collector: Option<&'a mut dyn crate::qcf_collector::ImportanceCollect>,
-    /// cache 자가-need(KIVI AWQE) 힌트 (Phase α-K ①-c). base trait 에 `needs_attn_scores` 가 없으므로
+    /// cache 자가-need(quant-window AWQE) 힌트 (Phase α-K ①-c). base trait 에 `needs_attn_scores` 가 없으므로
     /// (§4.1 R4 ③) caller 가 `caches[0].needs_attn_scores()` 를 산출해 주입한다 — `need_scores` 의 OR
     /// 항(`forward_gen.rs:409` 미러). production 은 `false`.
     pub cache_self_need_scores: bool,
@@ -1457,7 +1457,7 @@ impl TransformerModel {
         let mut workspace = args.workspace;
         // Phase α-K ①-c: eval feature threading (production ModelForward 은 전부 None/false).
         let mut score_accumulator = args.score_accumulator;
-        // Expected Attention Q running mean/var 누적기 (production 은 None).
+        // Q running mean/var 누적기 (QueryStats, future-attention 추정용; production 은 None).
         let mut query_stats_accumulator = args.query_stats_accumulator;
         let skip_config = args.skip_config;
         let mut importance_collector = args.importance_collector;
@@ -1548,7 +1548,7 @@ impl TransformerModel {
                 backend.wait_event_blocking(&evt)?;
             }
 
-            // SWIFT layer-skip (forward_into:1715 미러). skip_config None 이면 (false, false).
+            // layer-skip (forward_into:1715 미러). skip_config None 이면 (false, false).
             let (s_attn, s_mlp) =
                 skip_config.map_or((false, false), |sc| (sc.skip_attn(i), sc.skip_mlp(i)));
 
@@ -1612,7 +1612,7 @@ impl TransformerModel {
                     },
                 )?;
             } else if is_decode {
-                // need_scores = (GPU acc 미활성 시 score_acc layer-track) || cache 자가-need(KIVI AWQE).
+                // need_scores = (GPU acc 미활성 시 score_acc layer-track) || cache 자가-need(quant-window AWQE).
                 // forward_into:1707 + forward_gen.rs:409 AWQE OR 항 미러.
                 let acc_need = if gpu_score_active {
                     false
@@ -1627,7 +1627,7 @@ impl TransformerModel {
                 // format 내부 캡슐화 — owned KVReadPlan 반환). plan select 검증(ascending + 범위 내)
                 // 후 forward_gen_fmt 에 select 로 전달. read_stage=None(production)이면 `is_some` branch
                 // 1회 → read_select=None → full read 직행(INV-147 byte-identical).
-                // QueryStats(Expected-Attention) seam: read stage 가 wants_query_stats 면 디코드 루프가
+                // QueryStats(future-attention) seam: read stage 가 wants_query_stats 면 디코드 루프가
                 // 이 accumulator 를 Some 으로 공급한다. 이번 step 누적(아래 :1749) 전 시점이라 직전 step
                 // 까지의 running mean/var 를 읽는다(causal). `.to_vec()` 로 &mut 차용을 즉시 종료해
                 // 누적 seam 과 충돌하지 않게 한다(production read_stage=None 이면 None — 비용 0).
@@ -3370,7 +3370,7 @@ mod tests {
         let cap = (&fmt as &dyn crate::format::KVCacheFormat).as_selective_read();
         assert!(
             cap.is_none(),
-            "KIVIFormat 은 SelectiveRead 미구현 → as_selective_read()==None → full read 폴백"
+            "QuantWindowFormat 은 SelectiveRead 미구현 → as_selective_read()==None → full read 폴백"
         );
     }
 

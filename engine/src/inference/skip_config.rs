@@ -1,9 +1,7 @@
-//! SWIFT layer skip configuration for speculative decoding.
-//!
-//! Reference: SWIFT (arXiv 2024) — self-speculative decoding via layer skipping.
+//! Layer-skip configuration for self-speculative decoding.
 //!
 //! Allows attention and MLP sub-layers to be independently skipped per layer.
-//! Layer 0 and layer L-1 are always executed (SWIFT constraint).
+//! Layer 0 and layer L-1 are always executed (boundary constraint).
 
 use std::collections::HashSet;
 
@@ -24,7 +22,7 @@ impl SkipConfig {
         Self::default()
     }
 
-    /// Validate that layer 0 and layer L-1 are never skipped (SWIFT constraint).
+    /// Validate that layer 0 and layer L-1 are never skipped (boundary constraint).
     pub fn validate(&self, num_layers: usize) -> bool {
         if num_layers == 0 {
             return true;

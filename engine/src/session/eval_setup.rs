@@ -10,7 +10,7 @@
 //! [`build_inference_ctx`](crate::session::bin_setup::build_inference_ctx) 는
 //! happy-path 전용(`is_standard_happy_path` 전제)이라 [`StandardHappyCtx`] 만
 //! 만든다. eval ctx 는 eviction/swap/score 상태를 요구하므로 별 조립층을 둔다.
-//! 단 [`SessionInitCtx::build`] 를 **직접 호출**해 `caps`(KIVI 라우팅 필수) /
+//! 단 [`SessionInitCtx::build`] 를 **직접 호출**해 `caps`(quant-window 라우팅 필수) /
 //! `swap_algorithm` / `importance_formula` 등을 보존한다(bin_setup destructure 가
 //! drop 하는 값들).
 //!
@@ -50,7 +50,7 @@ use crate::session::ppl::PplRunCtx;
 /// `SessionInitCtx::build` 직후의 공통 결과 + eval 파생 상태.
 ///
 /// model/backend/tokenizer 등 owned 자원을 한곳에 모아 mode 별 빌더가 소비한다.
-/// `caps` 는 KIVI 경로 thread-through 용으로 보존된다.
+/// `caps` 는 quant-window 경로 thread-through 용으로 보존된다.
 struct EvalBase {
     backend: Arc<dyn crate::backend::Backend>,
     memory: Arc<dyn crate::memory::Memory>,
@@ -231,7 +231,7 @@ fn build_eval_cache_manager(
 
 /// legacy generate.rs:971-1021 의 score_accumulator 인라인 조립을 재현.
 ///
-/// 생성 조건: score-based(h2o/h2o_plus/d2o) || CAOTE || `--enable-resilience` ||
+/// 생성 조건: score-based(h2o/h2o_plus/d2o) || value-aware || `--enable-resilience` ||
 /// eviction!=none. GQA 변형(`new_gqa`) + `set_active(true)` +
 /// `set_time_normalize` + (OpenCL 시) `init_gpu_score_acc`.
 fn build_eval_score_accumulator(
@@ -241,7 +241,7 @@ fn build_eval_score_accumulator(
     max_seq_len: usize,
 ) -> Option<AttentionScoreAccumulator> {
     // `--qcf-mode caote|both` forces the score accumulator + GQA even with no eviction policy.
-    // The CAOTE QcfMode variant was name-only residue (no distinct arithmetic), so gate on the CLI
+    // The value-aware QcfMode variant was name-only residue (no distinct arithmetic), so gate on the CLI
     // string directly (B1-2).
     let needs_caote = matches!(args.qcf_mode.as_str(), "caote" | "both");
     let needs_score_based = stage_is_score_based(args.eviction_policy());
@@ -252,7 +252,7 @@ fn build_eval_score_accumulator(
         return None;
     }
 
-    // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + CAOTE) and for any per-head stage.
+    // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + value-aware) and for any per-head stage.
     // Any non-none eviction policy already enables it (has_eviction_policy), so no per-name branch.
     let use_gqa = needs_caote || has_eviction_policy;
     let mut acc = if use_gqa {
@@ -312,8 +312,8 @@ fn build_eval_score_accumulator(
 
 /// legacy generate.rs:1065-1097 의 skip_config 인라인 조립을 재현.
 ///
-/// `--skip-layers` 명시 → 해당 layer attn/mlp skip. `--skip-ratio` → SWIFT
-/// uniform_init. 둘 다 SWIFT 제약(layer 0/마지막 skip 불가)을 validate 한다.
+/// `--skip-layers` 명시 → 해당 layer attn/mlp skip. `--skip-ratio` → uniform_init.
+/// 둘 다 layer 0/마지막 skip 불가 제약을 validate 한다.
 fn build_eval_skip_config(args: &Args, model: &TransformerModel) -> Result<Option<SkipConfig>> {
     if let Some(ref layers) = args.skip_layers {
         let mut sc = SkipConfig::new();
@@ -322,7 +322,7 @@ fn build_eval_skip_config(args: &Args, model: &TransformerModel) -> Result<Optio
             sc.mlp_skip.insert(l);
         }
         if !sc.validate(model.config.num_hidden_layers) {
-            anyhow::bail!("Cannot skip layer 0 or last layer (SWIFT constraint)");
+            anyhow::bail!("Cannot skip layer 0 or last layer (boundary constraint)");
         }
         eprintln!(
             "[Skip] Explicit layers: {:?} ({} sub-layers skipped)",
@@ -350,7 +350,7 @@ fn build_eval_skip_config(args: &Args, model: &TransformerModel) -> Result<Optio
 
 /// `--eval-ll` (Standard KV) 진입용 [`EvalLlRunCtx`] 를 조립한다.
 ///
-/// pre: `eval_supported(&args)` 통과 + Standard KV mode (KIVI 는 별 경로 §13.6).
+/// pre: `eval_supported(&args)` 통과 + Standard KV mode (quant-window 는 별 경로 §13.6).
 /// post: KV capacity == max_seq_len, cache_manager 의 protected_prefix == eval 정책.
 pub fn build_eval_ll_ctx(args: Args) -> Result<EvalLlRunCtx> {
     let base = build_eval_base(&args)?;
@@ -359,7 +359,7 @@ pub fn build_eval_ll_ctx(args: Args) -> Result<EvalLlRunCtx> {
         memory,
         cpu_backend_arc,
         gpu_backend_arc,
-        caps: _caps, // Standard eval 은 caps 미소비 (KIVI 만 thread-through).
+        caps: _caps, // Standard eval 은 caps 미소비 (quant-window 만 thread-through).
         model,
         tokenizer,
         prompt,
@@ -595,7 +595,7 @@ pub fn build_dump_importance_ctx(args: Args) -> Result<DumpImportanceCtx> {
 /// `caps.get::<dyn QuantAttnBackend>()` 를 closure 밖에서 1회 pull —
 /// chat 의 `build_chat_quant_window_forward`(session/chat/session.rs, KvModeReg.build) thread-through 미러.
 ///
-/// 빌드부터 run 까지 한 함수에 둔다 (KIVI 는 ctx struct 표면이 없음).
+/// 빌드부터 run 까지 한 함수에 둔다 (quant-window 는 ctx struct 표면이 없음).
 pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
     use crate::backend::QuantAttnBackend;
     use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
@@ -634,7 +634,7 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
     let qcf_config = crate::qcf_types::QcfConfig::default();
     let quant_window_bits = args.effective_quant_window_bits();
 
-    // KIVI native attention handle 을 caps 에서 1회 pull (closure 밖). OpenCL 면 Some.
+    // quant-window native attention handle 을 caps 에서 1회 pull (closure 밖). OpenCL 면 Some.
     let quant_attn_cap = caps.get::<dyn QuantAttnBackend>();
     let mut kv_caches: Vec<QuantizedRecentWindowCache> = (0..num_layers)
         .map(|_| {
@@ -656,7 +656,7 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
         for cache in kv_caches.iter_mut() {
             cache.set_awqe_enabled(true);
         }
-        eprintln!("[KIVI] AWQE + AW-VOPR enabled (LLMRS_KIVI_AWQE)");
+        eprintln!("[quant-window] AWQE + AW-VOPR enabled (LLMRS_KIVI_AWQE)");
     }
 
     let kivi_n_layers = kv_caches.len();
@@ -715,7 +715,7 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
 /// `--ppl --kv-mode kivi` 진입 — QuantizedRecentWindowCache 기반 perplexity eval.
 ///
 /// legacy generate.rs:372-389 재현. `run_quant_window_ppl` free fn 을 caps 에서 pull 한
-/// KIVI handle 과 함께 직접 호출한다.
+/// quant-window handle 과 함께 직접 호출한다.
 pub fn run_ppl_quant_window(args: Args, ppl_path: &str) -> Result<()> {
     use crate::backend::QuantAttnBackend;
 

@@ -1,4 +1,4 @@
-//! KIVI-style KV cache with asymmetric 2-bit quantization (ICML 2024).
+//! Quantized-residual-window KV cache with asymmetric 2-bit quantization.
 //!
 //! Key insight: recent R tokens stay in FP32 (residual buffer). When full,
 //! they are batch-quantized to Q2 and flushed to compressed storage.
@@ -135,7 +135,7 @@ impl QuantizedBlocks {
     }
 }
 
-/// KIVI KV cache: quantized compressed storage + FP32 residual buffer.
+/// quant-window KV cache: quantized compressed storage + FP32 residual buffer.
 ///
 /// SeqMajor layout only (Phase 1). Data layout for residual:
 /// `[kv_heads, res_cap, head_dim]` (head-first for easier per-channel Key quantization).
@@ -205,7 +205,7 @@ pub struct QuantizedRecentWindowCache {
     last_attn_scores: Option<AttnScoresSnapshot>,
 
     // ── GPU-native buffers (None = CPU-only mode, backward compatible) ──
-    /// KIVI native attention capability handle (Phase α-W-4 §3.3). Some ↔ GPU
+    /// quant-window native attention capability handle (Phase α-W-4 §3.3). Some ↔ GPU
     /// 모드 + OpenCL backend. `update_gpu` 의 `gather_update_quant` dispatch 가
     /// 매 토큰 `as_quant_attn()` lookup 대신 본 handle 을 직접 쓴다. caller
     /// 가 `caps.get::<dyn QuantAttnBackend>()` 로 pull 해 `new_gpu` 에 전달
@@ -365,7 +365,7 @@ impl QuantizedRecentWindowCache {
     /// When `backend` is an OpenCL backend, allocates persistent GPU buffers for
     /// residual and attention data. Falls back to CPU-only mode if GPU allocation fails.
     ///
-    /// `quant_attn` 는 KIVI native attention capability handle (Phase α-W-4 §3.3). caller 가
+    /// `quant_attn` 는 quant-window native attention capability handle (Phase α-W-4 §3.3). caller 가
     /// `caps.get::<dyn QuantAttnBackend>()` 로 pull 해 전달한다. R3 불변식: OpenCL
     /// backend 로 GPU 모드 진입 시 반드시 `Some` (init.rs 가 OpenCL 에 register). R4
     /// 불변식: `backend` 와 동일 ocl 인스턴스의 clone.
@@ -508,7 +508,7 @@ impl QuantizedRecentWindowCache {
                     });
                 if let Err(e) = init_result {
                     log::warn!(
-                        "KiviCache: GPU buffer zero-init failed ({}), falling back to CPU mode",
+                        "QuantWindowCache: GPU buffer zero-init failed ({}), falling back to CPU mode",
                         e
                     );
                     return cache;
@@ -539,16 +539,16 @@ impl QuantizedRecentWindowCache {
 
                 if skip_attn_and_q {
                     log::info!(
-                        "KiviCache: GPU mode enabled (bits=16, attn/Q deferred, res_cap={residual_size})"
+                        "QuantWindowCache: GPU mode enabled (bits=16, attn/Q deferred, res_cap={residual_size})"
                     );
                 } else {
                     log::info!(
-                        "KiviCache: GPU mode enabled (attn cap={initial_attn_cap}, CPU attn/q freed)"
+                        "QuantWindowCache: GPU mode enabled (attn cap={initial_attn_cap}, CPU attn/q freed)"
                     );
                 }
             }
             Err(e) => {
-                log::warn!("KiviCache: GPU alloc failed ({}), using CPU mode", e);
+                log::warn!("QuantWindowCache: GPU alloc failed ({}), using CPU mode", e);
             }
         }
 
@@ -615,7 +615,11 @@ impl QuantizedRecentWindowCache {
             }
         }
 
-        log::debug!("KiviCache: GPU attn grow {} -> {} tokens", cur_cap, new_cap);
+        log::debug!(
+            "QuantWindowCache: GPU attn grow {} -> {} tokens",
+            cur_cap,
+            new_cap
+        );
 
         let slab = self.slab.as_mut().unwrap();
         slab.attn_k = Some(new_k);
@@ -680,7 +684,7 @@ impl QuantizedRecentWindowCache {
         backend.write_buffer(&mut q2v, &zeros_v)?;
 
         log::info!(
-            "KiviCache: deferred GPU Q-block alloc (bits={}, q2k={} B, q2v={} B)",
+            "QuantWindowCache: deferred GPU Q-block alloc (bits={}, q2k={} B, q2v={} B)",
             bits,
             q2k_bytes.max(block_bytes),
             q2v_bytes.max(block_bytes)
@@ -703,7 +707,7 @@ impl QuantizedRecentWindowCache {
         attn_bytes + res_bytes + q_bytes
     }
 
-    /// Get raw GPU buffers for native KIVI attention (no F32 intermediate).
+    /// Get raw GPU buffers for native quant-window attention (no F32 intermediate).
     ///
     /// Returns `None` if GPU mode is not active, no quantized tokens exist, or
     /// the quantization mode is unquantized (bits=16).
@@ -733,7 +737,7 @@ impl QuantizedRecentWindowCache {
         Some((s.attn_k.as_ref()?, s.attn_v.as_ref()?))
     }
 
-    /// Dry-run QCF estimate for KIVI quantization (read-only, no state mutation).
+    /// Dry-run QCF estimate for quant-window quantization (read-only, no state mutation).
     ///
     /// - **CPU mode** with residual data: computes actual NMSE via `compute_flush_nmse`.
     /// - **GPU mode** or empty residual: returns a bits-based proxy
@@ -1067,7 +1071,7 @@ impl QuantizedRecentWindowCache {
                 }
                 self.gpu_q2k_blocks = 0;
                 self.gpu_q2v_blocks = 0;
-                log::info!("KiviCache: GPU attn/Q buffers released (transition to bits=16)");
+                log::info!("QuantWindowCache: GPU attn/Q buffers released (transition to bits=16)");
             }
 
             return Ok(());
@@ -1119,7 +1123,7 @@ impl QuantizedRecentWindowCache {
                     slab.res_v = None;
                 }
                 log::info!(
-                    "KiviCache: GPU F32 residual released before 16→{} transition",
+                    "QuantWindowCache: GPU F32 residual released before 16→{} transition",
                     new_bits
                 );
 
@@ -1216,7 +1220,7 @@ impl QuantizedRecentWindowCache {
                         self.slab.as_mut().unwrap().res_v = Some(gpu_rv);
 
                         log::info!(
-                            "KiviCache: GPU F32 residual re-allocated (res_cap={})",
+                            "QuantWindowCache: GPU F32 residual re-allocated (res_cap={})",
                             new_res_cap
                         );
                     }
@@ -1235,7 +1239,7 @@ impl QuantizedRecentWindowCache {
                     self.slab.as_mut().unwrap().res_v = Some(gpu_rv);
 
                     log::info!(
-                        "KiviCache: GPU F32 residual re-allocated empty (res_cap={})",
+                        "QuantWindowCache: GPU F32 residual re-allocated empty (res_cap={})",
                         new_res_cap
                     );
                 }
@@ -1503,7 +1507,7 @@ impl QuantizedRecentWindowCache {
     fn update_gpu(&mut self, new_k: &Tensor, new_v: &Tensor, seq_len: usize) -> Result<()> {
         // slow path 의 `copy_slice` 는 Backend trait 의 일반 ops → slab backend 유지.
         let backend_arc = self.slab.as_ref().unwrap().backend.clone();
-        // fast path 의 `gather_update_quant` 는 KIVI native capability → 매 토큰
+        // fast path 의 `gather_update_quant` 는 quant-window native capability → 매 토큰
         // `as_quant_attn()` lookup 대신 construction 시 pull 된 handle 직접 사용
         // (Phase α-W-4 §3.3). R3: GPU 모드면 OpenCL backend 라 caller 가 Some 보장.
         // owned clone 으로 self 의 mutable borrow(gpu_res_k/flush_residual_gpu)와
@@ -1512,7 +1516,9 @@ impl QuantizedRecentWindowCache {
             .quant_attn
             .as_ref()
             .ok_or_else(|| {
-                anyhow::anyhow!("KIVI GPU mode but kivi handle missing (registry not registered?)")
+                anyhow::anyhow!(
+                    "quant-window GPU mode but kivi handle missing (registry not registered?)"
+                )
             })?
             .clone();
 
@@ -1558,7 +1564,7 @@ impl QuantizedRecentWindowCache {
                 };
                 let rc_k = quant_attn_be.gather_update_quant(&args_k);
                 if rc_k != 0 {
-                    anyhow::bail!("KIVI gather_update_quant (K) failed (rc={rc_k})");
+                    anyhow::bail!("quant-window gather_update_quant (K) failed (rc={rc_k})");
                 }
                 let args_v = crate::backend::QuantAttnGatherArgs {
                     cl_queue: backend_arc.cl_command_queue_ptr(),
@@ -1572,7 +1578,7 @@ impl QuantizedRecentWindowCache {
                 };
                 let rc_v = quant_attn_be.gather_update_quant(&args_v);
                 if rc_v != 0 {
-                    anyhow::bail!("KIVI gather_update_quant (V) failed (rc={rc_v})");
+                    anyhow::bail!("quant-window gather_update_quant (V) failed (rc={rc_v})");
                 }
             } else {
                 // Slow path: token-by-token copy_slice for the sub-range
@@ -1786,7 +1792,7 @@ impl QuantizedRecentWindowCache {
     /// `n_groups`: number of key groups (= flush_tokens / group_size)
     /// `tok_base`: token offset in the attention buffer for this flush
     /// `tmp_qk`/`tmp_qv`: temporary quantized blocks (not stored in self.qk/qv in GPU mode)
-    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path KIVI flush upload
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path quant-window flush upload
     fn upload_and_dequant_flush_with(
         &mut self,
         flush_tokens: usize,
@@ -1830,7 +1836,7 @@ impl QuantizedRecentWindowCache {
             use crate::backend::opencl::get_cl_mem;
 
             // Owned clones so neither borrows `self` while we mutably touch the GPU buffers
-            // (mirrors the gather_update fast-path above). The KIVI Q2 dequant kernels are
+            // (mirrors the gather_update fast-path above). The quant-window Q2 dequant kernels are
             // reached via the `QuantAttnBackend` cap trait — no concrete-OpenCLBackend downcast.
             let backend = self.slab.as_ref().unwrap().backend.clone();
             let quant_attn_be = self
@@ -1838,7 +1844,7 @@ impl QuantizedRecentWindowCache {
                 .as_ref()
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "KIVI GPU mode but kivi handle missing (registry not registered?)"
+                        "quant-window GPU mode but kivi handle missing (registry not registered?)"
                     )
                 })?
                 .clone();
@@ -1897,7 +1903,7 @@ impl QuantizedRecentWindowCache {
                     is_key: true,
                 });
                 if rc_k != 0 {
-                    anyhow::bail!("KIVI dequant_flush (K) failed (rc={rc_k})");
+                    anyhow::bail!("quant-window dequant_flush (K) failed (rc={rc_k})");
                 }
                 let q2v_mem = get_cl_mem(
                     self.slab
@@ -1934,7 +1940,7 @@ impl QuantizedRecentWindowCache {
                     is_key: false,
                 });
                 if rc_v != 0 {
-                    anyhow::bail!("KIVI dequant_flush (V) failed (rc={rc_v})");
+                    anyhow::bail!("quant-window dequant_flush (V) failed (rc={rc_v})");
                 }
             } else {
                 // Q4/Q8: CPU dequant into temporary F32 buffer, convert to F16,
@@ -2112,7 +2118,7 @@ impl QuantizedRecentWindowCache {
     /// - `q2_deq_tokens` is kept in sync with `q2_tokens` during `flush_residual_gpu`,
     ///   so no incremental dequant is needed here.
     /// - Residual scatter: uses `kivi_scatter_residual` kernel (always re-done each call).
-    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path KIVI view assemble
+    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path quant-window view assemble
     fn assemble_view_gpu(&mut self) -> Result<()> {
         // Defensive: ensure attn buffers can hold q2_tokens + res_pos
         let needed = self.q2_tokens + self.res_pos;
@@ -2132,7 +2138,7 @@ impl QuantizedRecentWindowCache {
                     .as_ref()
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "KIVI GPU mode but kivi handle missing (registry not registered?)"
+                            "quant-window GPU mode but kivi handle missing (registry not registered?)"
                         )
                     })?
                     .clone();
@@ -2174,7 +2180,7 @@ impl QuantizedRecentWindowCache {
                         tok_base: self.q2_tokens,
                     });
                 if rc_k != 0 {
-                    anyhow::bail!("KIVI scatter_residual (K) failed (rc={rc_k})");
+                    anyhow::bail!("quant-window scatter_residual (K) failed (rc={rc_k})");
                 }
                 let res_v_mem = get_cl_mem(
                     self.slab
@@ -2210,7 +2216,7 @@ impl QuantizedRecentWindowCache {
                         tok_base: self.q2_tokens,
                     });
                 if rc_v != 0 {
-                    anyhow::bail!("KIVI scatter_residual (V) failed (rc={rc_v})");
+                    anyhow::bail!("quant-window scatter_residual (V) failed (rc={rc_v})");
                 }
             }
             return Ok(());
@@ -2252,7 +2258,7 @@ impl QuantizedRecentWindowCache {
         // bits=2/4/8: assemble quantized + residual into F16 attn buffers
         if let Err(e) = self.assemble_view_gpu() {
             log::warn!(
-                "KiviCache assemble_view_gpu error: {}, returning stale GPU attention buffers \
+                "QuantWindowCache assemble_view_gpu error: {}, returning stale GPU attention buffers \
                  (CPU qk/qv not available in GPU mode)",
                 e
             );
@@ -2329,7 +2335,7 @@ impl QuantizedRecentWindowCache {
         self.head_dim
     }
 
-    /// The DType the caller should pass to `update()` (KIVI quantizes internally → F32).
+    /// The DType the caller should pass to `update()` (quant-window quantizes internally → F32).
     pub fn kv_dtype(&self) -> DType {
         DType::F32
     }
@@ -2340,7 +2346,7 @@ impl QuantizedRecentWindowCache {
         let total_after = self.total_tokens() + seq_len;
         if total_after > self.max_seq_len {
             return Err(anyhow::anyhow!(
-                "KiviCache overflow: {} + {} > {}",
+                "QuantWindowCache overflow: {} + {} > {}",
                 self.total_tokens(),
                 seq_len,
                 self.max_seq_len
@@ -2383,7 +2389,7 @@ impl QuantizedRecentWindowCache {
 
     /// K/V tensors for attention covering `[0..current_pos]` (dequantized assembly).
     ///
-    /// `&mut self` — internal buffer assembly (KIVI dequantization). 충돌 없는 동명 inherent
+    /// `&mut self` — internal buffer assembly (quant-window dequantization). 충돌 없는 동명 inherent
     /// (KVCache 와 달리 QuantizedRecentWindowCache 는 기존 `get_view` inherent 부재).
     pub fn get_view(&mut self) -> (Tensor, Tensor) {
         // GPU path: return tensors backed by GPU attention buffers
@@ -2459,7 +2465,7 @@ impl QuantizedRecentWindowCache {
         snapshot.valid_len = valid_len;
     }
 
-    /// Raw GPU buffers for native KIVI fused attention (Some only in GPU mode).
+    /// Raw GPU buffers for native quant-window fused attention (Some only in GPU mode).
     pub fn get_quant_window_raw_buffers(&self) -> Option<QuantWindowRawBuffers<'_>> {
         self.get_raw_gpu_buffers()
     }
@@ -2468,7 +2474,7 @@ impl QuantizedRecentWindowCache {
     /// (FORMAT Phase 2 Stage E). `QuantWindowFormat::attention_into` reads it here
     /// (instead of `backend.as_quant_attn()`) so the native-attention dispatch and
     /// gate pull the cap from the SAME `caps.get` handle the flush path uses —
-    /// keeping a single cap source once the KIVI kernels move to a dlopen plugin.
+    /// keeping a single cap source once the quant-window kernels move to a dlopen plugin.
     pub(crate) fn quant_attn_cap(&self) -> Option<&Arc<dyn QuantAttnBackend>> {
         self.quant_attn.as_ref()
     }
@@ -2830,7 +2836,7 @@ mod tests {
         );
     }
 
-    /// Direct quality comparison: KIVI Q2 vs Baseline.
+    /// Direct quality comparison: quant-window Q2 vs Baseline.
     ///
     /// Same synthetic KV data fed to both caches. Measures:
     /// - Cosine similarity (K and V separately)
@@ -2961,7 +2967,7 @@ mod tests {
         }
 
         // ═══════════════════════════════════════════════
-        // 2. KIVI Q2 (res_cap=32)
+        // 2. quant-window Q2 (res_cap=32)
         // ═══════════════════════════════════════════════
         let kivi_k: Vec<f32>;
         let kivi_v: Vec<f32>;
@@ -3009,7 +3015,7 @@ mod tests {
         // ═══════════════════════════════════════════════
         let n = total * kv_heads * head_dim;
 
-        // KIVI vs Baseline (F32)
+        // quant-window vs Baseline (F32)
         let kivi_k_cos = cosine_sim(&baseline_k, &kivi_k);
         let kivi_v_cos = cosine_sim(&baseline_v, &kivi_v);
         let kivi_k_mse = mse(&baseline_k, &kivi_k);
@@ -3027,7 +3033,7 @@ mod tests {
         // ═══════════════════════════════════════════════
         eprintln!();
         eprintln!("╔══════════════════════════════════════════════════════════════════╗");
-        eprintln!("║           KIVI vs Baseline Quality Comparison                   ║");
+        eprintln!("║           quant-window vs Baseline Quality Comparison                   ║");
         eprintln!(
             "║  Data: {total} tokens, {kv_heads} heads, {head_dim} dim, prefill={prefill_len} decode={decode_len}  ║"
         );
@@ -3041,7 +3047,7 @@ mod tests {
             mse(&baseline_k, &f16_baseline_k[..n])
         );
         eprintln!(
-            "║ KIVI Q2 res=32       │  {:.6}  │  {:.6}  │  {:.2e}  ║",
+            "║ quant-window Q2 res=32       │  {:.6}  │  {:.6}  │  {:.2e}  ║",
             kivi_k_cos, kivi_v_cos, kivi_k_mse
         );
         eprintln!("╠══════════════════════════════════════════════════════════════════╣");
@@ -3052,7 +3058,7 @@ mod tests {
             baseline_mem
         );
         eprintln!(
-            "║ KIVI Q2 res=32       │  {:.2e}  │  {:>7}B  │  {:.2}x       ║",
+            "║ quant-window Q2 res=32       │  {:.2e}  │  {:>7}B  │  {:.2}x       ║",
             kivi_v_mse,
             kivi_mem,
             baseline_mem as f64 / kivi_mem as f64
@@ -3064,14 +3070,17 @@ mod tests {
         // Assertions
         // ═══════════════════════════════════════════════
 
-        // KIVI should have reasonable K cosine similarity
-        assert!(kivi_k_cos > 0.9, "KIVI K CosSim {kivi_k_cos:.4} < 0.9");
+        // quant-window should have reasonable K cosine similarity
+        assert!(
+            kivi_k_cos > 0.9,
+            "quant-window K CosSim {kivi_k_cos:.4} < 0.9"
+        );
 
-        // KIVI should achieve good compression ratio
+        // quant-window should achieve good compression ratio
         let kivi_ratio = baseline_mem as f64 / kivi_mem as f64;
         assert!(
             kivi_ratio > 1.5,
-            "KIVI ratio ({kivi_ratio:.1}x) should be > 1.5x"
+            "quant-window ratio ({kivi_ratio:.1}x) should be > 1.5x"
         );
     }
 
@@ -3766,7 +3775,7 @@ mod tests {
         let cache = QuantizedRecentWindowCache::new(8, 64, 2048, 64);
         assert!(
             cache.get_quant_window_raw_buffers().is_none(),
-            "CPU-only KiviCache trait method should return None"
+            "CPU-only QuantWindowCache trait method should return None"
         );
     }
 
@@ -4010,7 +4019,7 @@ mod tests {
     }
 
     /// Verify that F16 round-trip of Q2 dequantized values preserves precision.
-    /// KIVI Q2 dequant outputs are in a narrow range (typically -2..+2),
+    /// quant-window Q2 dequant outputs are in a narrow range (typically -2..+2),
     /// so F16 (which covers +/-65504 with ~3.3 decimal digits) should be more
     /// than sufficient. This test confirms cosine similarity > 0.9999.
     #[test]

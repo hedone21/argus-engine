@@ -19,7 +19,7 @@ use crate::session::cli::Args;
 /// 수행한다. build() 완료 후 ctx는 모든 하위 decode 경로에서 필요한 값들을 보유한다.
 ///
 /// - `args`는 main()이 owned 보유; build()는 `&Args` borrow + 필요 필드만 clone.
-/// - `model`은 owned으로 보유 (KIVI/SwitchHw가 model.layers를 mutation).
+/// - `model`은 owned으로 보유 (quant-window/SwitchHw가 model.layers를 mutation).
 /// - `is_gpu`, `weights_on_gpu`는 main()이 mutation할 수 있도록 pub으로 노출.
 pub struct SessionInitCtx {
     /// sampling 파라미터 (greedy override 처리 완료).
@@ -57,7 +57,7 @@ pub struct SessionInitCtx {
     /// 명시적 swap 대상 layer 목록 (--swap-only-layers, § 4 ground-truth study).
     pub swap_only_layers: Option<Vec<usize>>,
 
-    /// 로드된 모델 (KIVI/SwitchHw가 model.layers를 swap하므로 owned).
+    /// 로드된 모델 (quant-window/SwitchHw가 model.layers를 swap하므로 owned).
     pub model: TransformerModel,
 }
 
@@ -236,7 +236,7 @@ impl SessionInitCtx {
                     Option<Arc<dyn Backend>>,
                     Option<Arc<dyn Memory>>,
                 ) = (None, None);
-                // CPU primary: backend(=CpuBackend) 는 KIVI native attention capability
+                // CPU primary: backend(=CpuBackend) 는 quant-window native attention capability
                 // 미보유 → 빈 registry. GPU secondary 가 있어도 primary backend 가 GPU
                 // 가 아니므로(decode 가 GPU new_gpu 로 진입 안 함) register 하지 않는다.
                 (
@@ -309,10 +309,10 @@ impl SessionInitCtx {
                         rpcmem_alloc,
                     ),
                 );
-                // Stage E: the engine ships NO built-in QuantAttn cap — the OpenCL KIVI kernels
+                // Stage E: the engine ships NO built-in QuantAttn cap — the OpenCL quant-window kernels
                 // moved to the `kivi` plugin. Only `--backend-cap <name>` registers a cap (the
                 // resolved plugin, built from the live GPU context). With no flag, no cap is
-                // registered; GPU KIVI then requires `--backend-cap kivi_abi --load-plugin
+                // registered; GPU quant-window then requires `--backend-cap kivi_abi --load-plugin
                 // <kivi>.so`, and `QuantizedRecentWindowCache`'s own GPU path surfaces the missing
                 // cap (the engine core names no technique). R4 불변식: the resolved cap is built
                 // from `gpu_concrete`'s context via `with_quant_attn_make_args`, so it shares the
@@ -408,7 +408,7 @@ impl SessionInitCtx {
                     }
                 }
                 let gpu: Arc<dyn Backend> = gpu_concrete;
-                // CUDA backend 는 KIVI native attention capability 미보유 → 빈 registry.
+                // CUDA backend 는 quant-window native attention capability 미보유 → 빈 registry.
                 (
                     gpu.clone(),
                     gpu_mem.clone(),
@@ -427,7 +427,7 @@ impl SessionInitCtx {
         // registry, so a named capability cannot be installed there. Warn, don't fail.
         if args.backend_cap.is_some() && !matches!(args.backend.as_str(), "opencl" | "gpu") {
             eprintln!(
-                "[init] --backend-cap '{}' ignored: only the OpenCL backend exposes a KIVI \
+                "[init] --backend-cap '{}' ignored: only the OpenCL backend exposes a quant-window \
                  attention capability (backend = {})",
                 args.backend_cap.as_deref().unwrap_or(""),
                 args.backend
@@ -472,14 +472,20 @@ impl SessionInitCtx {
             })?;
 
         // Parse --importance-formula (§4 EuroSys'27 study). `compare` enables
-        // three_way collector + post-warmup DP-LLM proxy ε computation.
+        // three_way collector + post-warmup weight-perturbation proxy ε computation.
         let (importance_formula, importance_compare) = match args.importance_formula.as_str() {
             "mean_pool" => (crate::qcf_types::ImportanceFormula::MeanPool, false),
-            "shortgpt_bi" => (crate::qcf_types::ImportanceFormula::ShortGptBi, false),
-            "dpllm_proxy" => (crate::qcf_types::ImportanceFormula::DpllmProxy, false),
-            "dpllm_multi" => (crate::qcf_types::ImportanceFormula::DpllmMulti, false),
-            "dpllm_abs" => (crate::qcf_types::ImportanceFormula::DpllmAbs, false),
-            "dpllm_qcf" => (crate::qcf_types::ImportanceFormula::DpllmQcf, false),
+            "shortgpt_bi" => (crate::qcf_types::ImportanceFormula::PerTokenCosineBi, false),
+            "dpllm_proxy" => (
+                crate::qcf_types::ImportanceFormula::WeightPerturbProxy,
+                false,
+            ),
+            "dpllm_multi" => (
+                crate::qcf_types::ImportanceFormula::WeightPerturbMulti,
+                false,
+            ),
+            "dpllm_abs" => (crate::qcf_types::ImportanceFormula::WeightPerturbAbs, false),
+            "dpllm_qcf" => (crate::qcf_types::ImportanceFormula::WeightPerturbQcf, false),
             "direct_attn" => (crate::qcf_types::ImportanceFormula::DirectAttn, false),
             "compare" => (crate::qcf_types::ImportanceFormula::MeanPool, true),
             other => anyhow::bail!(

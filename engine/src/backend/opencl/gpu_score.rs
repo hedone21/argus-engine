@@ -79,7 +79,7 @@ pub struct GpuScoreAccumulator {
     /// Cumulative per-KV-head importance: `[n_kv_heads * max_seq_len]`.
     head_importance: ocl::core::Mem,
 
-    // --- Reduce policy (the GPU score POLICY — per-layer MAX + GQA averaging + A2SF decay —
+    // --- Reduce policy (the GPU score POLICY — per-layer MAX + GQA averaging + forgetting-factor decay —
     // owned by the `attn-score` plugin; the engine core holds no GPU scoring arithmetic). ---
     reducer: Box<dyn ScoreReduceBackend>,
 

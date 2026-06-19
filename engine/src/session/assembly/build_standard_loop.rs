@@ -161,7 +161,7 @@ pub fn build_standard_loop(
             Some(reg) => {
                 // standard happy path 의 활성 format 은 StandardFormat = SelectiveRead 지원이라
                 // 폴백 경고가 발생하지 않는다. (미지원 format 폴백 경고는 transformer.rs seam 의
-                // as_selective_read()==None 자동 처리 — opaque/KIVI 진입 시.)
+                // as_selective_read()==None 자동 처리 — opaque/quant-window 진입 시.)
                 let stage = (reg.make)(argus_extension_api::ReadStageParams::default());
                 eprintln!(
                     "[read-stage] '{name}' active — read_plan called per layer right before decode attention"

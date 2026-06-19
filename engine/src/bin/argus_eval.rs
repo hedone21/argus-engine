@@ -13,7 +13,7 @@
 //! - `dump qcf` — `--qcf-dump <path>` (modifier — `ll`/`ppl` 에 결합)
 //! - `experiment` — `--experiment-schedule` (정적 directive schedule, `ScheduleCommandSource` 경유)
 //!
-//! KIVI(`--kv-mode kivi`)는 ll/ppl 양쪽에서 지원 — 별 `QuantizedRecentWindowCache` 경로(§13.6).
+//! quant-window(`--kv-mode kivi`)는 ll/ppl 양쪽에서 지원 — 별 `QuantizedRecentWindowCache` 경로(§13.6).
 //!
 //! ## resilience default-off
 //!
@@ -72,7 +72,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// argus-eval 의 dispatch 모드. mode 우선순위는 legacy main 분기 순서를 보존:
-/// KIVI-eval → KIVI-ppl → dump_importance → eval_ll → ppl → experiment.
+/// quant-window-eval → quant-window-ppl → dump_importance → eval_ll → ppl → experiment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvalMode {
     /// `--eval-ll` (Standard KV).
@@ -94,7 +94,7 @@ enum EvalMode {
 /// mode 게이트 flag: `--eval-ll`(+continuation/batch) / `--ppl` /
 /// `--dump-importance` / `--experiment-schedule`. 정확히 1개 모드만 활성이어야
 /// 한다 — 0개·복수면 bail(안내). `--qcf-dump` 는 modifier 라 mode 카운트에 포함
-/// 하지 않는다. KIVI 변형은 mode 결정 후 `effective_kv_mode()` 로 분기.
+/// 하지 않는다. quant-window 변형은 mode 결정 후 `effective_kv_mode()` 로 분기.
 fn classify_eval_mode(args: &Args) -> anyhow::Result<EvalMode> {
     let eval_ll_active =
         args.eval_ll || args.eval_batch.is_some() || args.eval_continuation.is_some();
@@ -121,7 +121,7 @@ fn classify_eval_mode(args: &Args) -> anyhow::Result<EvalMode> {
         );
     }
 
-    // 우선순위 보존: experiment(γ-3b) 는 별도 bail, KIVI 변형은 kv-mode 로 분기.
+    // 우선순위 보존: experiment(γ-3b) 는 별도 bail, quant-window 변형은 kv-mode 로 분기.
     if experiment_active {
         return Ok(EvalMode::Experiment);
     }
@@ -184,11 +184,11 @@ fn dispatch_eval(mode: EvalMode, args: Args) -> anyhow::Result<()> {
 }
 
 /// bin-local 허용목록 가드. argus_bench 의 `bench_supported`(argus_bench.rs:60)
-/// 패턴 미러. eval/ppl 의 핵심 사용례(eviction/qcf/skip/swap/KIVI)는 허용하고,
+/// 패턴 미러. eval/ppl 의 핵심 사용례(eviction/qcf/skip/swap/quant-window)는 허용하고,
 /// eval 측정과 무관·충돌하는 모드만 차단한다.
 ///
 /// 허용: eviction-policy, qcf-dump, skip-ratio/skip-layers, weight swap 계열,
-/// KIVI kv-mode. 차단(→ `reject_unsupported_modes_eval` 가 안내): profile,
+/// quant-window kv-mode. 차단(→ `reject_unsupported_modes_eval` 가 안내): profile,
 /// tensor-partition, chat.
 fn eval_supported(args: &Args) -> bool {
     !args.profile
@@ -200,7 +200,7 @@ fn eval_supported(args: &Args) -> bool {
 }
 
 /// eval 표면 밖 모드를 명시 reject 하며 행선지를 안내한다 (argus_cli 가드 미러).
-/// eviction/qcf/skip/swap/KIVI 는 `eval_supported` 가 통과시키므로 reject 하지
+/// eviction/qcf/skip/swap/quant-window 는 `eval_supported` 가 통과시키므로 reject 하지
 /// 않는다.
 fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
     if args.chat {

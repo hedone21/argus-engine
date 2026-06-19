@@ -98,7 +98,7 @@ impl Drop for Timer<'_> {
 
 /// Output-error QCF for KV cache eviction/merge actions.
 pub static QCF_KV_UNIFIED: Bucket = Bucket::new("qcf_kv_unified");
-/// KIVI dynamic-quantization dry-run estimate (residual NMSE or bits proxy).
+/// quant-window dynamic-quantization dry-run estimate (residual NMSE or bits proxy).
 pub static QCF_KV_DRYRUN: Bucket = Bucket::new("qcf_kv_dryrun");
 /// Weight-swap QCF (per-ratio sweep + actual-swap measurement).
 pub static QCF_WEIGHT_SWAP: Bucket = Bucket::new("qcf_weight_swap");

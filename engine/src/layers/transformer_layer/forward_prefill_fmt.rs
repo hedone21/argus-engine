@@ -53,7 +53,7 @@ pub(crate) struct ForwardPrefillFmtArgs<'a> {
 impl TransformerLayer {
     /// `forward_prefill` 의 trait-object fork (prefill, seq_len>1). KV write + attention 만 fmt 위임.
     pub(crate) fn forward_prefill_fmt(&self, args: ForwardPrefillFmtArgs) -> Result<()> {
-        // SWIFT: 두 sub-layer 모두 skip 이면 identity (forward_gen_fmt:59 동치).
+        // layer-skip: 두 sub-layer 모두 skip 이면 identity (forward_gen_fmt:59 동치).
         if args.skip_attn && args.skip_mlp {
             return Ok(());
         }

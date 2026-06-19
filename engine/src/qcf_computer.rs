@@ -1,4 +1,4 @@
-//! QcfComputer trait — KIVI flush proxy 메트릭 계산 추상화 (L2).
+//! QcfComputer trait — quant-window flush proxy 메트릭 계산 추상화 (L2).
 //!
 //! L3-pressure (`pressure/quant_window_cache.rs`) 가 L3-qcf 도메인의 자유 함수
 //! (`compute_flush_nmse` / `_opr` / `_awqe` / `_aw_vopr`) 를 직접 호출하는
@@ -10,7 +10,7 @@
 
 use crate::qcf_types::{FlushAttentionParams, QcfConfig, QcfMetric, QuantFlushParams};
 
-/// KIVI flush proxy 계산 trait.
+/// quant-window flush proxy 계산 trait.
 ///
 /// 4 메서드는 quant_qcf.rs 의 자유 함수 4개와 동등 signature.
 /// QuantizedRecentWindowCache 가 flush event 시 trait method 를 호출하여 QcfMetric 생성.

@@ -7,7 +7,7 @@
 //! `build_standard_loop`).
 //!
 //! 미구현이라 명시적으로 reject 하는 모드(각각 argus-chat·argus-bench·argus-eval 로 안내):
-//! chat, experiment, ppl, eval, dump, prompt-batch, weight swap, KIVI, offload,
+//! chat, experiment, ppl, eval, dump, prompt-batch, weight swap, quant-window, offload,
 //! KV-offload(`--swap-dir`), profile, tensor-partition, score-based eviction(h2o·d2o —
 //! attention-score accumulator 필요).
 //!
@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
 
     // 미지원 모드 reject. score-free eviction(none/sliding/streaming/`--load-plugin` stage)은
     // 통과하고 standard happy path 의 공용 디코드 경로가 처리한다. 미지원(qcf/skip/d2o-layer-alloc/
-    // profile/partition/swap/KIVI/offload/score-based eviction)은 reject 유지.
+    // profile/partition/swap/quant-window/offload/score-based eviction)은 reject 유지.
     reject_unsupported_modes_v0(&args)?;
 
     if args.num_tokens < 1 {
@@ -83,7 +83,9 @@ fn reject_unsupported_modes_v0(args: &Args) -> anyhow::Result<()> {
         bail!("argus-cli v0: --qcf-dump moved to argus-eval (--qcf-dump with --eval-ll or --ppl)");
     }
     if args.effective_kv_mode() != "standard" {
-        bail!("argus-cli v0: only --kv-mode standard supported (KIVI/Offload planned for v1)");
+        bail!(
+            "argus-cli v0: only --kv-mode standard supported (quant-window/Offload planned for v1)"
+        );
     }
     if args.secondary_gguf.is_some()
         || args.force_swap_ratio.is_some()

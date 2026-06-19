@@ -1,4 +1,3 @@
-pub mod a2sf_dump;
 pub mod assembly;
 pub mod bin_setup;
 pub mod chat;
@@ -26,6 +25,7 @@ pub mod qcf_runtime;
 pub mod resilience_adapter;
 pub mod resilience_init;
 pub mod samplers;
+pub mod score_decay_dump;
 pub mod standard_happy;
 pub mod swap_runtime;
 

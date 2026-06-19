@@ -3,7 +3,7 @@
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §3.3.
 //!
 //! 추론 경로는 backend 를 `Arc<dyn Backend>` 추상 핸들 하나로 들고 다니지만(호출지는 backend
-//! 종류를 모름), 일부 능력(GPU score accumulator·KIVI fused attention)은 특정 backend 에만
+//! 종류를 모름), 일부 능력(GPU score accumulator·quant-window fused attention)은 특정 backend 에만
 //! 있다. `CapabilityRegistry` 는 그 (backend → capability handle) 매핑을 한 곳(typed anymap)이
 //! 담당해, 소비자가 handle 을 construction 시점에 보유하게 한다 → per-forward `as_xxx()` lookup
 //! 폐기, hot path 분기 0 (§1.3 Capability over god-trait). registry lookup 은 construction(cold)

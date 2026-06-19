@@ -4,7 +4,7 @@
 //! 명세: `spec/30-engine.md` §3.7 (ENG-080). 불변식: `spec/41-invariants.md` §3.29 (INV-189~191).
 //!
 //! `KVCacheFormat` base trait(6-method)을 변경하지 않는다(ISP — snapshot-aware format만 비용
-//! 지불). `StandardFormat`(F32/F16/Q4_0)이 구현하며, capability 미구현 format(KIVI/opaque)은
+//! 지불). `StandardFormat`(F32/F16/Q4_0)이 구현하며, capability 미구현 format(quant-window/opaque)은
 //! no-cache 폴백(정확성 안전, 단지 가속 없음).
 //!
 //! **as_any() 추가 금지**: downcast 경로 대신 상위 API(`save_prefix`/`try_restore_prefix`)가

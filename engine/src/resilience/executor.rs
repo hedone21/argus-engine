@@ -304,7 +304,7 @@ impl CommandExecutor {
             actions.push("kv.evict_streaming".to_string());
             actions.push("kv.merge_d2o".to_string());
         }
-        // KV quantization: only available with KIVI cache (q2/q4/q8)
+        // KV quantization: only available with quant-window cache (q2/q4/q8)
         if kv_dtype.starts_with('q') {
             actions.push("kv.quant_dynamic".to_string());
         }

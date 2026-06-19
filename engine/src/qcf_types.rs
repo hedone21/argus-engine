@@ -14,28 +14,28 @@
 ///
 /// Five forms are supported; `compare` mode in `--importance-formula`
 /// activates the cosine-based variants side-by-side via
-/// `ImportanceCollector::new_with_formula(..., true)`.  The three DP-LLM
+/// `ImportanceCollector::new_with_formula(..., true)`.  The three weight-perturbation
 /// variants (single-tensor relative, multi-tensor relative, single-tensor
 /// absolute) are computed once after warmup in `noise_table.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportanceFormula {
     /// `1 − cos(mean_pool(h_in), mean_pool(h_out))` — current ARGUS baseline.
     MeanPool,
-    /// `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` — ShortGPT BI (Men et al., 2024).
-    ShortGptBi,
-    /// DP-LLM proxy (single tensor, relative L2 error on `attn_output.weight`).
-    DpllmProxy,
-    /// DP-LLM proxy (multi-tensor, summed relative L2 error across attn + MLP
+    /// `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` — per-token-cosine block influence (BI).
+    PerTokenCosineBi,
+    /// weight-perturbation proxy (single tensor, relative L2 error on `attn_output.weight`).
+    WeightPerturbProxy,
+    /// weight-perturbation proxy (multi-tensor, summed relative L2 error across attn + MLP
     /// weight tensors).
-    DpllmMulti,
-    /// DP-LLM proxy (single tensor, absolute L2 error — drops the `‖W·x‖`
+    WeightPerturbMulti,
+    /// weight-perturbation proxy (single tensor, absolute L2 error — drops the `‖W·x‖`
     /// normalisation that the single-tensor variant uses).
-    DpllmAbs,
+    WeightPerturbAbs,
     /// QCF-inspired multiplicative composition of attention block
     /// perturbations:  `ε_v_rel × ε_o_rel`  where  `ε_t_rel = ‖(W_p − W_q)·x‖
-    /// / ‖W_p·x‖`  for `t ∈ {W_v, W_o}`.  Decomposes the runtime QCF/caote
+    /// / ‖W_p·x‖`  for `t ∈ {W_v, W_o}`.  Decomposes the runtime QCF/value-aware
     /// attention output perturbation `‖ΔO‖/‖O‖` into two weight-space factors.
-    DpllmQcf,
+    WeightPerturbQcf,
     /// §4.2 cascade attention perturbation (F4 + F5 dual output).
     ///
     /// - **F4** (cascade-aware single):
@@ -57,11 +57,11 @@ impl ImportanceFormula {
     pub fn as_str(self) -> &'static str {
         match self {
             ImportanceFormula::MeanPool => "mean_pool",
-            ImportanceFormula::ShortGptBi => "shortgpt_bi",
-            ImportanceFormula::DpllmProxy => "dpllm_proxy",
-            ImportanceFormula::DpllmMulti => "dpllm_multi",
-            ImportanceFormula::DpllmAbs => "dpllm_abs",
-            ImportanceFormula::DpllmQcf => "dpllm_qcf",
+            ImportanceFormula::PerTokenCosineBi => "shortgpt_bi",
+            ImportanceFormula::WeightPerturbProxy => "dpllm_proxy",
+            ImportanceFormula::WeightPerturbMulti => "dpllm_multi",
+            ImportanceFormula::WeightPerturbAbs => "dpllm_abs",
+            ImportanceFormula::WeightPerturbQcf => "dpllm_qcf",
             ImportanceFormula::DirectAttn => "direct_attn",
         }
     }
@@ -99,7 +99,7 @@ pub struct ImportanceEntry {
     /// `1 − cos(mean_pool(h_in), mean_pool(h_out))`. None unless `three_way` enabled.
     pub importance_mean_pool: Option<f32>,
     /// Side-by-side measurement in 3-way comparison mode.
-    /// `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` (ShortGPT BI). None unless `three_way` enabled.
+    /// `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` (per-token-cosine BI). None unless `three_way` enabled.
     pub importance_shortgpt_bi: Option<f32>,
 }
 
@@ -108,7 +108,7 @@ pub struct ImportanceEntry {
 /// A QCF metric collected from a single lossy action execution.
 #[derive(Debug, Clone)]
 pub struct QcfMetric {
-    /// Action that produced this metric (e.g., "h2o", "snapkv", "kivi", "swift").
+    /// Action that produced this metric (e.g., "h2o", "snapkv", "kivi", "layer_skip").
     pub action: String,
     /// Aggregated QCF value in [0, 1] range (higher = more degradation).
     pub raw_value: f32,
@@ -184,7 +184,7 @@ pub enum AggregationMode {
 /// Aggregate per-head QCF values into a single scalar.
 ///
 /// - `Mean`: arithmetic mean.
-/// - `Defensive`: softmax-weighted mean (DefensiveKV, 2025) emphasizing worst-case heads.
+/// - `Defensive`: softmax-weighted mean emphasizing worst-case heads.
 /// - `Max`: maximum value (strict worst-case head).
 /// - `TopK { k }`: mean of the top-k largest values.
 pub fn aggregate_heads(per_head: &[f32], mode: &AggregationMode) -> f32 {

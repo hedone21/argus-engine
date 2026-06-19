@@ -27,12 +27,12 @@ use crate::tensor::Tensor;
 pub struct QcfWarmupResult {
     pub importance: crate::qcf::ImportanceTable,
     pub decision: Option<crate::weight::SwapDecision>,
-    /// Per-layer DP-LLM proxy ε (single-tensor relative `attn_output`).
+    /// Per-layer weight-perturbation proxy ε (single-tensor relative `attn_output`).
     /// `Some` only in compare mode.
     pub dpllm_epsilon: Option<Vec<f32>>,
-    /// §4 candidate A: per-layer DP-LLM ε summed across 6 attn+MLP tensors.
+    /// §4 candidate A: per-layer weight-perturbation ε summed across 6 attn+MLP tensors.
     pub dpllm_epsilon_multi: Option<Vec<f32>>,
-    /// §4 candidate D: per-layer DP-LLM ε without the `‖W·x‖` normalisation
+    /// §4 candidate D: per-layer weight-perturbation ε without the `‖W·x‖` normalisation
     /// (absolute L2 of the activation difference).
     pub dpllm_epsilon_abs: Option<Vec<f32>>,
     /// §4 candidate E: QCF-style multiplicative composition `ε_v × ε_o`.
@@ -424,7 +424,7 @@ pub fn run_qcf_warmup_workflow(
         None
     };
 
-    // ── Build ImportanceTable (+ optional DP-LLM ε variants) + reset KV cache ────
+    // ── Build ImportanceTable (+ optional weight-perturbation ε variants) + reset KV cache ────
     let direct_attn_primary = matches!(
         importance_formula,
         crate::qcf_types::ImportanceFormula::DirectAttn
@@ -849,11 +849,11 @@ pub fn dispatch_swap_weights(
 pub struct QcfEstimateContext<'a> {
     /// Standard format KV handles (one per layer). Empty → no KV-based estimates.
     pub kv_handles: &'a [Arc<StandardFormat>],
-    /// KIVI handles for `kv.quant_dynamic` estimate. Empty → quant estimate skipped.
+    /// quant-window handles for `kv.quant_dynamic` estimate. Empty → quant estimate skipped.
     pub quant_window_handles: &'a [Arc<QuantWindowFormat>],
-    /// Attention score lookup for H2O / D2O / streaming actions. `None` → uniform fallback.
+    /// Attention score lookup for score-based / merge / streaming actions. `None` → uniform fallback.
     pub importance: Option<&'a dyn ImportanceLookup>,
-    /// (sink_size, window_size) for StreamingLLM dry-run. None = skip.
+    /// (sink_size, window_size) for the sink+window eviction dry-run. None = skip.
     pub streaming_config: Option<(usize, usize)>,
     /// Pre-built importance table for LayerSkip dry-run. None = skip.
     pub importance_table: Option<&'a crate::qcf::ImportanceTable>,
@@ -868,7 +868,7 @@ pub struct QcfEstimateContext<'a> {
 }
 
 /// Compute dry-run QCF estimates for all 6 lossy actions (ENG-ALG-050).
-/// Read-only: does not modify KV caches or KIVI caches.
+/// Read-only: does not modify KV caches or quant-window caches.
 ///
 /// v1 anchor: `generate.rs`(`d5ed71d2^`) L3696-3850 `compute_qcf_estimates`. Byte-level
 /// lift-and-shift: only adaptation = `&[KVCache]` → `&[Arc<StandardFormat>]` handle access
@@ -1014,7 +1014,7 @@ pub fn compute_qcf_estimates(
         }
     }
 
-    // ── 5. KIVI dynamic quantization QCF ──
+    // ── 5. quant-window dynamic quantization QCF ──
     if !ctx.quant_window_handles.is_empty() {
         let mut total_qcf = 0.0f32;
         let mut count = 0u32;

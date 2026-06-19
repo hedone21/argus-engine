@@ -1,9 +1,9 @@
-//! QuantWindowFlushHook: StepHook implementation for KIVI quantization flush metric collection.
+//! QuantWindowFlushHook: StepHook implementation for quant-window flush metric collection.
 //!
-//! Encapsulates the KIVI flush proxy collection logic previously embedded in
+//! Encapsulates the quant-window flush proxy collection logic previously embedded in
 //! `run_quant_window_eval_ll` (generate.rs).
 //!
-//! KIVI does not perform eviction — instead, when the FP32 residual buffer fills,
+//! The quant-window cache does not perform eviction — instead, when the FP32 residual buffer fills,
 //! it batch-quantizes those tokens to Q2 and records the NMSE/OPR degradation as
 //! a `QcfMetric`. QuantWindowFlushHook collects those metrics from `take_flush_proxies()` after
 //! each prefill and decode step.
@@ -25,7 +25,7 @@ impl CacheSnapshot<QuantizedRecentWindowCache> for QuantWindowCacheSnapshot {
     }
 }
 
-/// StepHook for KIVI quantization flush metric collection.
+/// StepHook for quant-window quantization flush metric collection.
 ///
 /// After each prefill and decode step, drains `take_flush_proxies()` from
 /// the sample layers (default: layer 0 only, matching legacy behaviour).

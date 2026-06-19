@@ -254,10 +254,10 @@ mod tests {
         assert!(parse_qcf_sample_layers(",", 4).is_err());
     }
 
-    // ── A2SF (arXiv 2407.20485) score decay 주입 — CLI 배선 게이트 (KV roadmap 항목 0 §4.2) ──
+    // ── score decay(forgetting-factor) 주입 — CLI 배선 게이트 (KV roadmap 항목 0 §4.2) ──
 
     /// `--score-decay` 미지정(기본 0.0) → `h2o_decay()` 가 정책 자체 값을 그대로 반환.
-    /// flag 도입 전 경로 bit-identical: eviction 미지정 시 0.0, H2O `--decay 0.3` 시 0.3.
+    /// flag 도입 전 경로 bit-identical: eviction 미지정 시 0.0, heavy-hitter `--decay 0.3` 시 0.3.
     #[test]
     fn score_decay_default_preserves_policy_decay() {
         // eviction 미지정 → h2o_decay() = 0.0 (기존 동작).
@@ -287,7 +287,7 @@ mod tests {
     }
 
     /// `--score-decay 0.8` (> 0.0) → 정책 무관하게 0.8 을 우선 주입.
-    /// 정책 자체 decay(H2O --decay 0.3)보다 측정 flag 가 우선.
+    /// 정책 자체 decay(heavy-hitter --decay 0.3)보다 측정 flag 가 우선.
     #[test]
     fn score_decay_overrides_when_positive() {
         // eviction 미지정이어도 --score-decay 가 주입된다.
@@ -553,7 +553,7 @@ pub struct Args {
     #[arg(long, default_value = "ops,latency,scores")]
     pub profile_probes: String,
 
-    /// Enable per-KV-head score tracking (for H2O+ analysis).
+    /// Enable per-KV-head score tracking (for heavy-hitter+ analysis).
     #[arg(long, default_value_t = false)]
     pub profile_per_head: bool,
 
@@ -667,7 +667,7 @@ pub struct Args {
     #[arg(long = "load-plugin")]
     pub load_plugin: Vec<std::path::PathBuf>,
 
-    /// Select a backend-capability implementation by registry name — e.g. a KIVI fused
+    /// Select a backend-capability implementation by registry name — e.g. a quant-window fused
     /// dequant+attention backend — static (linkme `QUANT_ATTN_REGS`) or `--load-plugin`
     /// dlopen'd. The backend-capability axis's analogue of `--kv-format`. OpenCL-only;
     /// unset = the engine's built-in OpenCL implementation.
@@ -873,7 +873,7 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub dump_importance: bool,
 
-    /// A2SF 게이트 지표 덤프 경로(측정 전용, KV roadmap 항목 0 §4.2).
+    /// forgetting-factor 게이트 지표 덤프 경로(측정 전용, KV roadmap 항목 0 §4.2).
     /// 지정 시 PPL run 의 eviction 직전 스냅샷 + run 종료 시점에 score accumulator importance 에서
     /// BOS/non-BOS ratio + HH(top-k) 집합을 JSON 으로 이 경로에 쓴다. score accumulator 무수정(읽기
     /// 전용). 미지정 시 호출되지 않음(production 무영향). `--score-decay` 와 함께 사용해 forgetting
@@ -882,7 +882,7 @@ pub struct Args {
     pub dump_a2sf: Option<std::path::PathBuf>,
 
     /// Start an interactive multi-turn chat REPL (Llama 3.2 Instruct / Qwen2).
-    /// Uses standard (non-KIVI, non-offload) forward path.
+    /// Uses standard (non-quant-window, non-offload) forward path.
     #[arg(long, default_value_t = false)]
     pub chat: bool,
 
@@ -1044,8 +1044,8 @@ pub struct Args {
     ///
     /// - `mean_pool` (default): `1 − cos(mean_pool(h_in), mean_pool(h_out))`,
     ///   current ARGUS baseline (token-wise mean-pool then cosine).
-    /// - `shortgpt_bi`: `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` — ShortGPT BI
-    ///   (Men et al., 2024), token-wise cosine then mean.
+    /// - `shortgpt_bi`: `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` — per-token-cosine
+    ///   block influence (BI), token-wise cosine then mean.
     /// - `dpllm_proxy`: input-aware perturbation via
     ///   `‖(W_F16 − W_Q4) · x_mean‖ / ‖W_F16 · x_mean‖` on attn_output.weight.
     /// - `compare`: collect all three side-by-side. ImportanceTable still
@@ -1084,7 +1084,7 @@ pub struct Args {
 
     /// Enable QCF v3 schema metric dump for EuroSys'27 §3.
     /// Adds qcf_layer_worst_head/qcf_layer_mean_head/qcf_record_*/qcf_d7_*/
-    /// qcf_c1_* (schema_version=3) to eval-ll output for both Eviction and KIVI.
+    /// qcf_c1_* (schema_version=3) to eval-ll output for both Eviction and quant-window.
     #[arg(long, default_value_t = false)]
     pub enable_qcf_experimental: bool,
 
@@ -1344,7 +1344,7 @@ pub struct Args {
     ///
     /// Snapshot is taken immediately after prefill and before any eviction
     /// (INV-189). Supported formats: F32/F16/Q4_0 (StandardFormat).
-    /// KIVI/opaque caches are silently skipped (no error, no-cache fallback).
+    /// quant-window/opaque caches are silently skipped (no error, no-cache fallback).
     ///
     /// Uses atomic write (`<path>.tmp` → rename) to prevent corruption.
     /// Failure (permissions, disk full) is reported as a warning; the run
@@ -1446,12 +1446,12 @@ impl Args {
         self.kv_mode_args.read_stage.as_deref()
     }
 
-    /// KIVI quantization bits.
+    /// quant-window quantization bits.
     pub fn effective_quant_window_bits(&self) -> u8 {
         self.kv_mode_args.quant_window_bits
     }
 
-    /// KIVI residual buffer size.
+    /// quant-window residual buffer size.
     pub fn effective_quant_window_residual_size(&self) -> usize {
         self.kv_mode_args.quant_window_residual_len
     }
@@ -1545,11 +1545,11 @@ impl Args {
             .unwrap_or(0)
     }
 
-    /// Score accumulator decay factor (= A2SF α 의 1 − α). accumulator 생성자(`new`/`new_gqa`)의
+    /// Score accumulator decay factor (= forgetting-factor α 의 1 − α). accumulator 생성자(`new`/`new_gqa`)의
     /// 5번째 인자로 흐른다.
     ///
-    /// A2SF 측정(arch/kv_roadmap_item0_measurement.md §4.2): `--score-decay` 측정 flag 가 > 0.0 이면
-    /// 정책 무관하게 그 값을 우선한다(forgetting factor 주입). 0.0(기본) 이면 정책 자체 decay(H2O
+    /// score-decay 측정(arch/kv_roadmap_item0_measurement.md §4.2): `--score-decay` 측정 flag 가 > 0.0 이면
+    /// 정책 무관하게 그 값을 우선한다(forgetting factor 주입). 0.0(기본) 이면 정책 자체 decay(heavy-hitter
     /// `--decay`)를 그대로 반환 → flag 도입 전 경로 **bit-identical**(누적 로직 무수정, 주입만 추가).
     pub fn h2o_decay(&self) -> f32 {
         let score_decay = self.eviction_common.score_decay;
@@ -1565,7 +1565,7 @@ impl Args {
         matches!(self.plugin_set("raw_scores"), Some("true") | Some("1"))
     }
 
-    /// H2O verbose debug output — moved to env var `LLMRS_H2O_DEBUG`
+    /// heavy-hitter verbose debug output — moved to env var `LLMRS_H2O_DEBUG`
     /// (no longer a CLI flag).
     pub fn h2o_debug(&self) -> bool {
         std::env::var("LLMRS_H2O_DEBUG").is_ok()
