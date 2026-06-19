@@ -132,8 +132,10 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         }
     );
 
+    // "caote" folds to Attn: the CAOTE QcfMode variant was name-only residue and `mode` is
+    // dead-stored in QcfConfig (never branched on). --qcf-mode caote still flips needs_caote in
+    // eval_setup to build the accumulator (B1-2).
     let qcf_mode_enum = match args.qcf_mode.as_str() {
-        "caote" => crate::qcf_types::QcfMode::Caote,
         "both" => crate::qcf_types::QcfMode::Both,
         _ => crate::qcf_types::QcfMode::Attn,
     };

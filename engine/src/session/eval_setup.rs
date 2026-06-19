@@ -240,12 +240,10 @@ fn build_eval_score_accumulator(
     model: &TransformerModel,
     max_seq_len: usize,
 ) -> Option<AttentionScoreAccumulator> {
-    let qcf_mode = match args.qcf_mode.as_str() {
-        "caote" => crate::qcf::QcfMode::Caote,
-        "both" => crate::qcf::QcfMode::Both,
-        _ => crate::qcf::QcfMode::Attn,
-    };
-    let needs_caote = qcf_mode.has_caote();
+    // `--qcf-mode caote|both` forces the score accumulator + GQA even with no eviction policy.
+    // The CAOTE QcfMode variant was name-only residue (no distinct arithmetic), so gate on the CLI
+    // string directly (B1-2).
+    let needs_caote = matches!(args.qcf_mode.as_str(), "caote" | "both");
     let needs_score_based = stage_is_score_based(args.eviction_policy());
     let has_eviction_policy = args.eviction_policy() != "none";
     let needs_accumulator =
