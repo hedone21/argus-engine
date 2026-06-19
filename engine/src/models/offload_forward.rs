@@ -245,10 +245,11 @@ impl TransformerModel {
                 // read_select=None → full read 폴백(D4 byte-identical).
                 // plan.select 는 layer i+1 의 prefetch 우선 힌트로 PrefetchController 에 저장한다(D3).
                 // read_stage=None(기본) 이면 and_then 이 단락 → plan=None → hint 미발화(INV-147).
+                // offload path does not collect QueryStats (no QueryStatsAccumulator threaded) → None.
                 let read_plan = read_stage.and_then(|rs| {
                     dyn_fmts[i]
                         .as_selective_read()
-                        .and_then(|sr| sr.read_plan(rs, i))
+                        .and_then(|sr| sr.read_plan(rs, i, None))
                 });
                 let read_select = read_plan.as_ref().and_then(|plan| {
                     Self::validate_read_plan(plan, dyn_fmts[i].current_pos())

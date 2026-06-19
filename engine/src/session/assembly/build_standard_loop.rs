@@ -166,7 +166,7 @@ pub fn build_standard_loop(
                 eprintln!(
                     "[read-stage] '{name}' active — read_plan called per layer right before decode attention"
                 );
-                mf.set_read_stage(stage);
+                mf.set_read_stage(stage, reg.wants_query_stats);
             }
             None => {
                 let names = argus_extension_api::registered_read_names();

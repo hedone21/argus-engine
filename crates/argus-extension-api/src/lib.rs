@@ -2079,6 +2079,12 @@ pub struct KVReadStageReg {
     pub name: &'static str,
     /// Factory that builds a technique instance from the parameters.
     pub make: fn(ReadStageParams) -> Box<dyn KVReadStage>,
+    /// Whether this stage's `read_plan` consumes [`TensorKind::QueryStats`] (per-(layer,kv_head)
+    /// running Q mean/var). When `true`, the engine builds + activates a `QueryStatsAccumulator`
+    /// and threads its per-layer stats into the read ctx; when `false` it skips that per-decode-step
+    /// cost entirely. The engine reads this off the registration **before** instantiating the stage,
+    /// so it never needs to name-match `"quest"`. The read-axis analogue of `StageCaps.reads`.
+    pub wants_query_stats: bool,
 }
 
 /// Global read-stage registration slice — the **4th parallel linkme registry** on the stage axis.

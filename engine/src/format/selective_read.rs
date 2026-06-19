@@ -52,6 +52,16 @@ pub trait SelectiveRead {
     /// lock)와 충돌하지 않으며(plan 산출 후 owned `KVReadPlan` 반환 → borrow 종료), (3) `SelectiveRead`
     /// 미구현 format 은 `KVCacheFormat::as_selective_read()==None` 이라 엔진이 자동 full read 폴백한다(D4).
     ///
-    /// `None` = full read(read stage 가 `None` 반환). 반환 plan 은 *근사 힌트*(정확성 계약 아님, D3).
-    fn read_plan(&self, rs: &dyn KVReadStage, layer_idx: usize) -> Option<KVReadPlan>;
+    /// `query_stats`: 이 layer 의 per-(kv_head) running Q mean/var (`[n_kv_heads*2*head_dim]`,
+    /// `QueryStatsAccumulator::layer_stats`). `Some` 이면 read ctx 의 `tensor(QueryStats)` 로 노출되어
+    /// quest 의 Expected-Attention page score 를 활성화한다. `None`(QueryStats 미수집)이면 quest 는
+    /// 대칭 min/max proxy 로 폴백.
+    ///
+    /// `None` 반환 = full read(read stage 가 `None` 반환). 반환 plan 은 *근사 힌트*(정확성 계약 아님, D3).
+    fn read_plan(
+        &self,
+        rs: &dyn KVReadStage,
+        layer_idx: usize,
+        query_stats: Option<&[f32]>,
+    ) -> Option<KVReadPlan>;
 }
