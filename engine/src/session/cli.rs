@@ -3,9 +3,7 @@ use clap::Parser;
 pub mod eviction;
 pub mod kv_mode;
 
-pub use eviction::{
-    D2oArgs, EvictionCmd, EvictionCommonArgs, H2oArgs, SlidingArgs, StreamingArgs, TopLevelCmd,
-};
+pub use eviction::{EvictionCmd, EvictionCommonArgs, PluginArgs, TopLevelCmd};
 pub use kv_mode::KvModeArgs;
 
 /// `--secondary-dtype` CLI 인수 값 (D-3, ENG-ALG-225).
@@ -271,11 +269,20 @@ mod tests {
             "미주입 + 정책 없음 → 0.0 (bit-identical)"
         );
 
-        // H2O --decay 0.3, --score-decay 미지정 → 정책 값 0.3 유지.
-        let b = Args::try_parse_from(["test", "eviction", "h2o", "--decay", "0.3"]).unwrap();
+        // h2o --set decay=0.3, --score-decay 미지정 → 정책 값 0.3 유지.
+        let b = Args::try_parse_from([
+            "test",
+            "eviction",
+            "plugin",
+            "--name",
+            "h2o",
+            "--set",
+            "decay=0.3",
+        ])
+        .unwrap();
         assert!(
             (b.h2o_decay() - 0.3).abs() < 1e-6,
-            "score-decay 미주입 → H2O --decay 0.3 그대로"
+            "score-decay 미주입 → --set decay=0.3 그대로"
         );
     }
 
@@ -287,21 +294,114 @@ mod tests {
         let a = Args::try_parse_from(["test", "--score-decay", "0.8"]).unwrap();
         assert!((a.h2o_decay() - 0.8).abs() < 1e-6, "정책 무관 0.8 주입");
 
-        // H2O --decay 0.3 위에 --score-decay 0.9 → measurement flag 우선(0.9).
+        // --set decay=0.3 위에 --score-decay 0.9 → measurement flag 우선(0.9).
         let b = Args::try_parse_from([
             "test",
             "--score-decay",
             "0.9",
             "eviction",
+            "plugin",
+            "--name",
             "h2o",
-            "--decay",
-            "0.3",
+            "--set",
+            "decay=0.3",
         ])
         .unwrap();
         assert!(
             (b.h2o_decay() - 0.9).abs() < 1e-6,
-            "score-decay 0.9 가 H2O --decay 0.3 보다 우선"
+            "score-decay 0.9 가 --set decay=0.3 보다 우선"
         );
+    }
+
+    /// B1-3 feature-equivalence: `eviction plugin --name h2o --set k=v` reconstructs the same
+    /// downstream config the former typed `eviction h2o --keep-ratio ...` produced.
+    #[test]
+    fn plugin_set_form_matches_old_typed_h2o() {
+        let a = Args::try_parse_from([
+            "test",
+            "eviction",
+            "plugin",
+            "--name",
+            "h2o",
+            "--set",
+            "keep_ratio=0.3",
+            "--set",
+            "tracked_layers=8",
+            "--set",
+            "decay=0.1",
+            "--set",
+            "raw_scores=true",
+        ])
+        .unwrap();
+        assert_eq!(a.eviction_policy(), "h2o");
+        assert!((a.keep_ratio() - 0.3).abs() < 1e-6);
+        assert_eq!(a.h2o_tracked_layers(), 8);
+        assert!((a.h2o_decay() - 0.1).abs() < 1e-6);
+        assert!(a.h2o_raw_scores());
+        // POD knobs default cleanly for h2o (no sliding/streaming keys in the blob).
+        assert_eq!(a.eviction_window(), 1024);
+        assert_eq!(a.sink_size(), 4);
+    }
+
+    /// B1-3: sliding/streaming POD knobs are read from `--set`, not a typed variant.
+    #[test]
+    fn plugin_set_form_sliding_streaming_pod_knobs() {
+        let s = Args::try_parse_from([
+            "test",
+            "eviction",
+            "plugin",
+            "--name",
+            "sliding",
+            "--set",
+            "window=2048",
+        ])
+        .unwrap();
+        assert_eq!(s.eviction_policy(), "sliding");
+        assert_eq!(s.eviction_window(), 2048);
+
+        let st = Args::try_parse_from([
+            "test",
+            "eviction",
+            "plugin",
+            "--name",
+            "streaming",
+            "--set",
+            "sink=8",
+            "--set",
+            "recent_window=64",
+        ])
+        .unwrap();
+        assert_eq!(st.eviction_policy(), "streaming");
+        assert_eq!(st.sink_size(), 8);
+        assert_eq!(st.streaming_window(), 64);
+    }
+
+    /// B1-3: d2o's technique-private knobs round-trip through `stage_args()` (the opaque blob).
+    #[test]
+    fn plugin_set_form_d2o_blob_roundtrips() {
+        let a = Args::try_parse_from([
+            "test",
+            "eviction",
+            "plugin",
+            "--name",
+            "d2o",
+            "--set",
+            "keep_ratio=0.75",
+            "--set",
+            "ema_beta=0.6",
+            "--set",
+            "merge_axis=value_only",
+            "--set",
+            "protected_layers=0,1,2",
+        ])
+        .unwrap();
+        assert_eq!(a.eviction_policy(), "d2o");
+        // d2o must pass keep_ratio explicitly now (the typed 0.75 default is gone — B1-3).
+        assert!((a.keep_ratio() - 0.75).abs() < 1e-6);
+        let blob = a.stage_args();
+        assert!(blob.contains(&("merge_axis".to_string(), "value_only".to_string())));
+        assert!(blob.contains(&("protected_layers".to_string(), "0,1,2".to_string())));
+        assert!(blob.contains(&("ema_beta".to_string(), "0.6".to_string())));
     }
 }
 
@@ -1397,43 +1497,52 @@ impl Args {
             .unwrap_or("none")
     }
 
-    pub fn eviction_window(&self) -> usize {
+    /// Look up a `--set key=value` from the active `Plugin` policy's blob. `None` for
+    /// `EvictionCmd::None` or a missing key. The engine-owned POD keys (window/sink/recent_window/
+    /// keep_ratio) + the h2o accumulator keys (tracked_layers/decay/raw_scores) are parsed off this
+    /// by the accessors below; technique-private keys stay opaque and flow through [`stage_args`].
+    fn plugin_set(&self, key: &str) -> Option<&str> {
         match self.current_policy() {
-            Some(EvictionCmd::Sliding(s)) => s.window,
-            _ => 1024,
+            Some(EvictionCmd::Plugin(p)) => p
+                .sets
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str()),
+            _ => None,
         }
+    }
+
+    pub fn eviction_window(&self) -> usize {
+        self.plugin_set("window")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024)
     }
 
     pub fn sink_size(&self) -> usize {
-        match self.current_policy() {
-            Some(EvictionCmd::Streaming(s)) => s.sink,
-            _ => 4,
-        }
+        self.plugin_set("sink")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
     }
 
     pub fn streaming_window(&self) -> usize {
-        match self.current_policy() {
-            Some(EvictionCmd::Streaming(s)) => s.recent_window,
-            _ => 0,
-        }
+        self.plugin_set("recent_window")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     }
 
-    /// The active eviction variant's keep-ratio (heavy-hitter fraction). The single accessor that
-    /// replaces the per-binary keep-ratio branches that switched on the policy name — h2o, h2o_plus,
-    /// and d2o each report their own `--keep-ratio`; other variants default to 0.5.
+    /// The active stage's keep-ratio (heavy-hitter fraction), read from `--set keep_ratio=`;
+    /// defaults to 0.5. NOTE (B1-3): the former typed `eviction d2o` defaulted this to 0.75
+    /// (paper 3:1) — under the generic CLI, d2o users must pass `--set keep_ratio=0.75` explicitly.
     pub fn keep_ratio(&self) -> f32 {
-        match self.current_policy() {
-            Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.keep_ratio,
-            Some(EvictionCmd::D2o(d)) => d.keep_ratio,
-            _ => 0.5,
-        }
+        self.plugin_set("keep_ratio")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.5)
     }
 
     pub fn h2o_tracked_layers(&self) -> usize {
-        match self.current_policy() {
-            Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.tracked_layers,
-            _ => 0,
-        }
+        self.plugin_set("tracked_layers")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     }
 
     /// Score accumulator decay factor (= A2SF α 의 1 − α). accumulator 생성자(`new`/`new_gqa`)의
@@ -1447,17 +1556,13 @@ impl Args {
         if score_decay > 0.0 {
             return score_decay.clamp(0.0, 1.0);
         }
-        match self.current_policy() {
-            Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.decay,
-            _ => 0.0,
-        }
+        self.plugin_set("decay")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
     }
 
     pub fn h2o_raw_scores(&self) -> bool {
-        match self.current_policy() {
-            Some(EvictionCmd::H2o(h)) | Some(EvictionCmd::H2oPlus(h)) => h.raw_scores,
-            _ => false,
-        }
+        matches!(self.plugin_set("raw_scores"), Some("true") | Some("1"))
     }
 
     /// H2O verbose debug output — moved to env var `LLMRS_H2O_DEBUG`
@@ -1466,43 +1571,16 @@ impl Args {
         std::env::var("LLMRS_H2O_DEBUG").is_ok()
     }
 
-    /// The active eviction variant's technique-private parameters as an opaque `(key, val)` blob for
-    /// `make_stage_with_args(name, …)`. The single accessor that replaces the per-binary blob
-    /// branches that switched on the policy name — the engine routes this blob without knowing any
-    /// plugin's private knobs (each plugin parses its own keys in `from_args`, ignoring the rest):
-    ///
-    /// - typed `eviction d2o` sugar → d2o's keys (`target_ratio`/`ema_beta`/`merge_e`/`layer_alloc`/
-    ///   `protected_layers`/`merge_axis`), mirroring `d2o::D2OConfig::from_args`.
-    /// - typed `eviction rkv` sugar → `lambda`.
-    /// - generic `eviction plugin --name X --set k=v` → the raw `--set` pairs (any out-of-tree stage).
-    /// - everything else (sliding/streaming/h2o/none) → empty.
+    /// The active stage's technique-private parameters as an opaque `(key, val)` blob for
+    /// `make_stage_with_args(name, …)` — the raw `--set key=value` pairs of `eviction plugin
+    /// --name X --set k=v`. The engine routes them without knowing any plugin's private knobs (each
+    /// plugin parses its own keys in `from_args`, ignoring the rest), e.g. d2o reads
+    /// `ema_beta`/`merge_e`/`layer_alloc`/`protected_layers`/`merge_axis`, rkv reads `lambda`.
+    /// `EvictionCmd::None` → empty. (B1-3: the former per-technique typed mirrors are gone — d2o's
+    /// `target_ratio` is no longer auto-injected from `--eviction-target-ratio`; d2o budget now
+    /// follows `--set keep_ratio=` / its own defaults.)
     pub fn stage_args(&self) -> Vec<(String, String)> {
         match self.current_policy() {
-            Some(EvictionCmd::D2o(d)) => {
-                let protected_layers = d
-                    .protected_layers
-                    .clone()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                vec![
-                    (
-                        "target_ratio".to_string(),
-                        self.eviction_target_ratio().to_string(),
-                    ),
-                    ("ema_beta".to_string(), d.ema_beta.to_string()),
-                    ("merge_e".to_string(), d.merge_e.to_string()),
-                    ("layer_alloc".to_string(), d.layer_alloc.to_string()),
-                    ("protected_layers".to_string(), protected_layers),
-                    // D2oArgs.merge_axis is clap-validated to one of both/key_only/value_only.
-                    ("merge_axis".to_string(), d.merge_axis.clone()),
-                ]
-            }
-            #[cfg(feature = "rkv")]
-            Some(EvictionCmd::Rkv(r)) => vec![("lambda".to_string(), r.lambda.to_string())],
-            // `eviction plugin --name X --set k=v` — the raw key=value pairs for an out-of-tree stage.
             Some(EvictionCmd::Plugin(p)) => p.sets.clone(),
             _ => Vec::new(),
         }

@@ -18,9 +18,9 @@ use clap::{Args, Subcommand};
 /// Top-level wrapper exposing `eviction <policy>` as a single clap
 /// subcommand group. clap derive registers each [`EvictionCmd`] variant
 /// directly as a subcommand, so without this wrapper the CLI would be
-/// `generate ... h2o --keep-ratio 0.5`. The wrapper produces the
-/// `generate ... eviction h2o --keep-ratio 0.5` form documented in
-/// `docs/USAGE.md` and `docs/35_experiment_runner_guide.md`.
+/// `generate ... plugin --name h2o`. The wrapper produces the
+/// `generate ... eviction plugin --name h2o --set keep_ratio=0.5` form
+/// documented in `docs/USAGE.md` and `docs/35_experiment_runner_guide.md`.
 #[derive(Subcommand, Debug, Clone)]
 pub enum TopLevelCmd {
     /// KV cache eviction policy (variant chosen via nested subcommand).
@@ -32,11 +32,11 @@ pub enum TopLevelCmd {
 
 /// Eviction policy selection (nested under [`TopLevelCmd::Eviction`]).
 ///
-/// CLI usage:
+/// CLI usage — every stage (built-in or plugin) is selected generically by registry name + `--set`:
 /// ```text
-/// generate -m model.gguf eviction sliding --window 1024
-/// generate -m model.gguf eviction h2o --keep-ratio 0.5 --tracked-layers 0
-/// generate -m model.gguf eviction d2o --keep-ratio 0.75 --ema-beta 0.7
+/// generate -m model.gguf eviction plugin --name sliding --set window=1024
+/// generate -m model.gguf eviction plugin --name h2o --set keep_ratio=0.5 --set tracked_layers=0
+/// generate -m model.gguf eviction plugin --name d2o --set keep_ratio=0.75 --set ema_beta=0.7
 /// ```
 ///
 /// Omitting the subcommand is equivalent to [`EvictionCmd::None`] —
@@ -46,62 +46,24 @@ pub enum EvictionCmd {
     /// No eviction (default). KV cache grows up to --max-seq-len.
     None,
 
-    /// Sliding window — retain the most recent N tokens.
-    Sliding(SlidingArgs),
-
-    /// StreamingLLM — keep `sink` initial tokens plus a recent window.
-    Streaming(StreamingArgs),
-
-    /// H2O — heavy hitter selection (Round 14 default for Llama 3.2 1B).
-    H2o(H2oArgs),
-
-    /// H2O+ — per-head GQA-aware H2O variant.
-    H2oPlus(H2oArgs),
-
-    /// D2O — Dynamic Discriminative Operations (arXiv 2406.13035).
-    D2o(D2oArgs),
-
-    /// CAOTE — value-aware criticality `a_i·‖v_i − o_h‖`.
-    ///
-    /// feature `caote` 플러그인 install 시에만 노출된다(미설치 = subcommand 부재).
-    /// 튜닝 파라미터 없음 — V 는 ctx.tensor(Value)로, 가중치 a_i 는 importance 로 자동.
-    #[cfg(feature = "caote")]
-    Caote,
-
-    /// R-KV — cosine redundancy + importance joint eviction (arXiv 2505.24133).
-    ///
-    /// KV roadmap 항목 0 측정 프로토타입(arch/kv_roadmap_item0_measurement.md §4.1).
-    /// feature `rkv` 측정 게이트 install 시에만 노출된다(미설치 = subcommand 부재 = production
-    /// 표면 불변). λ(redundancy/importance fusion)만 측정 조정 가능(기본 0.1).
-    #[cfg(feature = "rkv")]
-    Rkv(RkvArgs),
-
-    /// Plugin-supplied eviction stage, selected by registry name.
-    ///
-    /// The stage-axis analogue of `--kv-format <name>`: any technique crate registered
-    /// statically (linkme `KV_CACHE_STAGES`) or dynamically (`--load-plugin`) is selectable
-    /// by name with no engine edit. CLI form: `eviction plugin --name <stage>`.
+    /// Plugin-supplied eviction stage, selected by registry name (the only stage selector — the
+    /// stage-axis analogue of `--kv-format <name>`). Any technique crate registered statically
+    /// (linkme `KV_CACHE_STAGES`) or dynamically (`--load-plugin`) is selectable with no engine
+    /// edit. CLI form: `eviction plugin --name <stage> [--set k=v]...`. Built-ins (sliding/
+    /// streaming/h2o/h2o_plus/d2o) and feature-gated stages (caote/rkv) are selected the same way;
+    /// a name the registry doesn't know (e.g. a feature-disabled stage) fails at construction.
     Plugin(PluginArgs),
 }
 
 impl EvictionCmd {
-    /// Canonical policy name — the stage registry key (a built-in like "h2o", or a plugin
-    /// name from `eviction plugin --name <name>`). Also used by manager IPC, the lua policy
-    /// DSL, and JSON dumps, so downstream code can keep matching on the policy name.
+    /// Canonical policy name — the stage registry key (a built-in like "h2o", a feature-gated name
+    /// like "caote"/"rkv", or any `eviction plugin --name <name>`). Also used by manager IPC, the
+    /// lua policy DSL, and JSON dumps, so downstream code can keep matching on the policy name.
     pub fn policy_name(&self) -> &str {
         match self {
             EvictionCmd::None => "none",
-            EvictionCmd::Sliding(_) => "sliding",
-            EvictionCmd::Streaming(_) => "streaming",
-            EvictionCmd::H2o(_) => "h2o",
-            EvictionCmd::H2oPlus(_) => "h2o_plus",
-            EvictionCmd::D2o(_) => "d2o",
-            #[cfg(feature = "caote")]
-            EvictionCmd::Caote => "caote",
-            #[cfg(feature = "rkv")]
-            EvictionCmd::Rkv(_) => "rkv",
-            // Plugin name is a runtime String (borrowed for &self's lifetime — this is why
-            // policy_name/eviction_policy return &str rather than &'static str).
+            // The runtime stage name, borrowed for &self's lifetime — this is why policy_name /
+            // eviction_policy return &str rather than &'static str.
             EvictionCmd::Plugin(a) => a.name.as_str(),
         }
     }
@@ -130,88 +92,6 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
         Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
         _ => Err(format!("expected key=value, got '{s}'")),
     }
-}
-
-/// R-KV 측정 프로토타입 파라미터(feature `rkv`). λ 만 노출 — α/τ 는 측정 상수(rkv_stage.rs).
-#[cfg(feature = "rkv")]
-#[derive(Args, Debug, Clone)]
-pub struct RkvArgs {
-    /// fusion 가중치 λ (Z = λ·I − (1−λ)·R). 0.1 = redundancy 지배(논문 기본).
-    #[arg(long, default_value_t = 0.1)]
-    pub lambda: f32,
-}
-
-#[derive(Args, Debug, Clone)]
-pub struct SlidingArgs {
-    /// Tokens to retain in the sliding window.
-    #[arg(long, default_value_t = 1024)]
-    pub window: usize,
-}
-
-#[derive(Args, Debug, Clone)]
-pub struct StreamingArgs {
-    /// Attention sink tokens to preserve at the start.
-    #[arg(long, default_value_t = 4)]
-    pub sink: usize,
-    /// Recent window size. 0 = auto (`kv_budget - sink`).
-    #[arg(long, default_value_t = 0)]
-    pub recent_window: usize,
-}
-
-#[derive(Args, Debug, Clone)]
-pub struct H2oArgs {
-    /// Fraction of tokens kept as heavy hitters (0.0–1.0).
-    /// 0.0 → equivalent to Sliding; Round 14 confirmed this as the
-    /// optimal H2O regime for Llama 3.2 1B.
-    #[arg(long, default_value_t = 0.5)]
-    pub keep_ratio: f32,
-
-    /// Number of final transformer layers to track for importance scores.
-    /// 0 = all layers.
-    #[arg(long, default_value_t = 0)]
-    pub tracked_layers: usize,
-
-    /// EMA decay factor for cumulative importance scores per step
-    /// (0.0 = no decay).
-    #[arg(long, default_value_t = 0.0)]
-    pub decay: f32,
-
-    /// Disable time-normalized scoring (use raw cumulative SUM).
-    /// By default H2O / H2O+ time-normalize to remove cumulative bias.
-    #[arg(long, default_value_t = false)]
-    pub raw_scores: bool,
-}
-
-#[derive(Args, Debug, Clone)]
-pub struct D2oArgs {
-    /// Heavy-hitter keep ratio (paper default 0.75 = 3:1).
-    #[arg(long, default_value_t = 0.75)]
-    pub keep_ratio: f32,
-
-    /// EMA smoothing factor β for threshold update
-    /// (paper Eq.10, default 0.7).
-    #[arg(long, default_value_t = 0.7)]
-    pub ema_beta: f32,
-
-    /// Eq.11 normalisation constant `e` controlling retained token's
-    /// self-weight (paper default 0.1).
-    #[arg(long, default_value_t = 0.1)]
-    pub merge_e: f32,
-
-    /// Enable D2O layer-level dynamic allocation
-    /// (per-layer attention variance from prefill).
-    #[arg(long, default_value_t = false)]
-    pub layer_alloc: bool,
-
-    /// Protected layer indices for D2O layer allocation (comma-separated).
-    #[arg(long, value_delimiter = ',')]
-    pub protected_layers: Option<Vec<usize>>,
-
-    /// Weighted-merge axis (WeightedKV ablation, KV 로드맵 항목 2).
-    /// `both` (default) = uniform K·V merge (구 동작 bit-identical).
-    /// `value_only` = WeightedKV (K discard + V-only weighted merge).
-    #[arg(long, default_value = "both", value_parser = ["both", "key_only", "value_only"])]
-    pub merge_axis: String,
 }
 
 /// Variant-independent eviction parameters.
@@ -298,138 +178,118 @@ mod tests {
     }
 
     #[test]
-    fn parses_sliding_with_window() {
-        let w = parse(&["sliding", "--window", "2048"]);
-        match w.ev {
-            Some(EvictionCmd::Sliding(s)) => assert_eq!(s.window, 2048),
-            _ => panic!("expected Sliding"),
-        }
-    }
-
-    #[test]
-    fn parses_streaming_defaults() {
-        let w = parse(&["streaming"]);
-        match w.ev {
-            Some(EvictionCmd::Streaming(s)) => {
-                assert_eq!(s.sink, 4);
-                assert_eq!(s.recent_window, 0);
-            }
-            _ => panic!("expected Streaming"),
-        }
-    }
-
-    #[test]
-    fn parses_h2o_full() {
+    fn parses_builtin_via_plugin_set_blob() {
+        // Built-ins are now selected generically: `plugin --name h2o --set k=v`. The blob carries
+        // every former typed knob; policy_name() returns the runtime stage name.
         let w = parse(&[
+            "plugin",
+            "--name",
             "h2o",
-            "--keep-ratio",
-            "0.3",
-            "--tracked-layers",
-            "8",
-            "--decay",
-            "0.1",
-            "--raw-scores",
+            "--set",
+            "keep_ratio=0.3",
+            "--set",
+            "tracked_layers=8",
+            "--set",
+            "decay=0.1",
+            "--set",
+            "raw_scores=true",
         ]);
         match w.ev {
-            Some(EvictionCmd::H2o(h)) => {
-                assert!((h.keep_ratio - 0.3).abs() < 1e-6);
-                assert_eq!(h.tracked_layers, 8);
-                assert!((h.decay - 0.1).abs() < 1e-6);
-                assert!(h.raw_scores);
+            Some(EvictionCmd::Plugin(ref a)) => {
+                assert_eq!(a.name, "h2o");
+                assert!(a.sets.contains(&("keep_ratio".into(), "0.3".into())));
+                assert!(a.sets.contains(&("tracked_layers".into(), "8".into())));
+                assert!(a.sets.contains(&("decay".into(), "0.1".into())));
+                assert!(a.sets.contains(&("raw_scores".into(), "true".into())));
             }
-            _ => panic!("expected H2o"),
+            _ => panic!("expected Plugin"),
         }
+        assert_eq!(w.ev.as_ref().unwrap().policy_name(), "h2o");
     }
 
     #[test]
-    fn parses_h2o_plus_uses_same_args() {
-        let w = parse(&["h2o-plus", "--keep-ratio", "0.4"]);
-        assert_eq!(w.ev.as_ref().unwrap().policy_name(), "h2o_plus");
-        match w.ev {
-            Some(EvictionCmd::H2oPlus(h)) => {
-                assert!((h.keep_ratio - 0.4).abs() < 1e-6);
-            }
-            _ => panic!("expected H2oPlus"),
-        }
-    }
-
-    #[test]
-    fn parses_d2o_with_protected_layers() {
+    fn parses_d2o_via_plugin_set_blob() {
+        // d2o's technique-private knobs ride the same `--set` blob (no typed mirror in the engine).
         let w = parse(&[
+            "plugin",
+            "--name",
             "d2o",
-            "--keep-ratio",
-            "0.8",
-            "--ema-beta",
-            "0.6",
-            "--merge-e",
-            "0.15",
-            "--layer-alloc",
-            "--protected-layers",
-            "0,1,2",
+            "--set",
+            "keep_ratio=0.8",
+            "--set",
+            "merge_axis=value_only",
+            "--set",
+            "protected_layers=0,1,2",
         ]);
         match w.ev {
-            Some(EvictionCmd::D2o(d)) => {
-                assert!((d.keep_ratio - 0.8).abs() < 1e-6);
-                assert!((d.ema_beta - 0.6).abs() < 1e-6);
-                assert!((d.merge_e - 0.15).abs() < 1e-6);
-                assert!(d.layer_alloc);
-                assert_eq!(d.protected_layers, Some(vec![0, 1, 2]));
+            Some(EvictionCmd::Plugin(ref a)) => {
+                assert_eq!(a.name, "d2o");
+                assert!(a.sets.contains(&("merge_axis".into(), "value_only".into())));
+                assert!(
+                    a.sets
+                        .contains(&("protected_layers".into(), "0,1,2".into()))
+                );
             }
-            _ => panic!("expected D2o"),
+            _ => panic!("expected Plugin"),
         }
+        assert_eq!(w.ev.as_ref().unwrap().policy_name(), "d2o");
     }
 
     #[test]
-    fn rejects_unknown_eviction_arg() {
-        // H2o has no --window flag (Sliding does) — clap must reject.
-        let r = Wrap::try_parse_from(["test", "h2o", "--window", "256"]);
-        assert!(r.is_err(), "h2o subcommand must reject Sliding's --window");
+    fn unknown_set_key_is_accepted_not_rejected() {
+        // UX-loss note (B1-3): the generic `--set` blob has no schema — a typo'd key is carried
+        // opaquely (the plugin ignores it), not rejected at parse time (the former typed clap
+        // rejection of unknown flags is gone).
+        let w = parse(&["plugin", "--name", "h2o", "--set", "windwo=256"]);
+        match w.ev {
+            Some(EvictionCmd::Plugin(ref a)) => {
+                assert!(a.sets.contains(&("windwo".into(), "256".into())));
+            }
+            _ => panic!("expected Plugin"),
+        }
     }
 
-    /// feature `caote` install 시 `eviction caote` 가 parse 되고 policy_name 이
-    /// "caote" — session/build_bench 의 `find_stage(name)` seam 으로 흘러 플러그인을 선택한다.
+    // caote/rkv are now selected like any other stage: `eviction plugin --name caote|rkv`. There is
+    // no typed subcommand, so the build-time clap-reject isolation moved to a RUNTIME registry miss
+    // (B1-3): `plugin --name <name>` always parses; feature-OFF means the stage crate isn't linked,
+    // so `find_stage(name)` resolves to None and construction fails.
+
+    /// feature ON: caote is registered, so `plugin --name caote` resolves.
     #[cfg(feature = "caote")]
     #[test]
-    fn parses_caote_unit_subcommand() {
-        let w = parse(&["caote"]);
-        assert!(matches!(w.ev, Some(EvictionCmd::Caote)));
+    fn caote_registered_when_feature_present() {
+        let w = parse(&["plugin", "--name", "caote"]);
         assert_eq!(w.ev.as_ref().unwrap().policy_name(), "caote");
+        assert!(argus_extension_api::find_stage("caote").is_some());
     }
 
-    /// feature OFF(plugin 미설치)에서는 caote subcommand 가 존재하지 않아 clap 이 거부한다.
+    /// feature OFF: `plugin --name caote` parses, but the registry resolves to None (runtime miss
+    /// replaces the former build-time clap reject).
     #[cfg(not(feature = "caote"))]
     #[test]
-    fn rejects_caote_when_plugin_absent() {
-        let r = Wrap::try_parse_from(["test", "caote"]);
-        assert!(
-            r.is_err(),
-            "feature OFF 시 caote subcommand 미존재 → clap reject"
-        );
+    fn caote_unregistered_when_feature_absent() {
+        let w = parse(&["plugin", "--name", "caote"]);
+        assert_eq!(w.ev.as_ref().unwrap().policy_name(), "caote");
+        assert!(argus_extension_api::find_stage("caote").is_none());
     }
 
-    /// feature `rkv` install 시 `eviction rkv [--lambda L]` 가 parse 되고 policy_name="rkv"
-    /// — find_stage("rkv") seam 으로 흘러 측정 stage 를 선택한다(KV roadmap 항목 0 §4.1).
+    /// feature ON: rkv measurement stage is registered.
     #[cfg(feature = "rkv")]
     #[test]
-    fn parses_rkv_subcommand() {
-        let w = parse(&["rkv", "--lambda", "0.2"]);
-        match w.ev {
-            Some(EvictionCmd::Rkv(ref a)) => assert!((a.lambda - 0.2).abs() < 1e-6),
-            _ => panic!("expected Rkv"),
-        }
+    fn rkv_registered_when_feature_present() {
+        let w = parse(&["plugin", "--name", "rkv"]);
         assert_eq!(w.ev.as_ref().unwrap().policy_name(), "rkv");
+        assert!(argus_extension_api::find_stage("rkv").is_some());
     }
 
-    /// feature OFF(측정 게이트 미설치)에서는 rkv subcommand 가 존재하지 않아 clap 이 거부한다 —
-    /// production 표면 불변(§6 Spec Triage, 빌드 타임 격리)의 직접 단언.
+    /// feature OFF: rkv unregistered → runtime registry miss (was a build-time clap reject — the
+    /// production-surface-invariance guarantee now holds at construction, not parse).
     #[cfg(not(feature = "rkv"))]
     #[test]
-    fn rejects_rkv_when_feature_absent() {
-        let r = Wrap::try_parse_from(["test", "rkv"]);
-        assert!(
-            r.is_err(),
-            "feature OFF 시 rkv subcommand 미존재 → clap reject (production 표면 불변)"
-        );
+    fn rkv_unregistered_when_feature_absent() {
+        let w = parse(&["plugin", "--name", "rkv"]);
+        assert_eq!(w.ev.as_ref().unwrap().policy_name(), "rkv");
+        assert!(argus_extension_api::find_stage("rkv").is_none());
     }
 
     #[test]
