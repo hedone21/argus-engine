@@ -4,12 +4,13 @@
 //! `&TransformerModel` 의 읽기 표면을 argus-extension-api `WeightStageCtx` plugin 표면으로
 //! 투영한다 — plugin 은 읽고 plan 만 내며 변형은 엔진 executor 독점.
 //!
-//! 투영은 기존 호출자(`session::swap_runtime::handle_swap_weights` §3–4)가 이미
-//! 수행하던 것과 **bit-identical**: budget = floor(ratio·n) − |currently_swapped|,
-//! importance = `flatten_importance`(SubLayer::Full), noise = `is_computed()` 일 때만 Some.
+//! 투영은 옛 swap commit 의 호출자 측 §3–4 가 수행하던 것과 **bit-identical**:
+//! budget = floor(ratio·n) − |currently_swapped|, importance = `flatten_importance`(SubLayer::Full),
+//! noise = `is_computed()` 일 때만 Some.
 //!
-//! production 호출부(decode loop) 배선은 Seam B(Phase β) 의 일이라, 본 모듈은 ctx 구현
-//! + 투영 + bit-identical 단위테스트까지만 둔다(호출부 배선 금지).
+//! production 호출부 배선은 EPIC 3 B3-0 에서 완료됐다 — `WeightSwapStage::commit` 이 `from_model`
+//! 로 ctx 를 투영해 빌트인 "swap" `WeightStage` seam 에 넘긴다. 본 모듈은 ctx 구현 + 투영 +
+//! bit-identical 단위테스트.
 
 use argus_extension_api::{LayerMetricKind, TensorDtype, WeightStageCtx};
 
@@ -66,7 +67,7 @@ impl WeightStageModelCtx {
 
     /// 투영 코어 — `from_model` 이 위임. `TransformerModel` 비의존(테스트가 직접 구성 가능).
     ///
-    /// `swap_runtime::handle_swap_weights` 의 호출자 측 투영(§3–4)과 1:1:
+    /// 옛 swap commit 의 호출자 측 투영(§3–4)과 1:1:
     /// currently_swapped = Q4_0 레이어 수, budget = floor(ratio·n) − swapped,
     /// importance = `flatten_importance`, noise = `is_computed()` 일 때만 `Some`.
     pub fn from_parts(
@@ -213,7 +214,7 @@ mod tests {
         let ctx =
             WeightStageModelCtx::from_parts(layer_formats.clone(), &noise, Some(&imp), ratio, 0);
 
-        // ── 1. ctx accessor == swap_runtime 투영 (handle_swap_weights §3–4) ──
+        // ── 1. ctx accessor == 옛 swap commit 의 inline 투영 (§3–4) ──
         let currently_swapped: Vec<usize> = (0..n)
             .filter(|&i| layer_formats[i] == TensorDtype::Q4_0)
             .collect();

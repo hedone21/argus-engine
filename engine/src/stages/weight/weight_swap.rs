@@ -3,9 +3,11 @@
 //! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §5.6.
 //!
 //! `WeightMutate` phase(구 `PostEviction`, §5.6.5)에서 발화하여, register 시점 보유한
-//! `Arc<TransformerModel>` 의 weight slot precision 을 런타임 swap(F16→Q4_0)한다. commit 본문은
-//! `EngineSwapRuntime::handle_swap_weights`(swap_runtime.rs) §1~7 을 byte-identical 이전한 것이며,
-//! 그 orphan 함수가 **등가 anchor** 다(§5.6.2 — 자기 비교 금지, Stage 산출 vs 직접 호출 산출 비교).
+//! `Arc<TransformerModel>` 의 weight slot precision 을 런타임 swap(F16→Q4_0)한다. commit §4 의
+//! 레이어 선택은 빌트인 "swap" `WeightStage` 어댑터(`find_weight_stage("swap")`)로 라우팅된다
+//! (EPIC 3 B3-0 — 등록만 되고 죽어 있던 `WEIGHT_STAGES` seam 의 첫 live 소비자). 등가(seam vs 옛
+//! inline decider)는 어댑터 self-test(stage_registry/stage_ctx)가 보증한다 — 옛 orphan 정본
+//! `EngineSwapRuntime::handle_swap_weights` 는 B3-0 에서 삭제됐다.
 //!
 //! PartitionStage 와 형제(둘 다 `stages/weight/`)이나 join 표면이 0 이다 — partition 은 weight slot
 //! **dispatch mode**(GPU/CPU split geometry), swap 은 weight **precision**(F16→Q4_0) 변경(format 축).
@@ -41,18 +43,17 @@ use crate::weight::IncrementalSwapPlan;
 /// Incremental mode 는 `plan` 을 보유·소진(multi-tick drain). 나머지 3-mode 는 commit tick 에
 /// hook 만 설치하고 plan 은 `None` 유지(즉시 `Consumed`).
 pub struct WeightSwapStage {
-    /// register 시점 보유 (§5.6.3 "model 측 접근 seam"). `handle_swap_weights` 가
-    /// `&TransformerModel` 인자로 query 하던 secondary_mmap / quant_noise / layers /
-    /// ratio_generation / current_dtype 을 Stage 가 held-handle 로 보유(god-ctx 회피,
-    /// INV-STAGE-LAYER-HANDLE). `layers[i].swap_weights(&self)` 가 ArcSwap RCU 라 `&self`
-    /// Stage 가 mutate 가능.
+    /// register 시점 보유 (§5.6.3 "model 측 접근 seam"). commit 이 `&TransformerModel` 에서 읽는
+    /// secondary_mmap / quant_noise / layers / ratio_generation / current_dtype 을 Stage 가
+    /// held-handle 로 보유(god-ctx 회피, INV-STAGE-LAYER-HANDLE). `layers[i].swap_weights(&self)`
+    /// 가 ArcSwap RCU 라 `&self` Stage 가 mutate 가능.
     model: Arc<TransformerModel>,
     /// swap 자원 묶음(swap_backend / dispatcher / config / release_worker / default_mode /
     /// 공유 in-flight 마커 / report sender). Arc 공유 → 새 Stage 인스턴스도 같은 in-flight
     /// 마커를 본다(§5.6.4 재submit 차단).
     runtime: Arc<EngineSwapRuntime>,
-    /// decider 입력(§5.6.1). `handle_swap_weights` 의 `importance: Option<&dyn ImportanceLookup>`
-    /// 인자를 held-handle 로 보유.
+    /// decider 입력(§5.6.1). swap decider 의 `importance: Option<&dyn ImportanceLookup>` 를
+    /// held-handle 로 보유 — commit 이 `WeightStageModelCtx` 투영에 넘긴다.
     importance: Option<Arc<dyn ImportanceLookup>>,
     /// directive 가 지정한 swap ratio (0,1].
     ratio: f32,
@@ -94,16 +95,17 @@ impl WeightSwapStage {
         }
     }
 
-    /// commit 본문 = `handle_swap_weights` §1~7 byte-identical 이전(§5.6.2, 정본 = swap_runtime.rs).
+    /// commit §1~3·5~7 = 옛 swap commit 본문, §4 레이어 선택만 빌트인 "swap" `WeightStage`
+    /// 어댑터로 라우팅(EPIC 3 B3-0). 등가는 stage_registry/stage_ctx self-test 가 보증.
     ///
     /// 반환: `Ok(true)` = Incremental plan 설치(이후 multi-tick drain 필요) / `Ok(false)` =
     /// reject(no-op) 또는 non-Incremental hook 설치(즉시 GC). reject 5종은 stderr 1회 + no-op
     /// (graceful — fail-fast 아님, §5.6.2 근거).
     fn commit(&self, decode_token_index: usize) -> bool {
-        use crate::weight::decider::flatten_importance;
+        use argus_extension_api::WeightStageCtx;
+
         use crate::weight::{
-            IntraForwardSwapHook, PhaseAwareSwapDispatcher, SwapAlgorithm, SwapDecision,
-            WeightSwapDecider, compute_qcf_weight_swap,
+            IntraForwardSwapHook, PhaseAwareSwapDispatcher, compute_qcf_weight_swap,
         };
 
         let model = self.model.as_ref();
@@ -143,7 +145,18 @@ impl WeightSwapStage {
             .filter(|&i| model.layers[i].current_dtype() == DType::Q4_0)
             .collect();
 
-        // ── 4. Decider ───────────────────────────────────────────────────
+        // ── 4. Decider (B3-0: WeightStage seam 경유) ──────────────────────
+        // 옛 inline `WeightSwapDecider::decide` 를 빌트인 "swap" WeightStage 어댑터로 라우팅한다
+        // — 등록만 되고 죽어 있던 `WEIGHT_STAGES` seam 에 첫 live 소비자를 준다(EPIC 3 B3-0).
+        // `WeightStageModelCtx` 가 budget/importance/noise 투영을 옛 호출자 경로와 bit-identical
+        // 재현하고(stage_ctx.rs), 어댑터가 동일 `WeightSwapDecider` 를 동일 입력으로 호출함이
+        // self-test(stage_registry.rs `stage_plan_matches_decider`, stage_ctx.rs
+        // `ctx_projection_and_plan_bit_identical_with_swap_runtime`)로 증명된다 — 이 self-test
+        // 들이 등가 anchor 다(옛 orphan `handle_swap_weights` 정본은 B3-0 에서 삭제).
+        //
+        // allow_boundary 는 여기서 1회 읽어(아래 [Decider] 로그와 동일 출처) `WeightStageParams`
+        // 로 주입한다 — seam 내부 plan() 에서 env 재독 금지(make()↔plan() 사이 env 변동 시 후보
+        // 필터 divergence 방지).
         let allow_boundary = crate::session::qcf_runtime::read_allow_boundary_env();
         eprintln!(
             "[Decider] allow_boundary_layers={} (ratio={:.4}, mode={:?})",
@@ -151,26 +164,23 @@ impl WeightSwapStage {
             ratio,
             self.runtime.default_mode()
         );
-        let importance_ref = self.importance.as_deref();
-        let importance_flat = importance_ref.map(|imp| flatten_importance(imp, n_layers));
-        let noise_flat = if model.quant_noise.is_computed() {
-            Some(model.quant_noise.as_slice())
-        } else {
-            None
-        };
-        let target_count = (ratio * n_layers as f32).floor() as usize;
-        let budget = target_count.saturating_sub(currently_swapped.len());
-        let decider = WeightSwapDecider {
-            importance: importance_flat.as_deref(),
-            noise: noise_flat,
-            n_decoder_layers: n_layers,
-            currently_swapped: &currently_swapped,
+        let ctx = crate::weight::WeightStageModelCtx::from_model(
+            model,
+            ratio,
+            self.importance.as_deref(),
+            0, // pressure: command path 는 0 (swap decider 는 pressure 미사용).
+        );
+        let reg = argus_extension_api::find_weight_stage("swap")
+            .expect("내장 'swap' WeightStage 등록됨 (ensure_builtin_weight_stages_registered)");
+        let stage = (reg.make)(argus_extension_api::WeightStageParams {
             allow_boundary_layers: allow_boundary,
-            algorithm: SwapAlgorithm::ImportanceAware,
-        };
-        let decision: SwapDecision = decider.decide(budget);
+        });
+        let selected_layers: Vec<usize> = stage
+            .plan(&ctx)
+            .map(|p| p.per_layer.into_iter().map(|d| d.layer).collect())
+            .unwrap_or_default();
 
-        if decision.selected_layers.is_empty() {
+        if selected_layers.is_empty() {
             eprintln!(
                 "[WeightSwap] No layers to swap (ratio={:.2}, already_swapped={})",
                 ratio,
@@ -180,15 +190,19 @@ impl WeightSwapStage {
         }
 
         // ── 5. QCF estimate ──────────────────────────────────────────────
+        // importance 는 ctx 투영(옛 importance_flat 과 value-identical)에서, noise 는 옛 경로와
+        // 동일하게 `model.quant_noise` 를 무조건 사용한다 — `ctx.quant_noise()` 는 is_computed
+        // 게이트라 §5 입력으로 쓰면 미산출 시 divergence(noise 산출-여부 게이트는 decider 쪽만의
+        // 계약).
         let qcf_swap_estimated = compute_qcf_weight_swap(
-            &decision.selected_layers,
+            &selected_layers,
             model.quant_noise.as_slice(),
-            importance_flat.as_deref(),
+            ctx.importance(),
             n_layers,
         );
 
-        let n_planned = decision.selected_layers.len();
-        let selected_for_report = decision.selected_layers.clone();
+        let n_planned = selected_layers.len();
+        let selected_for_report = selected_layers.clone();
 
         // ── 6. Mode-specific commit ──────────────────────────────────────
         let is_incremental = match self.runtime.default_mode() {
@@ -200,11 +214,7 @@ impl WeightSwapStage {
                     "[WeightSwap] manager path (Incremental): ratio={:.2}, {} layers, per_tick={} ({} ticks), qcf={:.4}",
                     ratio, n_planned, per_tick, ticks_est, qcf_swap_estimated,
                 );
-                let plan = IncrementalSwapPlan::new(
-                    decision.selected_layers,
-                    per_tick,
-                    decode_token_index,
-                );
+                let plan = IncrementalSwapPlan::new(selected_layers, per_tick, decode_token_index);
                 *self.plan.lock().expect("weight_swap plan mutex poisoned") = Some(plan);
                 self.runtime.mark_in_flight(true);
                 true
@@ -224,7 +234,7 @@ impl WeightSwapStage {
                     mode_label, ratio, n_planned, qcf_swap_estimated,
                 );
                 let hook = IntraForwardSwapHook::new(
-                    decision.selected_layers,
+                    selected_layers,
                     decode_token_index,
                     Arc::clone(self.runtime.dispatcher()),
                     Arc::clone(secondary),
@@ -296,7 +306,7 @@ impl WeightSwapStage {
         is_incremental
     }
 
-    /// §5.6.6: `WeightSwapReport` 구성 + 송출(commit 시점). `handle_swap_weights` §7 의
+    /// §5.6.6: `WeightSwapReport` 구성 + 송출(commit 시점). 옛 swap commit §7 의
     /// `manager_report_out = Some((ratio, n_planned, Instant, qcf))` tuple 을 commit 시점
     /// 송신으로 단순화(plan-retire 지연 송출 폐기). commit 시점엔 실 swap 미수행이라
     /// `layers_swapped` 는 plan(F16→Q4_0), `latency_ms=0`, `qcf_swap_actual=qcf_estimated`.
@@ -623,7 +633,7 @@ mod tests {
         // ratio=1.5 → invalid_ratio. (no_secondary 보다 먼저 ratio 검사하도록 secondary present
         // 가 필요하나, validate 순서상 no_secondary 가 먼저이므로 secondary mock 없이는 ratio
         // reject 단독 검증 불가 — 따라서 ratio reject 경로의 Consumed 동작은 본 테스트가 아니라
-        // 등가 anchor(handle_swap_weights)와의 코드 동일성으로 보장. 여기선 ratio=1.5 도
+        // §1~3 reject 로직의 코드 동일성으로 보장. 여기선 ratio=1.5 도
         // Consumed 임을 확인(no_secondary 가 먼저 막더라도 결과 동일 = graceful Consumed).
         let s = stage(&be, 2, SwapMode::Incremental, 1.5, DtypeTag::Q4_0);
         let mut profiler = OpProfiler::new();
@@ -682,11 +692,10 @@ mod tests {
     }
 
     // NOTE: Incremental multi-tick drain (Continue×N→Consumed) / IntraForward·PhaseAware 의 *실
-    // commit 경로* 를 통한 hook 설치 / decider-success / 등가 anchor(Stage commit ==
-    // handle_swap_weights 직접 호출) 는 secondary_mmap mock(mmap 파일) 을 요구하므로 **host 검증
+    // commit 경로* 를 통한 hook 설치 는 secondary_mmap mock(mmap 파일) 을 요구하므로 **host 검증
     // 불가** — device 게이트(S25/Jetson, §5.6.7)에서 legacy frozen baseline 대조로 검증한다.
-    // commit 본문은 swap_runtime.rs 의 handle_swap_weights §1~7 을 byte-identical 이전한 것이라
-    // 코드 동일성으로 등가가 보장된다.
+    // commit §4 레이어 선택의 등가(seam vs 옛 inline decider)는 stage_registry/stage_ctx 의
+    // self-test 가 host 에서 byte-identical 로 보증한다(EPIC 3 B3-0).
 
     /// §5.9.2 Track B: hook cell 설치 토글 계약. commit 의 IntraForward/LayerImmediate arm 이
     /// 쓰는 `*hook_cell.lock() = Some(hook as Arc<dyn LayerBoundaryHook>)` 와 **동일 coercion** 으로
