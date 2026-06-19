@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::kv::quant_window_format::QuantWindowFormat;
 use crate::pipeline::{LifecyclePhase, PipelineStage, StageContext, StageLifecycle, StageOutcome};
 
-/// `KvMutate` phase 에서 KIVI cache bit-width 를 전환하는 OneShot Stage.
+/// `KvMutate` phase 에서 quant-window cache bit-width 를 전환하는 OneShot Stage.
 ///
 /// `QuantWindowFormat::with_cache_mut(&self)` 가 `Mutex<QuantizedRecentWindowCache>` interior-mutate 라 `&self` Stage 가
 /// transition 가능(EvictionStage 의 `Mutex<CacheManager>` 와 달리 추가 Mutex 불요 — QuantWindowFormat 이
@@ -57,11 +57,11 @@ impl QuantWindowBitTransitionStage {
         let bits = self.target_bits;
         for h in &self.handles {
             if let Err(e) = h.with_cache_mut(|c| c.transition_bits(bits)) {
-                eprintln!("[KIVI-Resilience] transition_bits({bits}) error: {e}");
+                eprintln!("[quant-window-Resilience] transition_bits({bits}) error: {e}");
             }
         }
         // marker 라인 (글자단위 — v1 L4406 verbatim). `{}`(Display) u8 → "4bit" 등.
-        eprintln!("[KIVI-Resilience] Transitioned KV cache to {bits}bit");
+        eprintln!("[quant-window-Resilience] Transitioned KV cache to {bits}bit");
     }
 }
 

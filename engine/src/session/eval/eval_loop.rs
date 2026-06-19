@@ -29,7 +29,7 @@ use super::output::{EvalConfig, EvalOutput, EvalQuestion};
 /// Run log-likelihood evaluation for a list of multiple-choice questions.
 ///
 /// This is the unified entry point for both eviction (`EvictionHook`) and
-/// KIVI (`QuantWindowFlushHook`) eval modes. The caller provides:
+/// quant-window (`QuantWindowFlushHook`) eval modes. The caller provides:
 ///
 /// - `kv_caches`: per-layer KV cache (either `KVCache` or `QuantizedRecentWindowCache`)
 /// - `hook`: cache-management and QCF-collection logic
@@ -262,7 +262,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
                 acc.begin_step();
             }
 
-            // Phase α-K ①-c: forward_into → fmt round-trip. cache_self_need(KIVI AWQE)는 wrap 전 산출.
+            // Phase α-K ①-c: forward_into → fmt round-trip. cache_self_need(quant-window AWQE)는 wrap 전 산출.
             let probe_need = kv_caches.first().is_some_and(|c| c.needs_scores());
             C::forward_fmt_roundtrip(kv_caches, |fmts| {
                 model.forward_into(TransformerModelForwardArgs {
@@ -463,7 +463,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
             "qcf_layer_skip_layers": qcf_layer_skip_layers,
         });
 
-        // Merge hook-specific fields (qcf, qcf_kivi_legacy, qcf_caote, effective_budget, etc.)
+        // Merge hook-specific fields (qcf, qcf_kivi_legacy, qcf_value_aware, effective_budget, etc.)
         if let Some(obj) = extra.as_object() {
             for (k, v) in obj {
                 result_obj[k] = v.clone();
@@ -643,8 +643,8 @@ fn run_prefill<C: EvalCacheKind>(
     skip_config: Option<&SkipConfig>,
     prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
-    // When KV caches need attention scores (KIVI+AWQE/AW-VOPR), use token-by-token
-    // prefill so each KIVI flush has scores from the previous step.
+    // When KV caches need attention scores (quant-window+AWQE/AW-VOPR), use token-by-token
+    // prefill so each quant-window flush has scores from the previous step.
     let needs_scores = !kv_caches.is_empty() && kv_caches[0].needs_scores();
     if needs_scores && prompt_ids.len() > 1 {
         return run_token_by_token_prefill(
@@ -678,8 +678,8 @@ fn run_prefill<C: EvalCacheKind>(
     )
 }
 
-/// Token-by-token prefill for KIVI AWQE/AW-VOPR: processes each token individually
-/// so `set_attn_scores()` is called between tokens, giving KIVI flushes access to
+/// Token-by-token prefill for quant-window AWQE/AW-VOPR: processes each token individually
+/// so `set_attn_scores()` is called between tokens, giving quant-window flushes access to
 /// attention scores for weighted error computation.
 #[allow(clippy::too_many_arguments)]
 fn run_token_by_token_prefill<C: EvalCacheKind>(
@@ -827,7 +827,7 @@ fn run_full_prefill<C: EvalCacheKind>(
 /// Chunked prefill: forward first `effective_budget` tokens as a batch, then
 /// decode the remaining prompt tokens one-by-one.
 ///
-/// Used when eviction is active (prompt > budget) to accumulate H2O attention
+/// Used when eviction is active (prompt > budget) to accumulate heavy-hitter attention
 /// scores during the decode phase. This gives post_prefill high-quality scores
 /// for eviction decisions, matching the quality of decode-step accumulation.
 #[allow(clippy::too_many_arguments, dead_code, clippy::ptr_arg)]
@@ -918,9 +918,9 @@ fn run_chunked_prefill<C: EvalCacheKind>(
     );
 
     // ── Decode remaining prompt tokens one-by-one (no eviction during decode) ──
-    // Let KV cache grow to full prompt length so H2O scores accumulate across
-    // ALL decode steps. Eviction happens once after the loop (in post_prefill),
-    // giving H2O the full importance picture before selecting heavy hitters.
+    // Let KV cache grow to full prompt length so score-based importance accumulates
+    // across ALL decode steps. Eviction happens once after the loop (in post_prefill),
+    // giving the eviction stage the full importance picture before selecting heavy hitters.
     // This matches the OLD eval-ll behavior at 9f033a3.
     for &token_id in &prompt_ids[first_chunk_len..] {
         // SAFETY: cpu_gen_input was allocated with 4 bytes (one u32).

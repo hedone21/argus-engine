@@ -1,9 +1,8 @@
 //! `QueryStatsAccumulator` — per-(layer, kv_head) Q(query) running mean/var (Welford online).
 //!
-//! Expected Attention(arXiv 2510.00636)이 query 분포의 running mean/var 로
-//! *미래* attention 을 closed-form 추정하는 입력을 공급한다. `TensorKind::QueryStats` 소비자
-//! (Expected Attention / 항목 4 read-plan 의 Quest 류 page 선택)가 kv_head 마다 `(μ, σ²)` 쌍을
-//! 읽는다.
+//! query 분포의 running mean/var 로 *미래* attention 을 closed-form 추정하는 입력을 공급한다.
+//! `TensorKind::QueryStats` 소비자(future-attention 추정 / 항목 4 read-plan 의 page 선택)가
+//! kv_head 마다 `(μ, σ²)` 쌍을 읽는다.
 //!
 //! **설계 격리(U4)**: `AttentionScoreAccumulator` 패턴을 *참조*하되 **별도 struct·별도 모듈**로
 //! 격리한다 — `attention_scores.rs`/`qcf_runtime.rs` 의 기존 누적 로직은 무수정(QCF_kv 설계 라운드

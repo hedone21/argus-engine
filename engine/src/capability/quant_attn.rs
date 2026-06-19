@@ -1,4 +1,4 @@
-//! KIVI fused attention capability (§3.3).
+//! quant-window fused attention capability (§3.3).
 //!
 //! D8(2026-06-10, single-trait) 채택으로 canonical 정의가 `argus-extension-api` 로
 //! 이동했다. `&Tensor` 시그니처를 ABI struct(cl_mem) 시그니처로 바꿔 plugin 이

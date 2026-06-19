@@ -1,4 +1,4 @@
-//! StepHook trait: abstracts per-step cache management (eviction vs KIVI flush).
+//! StepHook trait: abstracts per-step cache management (eviction vs quant-window flush).
 //!
 //! The generic eval loop calls these hooks without knowing the cache management
 //! policy. Each implementation encapsulates its own eviction/flush logic and
@@ -11,7 +11,7 @@ use crate::inference::attention_scores::AttentionScoreAccumulator;
 pub struct PostStepResult {
     /// Whether any eviction/flush occurred this step.
     pub evicted: bool,
-    /// Number of tokens removed (eviction) or quantized (KIVI flush).
+    /// Number of tokens removed (eviction) or quantized (quant-window flush).
     pub tokens_affected: usize,
     /// New start_pos after eviction (if evicted, caller should update).
     pub new_start_pos: Option<usize>,
@@ -29,7 +29,7 @@ pub trait CacheSnapshot<C>: Send {
 /// Per-step cache management hook for the generic eval loop.
 ///
 /// Implementations:
-/// - `EvictionHook` (KVCache): budget-based eviction + CAOTE/attn QCF
+/// - `EvictionHook` (KVCache): budget-based eviction + value-aware/attn QCF
 /// - `QuantWindowFlushHook` (QuantizedRecentWindowCache): flush proxy collection (NMSE + OPR)
 pub trait StepHook<C> {
     /// Called after prefill completes. Handles chunked-prefill eviction

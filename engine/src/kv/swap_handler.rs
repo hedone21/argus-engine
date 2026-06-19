@@ -12,7 +12,7 @@
 //!
 //! LRU strategy: always offloads the oldest tokens first.
 //! Currently only F32/F16 KV dtypes are supported for disk write-back.
-//! Q4_0/KIVI caches fall back to lossy prune with a stderr warning.
+//! Q4_0/quant-window caches fall back to lossy prune with a stderr warning.
 
 use super::{ActionResult, CachePressureHandler, HandlerContext, PressureLevel};
 use crate::buffer::DType;
@@ -139,7 +139,7 @@ impl SwapHandler {
     // ── Internals ─────────────────────────────────────────────────
 
     /// Offload the LRU prefix of a single layer's cache.
-    /// Falls back to lossy prune on unsupported dtypes (Q4_0/KIVI) or when
+    /// Falls back to lossy prune on unsupported dtypes (Q4_0/quant-window) or when
     /// `swap_dir` is unset.
     fn offload_one(&self, layer_idx: usize, cache: &mut KVCache) -> Result<usize> {
         let total = cache.current_pos;

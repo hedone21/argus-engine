@@ -1,6 +1,6 @@
 //! Bridge between existing `EvictionPolicy` and the new `CachePressureHandler` trait.
 //!
-//! Wraps any `Box<dyn EvictionPolicy>` so that H2O and SlidingWindow policies
+//! Wraps any `Box<dyn EvictionPolicy>` so that heavy-hitter and SlidingWindow policies
 //! work seamlessly inside a `CachePressurePipeline`.
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
@@ -212,7 +212,7 @@ mod tests {
             } => {
                 assert!(tokens_removed > 0);
                 assert!(new_pos < 100);
-                // H2O: target = 100 * 0.3 = 30
+                // heavy-hitter: target = 100 * 0.3 = 30
                 assert_eq!(new_pos, 30);
             }
             _ => panic!("Expected Evicted, got {:?}", result),
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_h2o_fallback_without_scores() {
-        // H2O without importance scores → fallback to sliding-window-like behavior.
+        // heavy-hitter without importance scores → fallback to sliding-window-like behavior.
         // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let handler = EvictionHandler::new(h2o_backed_policy(0.5, 0), 0.3);
 

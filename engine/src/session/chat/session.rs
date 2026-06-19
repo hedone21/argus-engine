@@ -298,7 +298,7 @@ impl ChatSession {
                         } else {
                             None
                         };
-                    // CAOTE a_i: last-layer last-step per-head attention (value-aware policies).
+                    // value-aware a_i: last-layer last-step per-head attention (value-aware policies).
                     let attn_vec: Option<Vec<f32>> = if let ChatKvMode::Standard(s) = &self.kv_mode
                     {
                         if score_based {
@@ -403,7 +403,7 @@ impl ChatSession {
             None
         };
 
-        // CAOTE a_i: last-layer last-step per-head attention (value-aware policies).
+        // value-aware a_i: last-layer last-step per-head attention (value-aware policies).
         let attn_vec: Option<Vec<f32>> = if let ChatKvMode::Standard(s) = &self.kv_mode {
             if score_based {
                 s.score_accumulator
@@ -604,7 +604,7 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
     })
 }
 
-/// "kivi" mode forward-build (KvModeReg.build) — KIVI-private 구성 일체
+/// "kivi" mode forward-build (KvModeReg.build) — quant-window-private 구성 일체
 /// (alloc_quant_window_kv_caches / QuantWindowForward::new / bits·residual / caps.get::<QuantAttnBackend>())가
 /// 여기로 이동했다. dispatch 지점은 더는 "kivi" 를 NAME 하지 않는다.
 pub(crate) fn build_chat_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeBuild> {
@@ -615,7 +615,7 @@ pub(crate) fn build_chat_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<C
     let quant_attn = ctx.caps.get::<dyn QuantAttnBackend>();
 
     eprintln!(
-        "[Chat/KIVI] bits={}, residual_size={}, max_seq_len={}",
+        "[Chat/quant-window] bits={}, residual_size={}, max_seq_len={}",
         bits, residual_size, max_seq_len
     );
 
@@ -651,10 +651,10 @@ pub(crate) fn build_chat_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<C
 
     Ok(ChatModeBuild {
         forward: Box::new(fwd),
-        kv_handles: Vec::new(), // KIVI: no StandardFormat eviction handles.
+        kv_handles: Vec::new(), // quant-window: no StandardFormat eviction handles.
         kv_handle,
         quant_handle,
-        eviction_policy: String::new(), // KIVI: no in-loop eviction policy.
+        eviction_policy: String::new(), // quant-window: no in-loop eviction policy.
         kv_mode: ChatKvMode::QuantWindow {
             bits,
             residual_size,

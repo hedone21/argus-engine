@@ -271,7 +271,7 @@ impl WeightFormat for LayerSlot {
             }
             LayerDispatch::Skip => {
                 anyhow::bail!(
-                    "layer skip dispatch not wired (Phase β SWIFT; arch §4.2 (6) mode preserved)"
+                    "layer skip dispatch not wired (Phase β layer-skip; arch §4.2 (6) mode preserved)"
                 )
             }
         }

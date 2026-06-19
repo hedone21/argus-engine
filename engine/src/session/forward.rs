@@ -6,7 +6,7 @@
 //! [`crate::models::transformer::TransformerModel::forward_into`].
 //!
 //! Phase 4-5-a adds [`quant_window_forward::QuantWindowForward`] and
-//! [`offload_forward::OffloadForward`] for KIVI-quantized and token-streaming
+//! [`offload_forward::OffloadForward`] for quant-window-quantized and token-streaming
 //! offload KV cache paths respectively.
 //!
 //! **Phase β-7**: the [`Forward`] trait itself moved here from the deleted
@@ -60,9 +60,9 @@ pub trait Forward {
     /// 유지 (eviction 미지원).
     ///
     /// - `cache_manager`: eviction 정책을 보유한 CacheManager.
-    /// - `scores`: score-based policy (H2O/D2O)용 importance 점수. `None`이면
+    /// - `scores`: score-based policy 용 importance 점수. `None`이면
     ///   score-free force/maybe evict.
-    /// - `last_attn`: value-aware policy (CAOTE a_i)용 last-layer last-step per-head
+    /// - `last_attn`: value-aware policy (a_i)용 last-layer last-step per-head
     ///   attention slice. `None`이면 importance 폴백. score accumulator 의
     ///   `last_step_head_attn()` 에서 공급.
     /// - `force`: true이면 `force_evict*`, false이면 `maybe_evict*`.

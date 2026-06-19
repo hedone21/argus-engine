@@ -6,7 +6,7 @@
 //! 미지원 format 은 full read 폴백(정확). `SelectiveRead` 를 구현한 format 만 선택적 읽기를 제공.
 //!
 //! 첫 구현체: `StandardFormat` (`engine/src/kv/standard_format.rs`).
-//! 미구현: KIVI/opaque → 엔진 폴백 = full read.
+//! 미구현: quant-window/opaque → 엔진 폴백 = full read.
 
 use anyhow::Result;
 use argus_extension_api::{KVReadPlan, KVReadStage, ReadGranularity};
@@ -19,7 +19,7 @@ use crate::tensor::Tensor;
 ///
 /// `attention_into_selected` 는 `select` 된 KV 위치/페이지만 읽어 attention 을 수행한다.
 /// **정확성 계약 아님** — `select` 가 전체면 `attention_into` 와 bit-identical(Tier 1 게이트),
-/// 부분 select 는 *근사 답*(softmax 분모가 부분집합으로 정규화됨 — Quest 의 의도된 근사).
+/// 부분 select 는 *근사 답*(softmax 분모가 부분집합으로 정규화됨 — 부분 읽기의 의도된 근사).
 ///
 /// `KVCacheFormat` base trait 무변경: 이 capability 를 구현 안 한 format 은
 /// 엔진이 plan 을 무시하고 `attention_into`(full read) 를 호출한다.
@@ -54,7 +54,7 @@ pub trait SelectiveRead {
     ///
     /// `query_stats`: 이 layer 의 per-(kv_head) running Q mean/var (`[n_kv_heads*2*head_dim]`,
     /// `QueryStatsAccumulator::layer_stats`). `Some` 이면 read ctx 의 `tensor(QueryStats)` 로 노출되어
-    /// quest 의 Expected-Attention page score 를 활성화한다. `None`(QueryStats 미수집)이면 quest 는
+    /// read stage 의 future-attention page score 를 활성화한다. `None`(QueryStats 미수집)이면 read stage 는
     /// 대칭 min/max proxy 로 폴백.
     ///
     /// `None` 반환 = full read(read stage 가 `None` 반환). 반환 plan 은 *근사 힌트*(정확성 계약 아님, D3).

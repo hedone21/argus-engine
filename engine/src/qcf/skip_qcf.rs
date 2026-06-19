@@ -1,4 +1,4 @@
-//! SWIFT layer-skip proxy: tracks speculative decoding acceptance rate.
+//! Layer-skip quality proxy: tracks speculative-decoding acceptance rate.
 //!
 //! The proxy is `1 - acceptance_rate` (rejection rate), averaged over a
 //! sliding window. Zero additional computation — uses existing verify results.
@@ -6,7 +6,7 @@
 use super::QcfMetric;
 use std::collections::VecDeque;
 
-/// Tracks SWIFT speculative decoding acceptance rates as a proxy for skip quality.
+/// Tracks speculative-decoding acceptance rates as a proxy for skip quality.
 ///
 /// Maintains a sliding window of recent `(accepted, drafted)` pairs and
 /// computes a moving-average rejection rate as the proxy value.
@@ -55,7 +55,7 @@ impl SkipQcfTracker {
         };
 
         QcfMetric {
-            action: "swift".to_string(),
+            action: "layer_skip".to_string(),
             raw_value,
             normalized_value: raw_value, // rejection rate is already normalized
             per_head: None,
@@ -100,7 +100,7 @@ mod tests {
         let tracker = SkipQcfTracker::new(10);
         let metric = tracker.current_proxy();
         assert_eq!(metric.raw_value, 0.0);
-        assert_eq!(metric.action, "swift");
+        assert_eq!(metric.action, "layer_skip");
         assert_eq!(tracker.lifetime_acceptance_rate(), 1.0);
     }
 

@@ -86,7 +86,7 @@ pub enum DynamicArg {
     WritePos { arg_idx: u32 },
     /// KV cache capacity — changes on resize (i32)
     KvCapacity { arg_idx: u32 },
-    // KIVI-specific dynamic args
+    // quant-window-specific dynamic args
     /// Residual write position (i32) — kivi_gather_update res_pos arg
     ResPos { arg_idx: u32 },
     /// Number of quantized tokens (i32) — kivi attention q2_tokens arg
@@ -158,7 +158,7 @@ pub enum KvUpdateVariant {
     Standard(KernelStep),
 }
 
-/// Attention variant — Standard half-precision or KIVI fused attention.
+/// Attention variant — Standard half-precision or quant-window fused attention.
 #[allow(clippy::large_enum_variant)]
 pub enum AttentionVariant {
     /// Legacy kernel_attn_gen_half — supports score writes, any head_dim.
@@ -915,12 +915,12 @@ impl PartitionStep {
 /// separate `KVCacheOps` getter calls that `execute<C>` makes against a `&mut C`.
 /// Standard caches have no residual / quantized partition, so `res_pos` and
 /// `q2_tokens` are always `0`; the fields exist for symmetry with the (deferred)
-/// KIVI plan flip.
+/// quant-window plan flip.
 ///
 /// **Single-lock-snapshot contract**: a `PlanGeometry` value MUST be produced
 /// under one lock acquisition so the four fields are mutually consistent (matters
-/// for KIVI where `current_pos == q2_tokens + res_pos`; irrelevant for standard
-/// but the contract is documented here so the KIVI flip preserves it).
+/// for quant-window where `current_pos == q2_tokens + res_pos`; irrelevant for standard
+/// but the contract is documented here so the quant-window flip preserves it).
 pub(crate) struct PlanGeometry {
     pub current_pos: usize,
     pub capacity: usize,
@@ -1909,7 +1909,7 @@ pub struct LayerPlanConfig<'a> {
     /// Used for Qwen 2.5-1.5B and other head_dim=128 models.
     /// `None` forces the legacy path for head_dim=128 models.
     pub flash_attn_f32_f16_program_dk128: Option<&'a ocl::Program>,
-    /// True if this decode plan must capture attention scores (H2O/H2O+ or
+    /// True if this decode plan must capture attention scores (heavy-hitter/heavy-hitter+ or
     /// an active GPU score accumulator). When true, the builder must use
     /// `AttentionVariant::Standard` because the flash kernel has no score
     /// output.
@@ -2989,7 +2989,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     //
     // Implicit invariants (safe today, must be revisited on refactor):
     //   1. KV dtype is F16 — plan.rs is only invoked for F16 KV caches;
-    //      Q4_0 and KIVI use separate code paths. Add an explicit
+    //      Q4_0 and quant-window use separate code paths. Add an explicit
     //      `config.kv_dtype == DType::F16` check if a new KV dtype gets
     //      plan-routed.
     //   2. `is_head_major` is reverse-inferred from stride values set by
@@ -3736,7 +3736,7 @@ pub struct FullPlanConfig<'a> {
     /// builder may select `AttentionVariant::StandardFlash` for layers
     /// with head_dim=128 (e.g. Qwen 2.5-1.5B).
     pub flash_attn_f32_f16_program_dk128: Option<&'a ocl::Program>,
-    /// True if this decode plan must capture attention scores (H2O / GPU
+    /// True if this decode plan must capture attention scores (heavy-hitter / GPU
     /// score accumulator). Forces the legacy attention path because flash
     /// attention has no score output.
     pub needs_attention_scores: bool,

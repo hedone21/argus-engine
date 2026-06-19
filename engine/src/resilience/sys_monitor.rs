@@ -85,7 +85,7 @@ impl SystemMonitor for LinuxSystemMonitor {
 /// would show artificially low values, triggering false memory pressure alerts.
 ///
 /// With this monitor, KV cache eviction is driven purely by policy budgets
-/// (e.g., H2O keep_ratio, sliding window size) rather than system RAM pressure.
+/// (e.g., heavy-hitter keep_ratio, sliding window size) rather than system RAM pressure.
 pub struct NoOpMonitor;
 
 impl SystemMonitor for NoOpMonitor {

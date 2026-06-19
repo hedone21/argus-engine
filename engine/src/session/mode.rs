@@ -49,7 +49,7 @@ pub struct ModeCaps {
     pub supports_eviction: bool,
     /// Whether this mode pulls the `QuantAttnBackend` capability when building
     /// (generalizes the `caps.get::<dyn QuantAttnBackend>()` pull that used to fire
-    /// only on the KIVI arm). The quant_attn build closure consumes it; other modes ignore.
+    /// only on the quant-window arm). The quant_attn build closure consumes it; other modes ignore.
     pub needs_quant_attn: bool,
 }
 
@@ -180,7 +180,7 @@ pub fn resolve_kv_mode_checked(name: &str) -> Result<&'static KvModeReg> {
 // 각 build 클로저는 기존 chat 빌더(`build_chat_standard`/`build_chat_kivi`/
 // `build_chat_offload`)의 forward-구성 본문을 *그대로* 들고 와 `Box<dyn Forward>` (+
 // 핸들/라벨)를 반환한다. mode-agnostic 한 ChatSession 조립(registry/sampler/finish_chat_loop)
-// 은 `chat/build.rs` 가 이 build 결과 *둘레*에서 수행한다. KIVI-private 구성
+// 은 `chat/build.rs` 가 이 build 결과 *둘레*에서 수행한다. quant-window-private 구성
 // (alloc_quant_window_kv_caches / QuantWindowForward::new / bits·residual / caps.get::<QuantAttnBackend>())
 // 은 전부 "kivi" 클로저 *안*으로 이동했다 — dispatch 지점이 더는 "kivi" 를 NAME 하지 않는다.
 
@@ -227,7 +227,7 @@ fn build_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeBuild> {
     crate::session::chat::session::build_chat_standard_forward(ctx)
 }
 
-/// "kivi" build closure — KIVI-private 구성 일체(alloc_quant_window_kv_caches / QuantWindowForward::new /
+/// "kivi" build closure — quant-window-private 구성 일체(alloc_quant_window_kv_caches / QuantWindowForward::new /
 /// bits·residual / caps.get::<QuantAttnBackend>())가 여기로 이동했다.
 fn build_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatModeBuild> {
     crate::session::chat::session::build_chat_quant_window_forward(ctx)
@@ -256,7 +256,7 @@ mod tests {
         // Standard: eviction-capable, not quantized, no offload.
         let s = mode_caps("standard").unwrap();
         assert!(s.supports_eviction && !s.is_quantized_kv && !s.supports_offload);
-        // KIVI: quantized, needs quant-attn, no eviction.
+        // quant-window: quantized, needs quant-attn, no eviction.
         let k = mode_caps("kivi").unwrap();
         assert!(k.is_quantized_kv && k.needs_quant_attn && !k.supports_eviction);
         // Offload: offload container, no eviction, not quantized.

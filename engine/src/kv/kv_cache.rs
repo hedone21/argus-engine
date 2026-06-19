@@ -999,7 +999,7 @@ impl KVCache {
     ///
     /// Unlike `shift_positions()` which moves the same positions for all heads,
     /// this method only modifies data belonging to the specified `head`.
-    /// Used by per-head eviction policies (e.g., H2O+) where each KV head
+    /// Used by per-head eviction policies (e.g., heavy-hitter+) where each KV head
     /// independently selects which tokens to keep.
     ///
     /// **Requires HeadMajor layout** — panics on SeqMajor because per-head
@@ -1095,7 +1095,7 @@ impl KVCache {
     pub fn release_unused_pages(&mut self) -> usize {
         // Shrink buffers when significantly underutilized (works for any buffer type).
         // Reallocates smaller buffers, guaranteeing physical memory release.
-        // Threshold: 75% — e.g. H2O keep_ratio=0.5 evicts to capacity/2, which now triggers shrink.
+        // Threshold: 75% — e.g. heavy-hitter keep_ratio=0.5 evicts to capacity/2, which now triggers shrink.
         if self.memory.is_some() && self.current_pos * 4 < self.capacity * 3 {
             return self.shrink_to_fit().unwrap_or_else(|e| {
                 eprintln!("[KVCache] shrink_to_fit failed: {}", e);
@@ -1205,7 +1205,7 @@ impl KVCache {
         Ok(())
     }
 
-    /// Per-head variant of `compact_keep_positions` for H2O+ per-head eviction.
+    /// Per-head variant of `compact_keep_positions` for heavy-hitter+ per-head eviction.
     ///
     /// Only moves data for the specified `head`; other heads are untouched.
     /// `keep` must be sorted in ascending order.
@@ -2845,7 +2845,7 @@ mod tests {
 
     #[test]
     fn test_compact_keep_positions_one_gap() {
-        // Classic H2O scenario: keep HH at [0,2,4] and recent [7,8,9]
+        // Classic heavy-hitter scenario: keep HH at [0,2,4] and recent [7,8,9]
         // write_start = 0 (no protected prefix)
         // Batching: [0] in-place, [2] single, [4] single, [7,8,9] batch of 3
         let mut cache = make_filled_hm_cache(10, 2, 4);

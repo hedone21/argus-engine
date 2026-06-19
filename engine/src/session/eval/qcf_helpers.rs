@@ -62,7 +62,7 @@ pub struct QcfSwapDumpContext<'a> {
     /// this step, the layer added at this step (`null` for step 0 baseline),
     /// and the full `EvalOutput` from the eval-ll run.
     pub trajectory: Option<&'a [TrajectoryStep<'a>]>,
-    /// Per-layer DP-LLM proxy ε (single-tensor relative) from
+    /// Per-layer weight-perturbation proxy ε (single-tensor relative) from
     /// `--importance-formula compare` mode. Length = `num_layers`.
     pub dpllm_epsilon: Option<&'a [f32]>,
     /// §4 candidate A: per-layer multi-tensor sum of input-aware relative ε.
@@ -196,7 +196,7 @@ pub fn dump_qcf_swap_json(
 
     // per_layer_3way: only present when `--importance-formula compare` was used.
     // Each entry merges side-by-side importance (mean_pool + shortgpt_bi) with
-    // DP-LLM ε and Frobenius ε, one row per layer where mean_pool/shortgpt_bi
+    // weight-perturbation ε and Frobenius ε, one row per layer where mean_pool/shortgpt_bi
     // are both populated. Layers with `None` measurements (i.e. non-comparison
     // mode entries) are skipped.
     let three_way_val: Value = match (ctx.importance_table, ctx.dpllm_epsilon) {

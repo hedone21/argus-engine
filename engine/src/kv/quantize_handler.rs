@@ -9,9 +9,9 @@
 
 use super::PressureLevel;
 
-/// Map pressure level to target KIVI quantization bits. (ENG-ALG-092)
+/// Map pressure level to target quant-window quantization bits. (ENG-ALG-092)
 /// Returns `None` if no transition is needed (Normal pressure).
-/// production 호출지 없음 — KIVI dynamic transition 미배선. spec MUST 보존 진입점.
+/// production 호출지 없음 — quant-window dynamic transition 미배선. spec MUST 보존 진입점.
 pub fn target_bits_for_pressure(level: PressureLevel) -> Option<u8> {
     match level {
         PressureLevel::Normal => None,

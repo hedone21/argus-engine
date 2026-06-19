@@ -8,11 +8,11 @@ pub struct KvModeArgs {
     #[arg(long, default_value = "standard")]
     pub kv_mode: String,
 
-    /// KIVI quantization bits (kv-mode=kivi 한정)
+    /// quant-window quantization bits (kv-mode=kivi 한정)
     #[arg(long = "kivi-bits", default_value_t = 2)]
     pub quant_window_bits: u8,
 
-    /// KIVI residual buffer length (kv-mode=kivi 한정)
+    /// quant-window residual buffer length (kv-mode=kivi 한정)
     #[arg(long = "kivi-residual-len", default_value_t = 128)]
     pub quant_window_residual_len: usize,
 

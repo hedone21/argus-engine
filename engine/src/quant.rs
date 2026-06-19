@@ -76,11 +76,11 @@ impl BlockQ4_1 {
     }
 }
 
-// ── Q2_0: KIVI-style asymmetric 2-bit quantization ──────────────────────────
+// ── Q2_0: asymmetric 2-bit quantization ─────────────────────────────────────
 
 pub const QK2_0: usize = 32;
 
-/// Asymmetric 2-bit quantization block (KIVI paper, ICML 2024).
+/// Asymmetric 2-bit quantization block.
 ///
 /// Each block quantizes 32 f32 values into 2-bit unsigned integers [0..3].
 /// Formula: `q = round((x - min) / scale)`, `scale = (max - min) / 3`.
@@ -188,7 +188,7 @@ impl BlockQ8_0 {
     }
 }
 
-// ── KV cache asymmetric quantization blocks (KIVI multi-bit) ─────────────────
+// ── KV cache asymmetric quantization blocks (multi-bit) ──────────────────────
 
 /// Group size for KV cache quantization (same as QK2_0).
 pub const QKKV: usize = 32;

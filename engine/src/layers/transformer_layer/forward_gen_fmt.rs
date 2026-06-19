@@ -19,7 +19,7 @@
 //! 따라서 (3c) device 게이트는 **F16/Q4_0 KV**(default=F16) 또는 F32-device-only 만 대상으로 한다.
 //! 생략한 instrumentation(prof/op-trace/set_label)은 수치 무관(게이트는 `--profile`·env 미사용).
 //! `set_attn_scores`/`needs_attn_scores` OR 항 생략은 StandardKVCache trait default(no-op/false)라 안전
-//! (KIVI 전용). score_offset/effective_cache_len 은 forward_gen.rs:404 와 동일 식으로 재현. GPU score
+//! (quant-window 전용). score_offset/effective_cache_len 은 forward_gen.rs:404 와 동일 식으로 재현. GPU score
 //! acc layer_idx routing 도 동일 위치 보존.
 
 use super::*;
@@ -36,7 +36,7 @@ pub(crate) struct ForwardGenFmtArgs<'a> {
     pub ws: &'a mut crate::layers::workspace::LayerWorkspace,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
-    /// H2O/D2O score 누적이 필요하면 attention_into 에 scores 버퍼 전달.
+    /// heavy-hitter/weighted-merge score 누적이 필요하면 attention_into 에 scores 버퍼 전달.
     pub need_scores: bool,
     pub head_dim: usize,
     pub skip_attn: bool,
@@ -59,7 +59,7 @@ pub(crate) struct ForwardGenFmtArgs<'a> {
 impl TransformerLayer {
     /// `forward_gen` 의 trait-object fork (decode, seq_len=1). KV write + attention 만 fmt 위임.
     pub(crate) fn forward_gen_fmt(&self, args: ForwardGenFmtArgs) -> Result<()> {
-        // SWIFT: 두 sub-layer 모두 skip 이면 identity (forward_gen.rs:26 동치).
+        // layer-skip: 두 sub-layer 모두 skip 이면 identity (forward_gen.rs:26 동치).
         if args.skip_attn && args.skip_mlp {
             return Ok(());
         }
@@ -200,7 +200,7 @@ impl TransformerLayer {
                 )?;
             }
         }
-        // set_attn_scores(forward_gen.rs:1071) 는 StandardKVCache no-op(KIVI AWQE 전용) → 생략.
+        // set_attn_scores(forward_gen.rs:1071) 는 StandardKVCache no-op(quant-window AWQE 전용) → 생략.
 
         // 6. Output projection.
         backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;

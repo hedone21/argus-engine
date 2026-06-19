@@ -81,7 +81,7 @@ pub struct ModelForward {
     // transformer.rs seam 의 `is_some` branch 1회 → full read 직행(INV-147 byte-identical).
     read_stage: Option<Box<dyn argus_extension_api::KVReadStage>>,
 
-    // QueryStats(Expected Attention) producer. `Some` iff the installed read stage declared
+    // QueryStats(future-attention) producer. `Some` iff the installed read stage declared
     // `wants_query_stats` (set in `set_read_stage`); `step` then lends `&mut acc` to the decode
     // forward so transformer.rs accumulates the per-(layer,kv_head) running Q mean/var and feeds it
     // into the read seam (quest page scoring). `None` (production default / non-QueryStats read
@@ -212,7 +212,7 @@ impl ModelForward {
     ///
     /// `wants_query_stats`(= `KVReadStageReg::wants_query_stats`)이면 per-(layer,kv_head) Q running
     /// mean/var 를 모으는 `QueryStatsAccumulator` 를 모델 차원으로 생성·활성화해 decode 시 forward 에
-    /// 대여한다(quest Expected-Attention). false 면 미생성 → 디코드 루프 비용 0.
+    /// 대여한다(read stage 의 future-attention). false 면 미생성 → 디코드 루프 비용 0.
     pub fn set_read_stage(
         &mut self,
         stage: Box<dyn argus_extension_api::KVReadStage>,
@@ -670,11 +670,11 @@ impl Forward for ModelForward {
         // Phase α-K BC (3d): fmt 활성(chat fmt-wrap) 시 UER(Unwrap-Evict-Rewrap).
         // fmt-wrap 이 kv_caches 를 mem::take 해 비웠으므로 OLD 경로는 빈 슬라이스 → silent no-op.
         // inner KVCache 들을 연속 Vec 로 꺼내(take_inner) OLD `cache_manager.{force,maybe}_evict*`
-        // 를 **그대로 재사용**(전 정책 sliding/h2o/h2o_plus/d2o + D2O cross-layer merge + execute_dispatch
+        // 를 **그대로 재사용**(전 정책 sliding/h2o/h2o_plus/d2o + weighted-merge cross-layer merge + execute_dispatch
         // 의 madvise/new_pos/CacheEvent 보존, selection 동일성 = code-path 동일성) 후 다시 넣는다(put_inner).
         // 설계: design_alpha_k_3d_chat_fmt_2026_06_04.md (Approach B, 적대검증 3 lens 만장일치).
         if let Some(fmts) = &self.fmt_caches {
-            // W1 불변식: fmts = ensure_fmt_wrapped enumerate 순서 == layer idx (D2O cross-layer 전제).
+            // W1 불변식: fmts = ensure_fmt_wrapped enumerate 순서 == layer idx (weighted-merge cross-layer 전제).
             let before_pos = fmts
                 .first()
                 .map(|f| f.with_cache_mut(|c| c.current_pos))
@@ -742,7 +742,7 @@ impl Forward for ModelForward {
     /// prefix cache save (ENG-085, INV-189). prefill 완료 직후 호출됨.
     ///
     /// fmt_caches(StandardFormat)가 있으면 `SnapshotRestore::snapshot_prefix` 경유 직렬화.
-    /// opaque/KIVI(fmt_caches == None 또는 opaque buffer) 는 no-op (INV-190 정책 동치 — 에러 아님).
+    /// opaque/quant-window(fmt_caches == None 또는 opaque buffer) 는 no-op (INV-190 정책 동치 — 에러 아님).
     fn save_kv_prefix(
         &self,
         path: &std::path::Path,
@@ -813,7 +813,7 @@ fn read_score_cell_active(cell: &Arc<Mutex<Option<AttentionScoreAccumulator>>>) 
 /// `Vec<KVCache>` → `Vec<Arc<StandardFormat>>` wrap (by-value move, 단일 물리 캐시).
 ///
 /// 빈 입력이면 `None` (기존 `kv_caches.is_empty()` 가드 등가).
-/// W1 불변식: enumerate 순서 == layer idx (D2O cross-layer 전제).
+/// W1 불변식: enumerate 순서 == layer idx (weighted-merge cross-layer 전제).
 pub(crate) fn wrap_kv_caches(caches: Vec<KVCache>) -> Option<Vec<Arc<StandardFormat>>> {
     if caches.is_empty() {
         return None;

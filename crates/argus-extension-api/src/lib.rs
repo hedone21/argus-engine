@@ -33,17 +33,17 @@ pub use linkme::distributed_slice;
 pub enum TensorKind {
     /// raw K. row=(pos,head), cols=head_dim. dtype branching (F32/F16/Q4_0) is absorbed inside the handle.
     Key,
-    /// raw V. The v_i of CAOTE/VATP. Same (pos,head) coordinate system as Key.
+    /// raw V (the per-(pos,head) value vector value-aware policies read as v_i). Same (pos,head) coordinate system as Key.
     Value,
-    /// per-(kv_head,pos) attention weight from the previous decode step (last layer). The a_i of CAOTE. cols=1, per_head.
+    /// per-(kv_head,pos) attention weight from the previous decode step (last layer) — the a_i read by value-aware policies. cols=1, per_head.
     /// Source: `AttentionScoreAccumulator::last_step_head_attn` (CPU overwrite / GPU = head_importance proxy).
     /// **Note**: a last-layer, last-step approximation — not a windowed/per-layer exact value (`has_attn_weights` gate).
     AttnWeights,
     /// per-(kv_head,pos) accumulated head importance (h2o_plus). cols=1, per_head.
     /// flat per-token importance is exposed zero-copy directly via [`StageCtx::importance`] rather than this handle (a D1 exception).
     Scores,
-    /// per-(layer,kv_head) Q (query) running statistics — the input to the closed-form future-attention
-    /// estimate of Expected Attention (arXiv 2510.00636). `shape = {rows:2, cols:head_dim, per_head:true}`
+    /// per-(layer,kv_head) Q (query) running statistics — the input to a closed-form future-attention
+    /// estimate. `shape = {rows:2, cols:head_dim, per_head:true}`
     /// (MQ-1): `read_row(0, kv_head, out)` = that kv_head's Q running **mean[head_dim]**,
     /// `read_row(1, kv_head, out)` = running **var[head_dim]**. Reduced to kv_head coordinates by the element-wise
     /// mean of the Q-head statistics within a GQA group (MQ-2 — the same kv_head coordinates as the GQA reduction of `Scores`/`AttnWeights`, so they are cross-
@@ -97,7 +97,7 @@ pub trait TensorHandle {
 /// **Read unification**: all tensor/score reads flow through the single [`StageCtx::tensor`] mechanism.
 /// `dequant_k`/`dequant_v`/`head_score`/`has_head_scores`/`attn_weight`/`has_attn_weights` are
 /// default sugar on top of `tensor()` — the engine only needs to implement `tensor()`. Only flat `importance()` is exposed zero-copy
-/// directly (an exception, since routing a scalar through per-element read_row would be a net loss for the H2O ranking path).
+/// directly (an exception, since routing a scalar through per-element read_row would be a net loss for the heavy-hitter ranking path).
 pub trait StageCtx {
     /// Current number of valid tokens. Every technique reads this as the starting point for computing its keep/prune budget.
     /// Engine impl source: `KVCache::current_pos()`.
@@ -112,7 +112,7 @@ pub trait StageCtx {
     /// so the ctx maintains a single-layer view.
     fn layer_idx(&self) -> usize;
 
-    /// flat per-token importance score. `Some` → score-based (h2o heavy-hitter, d2o token rank),
+    /// flat per-token importance score. `Some` → score-based (heavy-hitter eviction, token-rank merge),
     /// `None` → score-free (sliding/streaming). For positional indexed access only (`imp.get(pos)`). The returned slice's
     /// borrow is bound to the ctx lifetime, keeping it dyn-safe.
     fn importance(&self) -> Option<&[f32]>;
@@ -140,7 +140,7 @@ pub trait StageCtx {
         }
     }
 
-    /// Fills raw V(`pos`,`head`) into `out` as f32 (the v_i of CAOTE/VATP). Sugar over `tensor(Value)`.
+    /// Fills raw V(`pos`,`head`) into `out` as f32 (value-aware policies' v_i). Sugar over `tensor(Value)`.
     /// Contract: `out.len() == head_dim`. no-op if the kind is unavailable.
     fn dequant_v(&self, pos: usize, head: usize, out: &mut [f32]) {
         if let Some(h) = self.tensor(TensorKind::Value) {
@@ -165,8 +165,8 @@ pub trait StageCtx {
         self.tensor(TensorKind::Scores).is_some()
     }
 
-    /// The previous decode step's per-head attention weight at `(kv_head, pos)` (the a_i of CAOTE). Sugar over `tensor(AttnWeights)`.
-    /// If `has_attn_weights()==false` it is meaningless (0.0) — CAOTE is advised to fall back to `importance()`.
+    /// The previous decode step's per-head attention weight at `(kv_head, pos)` (value-aware policies' a_i). Sugar over `tensor(AttnWeights)`.
+    /// If `has_attn_weights()==false` it is meaningless (0.0) — value-aware policies are advised to fall back to `importance()`.
     fn attn_weight(&self, kv_head: usize, pos: usize) -> f32 {
         match self.tensor(TensorKind::AttnWeights) {
             Some(h) => {
@@ -200,7 +200,7 @@ pub trait StageCtx {
 }
 
 /// A weighted merge instruction. Sums the evicted tokens (`from`) with weights into a single retained token's slot (`into`).
-/// `Σ from.1 + into_weight ≈ 1` (magnitude preservation, d2o Eq.11 weights).
+/// `Σ from.1 + into_weight ≈ 1` (magnitude preservation, the merge weights).
 ///
 /// The `into`/`from` positions are logical coordinates just before compact is applied (pre-compact). The weights are baked into the plan,
 /// and the engine executor (`apply_merges`) uses them as-is (replacing the current uniform merge). A merge-free policy uses an empty Vec.
@@ -208,7 +208,7 @@ pub trait StageCtx {
 pub struct WeightedMerge {
     /// The position of the retained token being merged into (the slot where the weighted sum accumulates).
     pub into: usize,
-    /// The weight of `into` itself (the `w_c` of d2o Eq.11).
+    /// The weight of `into` itself (the center weight `w_c` of the merge).
     pub into_weight: f32,
     /// The `(position, weight)` of the evicted tokens to be merged.
     pub from: Vec<(usize, f32)>,
@@ -290,7 +290,7 @@ pub struct StageParams {
     pub eviction_window: usize,
     /// the prefix length to protect at the front (BOS / system prompt, etc.).
     pub protected_prefix: usize,
-    /// heavy-hitter keep ratio (H2O family).
+    /// heavy-hitter keep ratio (score-based eviction family).
     pub keep_ratio: f32,
     /// streaming sink (attention sink) size.
     pub sink_size: usize,
@@ -336,8 +336,8 @@ pub struct StageCaps {
     /// the engine pick the recency/prompt-length default). Replaces the `match name { ... => 4 }`
     /// prefix tables.
     pub default_protected_prefix: usize,
-    /// `true` ⟺ `plan()` may emit a non-empty `merges` vector (weighted KV merge, à la D2O's
-    /// Eq.11). The eval/QCF path reads this to pick a merge-compensation estimator + K readback
+    /// `true` ⟺ `plan()` may emit a non-empty `merges` vector (a weighted KV merge).
+    /// The eval/QCF path reads this to pick a merge-compensation estimator + K readback
     /// instead of a pure-drop estimator. Replaces the engine-side `eviction_policy() == "d2o"` name
     /// match (the last STAGE-axis technique-name leak in eval).
     pub produces_merge_plan: bool,
@@ -1358,7 +1358,7 @@ pub fn registered_backend_capability_names() -> Vec<&'static str> {
     BACKEND_CAPABILITIES.iter().map(|r| r.name).collect()
 }
 
-// ── Backend-capability axis — ATTENTION (quantized fused attention, e.g. KIVI) category dynamic C-ABI ──
+// ── Backend-capability axis — ATTENTION (quantized fused attention, e.g. quant-window) category dynamic C-ABI ──
 //
 // D8 (single-trait): argus-extension-api owns the canonical [`QuantAttnBackend`]. The engine's static OpenCL
 // impl, the host dlopen adapter, and the plugin `.so` **all implement this one trait** (isomorphic to the stage `KVCacheStage`). The signatures take
@@ -1372,7 +1372,7 @@ pub fn registered_backend_capability_names() -> Vec<&'static str> {
 /// concrete-`OpenCLBackend` downcast on the live FORMAT-flush path). A v1 `.so` is rejected.
 pub const BACKEND_CAP_ABI_VERSION: u32 = 2;
 
-/// Capability category tag — ATTENTION (quantized fused dequant+attention, e.g. KIVI). [`BackendCapVTableAbi::category`].
+/// Capability category tag — ATTENTION (quantized fused dequant+attention, e.g. quant-window). [`BackendCapVTableAbi::category`].
 /// The host's category bridge (`match`) uses this value to cast the `vtable` pointer to its per-category table ([`QuantAttnVTable`]) (D7).
 pub const BACKEND_CAP_CATEGORY_ATTENTION: u32 = 1;
 
@@ -1706,7 +1706,7 @@ macro_rules! register_quant_attn_plugin {
 // Plan → garbage/crash), so this ABI carries only borrowed `cl_mem` and POD scalars.
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Capability category tag — CACHE (stateful quantized-KV cache construction, e.g. KIVI).
+/// Capability category tag — CACHE (stateful quantized-KV cache construction, e.g. quant-window).
 /// [`BackendCapVTableAbi::category`]. The host's category bridge casts the `vtable` pointer
 /// to [`QuantCacheVTable`] when `category == BACKEND_CAP_CATEGORY_CACHE` (D7). A fresh value
 /// (ATTENTION=1 is taken) — a new category is a new host `match` arm = host recompile (C1).
@@ -1768,7 +1768,7 @@ pub struct QuantCacheUpdateArgs {
 
 /// Out-parameter the plugin fills with the `cl_mem` of its assembled K/V view; the engine
 /// wraps each in a tensor (the underlying buffer is engine-owned → zero-alloc reuse) and
-/// runs standard attention on it. Mirrors `KiviCache::get_view` for the GPU regime.
+/// runs standard attention on it. Mirrors `QuantizedRecentWindowCache::get_view` for the GPU regime.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct QuantCacheViewOut {
@@ -1784,7 +1784,7 @@ pub struct QuantCacheViewOut {
 
 /// Out-parameter the plugin fills with the raw quantized + residual `cl_mem` set the ATTENTION
 /// cap (`attention_gen_quant`) consumes directly on the fused-native path — four separate
-/// buffers, NOT one assembled view. Mirrors `KiviCache::get_kivi_raw_buffers`. The vtable fn
+/// buffers, NOT one assembled view. Mirrors the cache's raw-buffer accessor. The vtable fn
 /// returns `false` (and leaves this untouched) when there is no native-consumable set (CPU /
 /// bits=16 / empty).
 #[repr(C)]
@@ -1835,7 +1835,7 @@ pub trait QuantCacheBackend: Send + Sync {
 
 /// Static (force-link) quantized-KV cache registration entry — the CACHE-category counterpart
 /// of [`QuantAttnReg`] (D8). `make` builds the kernels once from the host GPU context.
-/// The built-in engine KIVI does **not** register here (its construction needs engine
+/// The built-in engine quant-window does **not** register here (its construction needs engine
 /// `Backend`/`Memory` handles a POD `make` cannot carry — that lives engine-side); this slice
 /// is populated by out-of-tree cache plugins.
 pub struct QuantCacheReg {
@@ -2060,13 +2060,13 @@ pub trait KVReadStage: Send + Sync {
     fn read_plan(&self, ctx: &dyn StageCtx) -> Option<KVReadPlan>;
 }
 
-/// The CLI-derived static configuration for a read stage (a mirror of the KV `StageParams`). The static knobs of Quest (the first built-in).
+/// The CLI-derived static configuration for a read stage (a mirror of the KV `StageParams`). The static knobs of the first built-in read stage.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReadStageParams {
-    /// Page size (number of tokens grouped per page). Quest default 16.
+    /// Page size (number of tokens grouped per page). Default 16.
     pub page_size: u32,
-    /// Fraction of pages to select (1/`top_k_ratio_denom` of all pages). Quest default 4 (= 1/4 of the total).
+    /// Fraction of pages to select (1/`top_k_ratio_denom` of all pages). Default 4 (= 1/4 of the total).
     pub top_k_ratio_denom: u32,
 }
 
@@ -2089,14 +2089,14 @@ pub struct KVReadStageReg {
     /// running Q mean/var). When `true`, the engine builds + activates a `QueryStatsAccumulator`
     /// and threads its per-layer stats into the read ctx; when `false` it skips that per-decode-step
     /// cost entirely. The engine reads this off the registration **before** instantiating the stage,
-    /// so it never needs to name-match `"quest"`. The read-axis analogue of `StageCaps.reads`.
+    /// so it never needs to name-match a specific read stage. The read-axis analogue of `StageCaps.reads`.
     pub wants_query_stats: bool,
 }
 
 /// Global read-stage registration slice — the **4th parallel linkme registry** on the stage axis.
 ///
 /// **Starts with zero built-ins** — when no read stage is present the engine always does a full read (100% of current behavior preserved, D5).
-/// The first built-in will be Quest (to be registered in S4/S5).
+/// The first built-in read stage is registered out-of-tree (S4/S5).
 #[distributed_slice]
 pub static KV_READ_STAGES: [KVReadStageReg] = [..];
 
@@ -2139,7 +2139,7 @@ pub trait EstimatorCtx {
     fn n_kv_heads(&self) -> usize;
     /// Per-head dimension — the length of every `read_v` / `read_k` / O_after buffer.
     fn head_dim(&self) -> usize;
-    /// β exponent for redistributed-attention amplification (`1.0` = standard CAOTE / legacy).
+    /// β exponent for redistributed-attention amplification (`1.0` = no amplification / legacy).
     fn beta(&self) -> f32;
     /// Per-head redistribution weights α_h[t] (`out.len() == current_pos`) — the same weights the
     /// engine uses for O_before (per-head attention with a flat-score fallback). Estimators rank and
@@ -2249,7 +2249,7 @@ pub fn redistribute_value(
 // ════════════════════════════════════════════════════════════════════════════
 //
 // Per-layer importance scoring. The engine's ImportanceCollector used to hold every concrete
-// importance formula inline (mean-pool cosine, ShortGPT-BI per-token cosine), duplicating the
+// importance formula inline (mean-pool cosine, per-token-cosine block-influence), duplicating the
 // technique arithmetic in the engine core. This axis lets each formula live in a technique crate and
 // self-register, so the engine keeps only the streaming harness, the OPR telemetry, and the generic
 // per-layer ctx — no concrete scoring arithmetic.
@@ -2259,9 +2259,9 @@ pub fn redistribute_value(
 // serve. A future cdylib path stays open — the scorer output is POD (`score` returns `f32` by value),
 // so it would not break the surface.
 //
-// Two lifecycles share the axis. PerLayerStreaming scorers (mean-pool / ShortGPT-BI) run inside the
+// Two lifecycles share the axis. PerLayerStreaming scorers (mean-pool / per-token-cosine) run inside the
 // prefill layer loop, one call per (layer, sublayer), over the current layer's activations.
-// OneShotPostWarmup scorers (the DP-LLM / DirectAttn weight-perturbation formulas, not yet migrated)
+// OneShotPostWarmup scorers (the weight-perturbation / DirectAttn weight-perturbation formulas, not yet migrated)
 // run once after warmup over all layers, reading cached per-layer means and weight subtensors. The
 // `LayerScorerCtx` carries accessors for both; an implementation populates only the half matching its
 // phase (a streaming ctx returns None/0 for the post-warmup accessors, and vice versa).
@@ -2271,10 +2271,10 @@ pub fn redistribute_value(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerScorerPhase {
     /// Called once per (layer, sublayer) inside the prefill layer loop, over the current layer's
-    /// activations (pooled + raw in/out). Mean-pool and ShortGPT-BI are of this kind.
+    /// activations (pooled + raw in/out). Mean-pool and per-token-cosine scorers are of this kind.
     PerLayerStreaming,
     /// Called once after warmup over all layers, reading cached per-layer means and weight subtensors
-    /// (DP-LLM / DirectAttn). Reserved for a later stage; no built-in scorer uses it yet.
+    /// (weight-perturbation / DirectAttn). Reserved for a later stage; no built-in scorer uses it yet.
     OneShotPostWarmup,
 }
 
@@ -2307,7 +2307,7 @@ pub trait LayerScorerCtx {
     /// `(before_seq_len, before_dim)` describing `raw_in`'s shape (may differ from `seq_len`/`dim`).
     fn raw_in_dims(&self) -> (usize, usize);
 
-    // ── OneShotPostWarmup inputs (DP-LLM / DirectAttn) — None/0/empty for a streaming ctx ──
+    // ── OneShotPostWarmup inputs (weight-perturbation / DirectAttn) — None/0/empty for a streaming ctx ──
     /// Cached mean-pooled input `[dim]` for `layer` (post-warmup). `None` for a streaming ctx.
     fn x_mean(&self, layer: usize) -> Option<&[f32]>;
     /// F16 weight subtensor `name` for `layer` as `(data, rows, cols)`. `None` if unavailable.
@@ -2328,7 +2328,7 @@ pub trait LayerScorer: Send + Sync {
     /// Which lifecycle this scorer runs in (decides which ctx accessors it may read).
     fn phase(&self) -> LayerScorerPhase;
     /// Named weight subtensors the scorer reads (OneShotPostWarmup only) so the engine can pre-resolve
-    /// them to f32 before `score`. Empty for activation-only scorers (mean-pool / ShortGPT-BI).
+    /// them to f32 before `score`. Empty for activation-only scorers (mean-pool / per-token-cosine).
     fn reads_subtensors(&self) -> &'static [&'static str];
     /// Score `layer` using `ctx`. PerLayerStreaming scorers ignore `layer` (the ctx already holds the
     /// current layer's activations); OneShotPostWarmup scorers index `ctx` by `layer`.
@@ -2370,8 +2370,8 @@ pub fn registered_layer_scorer_names() -> Vec<&'static str> {
 // ════════════════════════════════════════════════════════════════════════════
 //
 // Forward-time attention-score production. The engine's `AttentionScoreAccumulator` used to hold the
-// per-layer score-accumulation policy inline (per-layer MAX, GQA group averaging, the CAOTE
-// last-layer overwrite, A2SF decay, cross-step SUM, time-normalization). This axis hosts that policy
+// per-layer score-accumulation policy inline (per-layer MAX, GQA group averaging, the value-aware
+// last-layer overwrite, forgetting-factor decay, cross-step SUM, time-normalization). This axis hosts that policy
 // in a plugin, so the engine core holds no concrete scoring arithmetic — only a delegating shell that
 // preserves the typed `&mut AttentionScoreAccumulator` forward param and forwards each call.
 //
@@ -2384,7 +2384,7 @@ pub fn registered_layer_scorer_names() -> Vec<&'static str> {
 /// Construction geometry for a [`ScoreProducer`], mirroring the engine accumulator's `new` / `new_gqa`
 /// signatures (the only POD a producer needs at build time). `n_kv_heads == 0` selects the flat
 /// (non-GQA) mode — per-token importance only; `n_kv_heads > 0` additionally tracks per-KV-head
-/// importance and the CAOTE last-layer attention. `time_normalize` is configured after construction
+/// importance and the value-aware last-layer attention. `time_normalize` is configured after construction
 /// via [`ScoreProducer::set_time_normalize`] (mirroring the engine's prior two-step setup).
 #[derive(Clone, Copy, Debug)]
 pub struct ScoreProducerParams {
@@ -2393,13 +2393,13 @@ pub struct ScoreProducerParams {
     /// Total query heads (kept for parity with the engine's `new`; the built-in producer derives
     /// per-step head counts from the `accumulate_layer*` arguments and does not read this).
     pub n_heads: usize,
-    /// KV heads for GQA grouping. `0` = flat mode (no per-head / CAOTE buffers).
+    /// KV heads for GQA grouping. `0` = flat mode (no per-head / value-aware buffers).
     pub n_kv_heads: usize,
     /// Total decoder layers (for the `last_n_layers` tracked-layer window).
     pub total_layers: usize,
     /// Track only the last N layers (`0` or `>= total_layers` = track all).
     pub last_n_layers: usize,
-    /// A2SF exponential decay factor per step (`0.0` = no decay; clamped to `[0, 1]`).
+    /// Exponential (forgetting-factor) decay factor per step (`0.0` = no decay; clamped to `[0, 1]`).
     pub decay: f32,
 }
 
@@ -2444,7 +2444,7 @@ pub trait ScoreProducer: Send + Sync {
     );
     /// GQA-aware accumulation: additionally averages Q-head scores within each KV group (per-KV-head
     /// importance, MAX across layers) and overwrites the last tracked layer's per-KV-head attention
-    /// (CAOTE).
+    /// (value-aware policy input).
     fn accumulate_layer_gqa(
         &mut self,
         scores: &[f32],
@@ -2472,7 +2472,7 @@ pub trait ScoreProducer: Send + Sync {
     fn raw_importance_scores(&self) -> &[f32];
     /// Per-KV-head cumulative importance `[n_kv_heads * max_seq_len]`, or `None` in flat mode.
     fn head_importance_scores(&self) -> Option<&[f32]>;
-    /// Last tracked layer's per-KV-head attention from the most recent step (CAOTE input)
+    /// Last tracked layer's per-KV-head attention from the most recent step (value-aware policy input)
     /// `[n_kv_heads * max_seq_len]`, or `None` in flat mode.
     fn last_step_head_attn(&self) -> Option<&[f32]>;
     /// Number of KV heads (`0` = flat mode).
@@ -2514,7 +2514,7 @@ pub fn registered_score_producer_names() -> Vec<&'static str> {
 // policy-neutral post-softmax weights into a `[n_layers, n_heads_q, score_stride]` score buffer
 // (that WRITE stays welded into the engine's flash/legacy attention kernels — it cannot be
 // intercepted mid-kernel). The per-token REDUCE that folds those weights into cumulative importance
-// — per-layer MAX, GQA group averaging, A2SF exponential decay — is the H2O-family score POLICY, and
+// — per-layer MAX, GQA group averaging, exponential (forgetting-factor) decay — is the score-reduce POLICY, and
 // this trait hosts it in the technique plugin so the engine core holds no GPU scoring policy (the CPU
 // twin already moved to `ScoreProducer` in Stage C).
 //
@@ -3279,7 +3279,7 @@ mod tests {
         assert!(!c.get_raw_buffers(&mut raw));
         assert_eq!(c.transition_bits(4), 0);
 
-        // No built-in registers in QUANT_CACHE_REGS at Stage C (the engine KIVI is engine-typed).
+        // No built-in registers in QUANT_CACHE_REGS at Stage C (the engine quant-window is engine-typed).
         assert!(find_quant_cache("nonexistent-cache").is_none());
     }
 

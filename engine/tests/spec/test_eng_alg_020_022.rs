@@ -1,7 +1,7 @@
-//! ENG-ALG-020 ~ ENG-ALG-022: KIVI Cache
+//! ENG-ALG-020 ~ ENG-ALG-022: Quantized recent-window cache
 //!
 //! QuantizedRecentWindowCache 기본 동작, bits 전이(transition), 점진적 역양자화(incremental deq).
-//! KiviCache는 FP32 residual buffer + quantized compressed storage 구조.
+//! QuantizedRecentWindowCache는 FP32 residual buffer + quantized compressed storage 구조.
 
 use argus_engine::kv::quant_window_cache::QuantizedRecentWindowCache;
 
@@ -98,7 +98,7 @@ fn test_eng_alg_022_kivi_cache_reset_clears_state() {
 
 #[test]
 fn test_eng_alg_022_kivi_cache_kv_dtype_is_f32() {
-    // KiviCache는 호출자에게 F32를 요구 (내부적으로 양자화 처리)
+    // QuantizedRecentWindowCache는 호출자에게 F32를 요구 (내부적으로 양자화 처리)
     use argus_engine::buffer::DType;
     let cache = QuantizedRecentWindowCache::new(2, 32, 256, 32);
     assert_eq!(cache.kv_dtype(), DType::F32);

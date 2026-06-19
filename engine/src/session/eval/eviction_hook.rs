@@ -1,8 +1,8 @@
 //! EvictionHook: StepHook implementation for budget-based KV cache eviction.
 //!
 //! Encapsulates the eviction logic previously embedded in `run_eval_ll` (generate.rs).
-//! Supports both H2O (score-based) and Sliding (position-based) eviction policies,
-//! and collects QCF/CAOTE metrics at each eviction event.
+//! Supports both score-based and position-based eviction policies,
+//! and collects QCF/value-aware metrics at each eviction event.
 
 use super::hook::{CacheSnapshot, StepHook};
 use crate::inference::attention_scores::AttentionScoreAccumulator;
@@ -17,10 +17,10 @@ use argus_extension_api::{StageParams, find_qcf_estimator};
 pub struct EvictionQcfResult {
     pub tokens_evicted: usize,
     pub eviction_ratio: f32,
-    pub qcf_caote: f32,
+    pub qcf_value_aware: f32,
 }
 
-/// QCF record schema v3 payload — cross-family unified (Eviction + KIVI).
+/// QCF record schema v3 payload — cross-family unified (Eviction + quant-window).
 ///
 /// Per-layer worst-head and mean-head series of `‖ΔO_h‖₂ / ‖O_h‖₂`, plus
 /// binary pre-computed record-level scalars and D7 / C1 dispersion metrics
@@ -128,7 +128,7 @@ impl CacheSnapshot<KVCache> for KVCacheSnapshot {
 ///
 /// After each decode step, checks whether `kv_caches[0].current_pos > effective_budget`.
 /// When over budget:
-/// - H2O / score-based: calls `force_evict_with_scores` with identified evicted tokens,
+/// - heavy-hitter / score-based: calls `force_evict_with_scores` with identified evicted tokens,
 ///   computes `eviction_attn` (and optionally `eviction_caote`) QCF metrics.
 /// - Sliding / position-based: calls `force_evict`, computes `sliding_attn`
 ///   (and optionally `sliding_caote`) QCF metrics.
@@ -137,7 +137,7 @@ impl CacheSnapshot<KVCache> for KVCacheSnapshot {
 pub struct EvictionHook {
     /// KV cache manager (wraps the eviction policy).
     pub cache_manager: CacheManager,
-    /// Attention score accumulator for H2O scoring (Some iff score-based).
+    /// Attention score accumulator for heavy-hitter scoring (Some iff score-based).
     pub score_accumulator: Option<AttentionScoreAccumulator>,
     /// QCF metric collection config.
     pub qcf_config: QcfConfig,
@@ -145,11 +145,11 @@ pub struct EvictionHook {
     pub effective_budget: usize,
     /// Number of prefix tokens protected from eviction.
     pub protected_prefix: usize,
-    /// Whether to use H2O/D2O score-based eviction (vs. positional sliding).
+    /// Whether to use score-based eviction (vs. positional sliding).
     pub score_based_eviction: bool,
-    /// H2O keep ratio (fraction of non-prefix tokens kept as heavy hitters).
+    /// Keep ratio (fraction of non-prefix tokens kept as heavy hitters).
     pub h2o_keep_ratio: f32,
-    /// Whether to use D2O merge compensation (vs. plain H2O eviction) for QCF-CAOTE.
+    /// Whether to use weighted-merge merge compensation (vs. plain heavy-hitter eviction) for QCF-value-aware.
     pub produces_merge_plan: bool,
     /// KV cache dtype string for QCF gating (only "f32" collects QCF).
     pub kv_type: String,
@@ -270,7 +270,7 @@ impl StepHook<KVCache> for EvictionHook {
             v_cpu_bytes.is_some() || !caches[0].v_buffer.buffer().as_ptr().is_null();
 
         // QCF (unified output-error formula). Action picks the simulated retention.
-        let qcf_caote = if can_compute_qcf {
+        let qcf_value_aware = if can_compute_qcf {
             let cache = &caches[0];
             let v_source = VDataSource::from_buffer(&cache.v_buffer, v_cpu_bytes.as_deref())
                 .unwrap_or_else(|| {
@@ -307,7 +307,7 @@ impl StepHook<KVCache> for EvictionHook {
                 .score_accumulator
                 .as_ref()
                 .and_then(|acc| acc.last_step_head_attn());
-            // D2O simulator (paper Eq.8) needs K for nearest-neighbour matching; other techniques
+            // The merge simulator (cosine-nearest matching) needs K for nearest-neighbour matching; other techniques
             // ignore `k_source` (their estimators never call read_k).
             let k_source = if self.produces_merge_plan {
                 VDataSource::from_buffer(&cache.k_buffer, None)
@@ -466,7 +466,7 @@ impl StepHook<KVCache> for EvictionHook {
             if active {
                 let acc = self.score_accumulator.as_ref().unwrap();
                 let scores = acc.importance_scores().to_vec();
-                // CAOTE a_i: last-layer last-step per-head attention (value-aware policies).
+                // a_i: last-layer last-step per-head attention (value-aware policies).
                 let attn = acc.last_step_head_attn().map(|s| s.to_vec());
                 self.cache_manager
                     .force_evict_with_scores(caches, ratio, &scores, attn.as_deref())
@@ -490,7 +490,7 @@ impl StepHook<KVCache> for EvictionHook {
             self.eviction_qcf = Some(EvictionQcfResult {
                 tokens_evicted: evict_result.tokens_removed,
                 eviction_ratio,
-                qcf_caote,
+                qcf_value_aware,
             });
         }
     }
@@ -559,7 +559,7 @@ impl StepHook<KVCache> for EvictionHook {
 
     fn needs_score_probe(&self, caches: &[KVCache]) -> bool {
         // Probe is needed when cache exceeds budget (eviction will happen).
-        // The probe step populates score_accumulator for H2O decisions and
+        // The probe step populates score_accumulator for heavy-hitter decisions and
         // captures last_step_head_attn for QCF-ATTN measurement.
         !caches.is_empty() && max_cache_pos(caches) > self.effective_budget
     }
@@ -571,7 +571,7 @@ impl StepHook<KVCache> for EvictionHook {
             "evicted_tokens": self.evicted_total,
         });
         if let Some(ref qcf) = self.eviction_qcf {
-            obj["qcf"] = serde_json::json!(qcf.qcf_caote);
+            obj["qcf"] = serde_json::json!(qcf.qcf_value_aware);
             obj["tokens_evicted"] = serde_json::json!(qcf.tokens_evicted);
             obj["eviction_ratio"] = serde_json::json!(qcf.eviction_ratio);
         }
@@ -707,8 +707,8 @@ mod tests {
         let hook = make_hook(512, false);
         let fields = hook.extra_question_fields(&[]);
         assert!(
-            fields.get("qcf_caote_max").is_none(),
-            "qcf_caote_max should be absent when experimental_qcf is None"
+            fields.get("qcf_value_aware_max").is_none(),
+            "qcf_value_aware_max should be absent when experimental_qcf is None"
         );
         assert!(
             fields.get("qcf_per_head").is_none(),

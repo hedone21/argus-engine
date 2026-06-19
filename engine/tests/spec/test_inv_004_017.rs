@@ -72,8 +72,8 @@ fn test_inv_004_skip_qcf_produces_metric_on_rejection() {
 
     let metric = tracker.current_proxy();
     assert_eq!(
-        metric.action, "swift",
-        "INV-004: skip tracker must produce 'swift' action metric"
+        metric.action, "layer_skip",
+        "INV-004: skip tracker must produce 'layer_skip' action metric"
     );
     assert!(
         metric.raw_value > 0.0,
@@ -90,7 +90,7 @@ fn test_inv_004_skip_qcf_produces_metric_on_rejection() {
 fn test_inv_004_skip_qcf_no_action_zero_metric() {
     let tracker = SkipQcfTracker::new(16);
     let metric = tracker.current_proxy();
-    assert_eq!(metric.action, "swift");
+    assert_eq!(metric.action, "layer_skip");
     assert!(
         metric.raw_value.abs() < 1e-6,
         "INV-004: no action should produce zero raw_value"

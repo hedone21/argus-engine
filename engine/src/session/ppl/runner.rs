@@ -242,7 +242,7 @@ pub fn run_quant_window_ppl(
     model: &TransformerModel,
     tokenizer: &Tokenizer,
     backend: &Arc<dyn Backend>,
-    // Phase α-W-4 §3.3: KIVI native attention handle (caller 가 caps 에서 pull).
+    // Phase α-W-4 §3.3: quant-window native attention handle (caller 가 caps 에서 pull).
     // OpenCL backend 면 Some, 그 외 None.
     quant_attn: Option<Arc<dyn QuantAttnBackend>>,
     memory: &Arc<dyn Memory>,
@@ -272,14 +272,14 @@ pub fn run_quant_window_ppl(
     let eval_tokens = total_tokens.min(max_seq_len);
     if total_tokens > max_seq_len {
         eprintln!(
-            "[KIVI-PPL] Warning: text has {} tokens, truncating to max_seq_len={}",
+            "[quant-window-PPL] Warning: text has {} tokens, truncating to max_seq_len={}",
             total_tokens, max_seq_len
         );
     }
     let token_ids = &all_ids[..eval_tokens];
 
     eprintln!(
-        "[KIVI-PPL] {} tokens, kivi_residual_size={}, max_seq_len={}",
+        "[quant-window-PPL] {} tokens, kivi_residual_size={}, max_seq_len={}",
         eval_tokens, residual_size, max_seq_len
     );
 
@@ -342,7 +342,7 @@ pub fn run_quant_window_ppl(
 
     // ── 4. Prefill phase ──
     let prefill_len = eval_tokens.min(max_seq_len);
-    eprintln!("[KIVI-PPL] Prefill: {} tokens", prefill_len);
+    eprintln!("[quant-window-PPL] Prefill: {} tokens", prefill_len);
 
     {
         let cpu_backend = Arc::new(CpuBackend::new());
@@ -367,7 +367,7 @@ pub fn run_quant_window_ppl(
         // 동안만 `Vec<QuantizedRecentWindowCache>` → `Arc<QuantWindowFormat>` wrap → `forward_into` → concrete 복귀
         // (①-c eval 미러). multi-token prefill 은 QuantWindowFormat::attention_into 의 신규 prefill arm
         // (seq_len>1 → `prefill_attention` 재사용, quant_window_format.rs:106)을 경유 — OLD forward_prefill<C>
-        // 의 KIVI 경로(get_view → flash)와 bit-identical. AWQE 는 run_quant_window_ppl 미활성
+        // 의 quant-window 경로(get_view → flash)와 bit-identical. AWQE 는 run_quant_window_ppl 미활성
         // (set_awqe_enabled 미호출)이라 `cache_self_need_scores`=false(forward_gen.rs:409 OR 항 = false);
         // prefill 은 score 누적 안 하므로 어차피 무관. roundtrip 종료 후 take_flush_proxies/q2_tokens/
         // res_pos 접근은 concrete Vec 복귀 후라 borrow 충돌 없음.
@@ -429,7 +429,7 @@ pub fn run_quant_window_ppl(
         }
 
         eprintln!(
-            "[KIVI-PPL] Prefill NLL: {:.4}, count={}, running PPL={:.4}, Q2_tokens={}, res_pos={}",
+            "[quant-window-PPL] Prefill NLL: {:.4}, count={}, running PPL={:.4}, Q2_tokens={}, res_pos={}",
             total_nll,
             nll_count,
             (total_nll / nll_count as f64).exp(),
@@ -454,7 +454,7 @@ pub fn run_quant_window_ppl(
 
         // Phase α-K ①-e: run_quant_window_ppl decode flip — forward_fmt_roundtrip + forward_into.
         // decode(seq_len=1)는 QuantWindowFormat::attention_into 의 decode arm(attention_native / F32-view
-        // fallback)을 경유 — ①-c eval KIVI 와 동일 경로(host nll Δ~1e-6=★2 carve-out bit-identical
+        // fallback)을 경유 — ①-c eval quant-window 와 동일 경로(host nll Δ~1e-6=★2 carve-out bit-identical
         // 검증됨). `cache_self_need_scores` 는 AWQE 미활성으로 false(decode 의 need_scores OR 항).
         let cache_self_need_scores = kv_caches.first().is_some_and(|c| c.needs_scores());
         QuantizedRecentWindowCache::forward_fmt_roundtrip(&mut kv_caches, |fmts| {
@@ -507,7 +507,7 @@ pub fn run_quant_window_ppl(
         if (i + 1) % 200 == 0 {
             let ppl = (total_nll / nll_count as f64).exp();
             eprintln!(
-                "[KIVI-PPL] step {}/{}: NLL={:.4}, PPL={:.4}, cache_pos={}, Q2_tokens={}",
+                "[quant-window-PPL] step {}/{}: NLL={:.4}, PPL={:.4}, cache_pos={}, Q2_tokens={}",
                 i + 1,
                 eval_tokens,
                 total_nll,
@@ -535,7 +535,7 @@ pub fn run_quant_window_ppl(
         .filter_map(|m| m["normalized_value"].as_f64())
         .sum();
 
-    // KIVI OPR: per-flush events and summary stats
+    // quant-window OPR: per-flush events and summary stats
     let qcf_kivi_events: Vec<&serde_json::Value> = qcf_metrics
         .iter()
         .filter(|m| m["action"].as_str() == Some("kivi_opr"))
@@ -591,7 +591,7 @@ pub fn run_quant_window_ppl(
     println!("{}", serde_json::to_string_pretty(&output)?);
 
     eprintln!(
-        "\n[KIVI-PPL] Final: PPL={:.4}, NLL={:.4}, tokens={}, {:.1} tok/s, {:.1}s, Q2_tokens={}",
+        "\n[quant-window-PPL] Final: PPL={:.4}, NLL={:.4}, tokens={}, {:.1} tok/s, {:.1}s, Q2_tokens={}",
         ppl, total_nll, nll_count, tok_per_sec, wall_time, kv_caches[0].q2_tokens
     );
 
@@ -751,9 +751,10 @@ pub fn run_ppl(
     let mut nll_count: usize = 0;
     // PPL v3: collect QCF for every eviction event
     let mut qcf_events: Vec<serde_json::Value> = Vec::new();
-    // A2SF 측정(KV roadmap 항목 0 §4.2): --dump-a2sf 지정 시 eviction 직전 + run 종료 시 score
+    // score-decay 측정(KV roadmap 항목 0 §4.2): --dump-a2sf 지정 시 eviction 직전 + run 종료 시 score
     // accumulator importance 에서 BOS/non-BOS ratio + HH(top-k) 집합 스냅샷을 누적(읽기 전용).
-    let mut a2sf_snapshots: Vec<crate::session::a2sf_dump::A2sfSnapshot> = Vec::new();
+    let mut score_decay_snapshots: Vec<crate::session::score_decay_dump::ScoreDecaySnapshot> =
+        Vec::new();
     let overall_start = std::time::Instant::now();
 
     // LISWAP-PPL: per-token NLL log + token-index-triggered weight swap.
@@ -964,7 +965,7 @@ pub fn run_ppl(
         })?;
 
         // Phase α-K ①-d: forward_into → fmt round-trip (run_ppl decode; workspace=Some →
-        // forward_gen_fmt, 발산 A 무관). score-feed 활성(H2O 누적).
+        // forward_gen_fmt, 발산 A 무관). score-feed 활성(heavy-hitter 누적).
         KVCache::forward_fmt_roundtrip(kv_caches, |fmts| {
             model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &gen_input_gpu,
@@ -1017,20 +1018,22 @@ pub fn run_ppl(
             if before_len > eviction_threshold {
                 let ratio = effective_budget as f32 / before_len as f32;
 
-                // A2SF 측정: eviction(+ acc.reset) 직전 importance 스냅샷(읽기 전용). budget=top-k.
+                // score-decay 측정: eviction(+ acc.reset) 직전 importance 스냅샷(읽기 전용). budget=top-k.
                 if args.dump_a2sf.is_some()
                     && let Some(acc) = score_accumulator.as_ref()
                     && acc.is_active()
                 {
-                    a2sf_snapshots.push(crate::session::a2sf_dump::compute_a2sf_snapshot(
-                        acc.importance_scores(),
-                        before_len,
-                        effective_budget,
-                        i as i64,
-                    ));
+                    score_decay_snapshots.push(
+                        crate::session::score_decay_dump::compute_score_decay_snapshot(
+                            acc.importance_scores(),
+                            before_len,
+                            effective_budget,
+                            i as i64,
+                        ),
+                    );
                 }
 
-                // GPU V buffer readback for QCF-CAOTE computation.
+                // GPU V buffer readback for QCF-value-aware computation.
                 let v_cpu_data: Option<Vec<f32>> = if args.kv_type == "f32"
                     && !kv_caches.is_empty()
                     && kv_caches[0].v_buffer.buffer().as_ptr().is_null()
@@ -1056,7 +1059,7 @@ pub fn run_ppl(
                     if let Some(acc) = score_accumulator.as_ref() {
                         if acc.is_active() {
                             let scores = acc.importance_scores().to_vec();
-                            // CAOTE a_i: last-layer last-step per-head attention (value-aware policies).
+                            // value-aware a_i: last-layer last-step per-head attention (value-aware policies).
                             let attn = acc.last_step_head_attn().map(|s| s.to_vec());
                             cache_manager.force_evict_with_scores(
                                 kv_caches,
@@ -1078,7 +1081,7 @@ pub fn run_ppl(
                     let eviction_ratio = result.tokens_removed as f32 / before_len as f32;
                     let ppl_at_event = (total_nll / nll_count as f64).exp();
 
-                    let qcf_caote_value = if can_compute_qcf
+                    let qcf_value_aware_value = if can_compute_qcf
                         && let Some(acc) = score_accumulator.as_ref()
                         && let Some(head_attn) = acc.last_step_head_attn()
                     {
@@ -1098,7 +1101,7 @@ pub fn run_ppl(
                         });
                         // Resolve the estimator (h2o when score-based, else sliding) by name; the
                         // engine no longer enumerates techniques here. PPL eval only ever triggers
-                        // Sliding/H2O — never D2O — so `k_source` stays None.
+                        // Sliding/heavy-hitter — never weighted-merge — so `k_source` stays None.
                         let (est_name, est_params) = if score_based_eviction {
                             (
                                 "h2o",
@@ -1120,8 +1123,8 @@ pub fn run_ppl(
                                     estimator: &*estimator,
                                     target_len,
                                     v_source,
-                                    // PPL eval site only triggers Sliding/H2O,
-                                    // never D2O — `k_source` is unused.
+                                    // PPL eval site only triggers Sliding/heavy-hitter,
+                                    // never weighted-merge — `k_source` is unused.
                                     k_source: None,
                                     attention_scores: acc.importance_scores(),
                                     head_attn: Some(head_attn),
@@ -1146,7 +1149,7 @@ pub fn run_ppl(
                         "step": i,
                         "tokens_evicted": result.tokens_removed,
                         "eviction_ratio": eviction_ratio,
-                        "qcf_caote": qcf_caote_value,
+                        "qcf_value_aware": qcf_value_aware_value,
                         "ppl_at_step": ppl_at_event,
                     }));
 
@@ -1182,7 +1185,7 @@ pub fn run_ppl(
         }
     }
 
-    // A2SF 측정: run 종료 시점 스냅샷(step=-1) + 누적 스냅샷을 JSON 파일로 덤프(읽기 전용).
+    // score-decay 측정: run 종료 시점 스냅샷(step=-1) + 누적 스냅샷을 JSON 파일로 덤프(읽기 전용).
     if let Some(dump_path) = args.dump_a2sf.as_ref() {
         if let Some(acc) = score_accumulator.as_ref()
             && acc.is_active()
@@ -1193,29 +1196,31 @@ pub fn run_ppl(
             } else {
                 pos
             };
-            a2sf_snapshots.push(crate::session::a2sf_dump::compute_a2sf_snapshot(
-                acc.importance_scores(),
-                pos,
-                top_k,
-                -1,
-            ));
+            score_decay_snapshots.push(
+                crate::session::score_decay_dump::compute_score_decay_snapshot(
+                    acc.importance_scores(),
+                    pos,
+                    top_k,
+                    -1,
+                ),
+            );
         }
         let dump = serde_json::json!({
             "score_decay": args.h2o_decay(),
             "eviction_policy": args.eviction_policy(),
-            "snapshots": a2sf_snapshots,
+            "snapshots": score_decay_snapshots,
         });
         std::fs::write(dump_path, serde_json::to_string_pretty(&dump)?)?;
         eprintln!(
-            "[A2SF] dumped {} snapshot(s) (score_decay={}) → {}",
-            a2sf_snapshots.len(),
+            "[score-decay] dumped {} snapshot(s) (score_decay={}) → {}",
+            score_decay_snapshots.len(),
             args.h2o_decay(),
             dump_path.display()
         );
         // BOS ratio 스모크 가시성: run-end 스냅샷을 stderr 마커로도 노출(파싱 가능).
-        if let Some(last) = a2sf_snapshots.last() {
+        if let Some(last) = score_decay_snapshots.last() {
             eprintln!(
-                "[A2SF] bos_ratio={:.4} bos_score={:.4} non_bos_mean={:.4} hh_topk_len={}",
+                "[score-decay] bos_ratio={:.4} bos_score={:.4} non_bos_mean={:.4} hh_topk_len={}",
                 last.bos_ratio,
                 last.bos_score,
                 last.non_bos_mean,
@@ -1232,13 +1237,13 @@ pub fn run_ppl(
 
     // Compute summary stats from all eviction events (v3)
     let n_evictions = qcf_events.len();
-    let qcf_sum_caote: f64 = qcf_events
+    let qcf_sum_value_aware: f64 = qcf_events
         .iter()
-        .filter_map(|e| e["qcf_caote"].as_f64())
+        .filter_map(|e| e["qcf_value_aware"].as_f64())
         .sum();
-    let qcf_max_caote: f64 = qcf_events
+    let qcf_max_value_aware: f64 = qcf_events
         .iter()
-        .filter_map(|e| e["qcf_caote"].as_f64())
+        .filter_map(|e| e["qcf_value_aware"].as_f64())
         .fold(0.0f64, f64::max);
 
     let output = serde_json::json!({
@@ -1249,8 +1254,8 @@ pub fn run_ppl(
         "wall_time_s": wall_time,
         "n_evictions": n_evictions,
         "qcf_events": qcf_events,
-        "qcf_sum_caote": qcf_sum_caote,
-        "qcf_max_caote": qcf_max_caote,
+        "qcf_sum_value_aware": qcf_sum_value_aware,
+        "qcf_max_value_aware": qcf_max_value_aware,
         "config": {
             "model": args.model_path,
             "text_file": text_file,

@@ -1,7 +1,7 @@
 //! Forward-time attention-score accumulation — a thin delegating shell over a [`ScoreProducer`].
 //!
-//! The per-layer score-accumulation policy (per-layer MAX, GQA group averaging, the CAOTE last-layer
-//! overwrite, A2SF decay, cross-step SUM, time-normalization) was extracted into the `attn-score`
+//! The per-layer score-accumulation policy (per-layer MAX, GQA group averaging, the value-aware last-layer
+//! overwrite, forgetting-factor decay, cross-step SUM, time-normalization) was extracted into the `attn-score`
 //! technique crate (observer/score axis, EPIC 2 Stage C). `AttentionScoreAccumulator` keeps its exact
 //! public surface — so the decode driver's typed `Option<&mut AttentionScoreAccumulator>` param and
 //! every call site stay byte-untouched — and forwards each call to the registered producer. The
@@ -45,7 +45,7 @@ pub fn ensure_score_producers_registered() -> anyhow::Result<()> {
 
 /// Accumulates per-token attention importance scores across layers, delegating the policy to a
 /// [`ScoreProducer`] plugin. The engine drives it with each layer's post-softmax attention weights;
-/// H2O (and the per-head stages) read the accumulated importance to decide which tokens to keep.
+/// heavy-hitter (and the per-head stages) read the accumulated importance to decide which tokens to keep.
 pub struct AttentionScoreAccumulator {
     /// The registered score-production policy (`"attn_score"` by default). Owns all accumulation
     /// state; this struct is a transparent forwarder preserving the engine-facing API.
@@ -72,7 +72,7 @@ impl AttentionScoreAccumulator {
         }
     }
 
-    /// Create a GQA-aware accumulator that tracks per-KV-head importance (and the CAOTE last-layer
+    /// Create a GQA-aware accumulator that tracks per-KV-head importance (and the value-aware last-layer
     /// attention) in addition to flat per-token importance.
     pub fn new_gqa(
         max_seq_len: usize,
@@ -292,7 +292,7 @@ mod tests {
         assert!((imp[3] - 2.0).abs() < 1e-6);
     }
 
-    /// A2SF (arXiv 2407.20485) 격리 게이트 — `decay=0.0` bit-identical 회귀.
+    /// forgetting-factor decay 격리 게이트 — `decay=0.0` bit-identical 회귀.
     ///
     /// `--score-decay` flag 도입 후에도 **decay 미주입(0.0)** 이면 `begin_step()` 의
     /// `if self.decay > 0.0` 가드가 진입하지 않아 누적 결과가 종전과 정확히 동일해야 한다.
@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(imp[3], 12.0);
     }
 
-    /// A2SF 격리 게이트 — `decay=0.8` 2-step 감쇠 동작.
+    /// forgetting-factor decay 격리 게이트 — `decay=0.8` 2-step 감쇠 동작.
     ///
     /// §4.2 게이트 (2): decay=0.8 일 때 begin_step 감쇠 factor=(1−0.8)=0.2 가 누적에 적용됨을
     /// 확인. step1 score 가 step2 begin_step 에서 0.2× 로 감쇠된 뒤 step2 score 가 더해진다.
@@ -947,7 +947,7 @@ mod tests {
             .sum();
         let gini = gini_sum / (n * score_sum as f64);
 
-        // H2O simulation: what would H2O select?
+        // heavy-hitter simulation: what would heavy-hitter select?
         let protected_prefix = 4usize;
         let target = 512usize;
         let keep_ratio = 0.5f32;
@@ -1071,7 +1071,7 @@ mod tests {
         );
         println!("  Gini coefficient:   {:.4} (0.0 = equal)", gini);
         println!(
-            "\n[H2O Simulation (prefix={}, target={}, kr={})]",
+            "\n[heavy-hitter Simulation (prefix={}, target={}, kr={})]",
             protected_prefix, target, keep_ratio
         );
         println!("  HH budget:      {}", hh_budget);
@@ -1246,7 +1246,7 @@ mod tests {
         let raw_pearson = compute_pearson(&gen_raw);
         let norm_pearson = compute_pearson(&gen_norm);
 
-        // H2O simulation for both
+        // heavy-hitter simulation for both
         let protected_prefix = 4usize;
         let target = 512usize;
         let keep_ratio = 0.5f32;
@@ -1304,7 +1304,7 @@ mod tests {
             avg(&gen_norm)
         );
         println!(
-            "\n[H2O Simulation (prefix={}, target={}, kr={})]",
+            "\n[heavy-hitter Simulation (prefix={}, target={}, kr={})]",
             protected_prefix, target, keep_ratio
         );
         println!(

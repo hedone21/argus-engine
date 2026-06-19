@@ -36,7 +36,7 @@ use crate::pipeline::{LifecyclePhase, PipelineStage, StageContext, StageLifecycl
 /// 는 `Send + Sync` 다.
 pub struct EvictionStage {
     lifecycle: StageLifecycle,
-    /// register 시점 보유 (INV-STAGE-LAYER-HANDLE). enumerate 순서 == layer idx (W1 — D2O
+    /// register 시점 보유 (INV-STAGE-LAYER-HANDLE). enumerate 순서 == layer idx (W1 — weighted-merge
     /// cross-layer 정확성 전제, `wrap_kv_caches` 와 동일 불변식).
     handles: Vec<Arc<StandardFormat>>,
     /// 적용 경로 = CacheManager UER (v1 `try_evict` 와 산출 동일).
@@ -58,7 +58,7 @@ pub struct EvictionStage {
     /// 압력 지속 중 캐시 재성장 시의 재prune 은 friction-triggered 후속 (doc).
     armed: std::sync::atomic::AtomicBool,
     /// §5.9.1 Track A: score-aware eviction 용 accumulator cell. `Some` 이면 run_eviction 이
-    /// acc.importance_scores() 를 추출해 force_evict_with_scores 로 H2O/D2O 정밀 선택, 직후 acc.reset().
+    /// acc.importance_scores() 를 추출해 force_evict_with_scores 로 heavy-hitter/weighted-merge 정밀 선택, 직후 acc.reset().
     /// `None`(score-free = sliding/streaming 또는 더미) 이면 기존 score-free force_evict 유지.
     score_cell: Option<Arc<Mutex<Option<AttentionScoreAccumulator>>>>,
 }
@@ -140,10 +140,10 @@ impl EvictionStage {
     /// (placeholder 폐기 — `?` 전파를 rewrap 이후로 미룸).
     ///
     /// §5.9.1 Track A: score_cell 이 Some 이고 acc active 이면 importance_scores() 를 추출해
-    /// force_evict_with_scores 로 H2O/D2O 정밀 token 선택(eval EvictionHook 동형).
+    /// force_evict_with_scores 로 heavy-hitter/weighted-merge 정밀 token 선택(eval EvictionHook 동형).
     /// eviction 성공 직후 acc.reset() — KV geometry 변경 후 stale score 방지(§5.9.1 landmine 해소).
     fn run_eviction(&self) -> anyhow::Result<()> {
-        // §5.9.1 Track A: score (+ CAOTE a_i) 추출 (lock 짧게 — 복사 후 즉시 해제).
+        // §5.9.1 Track A: score (+ value-aware a_i) 추출 (lock 짧게 — 복사 후 즉시 해제).
         let (scores_opt, attn_opt): (Option<Vec<f32>>, Option<Vec<f32>>) =
             if let Some(cell) = self.score_cell.as_ref() {
                 let guard = cell

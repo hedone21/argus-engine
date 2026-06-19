@@ -1,9 +1,9 @@
 //! `QuantWindowFormat` — `KVCacheFormat` impl wrapping a `QuantizedRecentWindowCache` (§4.1, Phase α-K).
 //!
-//! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §4.1 (R4 ④ KIVI creep 제거 + AWQE 자가 흡수).
+//! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §4.1 (R4 ④ quant-window creep 제거 + AWQE 자가 흡수).
 //!
 //! **purely additive wrapper, now LIVE** — 기존 `QuantizedRecentWindowCache`/`KVCacheOps` 를 1바이트도 건드리지
-//! 않는 신규 wrapper 로 출발했으나, production KIVI forward 경로가 이제 이 wrapper 를 생성한다
+//! 않는 신규 wrapper 로 출발했으나, production quant-window forward 경로가 이제 이 wrapper 를 생성한다
 //! (`session/forward/quant_window_forward.rs`). 내부 가변성 = `std::sync::Mutex`.
 //!
 //! `attention_into` 는 quant_attn-native(GPU fused dequant) 와 fallback(F32 view →
@@ -20,7 +20,7 @@ use crate::format::{AttnDims, KVCacheFormat};
 use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
 use crate::tensor::Tensor;
 
-/// KIVI (Q2 + residual) KV cache 를 `KVCacheFormat` 으로 노출하는 wrapper.
+/// quant-window (Q2 + residual) KV cache 를 `KVCacheFormat` 으로 노출하는 wrapper.
 ///
 /// 기존 `QuantizedRecentWindowCache` 를 `Mutex` 로 감싸 `&self` 메서드에서 내부 `&mut` 메서드에 위임한다.
 /// `QuantizedRecentWindowCache` 자체는 무변.
@@ -30,7 +30,7 @@ pub struct QuantWindowFormat {
 }
 
 impl QuantWindowFormat {
-    /// `QuantizedRecentWindowCache` 를 layer 인덱스와 함께 wrapping. (KIVI forward 경로가 생성 — live.)
+    /// `QuantizedRecentWindowCache` 를 layer 인덱스와 함께 wrapping. (quant-window forward 경로가 생성 — live.)
     pub fn new(idx: usize, inner: QuantizedRecentWindowCache) -> Self {
         Self {
             idx,
@@ -124,11 +124,11 @@ impl KVCacheFormat for QuantWindowFormat {
         let n_heads_q = dims.n_heads_q;
 
         // ── prefill (seq_len>1): multi-token causal attention (Phase α-K ①-e) ──
-        // KIVI 는 multi-token prefill native 커널 부재(attention_gen / attention_native 는 single-query
+        // quant-window 는 multi-token prefill native 커널 부재(attention_gen / attention_native 는 single-query
         // decode 전용 — causal-mask 없음)라, dequantized view(get_view) + StandardFormat 의
         // `prefill_attention`(free fn, pub(crate)) 재사용으로 처리한다(DRY). OLD generic
-        // `forward_prefill<C>`(forward.rs:251-585)의 KIVI 경로(get_view → flash_attention_prefill /
-        // flash_attention_forward_strided)와 bit-identical: KIVI CPU(SeqMajor F32) / GPU(bits=16
+        // `forward_prefill<C>`(forward.rs:251-585)의 quant-window 경로(get_view → flash_attention_prefill /
+        // flash_attention_forward_strided)와 bit-identical: quant-window CPU(SeqMajor F32) / GPU(bits=16
         // HeadMajor, bits 2/4/8 assembled) 모두 `kv_layout`/`kv_capacity` 인자로 분기된다.
         // `q_start_pos = cache_seq_len - seq_len`(= forward_prefill 의 start_pos, write 후 불변식).
         // prefill 은 score 누적 안 함(forward_prefill 의 `_need_scores` 동일) → `scores` 무시.
@@ -308,7 +308,7 @@ impl QuantWindowFormat {
         };
         let rc = quant_attn_be.attention_gen_quant(&args);
         if rc != 0 {
-            anyhow::bail!("KIVI attention_gen_quant failed (rc={rc})");
+            anyhow::bail!("quant-window attention_gen_quant failed (rc={rc})");
         }
         // 이후 `raw`(cache immutable borrow) 미사용 → NLL 이 set_attn_scores(가변) 전에 borrow 종료.
 
@@ -381,7 +381,7 @@ mod tests {
         // CPU QuantizedRecentWindowCache (bits=2): write 2 tokens, run attention via F32 view fallback.
         // Q2 quantization introduces error, so we only assert the output is finite and
         // bounded by the (positive) V magnitude — the CPU-testable seam is "runs + produces
-        // a sane attention output", not bit-exact dequant (that is KIVI's own concern).
+        // a sane attention output", not bit-exact dequant (that is quant-window's own concern).
         let kv_heads = 1;
         let n_heads_q = 1;
         let fmt = QuantWindowFormat::new(

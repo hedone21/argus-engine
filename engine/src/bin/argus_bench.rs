@@ -12,7 +12,7 @@
 //!   throttle·target_tbt·suspend 런타임 효과. eviction·quant·offload·partition·
 //!   weight-swap 는 후속 단계에서 stage 로 재배선.
 //! - AB-1: EvictionStage (plan.evict) 재배선.
-//! - AB-2: KIVI dynamic quant. AB-3: KvOffload. AB-4: tensor partition.
+//! - AB-2: quant-window dynamic quant. AB-3: KvOffload. AB-4: tensor partition.
 //! - AB-6: weight-swap 8종 SwapStage glue.
 
 use anyhow::bail;
@@ -99,7 +99,7 @@ fn bench_supported(args: &Args) -> bool {
 
 /// AB-0 에서 미구현인 mode 진입 flag 를 검사하여 즉시 reject 한다.
 /// argus_cli 의 reject 와 동일하되 `--experiment-output` 은 허용한다 (argus-bench
-/// 의 핵심 기능). eviction/swap/KIVI/offload/partition 은 AB-1..AB-6 에서 해제.
+/// 의 핵심 기능). eviction/swap/quant-window/offload/partition 은 AB-1..AB-6 에서 해제.
 fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
     if args.chat {
         bail!("argus-bench AB-0: --chat moved to argus-chat (planned)");

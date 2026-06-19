@@ -138,7 +138,7 @@ impl ResilienceAdapter {
     }
 }
 
-/// AB-2 §5.7.6: KIVI bit-width → heartbeat `kv_dtype` 문자열 (v1 census `generate.rs`(d5ed71d2^)
+/// AB-2 §5.7.6: quant-window bit-width → heartbeat `kv_dtype` 문자열 (v1 census `generate.rs`(d5ed71d2^)
 /// L4352 동형). verify YAML(`direct_cmd_kvquant_to_q4.yaml:27-30`)이 `q4` transition 을 검사한다.
 fn bits_to_kv_dtype(bits: u8) -> String {
     match bits {

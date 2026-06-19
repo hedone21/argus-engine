@@ -145,15 +145,15 @@ pub struct ImportanceCollector {
     /// Always populated; used by the MeanPool formula.
     before_snapshot: Vec<f32>,
     /// Raw `[seq_len × dim]` hidden state before the current layer (batch=1).
-    /// Populated only when `three_way` is true; used by ShortGPT BI.
+    /// Populated only when `three_way` is true; used by per-token-cosine BI.
     before_snapshot_raw: Vec<f32>,
     before_seq_len: usize,
     before_dim: usize,
-    /// 3-way comparison mode: side-by-side measurement of MeanPool + ShortGptBi.
+    /// 3-way comparison mode: side-by-side measurement of MeanPool + PerTokenCosineBi.
     three_way: bool,
     /// Primary formula whose value fills `ImportanceEntry::importance`.
     primary_formula: super::ImportanceFormula,
-    /// Per-layer mean-pooled input cache for DpllmProxy (post-warmup
+    /// Per-layer mean-pooled input cache for WeightPerturbProxy (post-warmup
     /// `noise_table::compute_input_aware_epsilon`). Populated only when
     /// `three_way` is true; one [dim] vector per `snapshot_before` call.
     x_means: Vec<Vec<f32>>,
@@ -165,7 +165,7 @@ pub struct ImportanceCollector {
     /// Resolved per-layer-streaming scorers (observer/score axis, EPIC 2 Stage B). The engine holds
     /// no scoring arithmetic — `record_after` routes the current layer's pooled / raw activations
     /// through these plugin [`LayerScorer`]s. `mean_pool` is the default formula + 3-way telemetry
-    /// source; `shortgpt_bi` feeds the 3-way telemetry field (and the ShortGptBi-primary selection).
+    /// source; `shortgpt_bi` feeds the 3-way telemetry field (and the PerTokenCosineBi-primary selection).
     /// Both are resolved once in `new_with_formula` (force-linked, so always present).
     mean_pool_scorer: Box<dyn LayerScorer>,
     shortgpt_scorer: Box<dyn LayerScorer>,
@@ -177,8 +177,8 @@ impl ImportanceCollector {
     }
 
     /// Construct with a chosen primary formula and optional 3-way mode.
-    /// In 3-way mode the collector additionally computes the ShortGptBi
-    /// importance per layer and caches `x_means` for DpllmProxy.
+    /// In 3-way mode the collector additionally computes the PerTokenCosineBi
+    /// importance per layer and caches `x_means` for WeightPerturbProxy.
     pub fn new_with_formula(formula: super::ImportanceFormula, three_way: bool) -> Self {
         Self {
             entries: Vec::new(),
@@ -206,7 +206,7 @@ impl ImportanceCollector {
     /// For prefill, `x_data` is `[seq_len × dim]` row-major (batch=1).
     /// Always retains the mean-pooled vector (`[dim]`) for MeanPool.
     /// In 3-way mode also retains the raw `[seq_len × dim]` slice for
-    /// ShortGptBi and pushes the mean to `x_means` for DpllmProxy.
+    /// PerTokenCosineBi and pushes the mean to `x_means` for WeightPerturbProxy.
     pub fn snapshot_before(&mut self, x_data: &[f32], seq_len: usize, dim: usize) {
         // Mean-pool path (always)
         self.before_snapshot.clear();
@@ -226,14 +226,14 @@ impl ImportanceCollector {
             }
         }
 
-        // Raw path (3-way only) — needed for ShortGPT BI per-token cosine
+        // Raw path (3-way only) — needed for per-token-cosine BI per-token cosine
         if self.three_way {
             let total = seq_len.saturating_mul(dim).min(x_data.len());
             self.before_snapshot_raw.clear();
             self.before_snapshot_raw.extend_from_slice(&x_data[..total]);
             self.before_seq_len = seq_len;
             self.before_dim = dim;
-            // x_means cache for DpllmProxy stage (`noise_table` post-warmup)
+            // x_means cache for WeightPerturbProxy stage (`noise_table` post-warmup)
             self.x_means.push(self.before_snapshot.clone());
         }
 
@@ -280,7 +280,7 @@ impl ImportanceCollector {
         let opr = residual_norm_ratio(&self.before_snapshot, &after);
 
         // (2) Score via the plugin LayerScorers — the engine holds no scoring arithmetic. The ctx
-        // lends the current layer's pooled (mean_pool) + raw (shortgpt_bi) activations. ShortGPT-BI
+        // lends the current layer's pooled (mean_pool) + raw (shortgpt_bi) activations. per-token-cosine-BI
         // is only meaningful when the raw before-snapshot is cached (3-way mode); otherwise it stays
         // `None` and the primary selection falls back to mean-pool, exactly as before extraction.
         let imp_mean_pool;
@@ -308,16 +308,16 @@ impl ImportanceCollector {
         }
 
         // (3) Primary importance selection. The engine owns only the routing — which scorer's value
-        // fills `importance` — plus the ShortGptBi→mean-pool fallback and the DP-LLM/DirectAttn
+        // fills `importance` — plus the PerTokenCosineBi→mean-pool fallback and the weight-perturbation/DirectAttn
         // placeholder (their real signal is computed post-warmup in `noise_table`, so importance
         // stays a constant here to keep the swap_key composition well-defined for all variants).
         let importance = match self.primary_formula {
             super::ImportanceFormula::MeanPool => imp_mean_pool,
-            super::ImportanceFormula::ShortGptBi => imp_shortgpt_bi.unwrap_or(imp_mean_pool),
-            super::ImportanceFormula::DpllmProxy
-            | super::ImportanceFormula::DpllmMulti
-            | super::ImportanceFormula::DpllmAbs
-            | super::ImportanceFormula::DpllmQcf
+            super::ImportanceFormula::PerTokenCosineBi => imp_shortgpt_bi.unwrap_or(imp_mean_pool),
+            super::ImportanceFormula::WeightPerturbProxy
+            | super::ImportanceFormula::WeightPerturbMulti
+            | super::ImportanceFormula::WeightPerturbAbs
+            | super::ImportanceFormula::WeightPerturbQcf
             | super::ImportanceFormula::DirectAttn => 1.0,
         };
 
@@ -440,7 +440,7 @@ fn residual_norm_ratio(before: &[f32], after: &[f32]) -> f32 {
 /// The engine-built [`LayerScorerCtx`] for the per-layer-streaming path: it lends the current layer's
 /// pooled and raw activations to a [`LayerScorer`]. The OneShotPostWarmup accessors
 /// (`n_layers`/`x_mean`/`primary_subtensor`/`secondary_subtensor`/`gqa`) return `None`/`0`/empty —
-/// they belong to the post-warmup DP-LLM lifecycle, not this streaming ctx.
+/// they belong to the post-warmup weight-perturbation lifecycle, not this streaming ctx.
 struct CollectorScorerCtx<'a> {
     dim: usize,
     seq_len: usize,
@@ -923,8 +923,11 @@ mod tests {
     fn test_importance_formula_as_str() {
         use super::super::ImportanceFormula;
         assert_eq!(ImportanceFormula::MeanPool.as_str(), "mean_pool");
-        assert_eq!(ImportanceFormula::ShortGptBi.as_str(), "shortgpt_bi");
-        assert_eq!(ImportanceFormula::DpllmProxy.as_str(), "dpllm_proxy");
+        assert_eq!(ImportanceFormula::PerTokenCosineBi.as_str(), "shortgpt_bi");
+        assert_eq!(
+            ImportanceFormula::WeightPerturbProxy.as_str(),
+            "dpllm_proxy"
+        );
     }
 
     #[test]
@@ -1012,17 +1015,17 @@ mod tests {
         let after = vec![0.0, 1.0, 1.0, 0.0];
 
         let mut collector =
-            ImportanceCollector::new_with_formula(ImportanceFormula::ShortGptBi, true);
+            ImportanceCollector::new_with_formula(ImportanceFormula::PerTokenCosineBi, true);
         collector.snapshot_before(&before, seq_len, dim);
         collector.record_after(&after, seq_len, dim, 0, SubLayer::Full);
 
         let table = collector.build();
         let e = &table.entries()[0];
         let sb = e.importance_shortgpt_bi.expect("shortgpt_bi must be Some");
-        // Primary is ShortGptBi → entry.importance == importance_shortgpt_bi
+        // Primary is PerTokenCosineBi → entry.importance == importance_shortgpt_bi
         assert!(
             (e.importance - sb).abs() < 1e-6,
-            "primary importance must match ShortGptBi when selected"
+            "primary importance must match PerTokenCosineBi when selected"
         );
     }
 }

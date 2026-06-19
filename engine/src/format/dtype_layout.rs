@@ -267,7 +267,7 @@ pub fn dequant_to_f32_tensor(b: &Tensor) -> Result<Tensor> {
 /// Dense)는 범위 한정 `Err`(format-bound encoder 가 비-canonical 정책을 코드로
 /// 공급할 때 확장). 출력은 `quant.rs::BlockQ4_0::quantize` 와 **byte-exact**(아래 테스트로 강제).
 /// `encode_via_descriptor` 의 역연산 — block-quant raw bytes(`src` = n_blocks·block_bytes)를
-/// f32(`dst` = n_blocks·block_elems)로 unpack. opaque KV merge(D2O, Stage 3)의 block-level
+/// f32(`dst` = n_blocks·block_elems)로 unpack. opaque KV merge(weighted-merge, Stage 3)의 block-level
 /// dequant 에 쓴다. `dst.len()` 은 `block_elems` 의 배수여야 한다.
 pub fn decode_via_descriptor(desc: &KVLayoutDesc, src: &[u8], dst: &mut [f32]) {
     let block_elems = desc.block_elems as usize;

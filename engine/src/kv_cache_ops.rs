@@ -20,7 +20,7 @@ pub enum KVLayout {
     HeadMajor,
 }
 
-/// Raw GPU buffer references for native KIVI fused attention.
+/// Raw GPU buffer references for native quant-window fused attention.
 ///
 /// Provides direct access to quantized KV blocks and F32 residual buffers
 /// without intermediate dequantization. Used by `attention_gen_kivi` kernel.

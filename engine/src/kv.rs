@@ -23,7 +23,7 @@ pub mod quant_window_format;
 pub mod read;
 pub mod standard_format;
 
-// Shared KV dequantization + similarity helpers (formerly in d2o_handler; D2O was extracted to
+// Shared KV dequantization + similarity helpers (formerly in d2o_handler; weighted-merge was extracted to
 // the out-of-tree `d2o` plugin crate). Consumed by the StageCtx Key/Value handles + R-KV stage.
 pub(crate) mod dequant;
 // Pressure pipeline handlers (구 core/pressure/ 내용 flat 병합)
@@ -59,7 +59,7 @@ pub struct HandlerContext<'a> {
     pub head_importance: Option<&'a [f32]>,
     /// Number of KV heads (0 = GQA mode disabled).
     pub n_kv_heads: usize,
-    /// Optional last-layer last-step per-(kv_head,pos) attention slice (CAOTE's `a_i`).
+    /// Optional last-layer last-step per-(kv_head,pos) attention slice (value-aware's `a_i`).
     /// Layout: `[n_kv_heads * max_seq_len]`, row-major. `None` when no AttnWeights producer
     /// is active; the value-aware stage then falls back to flat `importance`.
     pub last_attn: Option<&'a [f32]>,

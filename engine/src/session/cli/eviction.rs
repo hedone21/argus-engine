@@ -107,7 +107,7 @@ pub struct EvictionCommonArgs {
     pub kv_budget: usize,
 
     /// KV cache budget as ratio of prompt length (0.0–1.0).
-    /// When > 0, overrides --kv-budget per question. Matches H2O paper
+    /// When > 0, overrides --kv-budget per question. Matches heavy-hitter paper
     /// evaluation methodology.
     #[arg(long, default_value_t = 0.0)]
     pub kv_budget_ratio: f32,
@@ -136,10 +136,10 @@ pub struct EvictionCommonArgs {
     #[arg(long, default_value_t = 256)]
     pub min_kv_cache: usize,
 
-    /// A2SF forgetting factor 측정용 score decay (arXiv 2407.20485, A2SF α = 1 − decay).
+    /// forgetting-factor 측정용 score decay (forgetting-factor α = 1 − decay).
     /// KV roadmap 항목 0 측정(arch/kv_roadmap_item0_measurement.md §4.2) 전용 modifier.
     ///
-    /// **기본 0.0 = 미주입** → accumulator 생성자 decay 인자가 정책 자체 값(H2O `--decay`)으로
+    /// **기본 0.0 = 미주입** → accumulator 생성자 decay 인자가 정책 자체 값(heavy-hitter `--decay`)으로
     /// 결정 → flag 도입 전 경로 bit-identical. > 0.0 일 때만 정책 무관하게 score accumulator 에
     /// decay 를 주입한다(`begin_step()` 누적 로직 무수정 — 주입 경로만). production 무관.
     #[arg(long, default_value_t = 0.0)]

@@ -30,7 +30,7 @@ use argus_extension_api::KVLayoutDesc;
 /// `build_inference_ctx` / `build_quant_window_bench_ctx` 공통 prelude 산출물 (AB-2 §5.7.7).
 ///
 /// init(`SessionInitCtx`) → tokenizer resolve/load → prompt encode → token 까지 공통부.
-/// Standard 는 이 뒤에 `Vec<KVCache>` 할당을, KIVI 는 caps pull + `Vec<QuantizedRecentWindowCache>` 할당을 한다.
+/// Standard 는 이 뒤에 `Vec<KVCache>` 할당을, quant-window 는 caps pull + `Vec<QuantizedRecentWindowCache>` 할당을 한다.
 pub struct InferencePrelude {
     pub init: SessionInitCtx,
     pub tokenizer: Tokenizer,
@@ -40,7 +40,7 @@ pub struct InferencePrelude {
 /// `build_inference_ctx` / `build_quant_window_bench_ctx` 공통 prelude 조립 (AB-2 §5.7.7).
 ///
 /// plugin dlopen + fat-LTO self-test + `SessionInitCtx::build` + tokenizer/prompt/token 까지.
-/// caps 보존을 위해 `SessionInitCtx` 전체를 [`InferencePrelude`] 로 반환한다(KIVI 는 caps 가
+/// caps 보존을 위해 `SessionInitCtx` 전체를 [`InferencePrelude`] 로 반환한다(quant-window 는 caps 가
 /// `caps.get::<dyn QuantAttnBackend>()` pull 에 필요).
 pub fn build_inference_prelude(args: &Args) -> anyhow::Result<InferencePrelude> {
     // GATE-C: --load-plugin 의 `.so` 들을 .so 당 1회 dlopen 해 stage+format 양축
@@ -416,9 +416,9 @@ pub fn alloc_opaque_kv_caches(
     Ok(kv_caches)
 }
 
-/// AB-2 §5.7.7: argus-bench KIVI 분기 컨텍스트.
+/// AB-2 §5.7.7: argus-bench quant-window 분기 컨텍스트.
 ///
-/// Standard [`StandardHappyCtx`] 와 달리 KIVI 는 `Vec<QuantizedRecentWindowCache>`(typed `KVCache` 아님) + caps
+/// Standard [`StandardHappyCtx`] 와 달리 quant-window 는 `Vec<QuantizedRecentWindowCache>`(typed `KVCache` 아님) + caps
 /// (`QuantAttnBackend` pull) + initial_bits/residual_size 를 보유한다. `build_bench_quant_window_loop`
 /// (assembly) 가 이를 소비해 `QuantWindowForward` + `QuantWindowBitTransitionStage` 배선 `DecodeLoop` 를 조립한다.
 pub struct QuantWindowBenchCtx {
@@ -427,22 +427,22 @@ pub struct QuantWindowBenchCtx {
     pub memory: Arc<dyn Memory>,
     pub hardware: Arc<Hardware>,
     pub model: TransformerModel,
-    /// KIVI native attention capability (OpenCL backend 면 `Some` 필수 — alloc_quant_window_kv_caches R3).
+    /// quant-window native attention capability (OpenCL backend 면 `Some` 필수 — alloc_quant_window_kv_caches R3).
     pub quant_attn: Option<Arc<dyn QuantAttnBackend>>,
     pub tokenizer: Tokenizer,
     pub tokens: Vec<u32>,
     pub max_seq_len: usize,
     pub sampling_config: SamplingConfig,
     pub vocab_size: usize,
-    /// KIVI 진입 시 양자화 bits (`--kv-mode kivi` → `--kivi-bits`, `--kv-dynamic-quant` → 16).
+    /// quant-window 진입 시 양자화 bits (`--kv-mode kivi` → `--kivi-bits`, `--kv-dynamic-quant` → 16).
     pub initial_bits: u8,
-    /// KIVI residual buffer 길이 (`--kv-mode kivi` → `--kivi-residual-len`,
+    /// quant-window residual buffer 길이 (`--kv-mode kivi` → `--kivi-residual-len`,
     /// `--kv-dynamic-quant` → `(max_seq_len/32)*32`).
     pub residual_size: usize,
     pub resilience: Option<ResilienceAdapter>,
 }
 
-/// AB-2 §5.7.7: KIVI bench ctx 조립. v1 KIVI 진입 시맨틱(`generate.rs`(d5ed71d2^) L744-760) 재현.
+/// AB-2 §5.7.7: quant-window bench ctx 조립. v1 quant-window 진입 시맨틱(`generate.rs`(d5ed71d2^) L744-760) 재현.
 ///
 /// `--kv-mode kivi` → initial_bits=`effective_quant_window_bits()`, residual=`effective_quant_window_residual_size()`.
 /// `--kv-dynamic-quant`(orphan flag 재배선) → initial_bits=16(F16 등가 진입), residual=
@@ -458,7 +458,7 @@ pub fn build_quant_window_bench_ctx(args: Args) -> anyhow::Result<QuantWindowBen
     let hardware = init.hardware;
     let sampling_config = init.sampling_config;
     let model = init.model;
-    // KIVI native attention capability pull (R3: OpenCL backend 면 Some 필수, init.rs 가 register).
+    // quant-window native attention capability pull (R3: OpenCL backend 면 Some 필수, init.rs 가 register).
     let quant_attn = init.caps.get::<dyn QuantAttnBackend>();
 
     let max_seq_len = args.max_seq_len;

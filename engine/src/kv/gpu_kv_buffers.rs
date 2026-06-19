@@ -1,7 +1,7 @@
 //! Engine-owned GPU buffer set for the quantized-recent-window KV cache.
 //!
 //! `GpuKvBuffers` groups the persistent device buffers that the engine
-//! **allocates and owns** for GPU-mode KIVI: the F32 residual buffers, the
+//! **allocates and owns** for GPU-mode quant-window: the F32 residual buffers, the
 //! F16 assembled-attention buffers, and the U8 quantized-block buffers, plus
 //! the `Backend`/`Memory` handles used to allocate and write them.
 //!
@@ -29,7 +29,7 @@ use crate::memory::Memory;
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
-/// Engine-owned persistent GPU buffers for GPU-mode KIVI.
+/// Engine-owned persistent GPU buffers for GPU-mode quant-window.
 ///
 /// Presence of the enclosing `Option<GpuKvBuffers>` is the GPU-mode sentinel
 /// (`is_gpu() == slab.is_some()`), because `backend` is a mandatory non-`Option`

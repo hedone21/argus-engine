@@ -1,9 +1,9 @@
 //! Shared KV dequantization helpers.
 //!
-//! These were formerly defined inside `d2o_handler.rs`, but they are not D2O-specific: the
+//! These were formerly defined inside `d2o_handler.rs`, but they are not weighted-merge-specific: the
 //! [`StageCtx`](argus_extension_api::StageCtx) `tensor(Key)`/`tensor(Value)` handles (in
 //! `eviction/stage_registry.rs`) delegate to [`dequantize_k`]/[`dequantize_v`] so every stage reads
-//! raw K/V identically. When D2O / R-KV were extracted to out-of-tree plugin crates, these
+//! raw K/V identically. When weighted-merge / R-KV were extracted to out-of-tree plugin crates, these
 //! dequant helpers stayed in the engine core (the plugins read K via `ctx.dequant_k`, and carry
 //! their own `cosine_similarity`).
 
@@ -58,7 +58,7 @@ pub(crate) fn dequantize_k(
 ///
 /// V uses the IDENTICAL `[1, kv_heads, capacity, head_dim]` layout and `offset`/`q4_block_offset`
 /// as K (confirmed by `apply_weighted_merges` which dispatches K/V independently over the same
-/// offsets). `pub(crate)`: `StageCtx::tensor(Value)` (the `ValueHandle`) delegates here — CAOTE's `v_i`.
+/// offsets). `pub(crate)`: `StageCtx::tensor(Value)` (the `ValueHandle`) delegates here — value-aware policies' `v_i`.
 pub(crate) fn dequantize_v(
     cache: &KVCache,
     pos: usize,

@@ -1,6 +1,6 @@
 //! `KVCacheFormat` base trait + `Merge`/`AttnDims` (§4.1, C2).
 //!
-//! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §4.1 (R4 연혁 + ④ KIVI creep 제거).
+//! 설계 SSOT: `arch/pipeline_stage_design_v2.md` §4.1 (R4 연혁 + ④ quant-window creep 제거).
 //!
 //! KV 캐시의 **state 책임**(geometry · mutation · attention)을 **storage-format-agnostic**
 //! 하게 제공하는 base trait — geometry 3(`idx`/`current_pos`/`capacity`) + mutation 2
@@ -14,7 +14,7 @@
 //! (그들이 감싸는 `KVCache`/`QuantizedRecentWindowCache` 옆)에 둔다.
 //!
 //! **Phase α-K substep (1)** 신설 — purely additive, host-only. 기존 `KVCacheOps`
-//! 경로(`kv_cache_ops.rs`)와 공존하며, 이제 표준/KIVI/offload forward 가 이 trait 을
+//! 경로(`kv_cache_ops.rs`)와 공존하며, 이제 표준/quant-window/offload forward 가 이 trait 을
 //! trait-object(`Arc<dyn KVCacheFormat>`)로 live 사용한다.
 
 use anyhow::Result;
@@ -33,17 +33,17 @@ pub struct AttnDims {
     pub window: Option<usize>,
 }
 
-/// D2O merge 의미 기반의 compact merge 명세 (§4.1 `compact(keep, merges)`).
+/// 가중 병합(weighted-merge) 의미 기반의 compact merge 명세 (§4.1 `compact(keep, merges)`).
 ///
-/// "evicted 토큰들(`from`)을 retained(kept) 토큰(`into`)에 가중 병합" — `d2o` 플러그인의 cosine-nearest
-/// 와 Eq.11 가중 merge(엔진 executor `apply_weighted_merges` 가 적용)의 의미를 trait 표면으로 표현한다.
-/// 가중치(Eq.11 `w_c`/`w_e`, EMA threshold)는 impl 의 config
-/// 책임이라 여기 담지 않는다 — `from` 의 코사인 유사도·필터링·정규화는 D2O impl 이 자체 수행한다.
+/// "evicted 토큰들(`from`)을 retained(kept) 토큰(`into`)에 가중 병합" — 가중 merge plugin 의 cosine-nearest
+/// 가중 merge(엔진 executor `apply_weighted_merges` 가 적용)의 의미를 trait 표면으로 표현한다.
+/// 가중치(merge weight, threshold)는 impl 의 config
+/// 책임이라 여기 담지 않는다 — `from` 의 코사인 유사도·필터링·정규화는 plugin impl 이 자체 수행한다.
 ///
 /// `into`/`from` 은 **compact 적용 직전(pre-compact)의 논리 위치**다 — compact 가 keep 을 앞으로
 /// 당기기 전 좌표계에서 해석한다(`scatter_reduce_merge_layer_wide` 가 `cache.offset(pos, h)` 로
 /// 원위치를 읽는 것과 동일). impl 은 merge 를 buffer 에 in-place 적용한 뒤 `keep` compaction 을
-/// 수행한다(D2O Step 5 → Step 6 순서).
+/// 수행한다(merge 적용 후 compaction 순서).
 #[derive(Clone, Debug)]
 pub struct Merge {
     /// 병합 대상 retained 토큰의 위치 (가중 합이 누적될 자리).
@@ -90,7 +90,7 @@ pub trait KVCacheFormat: Send + Sync {
     /// q→out attention. impl 이 paired kernel dispatch (NVIDIA fused / Adreno dequant / CPU).
     ///
     /// `scores` 가 `Some` 이면 raw post-softmax score 를 기록한다(생산 seam — 누적·소비는 밖).
-    /// KIVI AWQE 자기-need 는 impl 내부에서 자가 흡수한다(base trait 에 `needs_attn_scores` 없음,
+    /// quant-window AWQE 자기-need 는 impl 내부에서 자가 흡수한다(base trait 에 `needs_attn_scores` 없음,
     /// §4.1 R4 ③).
     fn attention_into(
         &self,
@@ -114,5 +114,5 @@ pub trait KVCacheFormat: Send + Sync {
     }
     // as_any() 없음 — downcast 의도적 차단.
     // dtype() / KVCacheView 없음 — Stage 가 어느 Format 인지 모름.
-    // needs_attn_scores() 없음 — KIVI AWQE 자기-need 는 impl 내부 흡수 (§4.1 R4 ②③).
+    // needs_attn_scores() 없음 — quant-window AWQE 자기-need 는 impl 내부 흡수 (§4.1 R4 ②③).
 }

@@ -1,6 +1,6 @@
-//! A2SF forgetting factor 게이트 지표 덤프 — 측정 전용 읽기 표면 (P2b 잔여).
+//! forgetting-factor (score-decay) 게이트 지표 덤프 — 측정 전용 읽기 표면 (P2b 잔여).
 //!
-//! arXiv 2407.20485. KV roadmap 항목 0 측정 스프린트:
+//! KV roadmap 항목 0 측정 스프린트:
 //! `arch/kv_roadmap_item0_measurement.md` §2.2 / §4.2.
 //!
 //! score accumulator 의 token importance(`importance_scores()`, 읽기 전용)에서 두 게이트 지표를
@@ -12,9 +12,9 @@
 
 use serde::Serialize;
 
-/// A2SF 게이트 지표 1회 스냅샷(eviction 직전 또는 run 종료 시점).
+/// forgetting-factor 게이트 지표 1회 스냅샷(eviction 직전 또는 run 종료 시점).
 #[derive(Debug, Clone, Serialize)]
-pub struct A2sfSnapshot {
+pub struct ScoreDecaySnapshot {
     /// 스냅샷 시점 식별(예: decode step index, run-end 은 -1).
     pub step: i64,
     /// 유효 토큰 수(현재 cache_pos, importance 의 활성 prefix 길이).
@@ -29,17 +29,17 @@ pub struct A2sfSnapshot {
     pub hh_topk: Vec<usize>,
 }
 
-/// importance 슬라이스에서 A2SF 게이트 지표를 산출한다(읽기 전용).
+/// importance 슬라이스에서 forgetting-factor 게이트 지표를 산출한다(읽기 전용).
 ///
 /// `importance`: accumulator `importance_scores()`(`[max_seq_len]`, time-normalized 가능).
 /// `current_pos`: 유효 토큰 수(importance 의 활성 prefix — 나머지는 0). `top_k`: HH 집합 크기(budget).
 /// `step`: 스냅샷 식별자(run-end 은 -1).
-pub fn compute_a2sf_snapshot(
+pub fn compute_score_decay_snapshot(
     importance: &[f32],
     current_pos: usize,
     top_k: usize,
     step: i64,
-) -> A2sfSnapshot {
+) -> ScoreDecaySnapshot {
     let n = current_pos.min(importance.len());
     let imp = &importance[..n];
 
@@ -71,7 +71,7 @@ pub fn compute_a2sf_snapshot(
     let mut hh_topk: Vec<usize> = idx.into_iter().take(top_k.min(n)).collect();
     hh_topk.sort_unstable(); // ascending — Jaccard 오프라인 비교 편의.
 
-    A2sfSnapshot {
+    ScoreDecaySnapshot {
         step,
         current_pos: n,
         bos_score,
@@ -90,7 +90,7 @@ mod tests {
     fn bos_dominance_ratio_and_hh() {
         let mut imp = vec![3.0f32; 10];
         imp[0] = 3000.0;
-        let snap = compute_a2sf_snapshot(&imp, 10, 3, 0);
+        let snap = compute_score_decay_snapshot(&imp, 10, 3, 0);
         // non-BOS 평균 = 3.0, ratio = 1000.
         assert!((snap.non_bos_mean - 3.0).abs() < 1e-4);
         assert!(
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn flattened_distribution_lower_ratio() {
         let imp = vec![5.0, 4.0, 3.0, 9.0, 8.0, 1.0, 2.0, 0.5];
-        let snap = compute_a2sf_snapshot(&imp, 8, 3, 7);
+        let snap = compute_score_decay_snapshot(&imp, 8, 3, 7);
         // non-BOS 평균 = (4+3+9+8+1+2+0.5)/7 ≈ 3.93, ratio = 5/3.93 ≈ 1.27.
         assert!(
             snap.bos_ratio < 2.0,
@@ -125,7 +125,7 @@ mod tests {
         imp[0] = 50.0;
         imp[1] = 10.0;
         imp[2] = 20.0;
-        let snap = compute_a2sf_snapshot(&imp, 3, 2, 0);
+        let snap = compute_score_decay_snapshot(&imp, 3, 2, 0);
         assert_eq!(snap.current_pos, 3);
         assert!((snap.non_bos_mean - 15.0).abs() < 1e-4, "(10+20)/2");
         assert_eq!(snap.hh_topk, vec![0, 2], "top-2 = pos 0(50),2(20)");
@@ -135,10 +135,10 @@ mod tests {
     #[test]
     fn zero_non_bos_mean_yields_zero_ratio() {
         let imp = vec![5.0f32, 0.0, 0.0];
-        let snap = compute_a2sf_snapshot(&imp, 3, 1, 0);
+        let snap = compute_score_decay_snapshot(&imp, 3, 1, 0);
         assert_eq!(snap.bos_ratio, 0.0);
         // 단일 토큰.
-        let single = compute_a2sf_snapshot(&[7.0], 1, 1, 0);
+        let single = compute_score_decay_snapshot(&[7.0], 1, 1, 0);
         assert_eq!(single.bos_ratio, 0.0);
         assert_eq!(single.hh_topk, vec![0]);
     }

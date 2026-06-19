@@ -22,7 +22,7 @@ pub trait EvictionPolicy: Send + Sync {
 
     /// Performs eviction using per-token importance scores.
     /// Default implementation ignores scores and delegates to `evict()`.
-    /// Override in score-aware policies like H2O.
+    /// Override in score-aware policies like heavy-hitter.
     fn evict_with_scores(
         &self,
         cache: &mut KVCache,
@@ -38,7 +38,7 @@ pub trait EvictionPolicy: Send + Sync {
     /// has its own importance ranking, enabling per-head token selection.
     ///
     /// Default: ignores head scores, delegates to `evict_with_scores()`.
-    /// Override in GQA-aware policies like H2O+.
+    /// Override in GQA-aware policies like heavy-hitter+.
     fn evict_with_head_scores(
         &self,
         cache: &mut KVCache,
@@ -54,7 +54,7 @@ pub trait EvictionPolicy: Send + Sync {
     /// `(layer_idx, n_layers)` so per-layer techniques (d2o `protected_layers` / last-layer
     /// protection) know which layer they handle. `importance` is the flat per-token score (or
     /// `None`, score-free); `last_attn` is the optional last-layer last-step per-(kv_head,pos)
-    /// attention slice for value-aware techniques (CAOTE's `a_i`), `None` when no AttnWeights
+    /// attention slice for value-aware techniques (the `a_i` slice), `None` when no AttnWeights
     /// producer is active. Default ignores the layer info + attn slice and dispatches by score
     /// presence — only layer-aware adapters (`StageBackedPolicy`) override it to thread both into
     /// the ctx.
