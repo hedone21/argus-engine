@@ -59,6 +59,10 @@ pub struct HandlerContext<'a> {
     pub head_importance: Option<&'a [f32]>,
     /// Number of KV heads (0 = GQA mode disabled).
     pub n_kv_heads: usize,
+    /// Optional last-layer last-step per-(kv_head,pos) attention slice (CAOTE's `a_i`).
+    /// Layout: `[n_kv_heads * max_seq_len]`, row-major. `None` when no AttnWeights producer
+    /// is active; the value-aware stage then falls back to flat `importance`.
+    pub last_attn: Option<&'a [f32]>,
     /// Current pressure level determined by the pipeline.
     pub pressure_level: PressureLevel,
     /// Available system memory in bytes.
@@ -303,6 +307,7 @@ mod tests {
             importance: None,
             head_importance: None,
             n_kv_heads: 0,
+            last_attn: None,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
@@ -340,6 +345,7 @@ mod tests {
             importance: None,
             head_importance: None,
             n_kv_heads: 0,
+            last_attn: None,
             pressure_level: PressureLevel::Normal,
             mem_available: 1024 * 1024 * 1024,
             target_ratio: None,
@@ -378,6 +384,7 @@ mod tests {
             importance: None,
             head_importance: None,
             n_kv_heads: 0,
+            last_attn: None,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
@@ -400,6 +407,7 @@ mod tests {
             importance: None,
             head_importance: None,
             n_kv_heads: 0,
+            last_attn: None,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
@@ -432,6 +440,7 @@ mod tests {
             importance: None,
             head_importance: None,
             n_kv_heads: 0,
+            last_attn: None,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
@@ -521,6 +530,7 @@ mod tests {
             importance: None,
             head_importance: None,
             n_kv_heads: 0,
+            last_attn: None,
             pressure_level: PressureLevel::Warning,
             mem_available: 0,
             target_ratio: None,

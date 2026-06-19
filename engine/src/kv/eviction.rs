@@ -53,17 +53,21 @@ pub trait EvictionPolicy: Send + Sync {
     /// Per-layer eviction entry. The engine's per-cache loop calls this with the real
     /// `(layer_idx, n_layers)` so per-layer techniques (d2o `protected_layers` / last-layer
     /// protection) know which layer they handle. `importance` is the flat per-token score (or
-    /// `None`, score-free). Default ignores the layer info and dispatches by score presence — only
-    /// layer-aware adapters (`StageBackedPolicy`) override it to thread layer info into the ctx.
+    /// `None`, score-free); `last_attn` is the optional last-layer last-step per-(kv_head,pos)
+    /// attention slice for value-aware techniques (CAOTE's `a_i`), `None` when no AttnWeights
+    /// producer is active. Default ignores the layer info + attn slice and dispatches by score
+    /// presence — only layer-aware adapters (`StageBackedPolicy`) override it to thread both into
+    /// the ctx.
     fn evict_layer(
         &self,
         cache: &mut KVCache,
         target_len: usize,
         importance: Option<&[f32]>,
+        last_attn: Option<&[f32]>,
         layer_idx: usize,
         n_layers: usize,
     ) -> Result<()> {
-        let _ = (layer_idx, n_layers);
+        let _ = (layer_idx, n_layers, last_attn);
         match importance {
             Some(imp) => self.evict_with_scores(cache, target_len, imp),
             None => self.evict(cache, target_len),

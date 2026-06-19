@@ -1577,13 +1577,19 @@ impl SelectiveRead for StandardFormat {
     /// read stage 를 자기 `Mutex<KVCache>` 위에서 호출. ctx 구성·borrow 가
     /// 이 메서드에 갇혀 `attention_into_selected`(다시 lock) 와 충돌하지 않는다 — owned `KVReadPlan`
     /// 을 반환해 lock guard 가 함수 종료 시 drop 된다.
-    fn read_plan(&self, rs: &dyn KVReadStage, _layer_idx: usize) -> Option<KVReadPlan> {
+    fn read_plan(
+        &self,
+        rs: &dyn KVReadStage,
+        _layer_idx: usize,
+        query_stats: Option<&[f32]>,
+    ) -> Option<KVReadPlan> {
         use crate::kv::eviction::stage_registry::KVStageCtx;
         let guard = self.inner.lock().unwrap();
         // read stage 는 budget(target_len) 을 읽지 않는다(읽기 범위 결정 ≠ keep budget). importance/
-        // scores/query_stats 미공급(None) — read stage 는 `tensor(Key)`/`tensor(Value)` 로 자기 page
-        // 메타를 incremental 갱신한다(D5). QueryStats 는 score-active e2e seam 한정(production None).
-        let ctx = KVStageCtx::new(&guard.cache, 0, None, None, None, None);
+        // scores 미공급(None) — read stage 는 `tensor(Key)`/`tensor(Value)` 로 자기 page 메타를
+        // incremental 갱신한다(D5). query_stats 는 read-stage 가 wants_query_stats 일 때 디코드 루프가
+        // `QueryStatsAccumulator::layer_stats` 를 공급(quest Expected-Attention), 아니면 None.
+        let ctx = KVStageCtx::new(&guard.cache, 0, None, None, None, query_stats);
         rs.read_plan(&ctx)
     }
 }
@@ -2875,7 +2881,7 @@ mod tests {
             plan_none: false,
         };
         let plan = fmt_seam
-            .read_plan(&rs, 0)
+            .read_plan(&rs, 0, None)
             .expect("mock 전체 select plan 반환");
         assert_eq!(plan.select, (0..n_tokens).collect::<Vec<_>>());
 
@@ -2919,7 +2925,7 @@ mod tests {
             plan_none: true,
         };
         assert!(
-            fmt.read_plan(&rs, 0).is_none(),
+            fmt.read_plan(&rs, 0, None).is_none(),
             "mock plan_none=true → read_plan None → 엔진 full read 폴백"
         );
     }
@@ -2943,7 +2949,7 @@ mod tests {
             fixed_select: Some(vec![0, 2, 4]),
             plan_none: false,
         };
-        let plan = fmt.read_plan(&rs, 0).expect("부분 select plan");
+        let plan = fmt.read_plan(&rs, 0, None).expect("부분 select plan");
         assert_eq!(plan.select, vec![0, 2, 4]);
         let mut out = f32_tensor(vec![1, 1, 1, 4], &vec![0.0; 4]);
         fmt.attention_into_selected(

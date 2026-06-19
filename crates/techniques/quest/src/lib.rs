@@ -259,6 +259,9 @@ impl KVReadStage for Quest {
 static QUEST: KVReadStageReg = KVReadStageReg {
     name: "quest",
     make: |p: ReadStageParams| Box::new(Quest::new(p)),
+    // Quest's read_plan reads QueryStats (running Q mean) for the Expected-Attention page score
+    // when supplied, falling back to the symmetric min/max proxy otherwise.
+    wants_query_stats: true,
 };
 
 #[cfg(test)]
@@ -523,5 +526,109 @@ mod tests {
         assert!(plan.select.windows(2).all(|w| w[0] < w[1]));
         assert!(plan.select.contains(&0), "sink");
         assert!(plan.select.contains(&7), "recent");
+    }
+
+    /// QueryStats handle: row 0 = running Q mean[head_dim] (quest contract), row 1 = var (unused).
+    struct MockQStats {
+        mean: Vec<f32>,
+    }
+    impl TensorHandle for MockQStats {
+        fn shape(&self) -> TensorShape {
+            TensorShape {
+                rows: 2,
+                cols: self.mean.len(),
+                per_head: true,
+            }
+        }
+        fn dtype(&self) -> argus_extension_api::TensorDtype {
+            argus_extension_api::TensorDtype::F32
+        }
+        fn read_row(&self, row: usize, _kv_head: usize, out: &mut [f32]) {
+            if row == 0 {
+                out.copy_from_slice(&self.mean);
+            } else {
+                out.fill(0.0);
+            }
+        }
+    }
+
+    /// ctx supplying Key + (optionally) QueryStats — exercises quest's Expected-Attention path.
+    struct QStatsCtx {
+        cur: usize,
+        head_dim: usize,
+        key: MockKey,
+        qstats: Option<MockQStats>,
+    }
+    impl StageCtx for QStatsCtx {
+        fn current_pos(&self) -> usize {
+            self.cur
+        }
+        fn target_len(&self) -> usize {
+            self.cur
+        }
+        fn layer_idx(&self) -> usize {
+            0
+        }
+        fn importance(&self) -> Option<&[f32]> {
+            None
+        }
+        fn n_kv_heads(&self) -> usize {
+            1
+        }
+        fn head_dim(&self) -> usize {
+            self.head_dim
+        }
+        fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
+            match kind {
+                TensorKind::Key => Some(&self.key),
+                TensorKind::QueryStats => self.qstats.as_ref().map(|q| q as &dyn TensorHandle),
+                _ => None,
+            }
+        }
+    }
+
+    /// QueryStats(Expected-Attention) page scoring diverges from the query-agnostic magnitude proxy.
+    /// 10 single-token pages, head_dim=1, base = [0,10,9,8,7,-6,-5,-4,-3,1]:
+    ///   proxy score = |base| → top-4 {1,2,3,4}; QueryStats q_mean=-1 → score = q·base → top-4
+    ///   {5,6,7,8}. select = {0 sink} ∪ top-4 ∪ {9 recent}. Asserting the two differ proves the
+    ///   QueryStats path (now production-fed via QueryStatsAccumulator) actually drives selection.
+    #[test]
+    fn query_stats_path_diverges_from_proxy() {
+        let bases = vec![0.0, 10.0, 9.0, 8.0, 7.0, -6.0, -5.0, -4.0, -3.0, 1.0];
+        let mk_ctx = |qstats| QStatsCtx {
+            cur: 10,
+            head_dim: 1,
+            key: MockKey {
+                current_pos: 10,
+                head_dim: 1,
+                n_kv_heads: 1,
+                bases: bases.clone(),
+            },
+            qstats,
+        };
+
+        // proxy path (QueryStats=None): magnitude ranking.
+        let proxy = Quest::new(params(1))
+            .read_plan(&mk_ctx(None))
+            .expect("proxy plan");
+        assert_eq!(
+            proxy.select,
+            vec![0, 1, 2, 3, 4, 9],
+            "proxy = |base| ranking"
+        );
+
+        // QueryStats path (q_mean = -1): upper-bound inner product q·base prefers most-negative base.
+        let qa = Quest::new(params(1))
+            .read_plan(&mk_ctx(Some(MockQStats { mean: vec![-1.0] })))
+            .expect("query-aware plan");
+        assert_eq!(
+            qa.select,
+            vec![0, 5, 6, 7, 8, 9],
+            "QueryStats = q·base ranking"
+        );
+        assert_ne!(
+            proxy.select, qa.select,
+            "QueryStats must change the selection"
+        );
     }
 }

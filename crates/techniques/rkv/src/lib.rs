@@ -318,10 +318,14 @@ static RKV: KVCacheStageReg = KVCacheStageReg {
     name: "rkv",
     make: |_p: StageParams| Box::new(RkvStage::new(RkvConfig::default())),
     make_with_args: |_p: StageParams, args| Box::new(RkvStage::new(RkvConfig::from_args(args))),
-    // R-KV's fusion Z = λ·I − (1−λ)·R includes the importance term, so it is score-based; protect 4
-    // attention sinks by default (same as the other score-based stages).
+    // R-KV reads cached K for the redundancy matrix R (ctx.tensor(Key)/dequant_k => Key)
+    // and the importance term I for the fusion Z = λ·I − (1−λ)·R (Scores), so it is
+    // score-based; protect 4 attention sinks by default (same as the other score-based stages).
     caps: StageCaps {
-        reads: &[argus_extension_api::TensorKind::Scores],
+        reads: &[
+            argus_extension_api::TensorKind::Key,
+            argus_extension_api::TensorKind::Scores,
+        ],
         default_protected_prefix: 4,
     },
 };

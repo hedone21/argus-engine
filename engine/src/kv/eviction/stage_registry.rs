@@ -383,13 +383,16 @@ impl StageBackedPolicy {
         cache: &mut KVCache,
         target_len: usize,
         importance: Option<&[f32]>,
+        last_attn: Option<&[f32]>,
         layer_idx: usize,
         n_layers: usize,
     ) -> Result<()> {
         let plan = {
+            // last_attn(AttnWeights, CAOTE a_i): production eviction 경로가 score accumulator 의
+            // last_step_head_attn 을 공급할 때 Some — value-aware 기법(caote)이 ctx.attn_weight 로 읽는다.
             // QueryStats(MQ-4 e2e seam)는 production eviction 경로에서 미공급(None) — score-active
             // 측정 하네스가 별도로 공급한다(dump_importance.rs).
-            let ctx = KVStageCtx::new(cache, target_len, importance, None, None, None)
+            let ctx = KVStageCtx::new(cache, target_len, importance, None, last_attn, None)
                 .with_layer(layer_idx, n_layers);
             self.stage.plan(&ctx)
         };
@@ -408,7 +411,7 @@ impl EvictionPolicy for StageBackedPolicy {
     }
 
     fn evict(&self, cache: &mut KVCache, target_len: usize) -> Result<()> {
-        self.run(cache, target_len, None, 0, 1)
+        self.run(cache, target_len, None, None, 0, 1)
     }
 
     fn evict_with_scores(
@@ -417,20 +420,24 @@ impl EvictionPolicy for StageBackedPolicy {
         target_len: usize,
         importance: &[f32],
     ) -> Result<()> {
-        self.run(cache, target_len, Some(importance), 0, 1)
+        self.run(cache, target_len, Some(importance), None, 0, 1)
     }
 
-    /// Per-layer eviction: thread the real `(layer_idx, n_layers)` into the stage ctx so per-layer
-    /// techniques (d2o `protected_layers` / last-layer protection) see which layer they handle.
+    /// Per-layer eviction: thread the real `(layer_idx, n_layers)` + the optional `last_attn`
+    /// (CAOTE's `a_i`) into the stage ctx so per-layer / value-aware techniques (d2o
+    /// `protected_layers` / last-layer protection, caote attention-weighted criticality) see them.
     fn evict_layer(
         &self,
         cache: &mut KVCache,
         target_len: usize,
         importance: Option<&[f32]>,
+        last_attn: Option<&[f32]>,
         layer_idx: usize,
         n_layers: usize,
     ) -> Result<()> {
-        self.run(cache, target_len, importance, layer_idx, n_layers)
+        self.run(
+            cache, target_len, importance, last_attn, layer_idx, n_layers,
+        )
     }
 
     /// Per-KV-head eviction (stage ⑤ / F5): route the per-head accumulated importance
@@ -1412,5 +1419,163 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── B2-2 handshake precondition: declared `StageCaps.reads` ⊇ what `plan()` reads ──
+
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    /// One [`TensorHandle`] backing any kind — `head_dim` cols for Key/Value/QueryStats, 1 col for
+    /// Scores/AttnWeights, filled with distinct nonzero values so no plan degenerates.
+    struct AnyHandle {
+        cols: usize,
+        rows: usize,
+    }
+    impl TensorHandle for AnyHandle {
+        fn shape(&self) -> TensorShape {
+            TensorShape {
+                rows: self.rows,
+                cols: self.cols,
+                per_head: true,
+            }
+        }
+        fn dtype(&self) -> TensorDtype {
+            TensorDtype::F32
+        }
+        fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
+            for (d, o) in out.iter_mut().enumerate() {
+                *o = 1.0 + (row + kv_head + d) as f32 * 0.5;
+            }
+        }
+    }
+
+    /// A [`StageCtx`] that supplies ALL five [`TensorKind`]s with valid f32 data (so every `plan()`
+    /// takes its maximal-read path and nothing early-returns on a missing tensor) and records every
+    /// distinct kind the stage reads. `importance()` records [`TensorKind::Scores`] (the flat
+    /// zero-copy form of the per-token score, the D1 exception). It deliberately does NOT reuse
+    /// `KVStageCtx`, which hardwires Key/Value-always and only supplies Scores/AttnWeights/QueryStats
+    /// when slices are passed — that under-supplies and would let plans early-return, masking leaks.
+    struct RecordingCtx {
+        cur: usize,
+        tgt: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        imp: Vec<f32>,
+        seen: RefCell<HashSet<TensorKind>>,
+        h_key: AnyHandle,
+        h_value: AnyHandle,
+        h_scores: AnyHandle,
+        h_attn: AnyHandle,
+        h_qstats: AnyHandle,
+    }
+
+    impl RecordingCtx {
+        fn new(n_kv_heads: usize, head_dim: usize, cur: usize, tgt: usize) -> Self {
+            Self {
+                cur,
+                tgt,
+                n_kv_heads,
+                head_dim,
+                imp: (0..cur).map(|i| i as f32 + 1.0).collect(),
+                seen: RefCell::new(HashSet::new()),
+                h_key: AnyHandle {
+                    cols: head_dim,
+                    rows: cur,
+                },
+                h_value: AnyHandle {
+                    cols: head_dim,
+                    rows: cur,
+                },
+                h_scores: AnyHandle { cols: 1, rows: cur },
+                h_attn: AnyHandle { cols: 1, rows: cur },
+                h_qstats: AnyHandle {
+                    cols: head_dim,
+                    rows: 2,
+                },
+            }
+        }
+    }
+
+    impl StageCtx for RecordingCtx {
+        fn current_pos(&self) -> usize {
+            self.cur
+        }
+        fn target_len(&self) -> usize {
+            self.tgt
+        }
+        fn layer_idx(&self) -> usize {
+            0
+        }
+        fn n_layers(&self) -> usize {
+            2 // non-last → d2o is_protected(0, 2) == false, so its merge/K-read path fires.
+        }
+        fn kv_on_device(&self) -> bool {
+            false // CPU-resident → caote/d2o raw-read + merge paths run.
+        }
+        fn n_kv_heads(&self) -> usize {
+            self.n_kv_heads
+        }
+        fn head_dim(&self) -> usize {
+            self.head_dim
+        }
+        fn importance(&self) -> Option<&[f32]> {
+            self.seen.borrow_mut().insert(TensorKind::Scores);
+            Some(&self.imp)
+        }
+        fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
+            self.seen.borrow_mut().insert(kind);
+            Some(match kind {
+                TensorKind::Key => &self.h_key,
+                TensorKind::Value => &self.h_value,
+                TensorKind::Scores => &self.h_scores,
+                TensorKind::AttnWeights => &self.h_attn,
+                TensorKind::QueryStats => &self.h_qstats,
+            })
+        }
+    }
+
+    /// Handshake (B2-2) precondition guard: for EVERY registered score-based stage, the set of
+    /// [`TensorKind`]s its `plan()` actually reads must be a subset of its declared
+    /// `StageCaps.reads`. An undeclared read means the future buffer-allocation handshake would fail
+    /// to wire a tensor the stage silently consumes. caote/d2o/rkv `reads` were widened to satisfy
+    /// this (see their `KVCacheStageReg`s).
+    #[test]
+    fn plan_reads_are_subset_of_declared_caps() {
+        let mut checked = 0usize;
+        for name in registered_names() {
+            let Some(caps) = argus_extension_api::stage_caps(name) else {
+                continue; // dynamic `.so` stage whose caps don't cross the ABI — nothing to check.
+            };
+            if caps.reads.is_empty() {
+                continue; // score-free (sliding/streaming/none/example) — reads nothing.
+            }
+            let declared: HashSet<TensorKind> = caps.reads.iter().copied().collect();
+            let stage = make_stage(
+                name,
+                &StageParams {
+                    keep_ratio: 0.5,
+                    protected_prefix: 4,
+                    ..Default::default()
+                },
+            )
+            .expect("score-based stage builds via make_stage");
+            // cur > tgt + every kind supplied + non-empty importance → maximal-read path.
+            let ctx = RecordingCtx::new(2, PHD, 16, 8);
+            let _ = stage.plan(&ctx);
+            let recorded = ctx.seen.into_inner();
+            let undeclared: Vec<_> = recorded.difference(&declared).collect();
+            assert!(
+                undeclared.is_empty(),
+                "stage '{name}' plan() reads {recorded:?} but declares StageCaps.reads = \
+                 {declared:?}; undeclared kinds {undeclared:?} would be unwired by the B2-2 \
+                 handshake — widen its reads.",
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no score-based stages registered — force-link / feature regression?"
+        );
     }
 }

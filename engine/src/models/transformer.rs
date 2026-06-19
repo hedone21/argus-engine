@@ -1627,10 +1627,18 @@ impl TransformerModel {
                 // format 내부 캡슐화 — owned KVReadPlan 반환). plan select 검증(ascending + 범위 내)
                 // 후 forward_gen_fmt 에 select 로 전달. read_stage=None(production)이면 `is_some` branch
                 // 1회 → read_select=None → full read 직행(INV-147 byte-identical).
+                // QueryStats(Expected-Attention) seam: read stage 가 wants_query_stats 면 디코드 루프가
+                // 이 accumulator 를 Some 으로 공급한다. 이번 step 누적(아래 :1749) 전 시점이라 직전 step
+                // 까지의 running mean/var 를 읽는다(causal). `.to_vec()` 로 &mut 차용을 즉시 종료해
+                // 누적 seam 과 충돌하지 않게 한다(production read_stage=None 이면 None — 비용 0).
+                let qstats: Option<Vec<f32>> = query_stats_accumulator
+                    .as_deref_mut()
+                    .filter(|a| a.is_active())
+                    .map(|a| a.layer_stats(i).to_vec());
                 let read_plan = read_stage.and_then(|rs| {
                     fmts[i]
                         .as_selective_read()
-                        .and_then(|sr| sr.read_plan(rs, i))
+                        .and_then(|sr| sr.read_plan(rs, i, qstats.as_deref()))
                 });
                 let read_select = read_plan.as_ref().and_then(|plan| {
                     Self::validate_read_plan(plan, fmts[i].current_pos())

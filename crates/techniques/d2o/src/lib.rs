@@ -490,9 +490,14 @@ static D2O: KVCacheStageReg = KVCacheStageReg {
     name: "d2o",
     make: |p: StageParams| Box::new(D2OStage::new(D2OConfig::from_args(p, &[]))),
     make_with_args: |p: StageParams, args| Box::new(D2OStage::new(D2OConfig::from_args(p, args))),
-    // D2O ranks tokens by accumulated importance (score-based); protect 4 attention sinks by default.
+    // D2O ranks tokens by accumulated importance (Scores) and, on the off-device merge
+    // path, dequantizes cached K for the Eq.8 nearest-neighbour matching
+    // (ctx.dequant_k => Key); protect 4 attention sinks by default.
     caps: StageCaps {
-        reads: &[argus_extension_api::TensorKind::Scores],
+        reads: &[
+            argus_extension_api::TensorKind::Scores,
+            argus_extension_api::TensorKind::Key,
+        ],
         default_protected_prefix: 4,
     },
 };

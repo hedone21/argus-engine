@@ -105,10 +105,17 @@ static CAOTE: KVCacheStageReg = KVCacheStageReg {
     make: |_params: StageParams| Box::new(Caote),
     // caote takes no technique-private args — drop the blob.
     make_with_args: |_params: StageParams, _args| Box::new(Caote),
-    // CAOTE weights its value-aware criticality by importance (a_i), so it is score-based; protect 4
-    // attention sinks by default.
+    // CAOTE weights criticality by the attention weight a_i when available
+    // (ctx.attn_weight / has_attn_weights => AttnWeights) and reads cached V
+    // (ctx.dequant_v => Value), falling back to flat importance (Scores). Declare
+    // all three so the buffer-allocation handshake can wire each; it is score-based
+    // (non-empty reads). Protect 4 attention sinks by default.
     caps: StageCaps {
-        reads: &[argus_extension_api::TensorKind::Scores],
+        reads: &[
+            argus_extension_api::TensorKind::Scores,
+            argus_extension_api::TensorKind::Value,
+            argus_extension_api::TensorKind::AttnWeights,
+        ],
         default_protected_prefix: 4,
     },
 };
@@ -116,7 +123,7 @@ static CAOTE: KVCacheStageReg = KVCacheStageReg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argus_extension_api::{TensorHandle, find_stage};
+    use argus_extension_api::{TensorDtype, TensorHandle, TensorShape, find_stage};
 
     /// V 미공급 mock — fallback(importance 랭킹) 경로 검증용.
     struct MockCtx {
@@ -190,5 +197,107 @@ mod tests {
                 })
                 .is_none()
         );
+    }
+
+    /// head_dim=2 V handle (one [f32; 2] row per position).
+    struct VHandle {
+        rows: Vec<[f32; 2]>,
+    }
+    impl TensorHandle for VHandle {
+        fn shape(&self) -> TensorShape {
+            TensorShape {
+                rows: self.rows.len(),
+                cols: 2,
+                per_head: true,
+            }
+        }
+        fn dtype(&self) -> TensorDtype {
+            TensorDtype::F32
+        }
+        fn read_row(&self, row: usize, _kv_head: usize, out: &mut [f32]) {
+            out.copy_from_slice(&self.rows[row]);
+        }
+    }
+
+    /// per-(kv_head,pos) attention weight handle (cols=1 → CAOTE's `a_i`).
+    struct AHandle {
+        a: Vec<f32>,
+    }
+    impl TensorHandle for AHandle {
+        fn shape(&self) -> TensorShape {
+            TensorShape {
+                rows: self.a.len(),
+                cols: 1,
+                per_head: true,
+            }
+        }
+        fn dtype(&self) -> TensorDtype {
+            TensorDtype::F32
+        }
+        fn read_row(&self, row: usize, _kv_head: usize, out: &mut [f32]) {
+            out[0] = self.a[row];
+        }
+    }
+
+    /// Value + AttnWeights supplied (single kv_head) — the value-aware production path the
+    /// handshake activates. `importance()` is `None` to prove `a_i` comes from AttnWeights.
+    struct ValueAwareCtx {
+        cur: usize,
+        tgt: usize,
+        v: VHandle,
+        a: AHandle,
+    }
+    impl StageCtx for ValueAwareCtx {
+        fn current_pos(&self) -> usize {
+            self.cur
+        }
+        fn target_len(&self) -> usize {
+            self.tgt
+        }
+        fn layer_idx(&self) -> usize {
+            0
+        }
+        fn importance(&self) -> Option<&[f32]> {
+            None
+        }
+        fn n_kv_heads(&self) -> usize {
+            1
+        }
+        fn head_dim(&self) -> usize {
+            2
+        }
+        fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
+            match kind {
+                TensorKind::Value => Some(&self.v),
+                TensorKind::AttnWeights => Some(&self.a),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn value_aware_criticality_uses_attn_weights_and_value() {
+        // a_i = [0.1, 0.2, 0.3, 0.4]; v = [[1,0],[0,1],[1,1],[2,2]].
+        // o_h = Σ a_i·v_i = [1.2, 1.3]; crit_i = a_i·‖v_i − o_h‖ →
+        //   [0.1315, 0.2474, 0.1082, 0.4252]. top-2 = {3,1} → keep [1,3].
+        // Weight-only fallback would rank by a_i → {3,2} → keep [2,3]; asserting [1,3] proves
+        // the value-aware (Value + AttnWeights) path actually ran.
+        let stage = (find_stage("caote").unwrap().make)(params());
+        let ctx = ValueAwareCtx {
+            cur: 4,
+            tgt: 2,
+            v: VHandle {
+                rows: vec![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 2.0]],
+            },
+            a: AHandle {
+                a: vec![0.1, 0.2, 0.3, 0.4],
+            },
+        };
+        let plan = stage.plan(&ctx).expect("plan Some");
+        match plan.keep {
+            KeepSpec::LayerWide(k) => assert_eq!(k, vec![1, 3], "value-aware keep-set"),
+            KeepSpec::PerHead(_) => panic!("v1 은 LayerWide"),
+        }
+        assert!(plan.merges.is_empty());
     }
 }

@@ -62,6 +62,9 @@ pub trait Forward {
     /// - `cache_manager`: eviction 정책을 보유한 CacheManager.
     /// - `scores`: score-based policy (H2O/D2O)용 importance 점수. `None`이면
     ///   score-free force/maybe evict.
+    /// - `last_attn`: value-aware policy (CAOTE a_i)용 last-layer last-step per-head
+    ///   attention slice. `None`이면 importance 폴백. score accumulator 의
+    ///   `last_step_head_attn()` 에서 공급.
     /// - `force`: true이면 `force_evict*`, false이면 `maybe_evict*`.
     /// - `target_ratio`: `force=true` 시 eviction 목표 비율.
     ///
@@ -70,10 +73,11 @@ pub trait Forward {
         &mut self,
         cache_manager: &crate::kv::cache_manager::CacheManager,
         scores: Option<&[f32]>,
+        last_attn: Option<&[f32]>,
         force: bool,
         target_ratio: f32,
     ) -> anyhow::Result<(usize, usize)> {
-        let _ = (cache_manager, scores, force, target_ratio);
+        let _ = (cache_manager, scores, last_attn, force, target_ratio);
         Ok((0, 0))
     }
 

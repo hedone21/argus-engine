@@ -33,6 +33,7 @@ use crate::backend::opencl::plan::FullKernelPlan;
 use crate::buffer::DType;
 use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::query_stats::QueryStatsAccumulator;
 use crate::inference::sampling::StepCtx;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
@@ -79,6 +80,13 @@ pub struct ModelForward {
     // 기본)은 None. `step`(decode)이 `as_deref()` 로 forward args 에 대여 주입한다 — None 이면
     // transformer.rs seam 의 `is_some` branch 1회 → full read 직행(INV-147 byte-identical).
     read_stage: Option<Box<dyn argus_extension_api::KVReadStage>>,
+
+    // QueryStats(Expected Attention) producer. `Some` iff the installed read stage declared
+    // `wants_query_stats` (set in `set_read_stage`); `step` then lends `&mut acc` to the decode
+    // forward so transformer.rs accumulates the per-(layer,kv_head) running Q mean/var and feeds it
+    // into the read seam (quest page scoring). `None` (production default / non-QueryStats read
+    // stage) → forward arg None → seam `is_some` gate skips the per-step cost (INV-147).
+    query_stats_accumulator: Option<QueryStatsAccumulator>,
 
     decode_workspace: LayerWorkspace,
     // Phase 4-4.5: paradigm equivalence requires `prefill_workspace: None`
@@ -175,6 +183,7 @@ impl ModelForward {
             hook_cell,
             score_cell,
             read_stage: None,
+            query_stats_accumulator: None,
             decode_workspace,
             prefill_workspace: None,
             max_seq_len,
@@ -200,8 +209,27 @@ impl ModelForward {
 
     /// 선택적 read stage 를 주입한다(decode 시 attention 직전 read_plan 호출원).
     /// `--read-stage` 미지정이면 호출되지 않아 read_stage = None(full read, INV-147 byte-identical).
-    pub fn set_read_stage(&mut self, stage: Box<dyn argus_extension_api::KVReadStage>) {
+    ///
+    /// `wants_query_stats`(= `KVReadStageReg::wants_query_stats`)이면 per-(layer,kv_head) Q running
+    /// mean/var 를 모으는 `QueryStatsAccumulator` 를 모델 차원으로 생성·활성화해 decode 시 forward 에
+    /// 대여한다(quest Expected-Attention). false 면 미생성 → 디코드 루프 비용 0.
+    pub fn set_read_stage(
+        &mut self,
+        stage: Box<dyn argus_extension_api::KVReadStage>,
+        wants_query_stats: bool,
+    ) {
         self.read_stage = Some(stage);
+        if wants_query_stats {
+            let cfg = &self.model.config;
+            let mut acc = QueryStatsAccumulator::new(
+                cfg.num_hidden_layers,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+            );
+            acc.set_active(true);
+            self.query_stats_accumulator = Some(acc);
+        }
     }
 
     /// Phase 4-4.7 (A1): plan eligibility 검사 + build 시도.
@@ -561,6 +589,13 @@ impl Forward for ModelForward {
         let read_stage_slot: Option<&dyn argus_extension_api::KVReadStage> =
             self.read_stage.as_deref();
 
+        // QueryStats producer 대여(없으면 None). 별도 필드라 위 score_guard / read_stage_slot /
+        // 아래 &mut self.logits_decode 등과 disjoint borrow.
+        let query_stats_slot: Option<&mut QueryStatsAccumulator> = self
+            .query_stats_accumulator
+            .as_mut()
+            .filter(|a| a.is_active());
+
         self.model.forward_into(TransformerModelForwardArgs {
             input_tokens: &self.decode_input,
             start_pos: ctx.pos,
@@ -574,10 +609,11 @@ impl Forward for ModelForward {
             // §5.9.1 Track A: active acc 면 주입, 아니면 None(거동-0). end_step() 은
             // forward_into 내부(transformer.rs:1671) 자동 — 재호출 금지.
             score_accumulator: acc_slot,
-            // production decode 는 QueryStats 소비자(Expected Attention)가 없어
-            // 항상 None — score-active 여부와 무관하게 미공급(MQ-6 landmine: e2e 검증은 eval 하네스
-            // dump_importance.rs 에서). happy path 무비용은 transformer.rs seam 의 is_some 게이트가 보장.
-            query_stats_accumulator: None,
+            // wants_query_stats read stage(quest) 설치 시 Some — transformer.rs seam 이
+            // per-(layer,kv_head) Q running mean/var 를 누적하고 read_plan 에 공급한다(Expected
+            // Attention). 미설치(production 기본/비-QueryStats read stage)는 None → seam is_some
+            // 게이트가 비용 0 보장(INV-147 byte-identical).
+            query_stats_accumulator: query_stats_slot,
             skip_config: None,
             importance_collector: None,
             cache_self_need_scores: false,
@@ -627,6 +663,7 @@ impl Forward for ModelForward {
         &mut self,
         cache_manager: &crate::kv::cache_manager::CacheManager,
         scores: Option<&[f32]>,
+        last_attn: Option<&[f32]>,
         force: bool,
         target_ratio: f32,
     ) -> anyhow::Result<(usize, usize)> {
@@ -647,12 +684,17 @@ impl Forward for ModelForward {
             // evict 결과를 캡처 → `?` 전파를 rewrap 이후로 미뤄 placeholder 잔존 방지(잔여위험 1).
             let evict_result = if force {
                 match scores {
-                    Some(sc) => cache_manager.force_evict_with_scores(&mut temp, target_ratio, sc),
+                    Some(sc) => cache_manager.force_evict_with_scores(
+                        &mut temp,
+                        target_ratio,
+                        sc,
+                        last_attn,
+                    ),
                     None => cache_manager.force_evict(&mut temp, target_ratio),
                 }
             } else {
                 match scores {
-                    Some(sc) => cache_manager.maybe_evict_with_scores(&mut temp, sc),
+                    Some(sc) => cache_manager.maybe_evict_with_scores(&mut temp, sc, last_attn),
                     None => cache_manager.maybe_evict(&mut temp),
                 }
             };
@@ -672,14 +714,19 @@ impl Forward for ModelForward {
 
         let result = if force {
             match scores {
-                Some(sc) => {
-                    cache_manager.force_evict_with_scores(&mut self.kv_caches, target_ratio, sc)?
-                }
+                Some(sc) => cache_manager.force_evict_with_scores(
+                    &mut self.kv_caches,
+                    target_ratio,
+                    sc,
+                    last_attn,
+                )?,
                 None => cache_manager.force_evict(&mut self.kv_caches, target_ratio)?,
             }
         } else {
             match scores {
-                Some(sc) => cache_manager.maybe_evict_with_scores(&mut self.kv_caches, sc)?,
+                Some(sc) => {
+                    cache_manager.maybe_evict_with_scores(&mut self.kv_caches, sc, last_attn)?
+                }
                 None => cache_manager.maybe_evict(&mut self.kv_caches)?,
             }
         };
