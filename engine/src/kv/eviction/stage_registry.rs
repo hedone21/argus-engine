@@ -530,6 +530,16 @@ pub fn stage_default_protected_prefix(name: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Whether the named stage's `plan()` may emit a weighted-merge plan (à la D2O). The generic lookup
+/// the eval/QCF path uses instead of the `eviction_policy() == "d2o"` name match — it selects a
+/// merge-compensation estimator + K readback. Reads the plugin's declared [`StageCaps`]. Unknown →
+/// `false` (pure-drop).
+pub fn stage_produces_merge_plan(name: &str) -> bool {
+    argus_extension_api::stage_caps(name)
+        .map(|c| c.produces_merge_plan)
+        .unwrap_or(false)
+}
+
 /// 빌트인 LayerWide 기법(sliding/streaming/h2o)이 `KV_CACHE_STAGES` 에 등록됐는지 단언한다 — eviction
 /// CacheManager build 진입 시 1회 호출. fat-LTO `--gc-sections` 가 linkme 등록을 silent
 /// drop 하면 누락 기법에 대해 `Err` 로 fail-fast 한다(release 에서 정책 이름 미해석 → 조용한 폴백 방지).

@@ -155,7 +155,10 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
 
     // For ratio mode, hook starts with budget=0; eval_loop updates it per-question.
     let hook_budget = if ratio_mode { 0 } else { effective_budget };
-    let is_d2o = args.eviction_policy() == "d2o";
+    // Whether the selected stage emits weighted merges (D2O) → merge-compensation QCF estimator +
+    // K readback. Read off the plugin's StageCaps, not a "d2o" name match (B1-1).
+    let produces_merge_plan =
+        crate::kv::eviction::stage_registry::stage_produces_merge_plan(args.eviction_policy());
 
     // ARGUS Step 6: resolve --qcf-sample-layers from CLI.
     // When --enable-qcf-experimental is off, always use [0] (legacy, no overhead).
@@ -174,7 +177,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         actual_protected_prefix,
         score_based_eviction,
         args.keep_ratio(),
-        is_d2o,
+        produces_merge_plan,
         args.kv_type.clone(),
         backend.clone(),
         args.enable_qcf_experimental,
