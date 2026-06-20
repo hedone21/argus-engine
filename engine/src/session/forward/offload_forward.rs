@@ -192,7 +192,6 @@ impl Forward for OffloadForward {
             OffloadForwardArgs {
                 input_tokens: &input_tensor,
                 start_pos,
-                kv_caches: &mut [],
                 backend: &backend,
                 memory,
                 logits_out: &mut self.logits_prefill_last,
@@ -231,7 +230,6 @@ impl Forward for OffloadForward {
             OffloadForwardArgs {
                 input_tokens: &self.decode_input,
                 start_pos: ctx.pos,
-                kv_caches: &mut [],
                 backend: &backend,
                 memory,
                 logits_out: &mut self.logits_decode,

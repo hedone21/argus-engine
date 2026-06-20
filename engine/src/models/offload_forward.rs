@@ -22,18 +22,16 @@ use crate::shape::Shape;
 use crate::tensor::Tensor;
 // PreloadAccess/PreloadResult 는 L2(`crate::preload_access`) — cross-L3 아님(§13.8-O 격상).
 use crate::preload_access::{PreloadAccess, PreloadResult};
-// LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O offload-path concrete cache (forward_into_offload monomorphization, BC Step 2)
-use crate::kv::offload::OffloadKVCache;
 
 impl TransformerModel {
-    /// `forward_into_offload` 의 `KVCacheFormat` trait-object fork (Phase α-K Step 5-B).
+    /// offload KV forward 경로 — `OffloadKVCache` 를 `KVCacheFormat` trait object 로 구동한다.
     ///
-    /// **branch-by-abstraction, additive**: OLD `forward_into_offload`(:3717)를 1바이트도 안 건드린다.
-    /// `OffloadForward` 가 `LLMRS_OFFLOAD_FMT` 게이트 ON 일 때만 transient wrap 으로 호출한다.
-    /// 루프 골격(embedding / preload pool / depth loop / retain / release / final norm+head)은 OLD 와
-    /// 동일하고, 두 가지만 다르다:
-    ///   1. `kv_caches: &mut [OffloadKVCache]` → `fmts: &[Arc<OffloadFormat>]`(transient wrap).
-    ///      preload/retain/release 는 `OffloadFormat` 의 interior-mut(`&self`) 메서드 경유.
+    /// `OffloadForward`(`session/forward/offload_forward.rs`)가 매 prefill/decode 마다 `wrap_caches`
+    /// 로 만든 `Vec<Arc<OffloadFormat>>` 를 넘겨 호출하는 offload 의 **유일 live 경로**다(별도 env
+    /// 게이트나 OLD generic fork 없음). 루프 골격(embedding / preload pool / depth loop / retain /
+    /// release / final norm+head)은 standard forward 와 동형이고, KV 접근 두 가지만 다르다:
+    ///   1. KV 를 별도 `fmts: &[Arc<OffloadFormat>]` 파라미터로 받는다 — preload/retain/release 는
+    ///      `OffloadFormat` 의 interior-mut(`&self`) 메서드 경유.
     ///   2. forward 위임: decode → `forward_gen_fmt`(`&Arc<dyn KVCacheFormat>` + LayerWorkspace),
     ///      prefill → owned `PrefillWorkspace` + `forward_prefill_fmt`(forward_into:2096 미러).
     ///
@@ -45,7 +43,7 @@ impl TransformerModel {
     // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O offload-path concrete OffloadFormat + PrefetchController (offload 분리 backlog)
     pub fn forward_into_offload(
         &self,
-        args: OffloadForwardArgs<'_, OffloadKVCache>,
+        args: OffloadForwardArgs<'_>,
         fmts: &[Arc<crate::kv::offload_format::OffloadFormat>],
         prefetch: &mut crate::kv::offload::prefetch::PrefetchController,
     ) -> Result<()> {
@@ -54,7 +52,6 @@ impl TransformerModel {
 
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
-        // args.kv_caches 는 무시 (fmt 경로는 fmts 슬라이스 사용).
         let backend = args.backend;
         let memory = args.memory;
         let logits_out = args.logits_out;
