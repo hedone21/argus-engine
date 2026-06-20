@@ -81,8 +81,8 @@ impl KVCacheStage for SlidingWindow {
 }
 
 /// Registration — the engine finds this entry at construction via `find_stage("sliding")`.
-/// `eviction_window`/`protected_prefix` flow in from [`StageParams`] (CLI `eviction sliding
-/// --window <N>` + `--protected-prefix`).
+/// `eviction_window`/`protected_prefix` flow in from [`StageParams`] (CLI `eviction plugin --name
+/// sliding --set window=<N>` + `--protected-prefix`).
 #[distributed_slice(KV_CACHE_STAGES)]
 static SLIDING: KVCacheStageReg = KVCacheStageReg {
     name: "sliding",

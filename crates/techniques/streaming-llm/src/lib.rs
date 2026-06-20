@@ -74,8 +74,9 @@ impl KVCacheStage for StreamingLlm {
 }
 
 /// Registration — the engine finds this entry at construction via `find_stage("streaming")`.
-/// `sink_size`/`streaming_window` flow in from [`StageParams`] (CLI `eviction streaming --sink
-/// <S> --recent-window <W>`); `streaming_window == 0` is auto-derived upstream before make.
+/// `sink_size`/`streaming_window` flow in from [`StageParams`] (CLI `eviction plugin --name
+/// streaming --set sink=<S> --set recent_window=<W>`); `streaming_window == 0` is auto-derived
+/// upstream before make.
 #[distributed_slice(KV_CACHE_STAGES)]
 static STREAMING: KVCacheStageReg = KVCacheStageReg {
     name: "streaming",

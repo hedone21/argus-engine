@@ -3,7 +3,7 @@
 //! Extracted from the engine core into a self-registering technique crate (the `caote`/`quest`
 //! precedent): depends only on `argus-extension-api` + `linkme`, implements [`KVCacheStage`], and
 //! registers under the name `"h2o"` via `#[distributed_slice(KV_CACHE_STAGES)]`. The engine
-//! force-links it (`use h2o as _;`) so `eviction h2o` resolves the out-of-tree plugin.
+//! force-links it (`use h2o as _;`) so `eviction plugin --name h2o` resolves the out-of-tree plugin.
 //!
 //! 3-partition model: `[Protected Prefix] [Heavy Hitters (score-ranked)] [Recent Window]`. After
 //! reserving the prefix, the remaining budget splits between HH and recent by `keep_ratio`
@@ -105,7 +105,8 @@ impl KVCacheStage for H2o {
 }
 
 /// Registration — the engine finds this via `find_stage("h2o")`. `keep_ratio`/`protected_prefix`
-/// flow in from [`StageParams`] (CLI `eviction h2o --keep-ratio <R>` + `--protected-prefix <N>`).
+/// flow in from [`StageParams`] (CLI `eviction plugin --name h2o --set keep_ratio=<R>` +
+/// `--protected-prefix <N>`).
 #[distributed_slice(KV_CACHE_STAGES)]
 static H2O: KVCacheStageReg = KVCacheStageReg {
     name: "h2o",

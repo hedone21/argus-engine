@@ -12,10 +12,10 @@
 //! attention-score accumulator 필요).
 //!
 //! Note(streaming/sliding window 크기): eviction 의 retain window(streaming 은
-//! `--sink` + `--recent-window`, sliding 은 `--window`)는 high-water(85% × `--max-seq-len`)
+//! `--set sink=` + `--set recent_window=`, sliding 은 `--set window=`)는 high-water(85% × `--max-seq-len`)
 //! 보다 **작아야** 한다. window 가 high-water 이상이면 prune 후에도 pos 가 high-water 밑으로
 //! 내려가지 못해 재발화(re-arm)가 끊기고, KV 가 다시 차 `KV Cache overflow` 로 종료된다. 예:
-//! `eviction streaming --sink 4 --recent-window 128` 은 `--max-seq-len` 을 ~512 이상으로 둔다
+//! `eviction plugin --name streaming --set sink=4 --set recent_window=128` 은 `--max-seq-len` 을 ~512 이상으로 둔다
 //! (128 ≪ 0.85×512=435).
 //!
 //! 공용 셋업(SessionInitCtx → tokenizer → KV alloc → resilience)은
