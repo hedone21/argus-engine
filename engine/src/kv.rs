@@ -18,6 +18,8 @@ pub mod kv_migrate;
 pub mod offload;
 pub mod offload_format;
 pub mod quant_window_cache;
+// EPIC 4 PR3 de-risk: first in-tree QuantCacheBackend over the real cache (host-only harness).
+pub mod quant_window_cache_abi_shim;
 pub mod quant_window_format;
 // read 축(KVReadStage) 빌트인 등록 + force-link self-test (Quest).
 pub mod read;
