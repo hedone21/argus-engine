@@ -108,7 +108,7 @@ pub struct ImportanceEntry {
 /// A QCF metric collected from a single lossy action execution.
 #[derive(Debug, Clone)]
 pub struct QcfMetric {
-    /// Action that produced this metric (e.g., "h2o", "snapkv", "kivi", "layer_skip").
+    /// Action that produced this metric (e.g., "kv.evict_h2o", "kv.quant_flush_nmse", "layer_skip").
     pub action: String,
     /// Aggregated QCF value in [0, 1] range (higher = more degradation).
     pub raw_value: f32,

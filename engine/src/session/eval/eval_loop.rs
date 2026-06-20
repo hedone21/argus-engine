@@ -463,7 +463,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
             "qcf_layer_skip_layers": qcf_layer_skip_layers,
         });
 
-        // Merge hook-specific fields (qcf, qcf_kivi_legacy, qcf_value_aware, effective_budget, etc.)
+        // Merge hook-specific fields (qcf, qcf_quant_legacy, qcf_value_aware, effective_budget, etc.)
         if let Some(obj) = extra.as_object() {
             for (k, v) in obj {
                 result_obj[k] = v.clone();

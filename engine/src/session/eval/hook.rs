@@ -58,7 +58,7 @@ pub trait StepHook<C> {
         false
     }
 
-    /// Cache-specific per-question JSON fields (e.g., kivi_q2_tokens).
+    /// Cache-specific per-question JSON fields (e.g., quant_q2_tokens).
     fn extra_question_fields(&self, caches: &[C]) -> serde_json::Value;
 
     /// Cache-specific top-level config JSON fields.

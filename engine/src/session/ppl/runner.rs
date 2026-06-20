@@ -279,7 +279,7 @@ pub fn run_quant_window_ppl(
     let token_ids = &all_ids[..eval_tokens];
 
     eprintln!(
-        "[quant-window-PPL] {} tokens, kivi_residual_size={}, max_seq_len={}",
+        "[quant-window-PPL] {} tokens, quant_residual_size={}, max_seq_len={}",
         eval_tokens, residual_size, max_seq_len
     );
 
@@ -524,35 +524,35 @@ pub fn run_quant_window_ppl(
     let tok_per_sec = nll_count as f64 / wall_time;
 
     // Separate QCF (NMSE) and OPR metrics from flush proxies
-    let qcf_kivi_nmse_total: f64 = qcf_metrics
+    let qcf_quant_nmse_total: f64 = qcf_metrics
         .iter()
-        .filter(|m| m["action"].as_str() != Some("kivi_opr"))
+        .filter(|m| m["action"].as_str() != Some("kv.quant_flush_opr"))
         .filter_map(|m| m["raw_value"].as_f64())
         .sum();
     let qcf_attn_normalized_total: f64 = qcf_metrics
         .iter()
-        .filter(|m| m["action"].as_str() != Some("kivi_opr"))
+        .filter(|m| m["action"].as_str() != Some("kv.quant_flush_opr"))
         .filter_map(|m| m["normalized_value"].as_f64())
         .sum();
 
     // quant-window OPR: per-flush events and summary stats
-    let qcf_kivi_events: Vec<&serde_json::Value> = qcf_metrics
+    let qcf_quant_events: Vec<&serde_json::Value> = qcf_metrics
         .iter()
-        .filter(|m| m["action"].as_str() == Some("kivi_opr"))
+        .filter(|m| m["action"].as_str() == Some("kv.quant_flush_opr"))
         .collect();
-    let n_kivi_flushes = qcf_kivi_events.len();
-    let opr_raw_values: Vec<f64> = qcf_kivi_events
+    let n_quant_flushes = qcf_quant_events.len();
+    let opr_raw_values: Vec<f64> = qcf_quant_events
         .iter()
         .filter_map(|m| m["raw_value"].as_f64())
         .collect();
-    let qcf_kivi_opr_sum: f64 = opr_raw_values.iter().sum();
-    let qcf_kivi_opr_max: f64 = opr_raw_values.iter().cloned().fold(0.0f64, f64::max);
-    let qcf_kivi_opr_total: Option<f64> = if opr_raw_values.is_empty() {
+    let qcf_quant_opr_sum: f64 = opr_raw_values.iter().sum();
+    let qcf_quant_opr_max: f64 = opr_raw_values.iter().cloned().fold(0.0f64, f64::max);
+    let qcf_quant_opr_total: Option<f64> = if opr_raw_values.is_empty() {
         None
     } else {
-        Some(qcf_kivi_opr_sum / opr_raw_values.len() as f64)
+        Some(qcf_quant_opr_sum / opr_raw_values.len() as f64)
     };
-    let qcf_kivi_opr_events: Option<usize> = if opr_raw_values.is_empty() {
+    let qcf_quant_opr_events: Option<usize> = if opr_raw_values.is_empty() {
         None
     } else {
         Some(opr_raw_values.len())
@@ -566,23 +566,23 @@ pub fn run_quant_window_ppl(
         "wall_time_s": wall_time,
         "qcf_metrics": qcf_metrics,
         "flush_count": qcf_metrics.len(),
-        "n_kivi_flushes": n_kivi_flushes,
-        "qcf_kivi_events": qcf_kivi_events,
-        "qcf_kivi_nmse_total": qcf_kivi_nmse_total,
-        "qcf_attn_total": qcf_kivi_nmse_total,
+        "n_quant_flushes": n_quant_flushes,
+        "qcf_quant_events": qcf_quant_events,
+        "qcf_quant_nmse_total": qcf_quant_nmse_total,
+        "qcf_attn_total": qcf_quant_nmse_total,
         "qcf_attn_normalized_total": qcf_attn_normalized_total,
-        "qcf_kivi_opr_sum": qcf_kivi_opr_sum,
-        "qcf_kivi_opr_max": qcf_kivi_opr_max,
-        "qcf_kivi_opr_total": qcf_kivi_opr_total,
-        "qcf_kivi_opr_events": qcf_kivi_opr_events,
+        "qcf_quant_opr_sum": qcf_quant_opr_sum,
+        "qcf_quant_opr_max": qcf_quant_opr_max,
+        "qcf_quant_opr_total": qcf_quant_opr_total,
+        "qcf_quant_opr_events": qcf_quant_opr_events,
         "final_cache_pos": kv_caches[0].current_pos(),
-        "kivi_q2_tokens": kv_caches[0].q2_tokens,
-        "kivi_res_pos": kv_caches[0].res_pos,
+        "quant_q2_tokens": kv_caches[0].q2_tokens,
+        "quant_res_pos": kv_caches[0].res_pos,
         "config": {
             "model": args.model_path,
             "text_file": text_file,
-            "eviction_policy": "kivi",
-            "kivi_residual_size": residual_size,
+            "eviction_policy": "quant_window",
+            "quant_residual_size": residual_size,
             "max_seq_len": max_seq_len,
             "kv_type": "q2+f32_residual",
         }

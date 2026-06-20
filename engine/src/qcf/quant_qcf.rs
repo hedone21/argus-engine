@@ -71,7 +71,7 @@ pub fn compute_flush_nmse(params: &QuantFlushParams, config: &QcfConfig) -> QcfM
         (*kv_heads, *head_dim, *flush_tokens, *res_cap, *bits);
     if flush_tokens == 0 || kv_heads == 0 || head_dim == 0 {
         return QcfMetric {
-            action: "kivi".to_string(),
+            action: "kv.quant_flush_nmse".to_string(),
             raw_value: 0.0,
             normalized_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
@@ -83,7 +83,7 @@ pub fn compute_flush_nmse(params: &QuantFlushParams, config: &QcfConfig) -> QcfM
     let n_groups = flush_tokens / blocks_per_group;
     if n_groups == 0 {
         return QcfMetric {
-            action: "kivi".to_string(),
+            action: "kv.quant_flush_nmse".to_string(),
             raw_value: 0.0,
             normalized_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
@@ -152,7 +152,7 @@ pub fn compute_flush_nmse(params: &QuantFlushParams, config: &QcfConfig) -> QcfM
     let raw_value = aggregate_heads(&per_head, &config.aggregation);
 
     QcfMetric {
-        action: "kivi".to_string(),
+        action: "kv.quant_flush_nmse".to_string(),
         raw_value,
         normalized_value: raw_value, // NMSE is already a normalized metric
         per_head: Some(per_head),
@@ -170,7 +170,7 @@ pub fn compute_flush_nmse(params: &QuantFlushParams, config: &QcfConfig) -> QcfM
 /// (a second-order effect ignored per design decision B-6).
 ///
 /// Returns `QcfMetric` with:
-/// - `action`: "kivi_opr"
+/// - `action`: "kv.quant_flush_opr"
 /// - `raw_value`: sum of per-head OPR values
 /// - `normalized_value`: same as raw_value
 /// - `per_head`: per-head OPR vector
@@ -190,7 +190,7 @@ pub fn compute_flush_opr(params: &QuantFlushParams, _config: &QcfConfig) -> QcfM
 
     if flush_tokens == 0 || kv_heads == 0 || head_dim == 0 {
         return QcfMetric {
-            action: "kivi_opr".to_string(),
+            action: "kv.quant_flush_opr".to_string(),
             raw_value: 0.0,
             normalized_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
@@ -265,7 +265,7 @@ pub fn compute_flush_opr(params: &QuantFlushParams, _config: &QcfConfig) -> QcfM
     let raw_value: f32 = per_head_opr.iter().sum::<f32>() / kv_heads as f32;
 
     QcfMetric {
-        action: "kivi_opr".to_string(),
+        action: "kv.quant_flush_opr".to_string(),
         raw_value,
         normalized_value: raw_value,
         per_head: Some(per_head_opr),
@@ -299,7 +299,7 @@ pub fn compute_flush_awqe(params: &FlushAttentionParams, config: &QcfConfig) -> 
 
     if flush_tokens == 0 || kv_heads == 0 || head_dim == 0 {
         return QcfMetric {
-            action: "kivi_awqe".to_string(),
+            action: "kv.quant_flush_awqe".to_string(),
             raw_value: 0.0,
             normalized_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
@@ -358,7 +358,7 @@ pub fn compute_flush_awqe(params: &FlushAttentionParams, config: &QcfConfig) -> 
     let raw_value = aggregate_heads(&awqe_per_head, &config.aggregation);
 
     QcfMetric {
-        action: "kivi_awqe".to_string(),
+        action: "kv.quant_flush_awqe".to_string(),
         raw_value,
         normalized_value: raw_value,
         per_head: Some(awqe_per_head),
@@ -399,7 +399,7 @@ pub fn compute_flush_aw_vopr(params: &FlushAttentionParams, config: &QcfConfig) 
 
     if flush_tokens == 0 || kv_heads == 0 || head_dim == 0 || gqa_group_size == 0 {
         return QcfMetric {
-            action: "aw_vopr".to_string(),
+            action: "kv.quant_flush_aw_vopr".to_string(),
             raw_value: 0.0,
             normalized_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
@@ -498,7 +498,7 @@ pub fn compute_flush_aw_vopr(params: &FlushAttentionParams, config: &QcfConfig) 
     let raw_value = per_head_vopr.iter().sum::<f32>() / kv_heads as f32;
 
     QcfMetric {
-        action: "aw_vopr".to_string(),
+        action: "kv.quant_flush_aw_vopr".to_string(),
         raw_value,
         normalized_value: raw_value,
         per_head: Some(per_head_vopr),
@@ -620,7 +620,7 @@ mod tests {
         };
         let metric = compute_flush_nmse(&params, &config);
 
-        assert_eq!(metric.action, "kivi");
+        assert_eq!(metric.action, "kv.quant_flush_nmse");
         assert!(metric.raw_value >= 0.0);
         assert!(metric.raw_value <= 1.0);
         assert_eq!(metric.tokens_affected, flush_tokens);
@@ -742,7 +742,7 @@ mod tests {
         };
         let metric = compute_flush_opr(&params, &config);
 
-        assert_eq!(metric.action, "kivi_opr");
+        assert_eq!(metric.action, "kv.quant_flush_opr");
         assert!(metric.raw_value >= 0.0, "OPR must be non-negative");
         assert_eq!(metric.tokens_affected, flush_tokens);
         assert!(metric.per_head.is_some());
@@ -903,7 +903,7 @@ mod tests {
         };
         let metric = compute_flush_awqe(&params, &config);
 
-        assert_eq!(metric.action, "kivi_awqe");
+        assert_eq!(metric.action, "kv.quant_flush_awqe");
         assert!(metric.raw_value >= 0.0, "AWQE must be non-negative");
         assert_eq!(metric.tokens_affected, flush_tokens);
         assert_eq!(metric.per_head.as_ref().unwrap().len(), kv_heads);
@@ -1203,7 +1203,7 @@ mod tests {
             metric.raw_value >= 0.0,
             "uniform fallback must produce non-negative AWQE"
         );
-        assert_eq!(metric.action, "kivi_awqe");
+        assert_eq!(metric.action, "kv.quant_flush_awqe");
     }
 
     /// Test 8: flush_tokens=0 → raw_value=0.
@@ -1265,7 +1265,7 @@ mod tests {
         };
         let metric = compute_flush_awqe(&params, &config);
 
-        assert_eq!(metric.action, "kivi_awqe");
+        assert_eq!(metric.action, "kv.quant_flush_awqe");
         assert!(metric.raw_value >= 0.0);
         assert_eq!(metric.tokens_affected, flush_tokens);
     }
@@ -1291,7 +1291,7 @@ mod tests {
             scores_valid_len: 0,
         };
         let metric = compute_flush_aw_vopr(&params, &config);
-        assert_eq!(metric.action, "aw_vopr");
+        assert_eq!(metric.action, "kv.quant_flush_aw_vopr");
         assert_eq!(metric.raw_value, 0.0);
         assert_eq!(metric.tokens_affected, 0);
     }
@@ -1327,7 +1327,7 @@ mod tests {
         };
         let metric = compute_flush_aw_vopr(&params, &config);
 
-        assert_eq!(metric.action, "aw_vopr");
+        assert_eq!(metric.action, "kv.quant_flush_aw_vopr");
         assert!(
             metric.raw_value >= 0.0,
             "AW-VOPR must be non-negative, got {}",
@@ -1510,7 +1510,7 @@ mod tests {
         };
         let metric = compute_flush_aw_vopr(&params, &config);
 
-        assert_eq!(metric.action, "aw_vopr");
+        assert_eq!(metric.action, "kv.quant_flush_aw_vopr");
         assert!(metric.raw_value >= 0.0);
         assert_eq!(metric.per_head.as_ref().unwrap().len(), kv_heads);
         // Both heads should have non-negative per-head values

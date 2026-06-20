@@ -323,7 +323,7 @@ fn test_eng_alg_046_flush_proxy_basic() {
     let config = QcfConfig::default();
     let metric = compute_flush_nmse(&params, &config);
 
-    assert_eq!(metric.action, "kivi");
+    assert_eq!(metric.action, "kv.quant_flush_nmse");
     assert!(metric.raw_value >= 0.0);
     assert_eq!(metric.tokens_affected, flush_tokens);
 }
@@ -403,7 +403,7 @@ fn test_eng_alg_047_flush_opr_basic() {
     };
     let config = QcfConfig::default();
     let metric = compute_flush_opr(&params, &config);
-    assert_eq!(metric.action, "kivi_opr");
+    assert_eq!(metric.action, "kv.quant_flush_opr");
     assert!(metric.raw_value >= 0.0);
 }
 

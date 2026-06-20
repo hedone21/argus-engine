@@ -3244,8 +3244,8 @@ mod tests {
         }
 
         let proxies = cache.take_flush_proxies();
-        // Each flush pushes 2 QCF metrics (compute_flush_nmse → "kivi",
-        // compute_flush_opr → "kivi_opr"). 2 flushes × 2 metrics = 4 total.
+        // Each flush pushes 2 QCF metrics (compute_flush_nmse → "kv.quant_flush_nmse",
+        // compute_flush_opr → "kv.quant_flush_opr"). 2 flushes × 2 metrics = 4 total.
         assert_eq!(
             proxies.len(),
             4,
@@ -3254,7 +3254,7 @@ mod tests {
         );
         for p in &proxies {
             assert!(
-                p.action == "kivi" || p.action == "kivi_opr",
+                p.action == "kv.quant_flush_nmse" || p.action == "kv.quant_flush_opr",
                 "unexpected action: {}",
                 p.action
             );
@@ -3429,7 +3429,7 @@ mod tests {
 
         let proxies = cache.take_flush_proxies();
         // Must have NMSE, OPR, and AWQE
-        let awqe_metric = proxies.iter().find(|m| m.action == "kivi_awqe");
+        let awqe_metric = proxies.iter().find(|m| m.action == "kv.quant_flush_awqe");
         assert!(
             awqe_metric.is_some(),
             "flush_proxies must contain 'kivi_awqe' when awqe_enabled=true and scores present; got: {:?}",
@@ -3461,7 +3461,7 @@ mod tests {
         }
 
         let proxies = cache.take_flush_proxies();
-        let awqe_metric = proxies.iter().find(|m| m.action == "kivi_awqe");
+        let awqe_metric = proxies.iter().find(|m| m.action == "kv.quant_flush_awqe");
         assert!(
             awqe_metric.is_none(),
             "flush_proxies must NOT contain 'kivi_awqe' when no scores were provided; got: {:?}",
@@ -3469,11 +3469,11 @@ mod tests {
         );
         // But NMSE and OPR should still be present
         assert!(
-            proxies.iter().any(|m| m.action == "kivi"),
+            proxies.iter().any(|m| m.action == "kv.quant_flush_nmse"),
             "NMSE proxy must still be present"
         );
         assert!(
-            proxies.iter().any(|m| m.action == "kivi_opr"),
+            proxies.iter().any(|m| m.action == "kv.quant_flush_opr"),
             "OPR proxy must still be present"
         );
     }
