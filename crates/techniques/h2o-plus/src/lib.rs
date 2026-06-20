@@ -138,7 +138,8 @@ impl KVCacheStage for H2OPlus {
 }
 
 /// Registration — the engine finds this via `find_stage("h2o_plus")`. `keep_ratio`/`protected_prefix`
-/// flow in from [`StageParams`] (CLI `eviction h2o-plus --keep-ratio <R>` + `--protected-prefix`).
+/// flow in from [`StageParams`] (CLI `eviction plugin --name h2o_plus --set keep_ratio=<R>` +
+/// `--protected-prefix`).
 #[distributed_slice(KV_CACHE_STAGES)]
 static H2O_PLUS: KVCacheStageReg = KVCacheStageReg {
     name: "h2o_plus",

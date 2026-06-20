@@ -4,7 +4,7 @@
 //! Extracted from the engine core into a self-registering technique crate (the `caote`/`quest`/`h2o`
 //! precedent): depends only on `argus-extension-api` + `linkme`, implements [`KVCacheStage`], and
 //! registers under the name `"d2o"` via `#[distributed_slice(KV_CACHE_STAGES)]`. The engine
-//! force-links it (`use d2o as _;`) so `eviction d2o` resolves the out-of-tree plugin.
+//! force-links it (`use d2o as _;`) so `eviction plugin --name d2o` resolves the out-of-tree plugin.
 //!
 //! Algorithm (ported verbatim from the engine `compute_d2o_plan` + `D2OStage::plan`, proven
 //! bit-identical to the former in-place handler by the engine's M4 equivalence tests):
