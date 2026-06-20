@@ -702,9 +702,9 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
     let mut json_val = serde_json::from_str::<serde_json::Value>(&output.to_json()?)?;
     json_val["config"] = serde_json::json!({
         "model": args.model_path,
-        "eviction_policy": "kivi",
-        "kivi_bits": args.effective_quant_window_bits(),
-        "kivi_residual_size": args.effective_quant_window_residual_size(),
+        "eviction_policy": "quant_window",
+        "quant_bits": args.effective_quant_window_bits(),
+        "quant_residual_size": args.effective_quant_window_residual_size(),
         "max_seq_len": max_seq_len,
         "kv_type": format!("q{}+f32_residual", args.effective_quant_window_bits()),
     });

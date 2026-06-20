@@ -44,7 +44,7 @@ pub struct QuantWindowFlushHook {
     pub score_accumulator: Option<AttentionScoreAccumulator>,
 
     /// Running count of flush events for the current question (layer 0 legacy,
-    /// dumped as `kivi_flush_count`).
+    /// dumped as `quant_flush_count`).
     flush_count: usize,
 
     // Schema v3: per-layer accumulation. Buffers indexed by `sample_layers` position.
@@ -106,7 +106,7 @@ impl QuantWindowFlushHook {
                 if sample_set.contains(&cache_idx) {
                     let pos = sample_layers.iter().position(|&v| v == cache_idx).unwrap();
                     for metric in cache.take_flush_proxies() {
-                        if metric.action == "kivi_opr" {
+                        if metric.action == "kv.quant_flush_opr" {
                             if cache_idx == 0 {
                                 self.flush_count += 1;
                             }
@@ -114,7 +114,7 @@ impl QuantWindowFlushHook {
                             self.per_layer_sum[pos] += metric.raw_value;
                             self.per_layer_count[pos] += 1;
                         }
-                        // "aw_vopr" and NMSE proxies are drained but not exposed in v3.
+                        // "kv.quant_flush_aw_vopr" and NMSE proxies are drained but not exposed in v3.
                     }
                 } else {
                     cache.take_flush_proxies();
@@ -123,7 +123,7 @@ impl QuantWindowFlushHook {
         } else {
             // Legacy path: layer 0 only, no per-layer tracking.
             for metric in caches[0].take_flush_proxies() {
-                if metric.action == "kivi_opr" {
+                if metric.action == "kv.quant_flush_opr" {
                     self.flush_count += 1;
                 }
             }
@@ -178,9 +178,9 @@ impl StepHook<QuantizedRecentWindowCache> for QuantWindowFlushHook {
             (caches[0].q2_tokens, caches[0].res_pos)
         };
         let mut obj = serde_json::json!({
-            "kivi_q2_tokens": q2_tokens,
-            "kivi_res_pos": res_pos,
-            "kivi_flush_count": self.flush_count,
+            "quant_q2_tokens": q2_tokens,
+            "quant_res_pos": res_pos,
+            "quant_flush_count": self.flush_count,
         });
 
         if self.experimental_enabled {
@@ -216,7 +216,7 @@ impl StepHook<QuantizedRecentWindowCache> for QuantWindowFlushHook {
 
             use crate::qcf::{compute_c1, compute_d7};
             obj["schema_version"] = serde_json::json!(3);
-            obj["action_family"] = serde_json::json!("kivi");
+            obj["action_family"] = serde_json::json!("quant_window");
             obj["n_layers"] = serde_json::json!(n);
             obj["qcf_record_worst_head_max"] = serde_json::json!(max_or_zero(&layer_worst_head));
             obj["qcf_record_worst_head_mean"] = serde_json::json!(mean_or_zero(&layer_worst_head));
@@ -256,8 +256,8 @@ mod tests {
     fn test_extra_question_fields_empty() {
         let hook = make_hook();
         let fields = hook.extra_question_fields(&[]);
-        assert_eq!(fields["kivi_q2_tokens"], 0);
-        assert_eq!(fields["kivi_res_pos"], 0);
+        assert_eq!(fields["quant_q2_tokens"], 0);
+        assert_eq!(fields["quant_res_pos"], 0);
     }
 
     #[test]
@@ -266,8 +266,8 @@ mod tests {
         let cache = QuantizedRecentWindowCache::new(8, 64, 512, 32);
         // Initial state: q2_tokens=0, res_pos=0
         let fields = hook.extra_question_fields(&[cache]);
-        assert_eq!(fields["kivi_q2_tokens"], 0);
-        assert_eq!(fields["kivi_res_pos"], 0);
+        assert_eq!(fields["quant_q2_tokens"], 0);
+        assert_eq!(fields["quant_res_pos"], 0);
     }
 
     #[test]
@@ -277,10 +277,10 @@ mod tests {
 
         assert_eq!(hook.flush_count, 0);
 
-        // Schema v3: kivi_flush_count is always emitted (no longer gated on > 0).
+        // Schema v3: quant_flush_count is always emitted (no longer gated on > 0).
         hook.flush_count = 5;
         let fields = hook.extra_question_fields(&[cache]);
-        assert_eq!(fields["kivi_flush_count"], 5);
+        assert_eq!(fields["quant_flush_count"], 5);
 
         let cache2 = QuantizedRecentWindowCache::new(8, 64, 512, 32);
         hook.reset_caches(&mut [cache2]);
@@ -351,7 +351,7 @@ mod tests {
         let fields = hook.extra_question_fields(&[]);
 
         assert_eq!(fields["schema_version"], 3);
-        assert_eq!(fields["action_family"], "kivi");
+        assert_eq!(fields["action_family"], "quant_window");
         assert_eq!(fields["n_layers"], 3);
 
         assert!(
