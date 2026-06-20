@@ -16,8 +16,10 @@ pub struct KvModeArgs {
     #[arg(long = "kivi-residual-len", default_value_t = 128)]
     pub quant_window_residual_len: usize,
 
-    /// Offload storage backend: raw | disk | mmap | tmpfs | ... (kv-mode=offload 한정)
-    #[arg(long = "kv-offload-storage", default_value = "mmap")]
+    /// Offload storage backend (kv-mode=offload 한정). 배선된 backend 는 `raw`(in-memory)
+    /// 와 `disk` 뿐 — 그 외 값은 clap 이 거부한다. (mmap/tmpfs 는 미배선; 새 `OffloadStore`
+    /// impl 이 생기면 여기에 추가. `alloc_offload_kv_caches` 가 실 생성자.)
+    #[arg(long = "kv-offload-storage", value_parser = ["raw", "disk"], default_value = "raw")]
     pub kv_offload_storage: String,
 
     /// Directory for disk offload files (kv-mode=offload, storage=disk 한정).
@@ -45,7 +47,7 @@ impl Default for KvModeArgs {
             kv_mode: "standard".to_string(),
             quant_window_bits: 2,
             quant_window_residual_len: 128,
-            kv_offload_storage: "mmap".to_string(),
+            kv_offload_storage: "raw".to_string(),
             kv_offload_path: String::new(),
             kv_max_prefetch_depth: 128,
             read_stage: None,

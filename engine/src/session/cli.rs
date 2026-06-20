@@ -254,6 +254,37 @@ mod tests {
         assert!(parse_qcf_sample_layers(",", 4).is_err());
     }
 
+    // ── offload storage backend CLI 검증 (B5-2a: mmap-default 버그 수정) ──
+
+    /// `--kv-offload-storage` 는 배선된 backend(`raw`/`disk`)만 받고 그 외(`mmap`/`tmpfs`/…)는
+    /// clap 단에서 거부한다. 기본값은 `raw` — 과거 기본값 `mmap` 은 미배선이라 store 생성자에서
+    /// bail 해 offload 가 out-of-box 로 깨졌었다(`alloc_offload_kv_caches`).
+    #[test]
+    fn kv_offload_storage_rejects_unwired_backends() {
+        // 기본값 = raw(배선됨).
+        let a = Args::try_parse_from(["test"]).unwrap();
+        assert_eq!(
+            a.kv_mode_args.kv_offload_storage, "raw",
+            "기본 offload storage = raw"
+        );
+
+        // 배선된 값은 통과.
+        for ok in ["raw", "disk"] {
+            assert!(
+                Args::try_parse_from(["test", "--kv-offload-storage", ok]).is_ok(),
+                "배선된 backend '{ok}' 는 허용되어야 한다"
+            );
+        }
+
+        // 미배선 값은 런타임 bail 이 아니라 clap 파싱 단에서 거부.
+        for bad in ["mmap", "tmpfs", "bogus"] {
+            assert!(
+                Args::try_parse_from(["test", "--kv-offload-storage", bad]).is_err(),
+                "미배선 backend '{bad}' 는 clap 이 거부해야 한다"
+            );
+        }
+    }
+
     // ── score decay(forgetting-factor) 주입 — CLI 배선 게이트 (KV roadmap 항목 0 §4.2) ──
 
     /// `--score-decay` 미지정(기본 0.0) → `h2o_decay()` 가 정책 자체 값을 그대로 반환.

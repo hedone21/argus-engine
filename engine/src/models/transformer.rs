@@ -243,12 +243,13 @@ pub struct TransformerModel {
     pub release_worker: Arc<dyn crate::runtime_resources_access::ReleaseWorkerAccess>,
 }
 
-// 5-F: `C: KVCacheOps` bound 제거 — forward_into_offload(offload fmt 경로)가 concrete
-// OffloadKVCache 로만 단형화하며 OffloadKVCache inherent(5-E) 만 사용. 필드는 전부 데이터.
-pub struct OffloadForwardArgs<'a, C> {
+// offload fmt 경로(`forward_into_offload`)는 KV 를 별도 `fmts: &[Arc<OffloadFormat>]`
+// 파라미터로 받는다 — 본 구조체는 그 외 forward 입력만 운반한다. (옛 generic `kv_caches:
+// &mut [C]` 슬롯은 양쪽 호출부에서 `&mut []` 로 전달돼 본문에서 무시되던 vestigial 잔재라
+// 제거했다; 그에 따라 `C` 타입 파라미터도 더는 쓰이지 않아 함께 제거.)
+pub struct OffloadForwardArgs<'a> {
     pub input_tokens: &'a Tensor,
     pub start_pos: usize,
-    pub kv_caches: &'a mut [C],
     pub backend: &'a Arc<dyn Backend>,
     pub memory: &'a dyn Memory,
     pub logits_out: &'a mut Tensor,
@@ -290,7 +291,7 @@ pub struct OffloadForwardArgs<'a, C> {
 
 /// `forward_into` 의 KVCacheFormat trait-object fork 인자 (Phase α-K substep 3c).
 ///
-/// `OffloadForwardArgs` 의 `kv_caches: &mut [C]`(generic) 만
+/// `forward_into` 의 generic `kv_caches: &mut [C]` 입력을
 /// `fmts: &[Arc<dyn KVCacheFormat>]`(trait object, `&self` mutation 이라 `&mut` 불요)로 교체.
 /// **decode-only**(seq_len=1) — prefill flip 은 (3d). score/profiler/skip/importance/variance/
 /// prefill_ws/layer_boundary 는 happy-path decode 가 안 쓰므로(`is_standard_happy_path` 보장) 드롭
@@ -3394,8 +3395,6 @@ mod tests {
     fn s6_offload_forward_args_has_read_stage_field() {
         use crate::backend::cpu::CpuBackend;
         use crate::buffer::DType;
-        use crate::kv::offload::OffloadKVCache;
-        use crate::kv::offload::raw_store::RawStore;
         use crate::memory::galloc::Galloc;
         use crate::shape::Shape;
         use crate::tensor::Tensor;
@@ -3409,15 +3408,10 @@ mod tests {
         let logits_buf = memory.alloc(4 * 4, DType::F32).unwrap();
         let mut logits_out = Tensor::new(Shape::new(vec![1, 1, 4]), logits_buf, backend.clone());
 
-        let store = Box::new(RawStore::new(8 * 64 * 2)); // 더미 token_bytes
-        let kv_cache = OffloadKVCache::new(0, 8, 64, DType::F16, 16, store);
-        let mut kv_caches = vec![kv_cache];
-
         // OffloadForwardArgs 생성 — read_stage: None 필드가 컴파일 가능해야 한다.
         let _args = OffloadForwardArgs {
             input_tokens: &input_tokens,
             start_pos: 0,
-            kv_caches: &mut kv_caches,
             backend: &backend,
             memory: memory.as_ref(),
             logits_out: &mut logits_out,

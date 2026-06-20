@@ -4,11 +4,10 @@
 //! `StandardFormat`(pressure/standard_format.rs) 의 offload 짝 — offload KV forward 경로를
 //! generic `<C: KVCacheOps>` 에서 `KVCacheFormat` trait-object 로 이주하기 위한 wrapper.
 //!
-//! **purely additive, env-gated OFF default, unwired-on-OFF** — OLD `OffloadKVCache`/`KVCacheOps`
-//! 경로(`offload.rs`)와 OLD `forward_into_offload`(transformer.rs)를 1바이트도 안 건드린다.
-//! `LLMRS_OFFLOAD_FMT` 게이트 ON 일 때만 `OffloadForward` 가 transient wrap 한다. 내부 가변성 =
-//! `std::sync::Mutex`(trait `Send+Sync` 요구로 `RefCell` 불가). offload 는 SeqMajor + eviction
-//! 미지원이라 HeadMajor GPU scatter fast-path 와 compact 가 전부 부재(StandardFormat 과 갈림).
+//! `OffloadForward` 가 매 prefill/decode 마다 `OffloadKVCache` 를 이 wrapper 로 transient 하게
+//! 감싸 구동한다 — offload 의 **유일 live 경로**다(별도 env 게이트나 OLD `KVCacheOps` fork 없음).
+//! 내부 가변성 = `std::sync::Mutex`(trait `Send+Sync` 요구로 `RefCell` 불가). offload 는 SeqMajor +
+//! eviction 미지원이라 HeadMajor GPU scatter fast-path 와 compact 가 전부 부재(StandardFormat 과 갈림).
 
 use std::sync::Arc;
 use std::sync::Mutex;

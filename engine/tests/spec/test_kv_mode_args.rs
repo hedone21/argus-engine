@@ -54,7 +54,7 @@ fn explicit_offload_parses() {
         "--kv-mode",
         "offload",
         "--kv-offload-storage",
-        "tmpfs",
+        "disk",
         "--kv-offload-path",
         "/tmp/kv",
         "--kv-max-prefetch-depth",
@@ -62,7 +62,7 @@ fn explicit_offload_parses() {
     ]);
     assert_eq!(args.effective_kv_mode(), "offload");
     assert!(mode_caps("offload").unwrap().supports_offload);
-    assert_eq!(args.kv_mode_args.kv_offload_storage, "tmpfs");
+    assert_eq!(args.kv_mode_args.kv_offload_storage, "disk");
     assert_eq!(args.kv_mode_args.kv_offload_path, "/tmp/kv");
     assert_eq!(args.kv_mode_args.kv_max_prefetch_depth, 4);
 }
@@ -123,9 +123,32 @@ fn effective_kv_offload_storage_reads_new_field_when_offload() {
         "--kv-mode",
         "offload",
         "--kv-offload-storage",
-        "tmpfs",
+        "disk",
     ]);
-    assert_eq!(args.effective_kv_offload_storage(), "tmpfs");
+    assert_eq!(args.effective_kv_offload_storage(), "disk");
+}
+
+#[test]
+fn unwired_offload_storage_is_rejected_by_clap() {
+    // mmap/tmpfs 는 미배선 — 과거엔 String 으로 받아 store 생성자에서 런타임 bail(기본값
+    // mmap 이라 out-of-box 로 깨짐). 이제 clap value_parser 가 파싱 단에서 거부한다.
+    for bad in ["mmap", "tmpfs", "bogus"] {
+        let result = Args::try_parse_from([
+            "generate",
+            "--model-path",
+            "/tmp/x.gguf",
+            "--prompt",
+            "hi",
+            "--kv-mode",
+            "offload",
+            "--kv-offload-storage",
+            bad,
+        ]);
+        assert!(
+            result.is_err(),
+            "미배선 offload storage '{bad}' 는 clap 이 거부해야 한다"
+        );
+    }
 }
 
 #[test]
