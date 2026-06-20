@@ -67,7 +67,9 @@ impl QuantWindowBitTransitionStage {
 
 impl PipelineStage for QuantWindowBitTransitionStage {
     fn name(&self) -> &str {
-        "kv.kivi_quant"
+        // Generic stage-domain name (sibling convention: `kv.eviction` / `kv.offload`), aligned with
+        // the resilience action family `kv.quant_dynamic`. No engine-resident technique paper-name.
+        "kv.quant_dynamic"
     }
 
     fn lifecycle(&self) -> StageLifecycle {
