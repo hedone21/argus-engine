@@ -56,6 +56,14 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: default
+            args: ""
+          - label: +rkv,caote
+            args: "--features rkv,caote"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,7 +72,12 @@ jobs:
       # Host unit + integration tests. CI runners have no GPU: OpenCL-backed tests
       # self-skip when no platform initializes, and model-fixture tests skip when
       # the model files are absent. `--no-fail-fast` surfaces every failure at once.
-      - run: cargo test --workspace --no-fail-fast
+      # The `+rkv,caote` leg additionally runs the feature-gated tests (the two
+      # features together, exercising the StageCaps `reads` take-both interaction);
+      # the default-features leg alone never compiles or runs them. The `build`
+      # matrix compiles +caote/+rkv/+resilience separately but runs no tests.
+      - name: test (${{ matrix.label }})
+        run: cargo test --workspace --no-fail-fast ${{ matrix.args }}
 
   docs-lint:
     # Public-facing docs/comments must be English. Scope grows as the i18n burndown
