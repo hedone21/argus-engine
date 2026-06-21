@@ -8,8 +8,9 @@
 //!
 //! stats_line 포맷 (D5, G1 enforce):
 //! - Standard: `kv_pos={kv_pos}/{max_seq_len} policy={policy_name} evicted_total={evicted_total}`
-//! - QuantWindow: `kv_pos={kv_pos}/{max_seq_len} mode=kivi bits={bits} residual={residual_size}`
-//! - Offload: `kv_pos={kv_pos}/{max_seq_len} mode=offload store={mode} prefetch_depth={max_prefetch_depth}`
+//! - NonEvicting: `kv_pos={kv_pos}/{max_seq_len} {fragment}` — `fragment` 은 모드 build closure 가
+//!   공급한다(kivi: `mode=kivi bits={bits} residual={residual_size}`,
+//!   offload: `mode=offload store={mode} prefetch_depth={max_prefetch_depth}`).
 
 use std::sync::{Arc, Mutex};
 
@@ -52,20 +53,18 @@ pub struct ChatKvModeStandard {
     pub evicted_total: usize,
 }
 
-/// chat 모드의 KV-type 분기.
+/// chat 모드의 KV-type 분기 (eviction-capable vs not).
 ///
-/// stats_line 포맷 + ensure_capacity 동작이 분기된다.
-/// Standard만 eviction(CacheManager)을 자체 관리한다.
-/// QuantWindow/Offload는 overflow 시 bail (eviction 미지원).
+/// stats_line 포맷 + ensure_capacity 동작이 분기된다. Standard만 eviction
+/// (CacheManager)을 자체 관리한다. 그 외 모드(quant-window/offload)는 overflow 시
+/// bail (eviction 미지원) — 엔진 chat 계층은 구체 모드를 명명하지 않고, 모드의
+/// build closure 가 자신의 `/stats` fragment 를 공급한다(이름-비분기 불변식).
 pub enum ChatKvMode {
     Standard(Box<ChatKvModeStandard>),
-    QuantWindow {
-        bits: u8,
-        residual_size: usize,
-    },
-    Offload {
-        store_mode: String,
-        max_prefetch_depth: usize,
+    /// eviction 없는 모드 일반형. `stats_fragment` 는 build closure 가 만든
+    /// `/stats` 줄 조각(예: `mode=kivi bits=4 residual=32`).
+    NonEvicting {
+        stats_fragment: String,
     },
 }
 
@@ -352,7 +351,7 @@ impl ChatSession {
                     );
                 }
             }
-            ChatKvMode::QuantWindow { .. } | ChatKvMode::Offload { .. } => {
+            ChatKvMode::NonEvicting { .. } => {
                 if self.pos + additional > self.max_seq_len {
                     anyhow::bail!(
                         "context would exceed max_seq_len={} (pos={}, incoming_reserve={}). \
@@ -460,22 +459,10 @@ impl ChatSession {
                     self.pos, self.max_seq_len, s.policy_name, s.evicted_total
                 )
             }
-            ChatKvMode::QuantWindow {
-                bits,
-                residual_size,
-            } => {
+            ChatKvMode::NonEvicting { stats_fragment } => {
                 format!(
-                    "kv_pos={}/{} mode=kivi bits={} residual={}",
-                    self.pos, self.max_seq_len, bits, residual_size
-                )
-            }
-            ChatKvMode::Offload {
-                store_mode,
-                max_prefetch_depth,
-            } => {
-                format!(
-                    "kv_pos={}/{} mode=offload store={} prefetch_depth={}",
-                    self.pos, self.max_seq_len, store_mode, max_prefetch_depth
+                    "kv_pos={}/{} {}",
+                    self.pos, self.max_seq_len, stats_fragment
                 )
             }
         }
@@ -655,9 +642,8 @@ pub(crate) fn build_chat_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<C
         kv_handle,
         quant_handle,
         eviction_policy: String::new(), // quant-window: no in-loop eviction policy.
-        kv_mode: ChatKvMode::QuantWindow {
-            bits,
-            residual_size,
+        kv_mode: ChatKvMode::NonEvicting {
+            stats_fragment: format!("mode=kivi bits={bits} residual={residual_size}"),
         },
     })
 }
@@ -712,9 +698,10 @@ pub(crate) fn build_chat_offload_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatMo
         kv_handle: None,
         quant_handle: None,
         eviction_policy: String::new(),
-        kv_mode: ChatKvMode::Offload {
-            store_mode: offload_mode,
-            max_prefetch_depth,
+        kv_mode: ChatKvMode::NonEvicting {
+            stats_fragment: format!(
+                "mode=offload store={offload_mode} prefetch_depth={max_prefetch_depth}"
+            ),
         },
     })
 }
@@ -1032,9 +1019,8 @@ mod tests {
         let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let mut session = ChatSession {
             decode_loop,
-            kv_mode: ChatKvMode::QuantWindow {
-                bits: 4,
-                residual_size: 32,
+            kv_mode: ChatKvMode::NonEvicting {
+                stats_fragment: "mode=kivi bits=4 residual=32".to_string(),
             },
             pos: 10,
             max_seq_len: 2048,
@@ -1064,9 +1050,8 @@ mod tests {
         let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let mut session = ChatSession {
             decode_loop,
-            kv_mode: ChatKvMode::QuantWindow {
-                bits: 4,
-                residual_size: 32,
+            kv_mode: ChatKvMode::NonEvicting {
+                stats_fragment: "mode=kivi bits=4 residual=32".to_string(),
             },
             pos: 9,
             max_seq_len: 10,
@@ -1094,9 +1079,8 @@ mod tests {
         let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let mut session = ChatSession {
             decode_loop,
-            kv_mode: ChatKvMode::Offload {
-                store_mode: "raw".to_string(),
-                max_prefetch_depth: 2,
+            kv_mode: ChatKvMode::NonEvicting {
+                stats_fragment: "mode=offload store=raw prefetch_depth=2".to_string(),
             },
             pos: 9,
             max_seq_len: 10,
@@ -1241,9 +1225,8 @@ mod tests {
         let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let session = ChatSession {
             decode_loop,
-            kv_mode: ChatKvMode::QuantWindow {
-                bits: 4,
-                residual_size: 32,
+            kv_mode: ChatKvMode::NonEvicting {
+                stats_fragment: "mode=kivi bits=4 residual=32".to_string(),
             },
             pos: 100,
             max_seq_len: 512,
@@ -1269,9 +1252,8 @@ mod tests {
         let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
         let session = ChatSession {
             decode_loop,
-            kv_mode: ChatKvMode::Offload {
-                store_mode: "raw".to_string(),
-                max_prefetch_depth: 4,
+            kv_mode: ChatKvMode::NonEvicting {
+                stats_fragment: "mode=offload store=raw prefetch_depth=4".to_string(),
             },
             pos: 77,
             max_seq_len: 512,
