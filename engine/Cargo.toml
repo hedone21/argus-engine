@@ -61,6 +61,9 @@ path = "src/bin/test_q4_soa_byte_equal.rs"
 argus-shared = { git = "https://github.com/hedone21/argus-shared.git", branch = "main" }
 # Extension surface: the stage-axis KVCacheStage registry + linkme auto-registration.
 argus-extension-api = { path = "../crates/argus-extension-api" }
+# No-engine-dependency leaf crate holding the KV-cache quantization codecs
+# (re-exported from `crate::quant`). Shared with out-of-tree KV plugins, cycle-free.
+argus-kv-codec = { path = "../crates/argus-kv-codec" }
 linkme = "0.3"
 # CAOTE (value-aware KVCacheStage) production plugin. Opt-in via the `caote` feature.
 caote = { path = "../crates/techniques/caote", optional = true }
