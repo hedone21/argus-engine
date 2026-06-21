@@ -102,9 +102,8 @@ fn make_kivi_session(max_seq_len: usize) -> ChatSession {
         .build();
     ChatSession::new_for_test(
         decode_loop,
-        ChatKvMode::QuantWindow {
-            bits: 4,
-            residual_size: 32,
+        ChatKvMode::NonEvicting {
+            stats_fragment: "mode=kivi bits=4 residual=32".to_string(),
         },
         max_seq_len,
     )
@@ -122,9 +121,8 @@ fn make_offload_session(max_seq_len: usize) -> ChatSession {
         .build();
     ChatSession::new_for_test(
         decode_loop,
-        ChatKvMode::Offload {
-            store_mode: "raw".to_string(),
-            max_prefetch_depth: 4,
+        ChatKvMode::NonEvicting {
+            stats_fragment: "mode=offload store=raw prefetch_depth=4".to_string(),
         },
         max_seq_len,
     )
