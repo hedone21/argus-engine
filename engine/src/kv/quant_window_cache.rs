@@ -406,11 +406,19 @@ impl QuantizedRecentWindowCache {
         let max_k_blocks = max_flushes * groups_per_flush * kv_heads * head_dim;
         let max_v_blocks = max_flushes * kv_heads * residual_size * blocks_per_token_v;
 
-        // GPU residual capacity: full residual_size for all bit-widths.
-        // For bits=16 with large max_seq_len, alloc may fail — the Err path
-        // below falls back to CPU mode gracefully.
+        // GPU residual capacity must track self.res_cap (set in new_with_bits):
+        // residual_size for the Q-bit regime, but max_seq_len for bits=16 — which is
+        // residual-only mode and holds the FULL sequence in the residual (no quant
+        // store). update_gpu writes, and get_view_gpu/attention read, the residual at
+        // self.res_cap stride, so the physical buffer must match or it over-runs.
+        // For bits=16 with large max_seq_len this alloc may fail — the Err path below
+        // falls back to CPU mode gracefully (the CPU res_k Vec is already max_seq_len).
         // F16 attn and Q-block buffers are still skipped for bits=16.
-        let gpu_res_cap = residual_size;
+        let gpu_res_cap = if bits == 16 {
+            max_seq_len
+        } else {
+            residual_size
+        };
         let gpu_res_elems = kv_heads * gpu_res_cap * head_dim;
 
         #[allow(clippy::type_complexity)]
@@ -539,7 +547,7 @@ impl QuantizedRecentWindowCache {
 
                 if skip_attn_and_q {
                     log::info!(
-                        "QuantWindowCache: GPU mode enabled (bits=16, attn/Q deferred, res_cap={residual_size})"
+                        "QuantWindowCache: GPU mode enabled (bits=16, attn/Q deferred, res_cap={gpu_res_cap})"
                     );
                 } else {
                     log::info!(
@@ -1056,13 +1064,40 @@ impl QuantizedRecentWindowCache {
             self.qk = QuantizedBlocks::Unquantized;
             self.qv = QuantizedBlocks::Unquantized;
 
-            // GPU mode: release attn and Q-block buffers to reclaim memory.
-            // bits=16 uses only F32 residual; these buffers are unused.
+            // GPU mode: regrow the residual to res_cap (=max_seq_len) and release the
+            // now-unused attn + Q-block buffers. bits=16 is residual-only: slab.res_k/
+            // res_v become the authoritative attention store (get_view_gpu hands them
+            // straight to attention; update_gpu writes them at self.res_cap stride).
+            // new_gpu sized them at residual_size for the Q-bit regime, so they are now
+            // undersized AND stale — regrow to new_res_cap and upload the restored CPU
+            // residual (bug 42: leaving them undersized faults the later 16→Q readback,
+            // and leaving them stale/zero corrupts the bits=16 attention store).
             if self.is_gpu() {
+                let backend = self.slab.as_ref().unwrap().backend.clone();
+                let memory = self.slab.as_ref().unwrap().memory.clone();
+                // SAFETY: res_k/res_v hold new_elems f32 values (resized + populated above).
+                let k_bytes = unsafe {
+                    std::slice::from_raw_parts(self.res_k.as_ptr() as *const u8, new_elems * 4)
+                };
+                let v_bytes = unsafe {
+                    std::slice::from_raw_parts(self.res_v.as_ptr() as *const u8, new_elems * 4)
+                };
+                let shape = Shape::new(vec![self.kv_heads, new_res_cap, self.head_dim]);
+                // Alloc-both-then-swap: the old (residual_size) buffers drop only after the
+                // new ones succeed; a failed alloc/write propagates Err (same mid-transition
+                // contract as the 16→Q path) without leaving a partially-swapped slab.
+                let k_buf = memory.alloc(new_elems * 4, DType::F32)?;
+                let mut gpu_rk = Tensor::new(shape.clone(), k_buf, backend.clone());
+                backend.write_buffer(&mut gpu_rk, k_bytes)?;
+                let v_buf = memory.alloc(new_elems * 4, DType::F32)?;
+                let mut gpu_rv = Tensor::new(shape, v_buf, backend.clone());
+                backend.write_buffer(&mut gpu_rv, v_bytes)?;
                 {
-                    // Null the attn + Q-block buffers but KEEP the slab itself (bits=16 =
-                    // residual-only GPU mode retains backend/memory + F32 residual buffers).
+                    // Swap in the regrown residual, then null attn + Q-block buffers but
+                    // KEEP the slab itself (bits=16 retains backend/memory + F32 residual).
                     let slab = self.slab.as_mut().unwrap();
+                    slab.res_k = Some(gpu_rk);
+                    slab.res_v = Some(gpu_rv);
                     slab.attn_k = None;
                     slab.attn_v = None;
                     slab.attn_cap = 0;
@@ -1071,7 +1106,9 @@ impl QuantizedRecentWindowCache {
                 }
                 self.gpu_q2k_blocks = 0;
                 self.gpu_q2v_blocks = 0;
-                log::info!("QuantWindowCache: GPU attn/Q buffers released (transition to bits=16)");
+                log::info!(
+                    "QuantWindowCache: GPU residual regrown to res_cap={new_res_cap}, attn/Q released (transition to bits=16)"
+                );
             }
 
             return Ok(());
@@ -3524,6 +3561,50 @@ mod tests {
         );
         assert_eq!(cache.q2_tokens, 0);
         assert_eq!(cache.res_pos, 0);
+    }
+
+    /// Bug 42 guard: the GPU residual buffer (new_gpu's `gpu_res_cap`) must track
+    /// `self.res_cap` for every bit-width — `residual_size` for the Q-bit regime,
+    /// `max_seq_len` for bits=16 (residual-only mode holds the full sequence). Host
+    /// cannot exercise the GPU alloc (new_gpu falls back to CPU mode without OpenCL),
+    /// so this locks the SIZING RULE that `gpu_res_cap` mirrors. The bug-42 root cause
+    /// was `gpu_res_cap = residual_size` hard-coded for ALL bit-widths, desyncing the
+    /// GPU buffer from a bits=16 `res_cap = max_seq_len` → over-run on the 16→Q readback.
+    #[test]
+    fn test_kivi_gpu_res_cap_tracks_res_cap() {
+        let kv_heads = 2;
+        let head_dim = 64;
+        let max_seq = 256;
+        let residual_size = 32;
+
+        // bits=16: res_cap (and therefore gpu_res_cap) must be max_seq_len.
+        let c16 = QuantizedRecentWindowCache::new_with_bits(
+            kv_heads,
+            head_dim,
+            max_seq,
+            residual_size,
+            16,
+        );
+        assert_eq!(
+            c16.res_cap, max_seq,
+            "bits=16 res_cap must be max_seq_len; new_gpu's gpu_res_cap must mirror it"
+        );
+
+        // bits in {2,4,8}: res_cap (and gpu_res_cap) must stay residual_size — the
+        // byte-identical Q-bit path the bug-42 fix must NOT perturb.
+        for bits in [2u8, 4, 8] {
+            let c = QuantizedRecentWindowCache::new_with_bits(
+                kv_heads,
+                head_dim,
+                max_seq,
+                residual_size,
+                bits,
+            );
+            assert_eq!(
+                c.res_cap, residual_size,
+                "bits={bits} res_cap must stay residual_size (Q-bit regime unchanged)"
+            );
+        }
     }
 
     /// bits=16 mode stores all tokens in residual; no flush is ever performed.
