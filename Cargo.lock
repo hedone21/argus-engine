@@ -103,6 +103,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "argus-extension-api",
+ "argus-kv-codec",
  "argus-shared",
  "attn-score",
  "caote",
@@ -145,6 +146,13 @@ name = "argus-extension-api"
 version = "0.1.0"
 dependencies = [
  "linkme",
+]
+
+[[package]]
+name = "argus-kv-codec"
+version = "0.1.0"
+dependencies = [
+ "half",
 ]
 
 [[package]]

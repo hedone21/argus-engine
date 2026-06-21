@@ -5,6 +5,7 @@
 members = [
     "engine",
     "crates/argus-extension-api",
+    "crates/argus-kv-codec",
     "crates/techniques/*",
 ]
 resolver = "3"

@@ -1,0 +1,13 @@
+[package]
+name = "argus-kv-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "KV-cache quantization codecs (2-bit / 4-bit / 8-bit asymmetric blocks) for argus-engine. A no-engine-dependency leaf crate so the engine and out-of-tree KV-cache plugins share one byte-identical codec without a cargo cycle."
+publish = false
+
+[dependencies]
+# f16 scale/min fields in the repr(C) block layouts. Single-pinned to match the
+# engine so the f16 representation is byte-identical across the crate boundary.
+half = "2.7.1"
