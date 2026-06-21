@@ -226,8 +226,8 @@ pub struct QuantizedRecentWindowCache {
     gpu_q2v_blocks: usize,
 
     /// QCF flush proxy 계산기 (L2 trait dispatch, S-3b-4 γ-2).
-    /// Default = `QuantFlushQcfComputer` (stateless). caller 가 다른 구현체를
-    /// 주입하려면 `set_qcf_computer` 사용.
+    /// 기본값이자 현재 유일 구현체 = `QuantFlushQcfComputer` (stateless);
+    /// 생성자에서 기본값으로 1회 구성되며 런타임 주입 setter 는 없다.
     qcf_computer: Box<dyn crate::qcf_computer::QcfComputer>,
 }
 
