@@ -95,10 +95,6 @@ pub enum DynamicArg {
     ResTokens { arg_idx: u32 },
     /// Tok base offset for scatter (i32) — q2_tokens passed to scatter
     TokBase { arg_idx: u32 },
-    /// Hybrid KV-split: GPU partial end index (i32). Computed per token from
-    /// `attn_seq_len` and the installed `HybridAttnSetup::kv_frac`.
-    /// Only consumed by `AttentionVariant::HybridKvSplit`.
-    HybridKvEnd { arg_idx: u32 },
 }
 
 /// A single GPU kernel dispatch with pre-bound arguments.
@@ -167,52 +163,7 @@ pub enum AttentionVariant {
     /// softmax, no score output. Selected at plan-build time when
     /// head_dim==64, F16 KV, HeadMajor, and no scores are needed.
     StandardFlash(KernelStep),
-    /// UMA hybrid KV-split attention. GPU partial covers `[0, kv_end_gpu)`
-    /// via `flash_attn_f32_f16_q1_partial`; CPU partial covers
-    /// `[kv_end_gpu, kv_len)` via the NEON helper. Stage C uses blocking
-    /// `clFinish` between the two before the NEON merge writes the final
-    /// row into `out_attn`.
-    HybridKvSplit {
-        partial_step: KernelStep,
-        /// Host pointers + model shape, snapshotted at plan-build time.
-        hybrid: HybridStepMeta,
-    },
 }
-
-/// Metadata needed to run the hybrid CPU partial + merge after the GPU partial
-/// kernel finishes. All pointers are permanent-mapped for the decode and come
-/// from the currently-installed `HybridAttnSetup` plus the workspace Q / out
-/// buffer maps carried through the plan config.
-///
-/// The cl_mem handles for K/V cache live in the per-layer `KernelStep` args
-/// (already pre-bound), but the CPU partial needs the *host_ptr* equivalents
-/// — captured here per layer.
-#[cfg(feature = "opencl")]
-pub struct HybridStepMeta {
-    /// Host-mapped pointer to workspace `q_buf` (f32, n_heads_q * head_dim).
-    pub q_host_ptr: *const f32,
-    /// Host-mapped pointer to the layer's K cache (f16 bits, HeadMajor).
-    pub k_host_ptr: *const u16,
-    /// Host-mapped pointer to the layer's V cache.
-    pub v_host_ptr: *const u16,
-    /// Host-mapped pointer to workspace `out_attn_buf` (f32, n_heads_q * head_dim).
-    pub out_attn_host_ptr: *mut f32,
-    /// Model shape (captured at build time — constant across decode).
-    pub n_heads_q: usize,
-    pub n_heads_kv: usize,
-    pub head_dim: usize,
-    pub kv_capacity: usize,
-    pub kv_frac: f32,
-}
-
-// SAFETY: Raw pointers are only dereferenced during plan dispatch on the
-// decode thread. The OpenCL driver keeps the host maps valid for the
-// lifetime of the owning HybridAttnSetup (held alive by the HybridScope
-// guard in generate.rs).
-#[cfg(feature = "opencl")]
-unsafe impl Send for HybridStepMeta {}
-#[cfg(feature = "opencl")]
-unsafe impl Sync for HybridStepMeta {}
 
 /// Execution plan for a single transformer layer.
 pub struct LayerKernelPlan {
@@ -220,7 +171,7 @@ pub struct LayerKernelPlan {
     pub steps_pre_kv: Vec<KernelStep>,
     /// Step 7: KV update (Standard scatter)
     pub kv_update: KvUpdateVariant,
-    /// Step 8: Attention (Standard or hybrid KV-split)
+    /// Step 8: Attention (Standard or flash)
     pub attention: AttentionVariant,
     /// Steps 9-10: Wo matmul, add+RMSNorm. FFN input (`residual`) is produced
     /// by the last step here.
@@ -1168,18 +1119,6 @@ impl FullKernelPlan {
                             ocl::core::ArgVal::scalar(&q2_tokens),
                         ),
                     ),
-                    // HybridKvEnd is patched specially by the HybridKvSplit
-                    // executor (it needs kv_frac to compute the split),
-                    // NOT here. If the standard dispatcher hits it, fall
-                    // through to writing 0 (empty GPU range) which is safe.
-                    DynamicArg::HybridKvEnd { arg_idx } => (
-                        *arg_idx,
-                        ocl::core::set_kernel_arg(
-                            &step.kernel,
-                            *arg_idx,
-                            ocl::core::ArgVal::scalar(&0i32),
-                        ),
-                    ),
                 }
             };
             if let Err(e) = result {
@@ -1449,212 +1388,6 @@ impl FullKernelPlan {
                         eprintln!(
                             "[Plan] L{} flash attention OK (attn_seq_len={})",
                             i, attn_seq_len
-                        );
-                    }
-                }
-                AttentionVariant::HybridKvSplit {
-                    partial_step,
-                    hybrid,
-                } => {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        use std::sync::atomic::{AtomicI32, Ordering, fence};
-
-                        // Stage D: blocking clFinish를 제거하고 sigflag(atomic_xchg)
-                        // + 호스트 spin-poll 로 CPU/GPU partial을 병렬 실행한다.
-                        // fallback 경로로 spin count 초과 시에만 blocking finish.
-                        //
-                        // 최대 spin iteration. Adreno 830 기준 Q1 partial 커널이
-                        // 수백 μs 내에 끝나므로 10M iteration은 넉넉한 상한
-                        // (ARM A72 @ 2GHz 기준 약 5ms).
-                        const MAX_SPIN: u64 = 10_000_000;
-
-                        // 1) kv_end(GPU) = attn_seq_len - round(attn_seq_len * kv_frac)
-                        //    kv_start = 0 (고정). CPU는 [kv_end_gpu, attn_seq_len)를 담당.
-                        let kv_len = attn_seq_len as usize;
-                        let (kv_end_gpu, _kv_end_cpu) =
-                            crate::hybrid_attention::compute_kv_split(kv_len, hybrid.kv_frac);
-
-                        // 현재 설치된 setup 획득 — ready_flags host_ptr 직접 접근용.
-                        let setup = crate::hybrid_attention::current().expect(
-                            "HybridKvSplit variant selected but no HybridAttnSetup installed",
-                        );
-
-                        // 2) ready_flags 를 0으로 리셋 (UMA 직접 쓰기).
-                        //    반드시 partial kernel enqueue **전**에 수행해야 한다.
-                        //    enqueue 후에 리셋하면 커널이 1로 set 한 값을 덮어쓰는 race 발생.
-                        let ready_ptr = setup.ready_flags_gpu.host_ptr() as *mut AtomicI32;
-                        let n_heads_q = hybrid.n_heads_q;
-                        unsafe {
-                            for h in 0..n_heads_q {
-                                // Relaxed store는 순서 보장이 약하지만, 뒤에 release
-                                // fence 를 삽입하므로 GPU kernel dispatch 이전에
-                                // 모든 0 쓰기가 가시화된다.
-                                (*ready_ptr.add(h)).store(0, Ordering::Relaxed);
-                            }
-                        }
-                        // ARM DMB ISH: 0 초기화 쓰기가 GPU(같은 UMA 메모리)에
-                        // 가시화된 뒤에 커널이 시작되도록 release fence.
-                        fence(Ordering::Release);
-
-                        // 3) GPU partial enqueue — HybridKvEnd(arg 41) 는 직접 패치.
-                        unsafe {
-                            let kv_end_i32 = kv_end_gpu as i32;
-                            // partial_step.dynamic_args에 HybridKvEnd가 들어있지만,
-                            // 실제 값을 kv_frac과 kv_len 기반으로 여기서 계산하므로
-                            // dispatch_step의 기본 경로 대신 수동으로 세팅 후 enqueue.
-                            for dyn_arg in &partial_step.dynamic_args {
-                                if let DynamicArg::HybridKvEnd { arg_idx } = dyn_arg {
-                                    let _ = ocl::core::set_kernel_arg(
-                                        &partial_step.kernel,
-                                        *arg_idx,
-                                        ocl::core::ArgVal::scalar(&kv_end_i32),
-                                    );
-                                }
-                            }
-                        }
-
-                        // Enqueue GPU partial (dynamic_args의 HybridKvEnd 는 위에서 패치함).
-                        let enqueue_ok = unsafe {
-                            match ocl::core::enqueue_kernel(
-                                queue,
-                                &partial_step.kernel,
-                                partial_step.ndim,
-                                None,
-                                &partial_step.global_work_size,
-                                partial_step.local_work_size,
-                                None::<&ocl::core::Event>,
-                                None::<&mut ocl::core::Event>,
-                            ) {
-                                Ok(_) => true,
-                                Err(e) => {
-                                    log::error!(
-                                        "Plan hybrid partial enqueue failed: L{} n_kv={}: {}",
-                                        i,
-                                        kv_len,
-                                        e
-                                    );
-                                    false
-                                }
-                            }
-                        };
-
-                        // 4) Flush — 드라이버 큐에서 디바이스로 실제 제출 개시.
-                        //    Adreno는 대체로 즉시 시작하나, 명시적 flush로 드라이버
-                        //    지연 가능성을 차단한다.
-                        if enqueue_ok {
-                            let _ = ocl::core::flush(queue);
-                        }
-
-                        // 5) CPU partial over [kv_end_gpu, kv_len) — GPU와 병렬 실행.
-                        let inv_sqrt_dk = 1.0f32 / (hybrid.head_dim as f32).sqrt();
-                        let mut ml_guard = setup
-                            .partial_ml_cpu
-                            .lock()
-                            .expect("hybrid partial_ml_cpu mutex poisoned");
-                        let mut o_guard = setup
-                            .partial_o_cpu
-                            .lock()
-                            .expect("hybrid partial_o_cpu mutex poisoned");
-                        // SAFETY: host pointers are permanent-mapped for the
-                        // lifetime of the HybridScope installed by generate.rs.
-                        // CPU partial은 GPU-side partial 버퍼는 건드리지 않고
-                        // setup의 CPU Vec (Mutex guarded single-writer)에만 쓴다.
-                        // GPU partial 읽기는 6)의 spin-poll + acquire fence 이후.
-                        unsafe {
-                            crate::quant::flash_neon::flash_partial_kv_range_f16(
-                                hybrid.q_host_ptr,
-                                hybrid.k_host_ptr,
-                                hybrid.v_host_ptr,
-                                ml_guard.as_mut_ptr(),
-                                o_guard.as_mut_ptr(),
-                                hybrid.n_heads_q,
-                                hybrid.n_heads_kv,
-                                hybrid.head_dim,
-                                hybrid.kv_capacity,
-                                kv_end_gpu,
-                                kv_len,
-                                inv_sqrt_dk,
-                            );
-                        }
-
-                        // 6) Spin-poll: head 별 sigflag 가 1이 될 때까지 대기.
-                        //    enqueue 자체가 실패한 경우 폴링 생략 (flag는 영원히 0).
-                        let mut fallback_used = false;
-                        if enqueue_ok {
-                            for h in 0..n_heads_q {
-                                // SAFETY: ready_flags_gpu는 n_heads_q 크기로
-                                // 할당되었고 UMA로 permanent-map 되어 있다.
-                                let flag = unsafe { &*ready_ptr.add(h) };
-                                let mut spins: u64 = 0;
-                                while flag.load(Ordering::Acquire) == 0 {
-                                    std::hint::spin_loop();
-                                    spins += 1;
-                                    if spins >= MAX_SPIN {
-                                        // Fallback: blocking finish로 전환.
-                                        fallback_used = true;
-                                        break;
-                                    }
-                                }
-                                if fallback_used {
-                                    break;
-                                }
-                            }
-                        }
-                        if fallback_used {
-                            // 안전망: 드라이버가 커널 실행을 지연시키거나
-                            // 기타 이유로 sigflag가 늦는 경우 blocking finish.
-                            let _ = ocl::core::finish(queue);
-                            thread_local! {
-                                static WARNED: std::cell::Cell<bool> =
-                                    const { std::cell::Cell::new(false) };
-                            }
-                            WARNED.with(|w| {
-                                if !w.get() {
-                                    log::warn!(
-                                        "Plan hybrid spin-poll exceeded MAX_SPIN={} iterations; \
-                                         falling back to blocking finish (future occurrences suppressed)",
-                                        MAX_SPIN
-                                    );
-                                    w.set(true);
-                                }
-                            });
-                        }
-                        // 명시적 acquire fence — ARM memory model상 Acquire load 가
-                        // 뒤따르는 비-atomic 읽기 (partial_ml/partial_o) 의 가시성을
-                        // 보장하지만, head별 loop 완료 후 partial_ml_gpu /
-                        // partial_o_gpu 전체에 대한 acquire 를 한 번 더 잠그는
-                        // 차원에서 배리어 삽입.
-                        fence(Ordering::Acquire);
-
-                        // 7) Merge (GPU partial + CPU partial → out_attn).
-                        unsafe {
-                            crate::quant::flash_neon::merge_two_partials_f32(
-                                setup.partial_ml_gpu.host_ptr() as *const f32,
-                                setup.partial_o_gpu.host_ptr() as *const f32,
-                                ml_guard.as_ptr(),
-                                o_guard.as_ptr(),
-                                hybrid.out_attn_host_ptr,
-                                hybrid.n_heads_q,
-                                hybrid.head_dim,
-                            );
-                        }
-                        // 8) Release fence — out_attn 쓰기가 후속 OpenCL 커널
-                        //    (Wo matmul 등) 에 가시화되도록.
-                        fence(Ordering::Release);
-                        drop(ml_guard);
-                        drop(o_guard);
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        // NEON 의존 → 비 aarch64 호스트에서는 hybrid variant를
-                        // 건드리지 않는다. gating(build_layer_plan)이 이미
-                        // aarch64 용도가 아니면 hybrid를 만들지 못하도록
-                        // 막는 게 이상적이나, 현재는 컴파일 가드만 유지.
-                        let _ = (partial_step, hybrid);
-                        log::error!(
-                            "HybridKvSplit reached dispatch on non-aarch64 host; \
-                             gate in generate.rs or build_layer_plan is broken"
                         );
                     }
                 }
@@ -1962,27 +1695,6 @@ pub struct LayerPlanConfig<'a> {
     /// by `build_partitioned_layer_plan` to stash into
     /// `PartitionPlanContext.residual_host_ptr`.
     pub residual_host_ptr: *const u8,
-    /// UMA hybrid attention parameters for this layer. When `Some`, the
-    /// attention gate in `build_layer_plan` selects
-    /// `AttentionVariant::HybridKvSplit` instead of the legacy/flash paths.
-    /// The per-layer K/V host pointers are captured inline so each layer's
-    /// `HybridStepMeta` can embed them.
-    pub hybrid_attn: Option<LayerHybridAttnConfig<'a>>,
-}
-
-/// Per-layer view of the hybrid attention wiring (see `HybridAttnPlanConfig`
-/// for the plan-level config). Stored inside `LayerPlanConfig`; consumed
-/// only by `build_hybrid_kv_split_step`.
-#[cfg(feature = "opencl")]
-pub struct LayerHybridAttnConfig<'a> {
-    pub kv_frac: f32,
-    pub partial_ml_mem: &'a Mem,
-    pub partial_o_mem: &'a Mem,
-    pub ready_flags_mem: &'a Mem,
-    pub q_host_ptr: *const f32,
-    pub out_attn_host_ptr: *mut f32,
-    pub k_host_ptr: *const u16,
-    pub v_host_ptr: *const u16,
 }
 
 /// Lightweight reference to a noshuffle SOA entry for plan building.
@@ -2473,148 +2185,6 @@ fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVaria
     }))
 }
 
-/// Build a pre-bound `flash_attn_f32_f16_q1_partial` step for UMA hybrid
-/// attention. This mirrors `build_flash_attention_step` but binds four extra
-/// args (`kv_start`, `kv_end`, `partial_ml`, `partial_o`, `ready_flags`) and
-/// tags the kernel with `AttentionVariant::HybridKvSplit` so the executor
-/// runs the CPU partial + merge after the GPU dispatch finishes.
-///
-/// The dispatch grid is identical to the Q1 variant (WG=64, one WG per Q
-/// head). `kv_end` is dynamic (depends on `attn_seq_len` per token) and
-/// patched at dispatch time via `DynamicArg::HybridKvEnd`. `kv_start` stays
-/// at 0 (the CPU always owns the tail).
-#[cfg(feature = "opencl")]
-fn build_hybrid_kv_split_step(
-    config: &LayerPlanConfig,
-    h: &LayerHybridAttnConfig,
-) -> Result<AttentionVariant> {
-    let program = match config.head_dim {
-        64 => config.flash_attn_f32_f16_program_dk64,
-        128 => config.flash_attn_f32_f16_program_dk128,
-        _ => None,
-    }
-    .expect("caller must verify flash program is Some for hybrid path");
-
-    let kernel = ocl::core::create_kernel(program, "flash_attn_f32_f16_q1_partial")
-        .context("create flash_attn_f32_f16_q1_partial for plan")?;
-
-    let n_heads_q = config.n_heads_q;
-    let n_heads_kv = config.n_kv_heads;
-    let head_dim = config.head_dim;
-    let kv_capacity = config.kv_capacity;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-    // Strides (identical layout to Q1 kernel — HeadMajor KV + per-token Q).
-    let q_nb1 = (n_heads_q * head_dim * 4) as u64;
-    let q_nb2 = (head_dim * 4) as u64;
-    let q_nb3 = q_nb1;
-
-    let kv_elem_size: u64 = 2;
-    let k_nb1 = (head_dim as u64) * kv_elem_size;
-    let k_nb2 = (kv_capacity * head_dim) as u64 * kv_elem_size;
-    let k_nb3 = (n_heads_kv as u64) * k_nb2;
-
-    let o_nb1 = (head_dim * 4) as u64;
-    let o_nb2 = (n_heads_q * head_dim * 4) as u64;
-    let o_nb3 = o_nb2;
-
-    let n_q = 1i32;
-    let initial_n_kv = 0i32;
-    let is_causal = 0i32;
-    let n_head = n_heads_q as i32;
-    let n_head_kv_arg = n_heads_kv as i32;
-    let max_bias = 0.0f32;
-    let m0 = 0.0f32;
-    let m1 = 0.0f32;
-    let n_head_log2 = 0i32;
-    let logit_softcap = 0.0f32;
-    let zero_u64 = 0u64;
-    let kv_start_init = 0i32;
-    let kv_end_init = 0i32;
-
-    unsafe {
-        // Args 0-39: identical to flash_attn_f32_f16_q1 arg layout.
-        ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.q_buf))?;
-        ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(config.k_cache_buf))?;
-        ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(config.v_cache_buf))?;
-        ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::mem(config.out_attn_buf))?;
-        ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
-        ocl::core::set_kernel_arg(&kernel, 9, ocl::core::ArgVal::scalar(&n_q))?;
-        ocl::core::set_kernel_arg(&kernel, 10, ocl::core::ArgVal::scalar(&initial_n_kv))?;
-        ocl::core::set_kernel_arg(&kernel, 11, ocl::core::ArgVal::scalar(&is_causal))?;
-        ocl::core::set_kernel_arg(&kernel, 12, ocl::core::ArgVal::scalar(&n_head))?;
-        ocl::core::set_kernel_arg(&kernel, 13, ocl::core::ArgVal::scalar(&q_nb1))?;
-        ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&q_nb2))?;
-        ocl::core::set_kernel_arg(&kernel, 15, ocl::core::ArgVal::scalar(&q_nb3))?;
-        ocl::core::set_kernel_arg(&kernel, 16, ocl::core::ArgVal::scalar(&k_nb1))?;
-        ocl::core::set_kernel_arg(&kernel, 17, ocl::core::ArgVal::scalar(&k_nb2))?;
-        ocl::core::set_kernel_arg(&kernel, 18, ocl::core::ArgVal::scalar(&k_nb3))?;
-        ocl::core::set_kernel_arg(&kernel, 19, ocl::core::ArgVal::scalar(&k_nb1))?;
-        ocl::core::set_kernel_arg(&kernel, 20, ocl::core::ArgVal::scalar(&k_nb2))?;
-        ocl::core::set_kernel_arg(&kernel, 21, ocl::core::ArgVal::scalar(&k_nb3))?;
-        ocl::core::set_kernel_arg(&kernel, 22, ocl::core::ArgVal::scalar(&o_nb1))?;
-        ocl::core::set_kernel_arg(&kernel, 23, ocl::core::ArgVal::scalar(&o_nb2))?;
-        ocl::core::set_kernel_arg(&kernel, 24, ocl::core::ArgVal::scalar(&o_nb3))?;
-        ocl::core::set_kernel_arg(&kernel, 25, ocl::core::ArgVal::scalar(&max_bias))?;
-        ocl::core::set_kernel_arg(&kernel, 26, ocl::core::ArgVal::scalar(&m0))?;
-        ocl::core::set_kernel_arg(&kernel, 27, ocl::core::ArgVal::scalar(&m1))?;
-        ocl::core::set_kernel_arg(&kernel, 28, ocl::core::ArgVal::scalar(&n_head_log2))?;
-        ocl::core::set_kernel_arg(&kernel, 29, ocl::core::ArgVal::scalar(&logit_softcap))?;
-        ocl::core::set_kernel_arg(&kernel, 30, ocl::core::ArgVal::scalar(&n_head_kv_arg))?;
-        ocl::core::set_kernel_arg(&kernel, 31, ocl::core::ArgVal::mem_null())?;
-        ocl::core::set_kernel_arg(&kernel, 32, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 33, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 34, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 35, ocl::core::ArgVal::scalar(&zero_u64))?;
-        let zero_i32 = 0i32;
-        ocl::core::set_kernel_arg(&kernel, 36, ocl::core::ArgVal::scalar(&zero_i32))?;
-        ocl::core::set_kernel_arg(&kernel, 37, ocl::core::ArgVal::scalar(&zero_i32))?;
-        ocl::core::set_kernel_arg(&kernel, 38, ocl::core::ArgVal::mem_null())?;
-        ocl::core::set_kernel_arg(&kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
-        // Hybrid-partial extra args (40-44).
-        ocl::core::set_kernel_arg(&kernel, 40, ocl::core::ArgVal::scalar(&kv_start_init))?;
-        ocl::core::set_kernel_arg(&kernel, 41, ocl::core::ArgVal::scalar(&kv_end_init))?;
-        ocl::core::set_kernel_arg(&kernel, 42, ocl::core::ArgVal::mem(h.partial_ml_mem))?;
-        ocl::core::set_kernel_arg(&kernel, 43, ocl::core::ArgVal::mem(h.partial_o_mem))?;
-        ocl::core::set_kernel_arg(&kernel, 44, ocl::core::ArgVal::mem(h.ready_flags_mem))?;
-    }
-
-    const Q1_WG_SIZE: usize = 64;
-    let partial_step = KernelStep {
-        kernel,
-        ndim: 2,
-        global_work_size: [Q1_WG_SIZE, n_heads_q, 1],
-        local_work_size: Some([Q1_WG_SIZE, 1, 1]),
-        // n_kv (arg 10) stays at 0 for partial — the kernel consults
-        // kv_start/kv_end instead; kv_end is dynamic per token.
-        dynamic_args: vec![DynamicArg::HybridKvEnd { arg_idx: 41 }],
-        op_tag: OpTag::Attention,
-        retained_bufs: vec![],
-        noshuffle_act_rebuild: None,
-    };
-
-    let hybrid_meta = HybridStepMeta {
-        q_host_ptr: h.q_host_ptr,
-        k_host_ptr: h.k_host_ptr,
-        v_host_ptr: h.v_host_ptr,
-        out_attn_host_ptr: h.out_attn_host_ptr,
-        n_heads_q,
-        n_heads_kv,
-        head_dim,
-        kv_capacity,
-        kv_frac: h.kv_frac,
-    };
-
-    Ok(AttentionVariant::HybridKvSplit {
-        partial_step,
-        hybrid: hybrid_meta,
-    })
-}
-
 /// Build a pre-bound `kernel_add_row_bias` step that adds the given bias
 /// buffer to the given `x` buffer in-place. Used after QKV matmul steps
 /// for models with `has_qkv_bias=true` (Qwen2 etc.).
@@ -3014,23 +2584,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         config.needs_attention_scores && config.gpu_score_buf.is_none();
     let use_flash = is_head_major && flash_program_available && !scores_need_legacy_readback;
 
-    // UMA hybrid attention gate — more restrictive than vanilla flash:
-    //   * per-layer hybrid_attn config must be provided by the caller
-    //   * HeadMajor + flash program available + scores must not need legacy
-    //     readback (same preconditions as `use_flash`)
-    //   * GQA (n_kv_heads < n_heads_q) — the hybrid split amortises only
-    //     when there is GQA broadcasting to reuse
-    //   * head_dim ∈ {64, 128} (already enforced by `flash_program_available`)
-    //
-    // When the gate fails but hybrid was requested, we silently fall through
-    // to the non-hybrid path. The caller is responsible for warning the user
-    // at setup time if conditions are known-wrong.
-    let use_hybrid =
-        use_flash && config.hybrid_attn.is_some() && config.n_kv_heads < config.n_heads_q;
-
-    let attention = if use_hybrid {
-        build_hybrid_kv_split_step(config, config.hybrid_attn.as_ref().unwrap())?
-    } else if use_flash {
+    let attention = if use_flash {
         build_flash_attention_step(config)?
     } else {
         let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_attn_gen_half")
@@ -3817,53 +3371,12 @@ pub struct FullPlanConfig<'a> {
     /// emitting a broken GPU step and let `execute_plan` fall through to
     /// `lm_head_matmul_cpu`.
     pub lm_head_dtype: crate::buffer::DType,
-    /// Optional UMA hybrid attention configuration. When `Some`, the plan
-    /// builder tries to select `AttentionVariant::HybridKvSplit` for each
-    /// layer (subject to per-layer gating in `build_layer_plan`). See
-    /// `arch/hybrid_attention.md` for the decoding scheme.
-    ///
-    /// Mutually exclusive with an active FFN tensor partition in v1:
-    /// `transformer::build_plan` is responsible for enforcing that exclusion
-    /// before populating this field.
-    pub hybrid_attn: Option<HybridAttnPlanConfig<'a>>,
     /// ENG-ALG-219: `TransformerModel::ratio_generation` Arc clone passed in
     /// from `build_plan`. The plan builder captures the current value with
     /// Acquire and stores both into `FullKernelPlan`. `execute()` uses this
     /// for the global weight-swap invalidation check (INV-129).
     pub ratio_generation: Arc<std::sync::atomic::AtomicU64>,
 }
-
-/// Plan-build config describing the currently-installed UMA hybrid setup.
-///
-/// Carries the three shared GPU scratch cl_mems (partial_ml, partial_o,
-/// ready_flags) and the host-mapped pointers used by the CPU partial + merge.
-/// Per-layer K/V host pointers are captured at build time from the caller's
-/// `KVCache` slice and stored inside the per-layer `HybridStepMeta`.
-#[cfg(feature = "opencl")]
-pub struct HybridAttnPlanConfig<'a> {
-    pub kv_frac: f32,
-    /// Shared GPU cl_mems (one set for all layers). Bound into every
-    /// hybrid attention KernelStep.
-    pub partial_ml_mem: &'a Mem,
-    pub partial_o_mem: &'a Mem,
-    pub ready_flags_mem: &'a Mem,
-    /// Host-mapped pointer of the workspace `q_buf`. Required for the NEON
-    /// partial call. Must remain valid for the plan's lifetime.
-    pub q_host_ptr: *const f32,
-    /// Host-mapped pointer of the workspace `out_attn_buf`. Required for the
-    /// NEON merge to write the final output row.
-    pub out_attn_host_ptr: *mut f32,
-    /// Per-layer host-mapped K/V cache pointers (aligned with `kv_bufs`).
-    /// Length must equal `layer_bufs.len()` when `Some(_)` is used.
-    pub kv_host_ptrs: Vec<(*const u16, *const u16)>,
-}
-
-// SAFETY: Same rationale as HybridStepMeta — pointers are dereferenced only
-// on the decode dispatch thread while the install scope holds them alive.
-#[cfg(feature = "opencl")]
-unsafe impl<'a> Send for HybridAttnPlanConfig<'a> {}
-#[cfg(feature = "opencl")]
-unsafe impl<'a> Sync for HybridAttnPlanConfig<'a> {}
 
 /// Per-layer weight buffer references.
 pub struct LayerBufs<'a> {
@@ -4023,38 +3536,6 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
                 None
             },
             residual_host_ptr: config.residual_host_ptr,
-            // UMA hybrid attention: inject per-layer config only when the
-            // plan-level `hybrid_attn` is Some AND this layer isn't running
-            // the cooperative FFN partition (mutually exclusive with hybrid
-            // in v1 — gating enforced at `transformer::build_plan` level too).
-            hybrid_attn: match config.hybrid_attn.as_ref() {
-                Some(h)
-                    if config
-                        .partition_layers
-                        .as_ref()
-                        .and_then(|v| v.get(i))
-                        .copied()
-                        .flatten()
-                        .is_none() =>
-                {
-                    let (k_ptr, v_ptr) = h
-                        .kv_host_ptrs
-                        .get(i)
-                        .copied()
-                        .unwrap_or((std::ptr::null::<u16>(), std::ptr::null::<u16>()));
-                    Some(LayerHybridAttnConfig {
-                        kv_frac: h.kv_frac,
-                        partial_ml_mem: h.partial_ml_mem,
-                        partial_o_mem: h.partial_o_mem,
-                        ready_flags_mem: h.ready_flags_mem,
-                        q_host_ptr: h.q_host_ptr,
-                        out_attn_host_ptr: h.out_attn_host_ptr,
-                        k_host_ptr: k_ptr,
-                        v_host_ptr: v_ptr,
-                    })
-                }
-                _ => None,
-            },
         };
         // Route through the partition builder when this layer has a
         // `PartitionContext` attached AND the plan-path feature is enabled.
