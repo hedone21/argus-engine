@@ -6,7 +6,7 @@ running on a phone's Adreno GPU. It is a side-by-side of two on-device
 
 - **left — `eviction none`**: a multi-turn chat fills the KV cache and **overflows at the
   sequence-length limit**, so generation stops.
-- **right — `eviction streaming --sink 4 --recent-window 256`**: the StreamingLLM stage
+- **right — `eviction plugin --name streaming --set sink=4 --set recent_window=256`**: the StreamingLLM stage
   **prunes the cache each turn** (`[Chat/Evict] removed=… new_pos=…`) and the chat keeps
   going.
 

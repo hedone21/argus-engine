@@ -478,8 +478,8 @@ argus-eval  ... eviction plugin --name my_stage
 `eviction plugin --name <name>` is the `eviction` subcommand's free-string escape hatch,
 the stage-axis analogue of `--kv-format`. The name resolves through `make_stage` (static
 `KV_CACHE_STAGES` first, then the `--load-plugin` dynamic registry), so any registered stage
-is selectable with no engine edit. (The built-in policies keep their own typed
-subcommands: `eviction sliding`, `eviction h2o`, ….)
+is selectable with no engine edit. (The built-in policies are selected the same way, by
+registry name: `eviction plugin --name sliding`, `--name h2o`, ….)
 
 Two scoping notes:
 
@@ -490,8 +490,7 @@ Two scoping notes:
   at runtime over the manager IPC would need a new `argus-shared` command (out of scope today).
 
 > Some `argus-extension-api` doc-comments still call the selector `--eviction-policy <name>`, a
-> legacy name; the real CLI form is `eviction plugin --name <name>` (or a built-in
-> `eviction <policy>` subcommand).
+> legacy name; the real CLI form is `eviction plugin --name <name>`.
 
 ---
 
