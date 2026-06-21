@@ -12,7 +12,6 @@ pub mod capability;
 pub mod cpu_kernels;
 pub mod format;
 pub mod hardware;
-pub mod hybrid_attention;
 pub mod inference;
 pub mod instrument;
 pub mod kv;

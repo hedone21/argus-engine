@@ -2153,17 +2153,6 @@ impl TransformerModel {
             (None, 0)
         };
 
-        // Hybrid setup Arc: build_full_plan 호출 동안 cl_mem 참조가 유효해야
-        // 하므로 local binding으로 lifetime을 확장한다. None이면 hybrid 비활성.
-        let hybrid_setup_arc = {
-            let partition_active = layer_snaps.iter().any(|l| l.partition_ctx.is_some());
-            if partition_active {
-                None
-            } else {
-                crate::hybrid_attention::current()
-            }
-        };
-
         let full_config = FullPlanConfig {
             context: &ocl_backend.context,
             f16_program: &ocl_backend.f16_program,
@@ -2235,44 +2224,6 @@ impl TransformerModel {
                 .find_map(|l| l.partition_ctx.as_ref().map(|c| c.cpu_backend.clone())),
             partition_use_gelu_tanh: self.config.arch == crate::model_config::ModelArch::Gemma3,
             lm_head_dtype: self.lm_head.dtype(),
-            // UMA hybrid attention: pulled from the thread-local HybridScope
-            // installed by the caller (generate.rs decode entry). Mutually
-            // exclusive with FFN tensor partition in v1.
-            hybrid_attn: hybrid_setup_arc.as_ref().and_then(|setup| {
-                // Gather per-layer K/V host pointers from the KV caches
-                // (must already be host-mapped by the caller — we rely
-                // on as_ptr() returning non-null; if any KV buffer isn't
-                // mapped, bail out and disable hybrid for this plan build).
-                let kv_host_ptrs: Vec<(*const u16, *const u16)> = kv_caches
-                    .iter()
-                    .map(|c| {
-                        let k = c.k_buffer.buffer().as_ptr() as *const u16;
-                        let v = c.v_buffer.buffer().as_ptr() as *const u16;
-                        (k, v)
-                    })
-                    .collect();
-                let any_null = kv_host_ptrs.iter().any(|(k, v)| k.is_null() || v.is_null());
-                // Workspace q/out_attn must also be mapped.
-                let q_host_ptr = ws.q.buffer().as_ptr() as *const f32;
-                let out_host_ptr = ws.out_attn.buffer().as_ptr() as *mut f32;
-                if any_null || q_host_ptr.is_null() || out_host_ptr.is_null() {
-                    log::warn!(
-                        "Hybrid attention requested but KV/Q/out_attn buffers not \
-                         host-mapped; skipping hybrid for this plan build"
-                    );
-                    None
-                } else {
-                    Some(HybridAttnPlanConfig {
-                        kv_frac: setup.kv_frac,
-                        partial_ml_mem: setup.partial_ml_gpu.cl_mem(),
-                        partial_o_mem: setup.partial_o_gpu.cl_mem(),
-                        ready_flags_mem: setup.ready_flags_gpu.cl_mem(),
-                        q_host_ptr,
-                        out_attn_host_ptr: out_host_ptr,
-                        kv_host_ptrs,
-                    })
-                }
-            }),
             // ENG-ALG-219: pass the global ratio_generation counter so the
             // plan can detect weight swaps at execute() entry (INV-129).
             ratio_generation: self.ratio_generation.clone(),

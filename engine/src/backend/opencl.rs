@@ -281,15 +281,6 @@ struct KernelCache {
     /// Decode-specialized flash attention, head_dim=128 variant
     /// (Q=F32, KV=F16, compiled with -DDK=128 -DDV=128).
     kernel_flash_attn_f32_f16_q1_dk128: Option<CoreKernel>,
-    /// UMA hybrid partial flash attention, head_dim=64 (Stage B, arch/hybrid_attention.md).
-    /// Writes un-normalised (m, l, o) partials + per-head sigflag instead of
-    /// producing a final normalised output row. Dispatched by the UMA hybrid
-    /// path only (Stage C); falls back to the regular Q1 kernel when not wired.
-    #[allow(dead_code)] // Stage B: kernel cached, Stage C wires plan dispatch.
-    kernel_flash_attn_f32_f16_q1_partial_dk64: Option<CoreKernel>,
-    /// UMA hybrid partial flash attention, head_dim=128.
-    #[allow(dead_code)] // Stage B: kernel cached, Stage C wires plan dispatch.
-    kernel_flash_attn_f32_f16_q1_partial_dk128: Option<CoreKernel>,
     // GEMM kernels for prefill (tiled matrix multiply, M > 1)
     kernel_mul_mm_f16_f32: Option<CoreKernel>,
     kernel_mul_mm_q4_0_f32: Option<CoreKernel>,
@@ -1391,12 +1382,6 @@ impl OpenCLBackend {
             kernel_flash_attn_f32_f16_q1_dk128: flash_attn_f32_f16_program_dk128
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1").ok()),
-            kernel_flash_attn_f32_f16_q1_partial_dk64: flash_attn_f32_f16_program_dk64
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1_partial").ok()),
-            kernel_flash_attn_f32_f16_q1_partial_dk128: flash_attn_f32_f16_program_dk128
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1_partial").ok()),
             kernel_mul_mm_f16_f32: gemm_f16_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mm_f16_f32_l4_lm").ok()),
