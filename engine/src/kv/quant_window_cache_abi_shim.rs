@@ -22,9 +22,10 @@
 //!   non-null `cl_mem` handles + correct scalars across ≥2 flush boundaries, the assembled-view
 //!   layout faithfully propagated, and the forward `transition_bits(→16)` dequant, for bits 2/4/8.
 //!   The test surfaced one PRE-EXISTING cache bug (NOT an ABI fault): the reverse `16→Q` requant
-//!   over-reads the GPU residual buffer (`transition_bits(16)` grows only the CPU residual Vec, not
-//!   `slab.res_k`/`res_v`) → CL_INVALID_VALUE. The shim reports it cleanly as `RC_TRANSITION_ERR`;
-//!   fixing the requant path belongs to the PR4 flush/transition lift.
+//!   over-read the GPU residual buffer (`transition_bits(16)` grew only the CPU residual Vec, not
+//!   `slab.res_k`/`res_v`) → CL_INVALID_VALUE. FIXED as bug 42 (`new_gpu` now sizes the GPU residual
+//!   to `res_cap`, and the Q→16 branch regrows + uploads it); the device test now asserts the
+//!   back-transition returns `RC_OK`.
 //!
 //! ## Deferred to PR4 — each surfaced concretely in code, not hand-waved
 //! 1. **`update` write marshalling.** The cache's `update` takes `&Tensor` even on its GPU path
@@ -412,20 +413,22 @@ mod tests {
             assert_eq!(shim.transition_bits(16), RC_OK, "bits={bits} → 16");
             assert_eq!(shim.current_bits(), 16);
 
-            // The reverse (16 → Q) requant currently fails on-device with CL_INVALID_VALUE — a
-            // PRE-EXISTING cache bug this de-risk surfaced, NOT an ABI-marshalling fault:
-            // `transition_bits(16)` resizes only the CPU residual Vec (`self.res_k.resize`) to
-            // max_seq_len and sets `res_cap = max_seq_len`, but leaves the GPU `slab.res_k`/`res_v`
-            // at their residual_size capacity. The back-transition's "read GPU F32 residual → CPU"
-            // step (`res_bytes = kv_heads * res_cap * head_dim * 4`) then over-reads that smaller
-            // GPU buffer. Fixing the requant path belongs to the PR4 flush/transition lift, not this
-            // de-risk shim. The shim faithfully reports the failure via RC_TRANSITION_ERR and does
-            // not crash, so assert only that the back-transition surfaces a DEFINED ABI sentinel
-            // (robust to a later cache fix), not a specific outcome.
+            // The reverse (16 → Q) requant. This was bug 42: `transition_bits(16)` grew only the
+            // CPU residual Vec (`self.res_k.resize`) + set `res_cap = max_seq_len`, but left the
+            // GPU `slab.res_k`/`res_v` at their residual_size capacity, so the back-transition's
+            // "read GPU F32 residual → CPU" step (`res_bytes = kv_heads * res_cap * head_dim * 4`)
+            // over-read the smaller GPU buffer → CL_INVALID_VALUE. FIXED: new_gpu now sizes the GPU
+            // residual to res_cap, and the Q→16 branch regrows + uploads it, so the readback is
+            // in-bounds. The back-transition must now succeed.
             let back = shim.transition_bits(bits);
-            assert!(
-                back == RC_OK || back == RC_TRANSITION_ERR,
-                "16 → {bits}: must surface a defined ABI sentinel, got {back}"
+            assert_eq!(
+                back, RC_OK,
+                "16 → {bits}: requant must succeed post-bug-42-fix"
+            );
+            assert_eq!(
+                shim.current_bits(),
+                bits,
+                "bits={bits}: back at target width"
             );
         }
     }
