@@ -747,6 +747,13 @@ pub struct Args {
     #[arg(long)]
     pub experiment_output: Option<String>,
 
+    /// argus-bench: emit a single-line metrics JSON to stdout
+    /// (`decode_ms_per_tok`, `prefill_ms`, `peak_kv_mb`, `tokens_per_sec`, …) and route the
+    /// human-readable text + metric lines to stderr, so the validation harness can fold stdout
+    /// straight into metrics.json. No effect on other bins.
+    #[arg(long)]
+    pub bench_json: bool,
+
     /// Number of top-K logits to record per token in experiment mode
     #[arg(long, default_value_t = 10)]
     pub experiment_logits_topk: usize,
