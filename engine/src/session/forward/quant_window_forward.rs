@@ -201,6 +201,7 @@ impl Forward for QuantWindowForward {
             cache_self_need_scores: need_scores,
             layer_boundary_hook: None,
             read_stage: None,
+            prefill_attn: None,
         });
 
         fwd_result?;
@@ -248,6 +249,7 @@ impl Forward for QuantWindowForward {
             cache_self_need_scores: need_scores,
             layer_boundary_hook: None,
             read_stage: None,
+            prefill_attn: None,
         });
 
         fwd_result?;

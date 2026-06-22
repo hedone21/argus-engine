@@ -375,6 +375,7 @@ impl KVCacheFormat for StandardFormat {
         out: &mut Tensor,
         dims: AttnDims,
         scores: Option<&mut [f32]>,
+        prefill_scores: Option<(&mut [f32], usize)>,
     ) -> Result<()> {
         let seq_len = q.shape().dims()[1];
 
@@ -411,6 +412,7 @@ impl KVCacheFormat for StandardFormat {
                     q_start_pos,
                     dims.window,
                     backend,
+                    prefill_scores,
                 );
             }
             let effective = match dims.window {
@@ -459,6 +461,7 @@ impl KVCacheFormat for StandardFormat {
                 q_start_pos,
                 dims.window,
                 backend,
+                prefill_scores,
             );
         }
 
@@ -835,6 +838,10 @@ pub(crate) fn prefill_attention(
     q_start_pos: usize,
     window: Option<usize>,
     backend: &dyn Backend,
+    // R-P1-1 PFA side-channel: `Some((out_scores, q_window))` 면 trailing q_window attention 확률을
+    // `out_scores`(caller pre-zeroed, `[n_heads_q * cache_seq_len]`)에 SUM-누적. GPU dispatch 시엔
+    // 아래에서 early-return 하므로 자연히 CPU-only. `None`=기존과 byte-identical(producer 미무장).
+    prefill_scores: Option<(&mut [f32], usize)>,
 ) -> Result<()> {
     use crate::kv_cache_ops::KVLayout;
 
@@ -1047,6 +1054,34 @@ pub(crate) fn prefill_attention(
                 window,
             );
         }
+
+        // R-P1-1: PFA side-channel — flash 가 쓰는 동일 dequant K/stride 로 batch 0(단일 시퀀스
+        // prefill)의 trailing q_window attention 확률 계산. `out`/`out_ptr` 미접촉(별도 버퍼).
+        // GPU dispatch 는 위에서 early-return 했으므로 여기는 CPU-only.
+        if let Some((pfa_out, q_window)) = prefill_scores {
+            let k_valid_len = if is_head_major_pf {
+                n_heads_kv * kv_capacity * head_dim
+            } else {
+                cache_seq_len * n_heads_kv * head_dim
+            };
+            let q_slice = &q_data[0..chunk_q_stride];
+            let k_slice = &k_data[0..k_valid_len];
+            prefill_attention_scores(
+                q_slice,
+                k_slice,
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                seq_len,
+                cache_seq_len,
+                k_pos_stride,
+                kv_head_stride,
+                q_start_pos,
+                q_window,
+                window,
+                pfa_out,
+            );
+        }
     }
 
     if is_device_only {
@@ -1087,6 +1122,95 @@ pub(crate) fn prefill_attention(
         }
     }
     Ok(())
+}
+
+/// R-P1-1 PFA side-channel: prefill 의 trailing query window(`q_window` rows)에서 전체 prefix key 로의
+/// per-ATTENTION-head(pre-GQA) softmax(q·Kᵀ/√head_dim) 확률을 q_window 에 SUM-accumulate 한다 →
+/// `out_scores[h * prefix_len + key_pos]`. flash `out` 은 미접촉(pure scalar CPU, no backend op).
+/// `q_data`/`k_data` 는 [`prefill_attention`] 의 CPU 분기가 이미 dequant 한 f32 슬라이스 + 동일 stride
+/// (= "모델이 본 attention" 충실). Gate-1 bit-exact 위해 **scalar dot**(SIMD 금지) + eager reference 와
+/// 동일 op order(dot→×scale→max→exp/denom→divide). `out_scores` 는 caller 가 pre-zero(SUM 누적, §4.7).
+///
+/// 사전: `out_scores.len() == n_heads_q * cache_seq_len`; `n_heads_q % n_heads_kv == 0`. batch=0(단일
+/// 시퀀스 prefill)만 — KV eviction 은 per-sequence.
+// needless_range_loop: 명시적 `key_pos` 인덱스 루프는 Gate-1 bit-exact op-order 계약(§6.1)이다 —
+// eager reference(test `pfa_reference`)와 구조가 byte-for-byte 일치해야 bit-exact 비교가 성립한다.
+// 반복자 변환은 동일 값이나 계약상 인덱스 형태를 고정한다.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn prefill_attention_scores(
+    q_data: &[f32],
+    k_data: &[f32],
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    seq_len: usize,
+    cache_seq_len: usize,
+    k_pos_stride: usize,
+    kv_head_stride: usize,
+    q_start_pos: usize,
+    q_window: usize,
+    window: Option<usize>,
+    out_scores: &mut [f32],
+) {
+    let prefix_len = cache_seq_len;
+    debug_assert_eq!(
+        out_scores.len(),
+        n_heads_q * prefix_len,
+        "PFA out_scores.len must == n_heads_q * prefix_len"
+    );
+    debug_assert_eq!(
+        n_heads_q % n_heads_kv,
+        0,
+        "n_heads_q must be divisible by n_heads_kv"
+    );
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let gqa_group = n_heads_q / n_heads_kv;
+    let q_row_stride = n_heads_q * head_dim;
+    // trailing query window rows within this chunk: [seq_len - min(q_window, seq_len) .. seq_len).
+    let qwin = q_window.min(seq_len);
+    let qwin_start = seq_len - qwin;
+    // per-(h,r) 재사용 scratch (logits → exp). len = prefix_len. prefill one-shot 라 alloc 1회.
+    let mut scratch = vec![0.0f32; prefix_len];
+
+    for h in 0..n_heads_q {
+        let kv_head = h / gqa_group; // K group 선택만 — NO GQA reduction.
+        let out_row_base = h * prefix_len;
+        for r in qwin_start..seq_len {
+            let p = q_start_pos + r; // 절대 query 위치 (<= cache_seq_len - 1).
+            let lo = match window {
+                // SWA band 하한. `w.saturating_sub(1)` — window=0 degenerate 에서 `w-1` underflow 회피
+                // (w>=1 인 실제 config 에선 == w-1, bit-exact 무변화; flash 경로보다 strictly robust).
+                Some(w) => p.saturating_sub(w.saturating_sub(1)),
+                None => 0,
+            };
+            let q_base = r * q_row_stride + h * head_dim;
+            // 1) logits over key_pos in lo..=p (causal + optional SWA band), scalar dot (no SIMD).
+            let mut maxv = f32::NEG_INFINITY;
+            for key_pos in lo..=p {
+                let k_base = key_pos * k_pos_stride + kv_head * kv_head_stride;
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q_data[q_base + d] * k_data[k_base + d];
+                }
+                let logit = dot * scale;
+                scratch[key_pos] = logit;
+                if logit > maxv {
+                    maxv = logit;
+                }
+            }
+            // 2) numerically-stable softmax denom (exp 를 scratch 에 저장 → 단일 exp).
+            let mut denom = 0.0f32;
+            for key_pos in lo..=p {
+                let e = (scratch[key_pos] - maxv).exp();
+                scratch[key_pos] = e;
+                denom += e;
+            }
+            // 3) SUM-accumulate post-softmax prob over the q_window.
+            for key_pos in lo..=p {
+                out_scores[out_row_base + key_pos] += scratch[key_pos] / denom;
+            }
+        }
+    }
 }
 
 // ── SnapshotRestore capability ────────────────────────────────────
@@ -1736,6 +1860,7 @@ mod tests {
                 window: None,
             },
             None,
+            None,
         )
         .unwrap();
 
@@ -1851,6 +1976,7 @@ mod tests {
                 window: None,
             },
             None,
+            None,
         )
         .unwrap();
         for &x in out.as_slice::<f32>() {
@@ -1942,6 +2068,7 @@ mod tests {
                 n_heads_q,
                 window: None,
             },
+            None,
             None,
         )
         .unwrap();
@@ -2486,6 +2613,7 @@ mod tests {
                 window: None,
             },
             Some(&mut scores),
+            None,
         )
         .unwrap();
 
@@ -2543,6 +2671,7 @@ mod tests {
                 window: None,
             },
             None,
+            None,
         )
         .unwrap();
 
@@ -2557,6 +2686,266 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ───────────────── R-P1-1 PFA producer (prefill_attention_scores) ─────────────────
+
+    /// `prefill_attention_scores` 를 op-for-op 미러하는 eager reference(Gate-1 bit-exact 핀, §6.1).
+    /// scalar dot → ×scale → max → exp/denom → divide, 동일 loop 순서. producer 가 spec 에서 벗어나면
+    /// 이 reference 와 발산 → 회귀 검출(§6.6: PFA-vs-eager self-referential, flash `out` 무관).
+    #[allow(clippy::too_many_arguments)]
+    fn pfa_reference(
+        q: &[f32],
+        k: &[f32],
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        head_dim: usize,
+        seq_len: usize,
+        cache_seq_len: usize,
+        k_pos_stride: usize,
+        kv_head_stride: usize,
+        q_start_pos: usize,
+        q_window: usize,
+        window: Option<usize>,
+    ) -> Vec<f32> {
+        let prefix_len = cache_seq_len;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let gqa = n_heads_q / n_heads_kv;
+        let q_row = n_heads_q * head_dim;
+        let qwin = q_window.min(seq_len);
+        let qwin_start = seq_len - qwin;
+        let mut out = vec![0.0f32; n_heads_q * prefix_len];
+        let mut scratch = vec![0.0f32; prefix_len];
+        for h in 0..n_heads_q {
+            let kvh = h / gqa;
+            let base = h * prefix_len;
+            for r in qwin_start..seq_len {
+                let p = q_start_pos + r;
+                let lo = match window {
+                    // 미러: producer 와 동일 saturating_sub(1) (w>=1 인 테스트 config 에선 == w-1).
+                    Some(w) => p.saturating_sub(w.saturating_sub(1)),
+                    None => 0,
+                };
+                let qb = r * q_row + h * head_dim;
+                let mut m = f32::NEG_INFINITY;
+                for kp in lo..=p {
+                    let kb = kp * k_pos_stride + kvh * kv_head_stride;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[qb + d] * k[kb + d];
+                    }
+                    let l = dot * scale;
+                    scratch[kp] = l;
+                    if l > m {
+                        m = l;
+                    }
+                }
+                let mut denom = 0.0f32;
+                for kp in lo..=p {
+                    let e = (scratch[kp] - m).exp();
+                    scratch[kp] = e;
+                    denom += e;
+                }
+                for kp in lo..=p {
+                    out[base + kp] += scratch[kp] / denom;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pfa_bit_exact_matches_eager_reference() {
+        let head_dim = 8;
+        let seq_len = 6;
+        let q_start_pos = 0; // fresh prefill → cache_seq_len == seq_len.
+        let cache_seq_len = seq_len;
+        let q_window = 3;
+        let kv_capacity = 16; // HeadMajor stride 용(>= cache_seq_len).
+        // (n_heads_q, n_heads_kv, layout): MHA/GQA × SeqMajor/HeadMajor.
+        for (nq, nkv, layout) in [(4, 4, "seq"), (4, 2, "seq"), (4, 4, "head"), (4, 2, "head")] {
+            for window in [None, Some(4usize)] {
+                let q: Vec<f32> = (0..seq_len * nq * head_dim)
+                    .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
+                    .collect();
+                let (k_pos_stride, kv_head_stride, k_len) = if layout == "seq" {
+                    (nkv * head_dim, head_dim, cache_seq_len * nkv * head_dim)
+                } else {
+                    (
+                        head_dim,
+                        kv_capacity * head_dim,
+                        nkv * kv_capacity * head_dim,
+                    )
+                };
+                let k: Vec<f32> = (0..k_len).map(|i| ((i % 17) as f32 - 8.0) * 0.07).collect();
+
+                let mut got = vec![0.0f32; nq * cache_seq_len];
+                prefill_attention_scores(
+                    &q,
+                    &k,
+                    nq,
+                    nkv,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    k_pos_stride,
+                    kv_head_stride,
+                    q_start_pos,
+                    q_window,
+                    window,
+                    &mut got,
+                );
+                let want = pfa_reference(
+                    &q,
+                    &k,
+                    nq,
+                    nkv,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    k_pos_stride,
+                    kv_head_stride,
+                    q_start_pos,
+                    q_window,
+                    window,
+                );
+                // bit-exact (not approx) — §6.1 op-order 계약.
+                assert_eq!(
+                    got, want,
+                    "PFA != eager ref (nq={nq}, nkv={nkv}, layout={layout}, window={window:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pfa_softmax_sum_property() {
+        // 독립 검증(미러 아님): per-(h, query row) post-softmax 확률은 그 causal/SWA 범위에서 1.0 으로
+        // 정규화 → out_scores[h] 의 전체 합 == 그 head 가 SUM-누적한 query row 수(qwin). q_window=1 이면
+        // 각 head row 합 == 1.0.
+        let head_dim = 4;
+        let seq_len = 5;
+        let nq = 2;
+        let nkv = 1; // GQA(2 q-head → 1 kv-head).
+        let cache_seq_len = seq_len;
+        let k_pos_stride = nkv * head_dim; // SeqMajor.
+        let kv_head_stride = head_dim;
+        let q: Vec<f32> = (0..seq_len * nq * head_dim)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.2)
+            .collect();
+        let k: Vec<f32> = (0..cache_seq_len * nkv * head_dim)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.3)
+            .collect();
+        for q_window in [1usize, 3] {
+            let mut out = vec![0.0f32; nq * cache_seq_len];
+            prefill_attention_scores(
+                &q,
+                &k,
+                nq,
+                nkv,
+                head_dim,
+                seq_len,
+                cache_seq_len,
+                k_pos_stride,
+                kv_head_stride,
+                0,
+                q_window,
+                None,
+                &mut out,
+            );
+            let qwin = q_window.min(seq_len) as f32;
+            for h in 0..nq {
+                let sum: f32 = out[h * cache_seq_len..(h + 1) * cache_seq_len].iter().sum();
+                assert!(
+                    (sum - qwin).abs() < 1e-4,
+                    "head {h} q_window {q_window}: row-sum {sum} != qwin {qwin}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pfa_side_channel_does_not_touch_out() {
+        // Gate-0 armed-identity(§6.2 ii): producer 무장(prefill_scores=Some) 시에도 flash `out` 은
+        // 미무장(None)과 byte-identical. 동시에 PFA buffer 는 채워진다(producer 가 실제 발화).
+        let kv_heads = 2;
+        let head_dim = 4;
+        let n_heads_q = 4; // GQA.
+        let seq = 5;
+        let backend = CpuBackend::new();
+
+        // 비-uniform K/V (PFA 가 trivial 0 이 아니도록).
+        let mk = |fmt: &StandardFormat| {
+            let mut k_data = vec![0.0f32; seq * kv_heads * head_dim];
+            let mut v_data = vec![0.0f32; seq * kv_heads * head_dim];
+            for (i, x) in k_data.iter_mut().enumerate() {
+                *x = ((i % 11) as f32 - 5.0) * 0.13;
+            }
+            for (i, x) in v_data.iter_mut().enumerate() {
+                *x = ((i % 9) as f32 - 4.0) * 0.21;
+            }
+            let kb = f32_tensor(vec![1, seq, kv_heads, head_dim], &k_data);
+            let vb = f32_tensor(vec![1, seq, kv_heads, head_dim], &v_data);
+            fmt.write_kv_batch(&kb, &vb, &backend).unwrap();
+        };
+        let q_data: Vec<f32> = (0..seq * n_heads_q * head_dim)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
+            .collect();
+
+        // baseline: prefill_scores=None.
+        let fmt0 = StandardFormat::new(0, make_cache(16, kv_heads, head_dim));
+        mk(&fmt0);
+        let q0 = f32_tensor(vec![1, seq, n_heads_q, head_dim], &q_data);
+        let mut out0 = f32_tensor(
+            vec![1, seq, n_heads_q * head_dim],
+            &vec![0.0; seq * n_heads_q * head_dim],
+        );
+        fmt0.attention_into(
+            &q0,
+            &backend,
+            &mut out0,
+            AttnDims {
+                n_heads_q,
+                window: None,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        // armed: prefill_scores=Some.
+        let fmt1 = StandardFormat::new(0, make_cache(16, kv_heads, head_dim));
+        mk(&fmt1);
+        let q1 = f32_tensor(vec![1, seq, n_heads_q, head_dim], &q_data);
+        let mut out1 = f32_tensor(
+            vec![1, seq, n_heads_q * head_dim],
+            &vec![0.0; seq * n_heads_q * head_dim],
+        );
+        let mut pfa = vec![0.0f32; n_heads_q * seq];
+        fmt1.attention_into(
+            &q1,
+            &backend,
+            &mut out1,
+            AttnDims {
+                n_heads_q,
+                window: None,
+            },
+            None,
+            Some((&mut pfa, 2)),
+        )
+        .unwrap();
+
+        // `out` byte-identical(side-channel 이 out 미접촉).
+        assert_eq!(
+            out0.as_slice::<f32>(),
+            out1.as_slice::<f32>(),
+            "armed PFA changed flash out (must be side-channel)"
+        );
+        // producer 가 실제 발화(buffer 비어있지 않음).
+        assert!(
+            pfa.iter().any(|&x| x != 0.0),
+            "PFA buffer empty — producer did not fire"
+        );
     }
 
     #[test]
@@ -2589,6 +2978,7 @@ mod tests {
                 window: Some(1),
             },
             Some(&mut scores),
+            None,
         )
         .unwrap();
 
@@ -2676,7 +3066,7 @@ mod tests {
             &vec![0.0; n_heads_q * head_dim],
         );
         fmt_ref
-            .attention_into(&q, &backend, &mut out_full, dims, None)
+            .attention_into(&q, &backend, &mut out_full, dims, None, None)
             .unwrap();
 
         // SelectiveRead: select = 전체 토큰 목록
@@ -2871,7 +3261,7 @@ mod tests {
 
         let mut out_ref = f32_tensor(vec![1, 1, n_heads_q, head_dim], &vec![0.0; head_dim]);
         fmt_ref
-            .attention_into(&q, &backend, &mut out_ref, dims, None)
+            .attention_into(&q, &backend, &mut out_ref, dims, None, None)
             .unwrap();
 
         // mock: 전체 select(None → ctx.current_pos() 로 0..n_tokens)

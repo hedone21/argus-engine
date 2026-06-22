@@ -269,6 +269,7 @@ pub fn run_qcf_warmup_workflow(
                 cache_self_need_scores: false,
                 layer_boundary_hook: None,
                 read_stage: None,
+                prefill_attn: None,
             })
         })?;
         backend.synchronize()?;
@@ -360,6 +361,7 @@ pub fn run_qcf_warmup_workflow(
                         cache_self_need_scores: false,
                         layer_boundary_hook: None,
                         read_stage: None,
+                        prefill_attn: None,
                     })
                 })?;
                 backend.synchronize()?;

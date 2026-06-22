@@ -17,4 +17,5 @@
 
 pub mod eviction;
 pub mod offload;
+pub mod prefill_keepset;
 pub mod quant_window_stage;

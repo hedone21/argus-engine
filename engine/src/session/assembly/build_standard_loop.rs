@@ -41,11 +41,16 @@ use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 use crate::stages::kv::eviction::EvictionStage;
+use crate::stages::kv::prefill_keepset::PrefillKeepSetStage;
 
 /// argus-cli score-free eviction 의 KV-fill high-water (점유율 percent). `pos >= 85% * max_seq_len`
 /// 에서 [`KvFillPressureSource`] 가 Warning 밴드를 보고해 Persistent EvictionStage 를 1회 발화시킨다.
 /// 15% headroom 은 decode loop 의 8-step pressure 캐시 지연(`PRESSURE_QUERY_INTERVAL`)을 덮는다.
 const KV_FILL_HIGH_WATER_PCT: u32 = 85;
+
+/// R-P1-1: PFA producer 무장 시 사용할 q_window 기본값(kvpress 관례). plugin policy 화(§8 열린 결정)는
+/// R-P1-2 에서 plugin StageParams 로 plumb. PR1 은 consumer plugin 0개라 dormant.
+const PFA_Q_WINDOW_DEFAULT: usize = 32;
 
 /// Phase 4-4-a: standard generate happy path 진입 가드.
 ///
@@ -144,6 +149,14 @@ pub fn build_standard_loop(
     let score_cell: Arc<
         Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>,
     > = Arc::new(Mutex::new(None));
+    // R-P1-1 PFA producer arming(caps-driven): 등록 stage 중 PrefillAttention 을 읽는 게 있으면 무장한다.
+    // PR1 은 그런 builtin 0개 → `arm_prefill_keepset=false` → set_prefill_attn/submit 미진입 = 기존과
+    // byte-identical. cell 은 producer(ModelForward)와 consumer(PrefillKeepSetStage)가 공유한다.
+    let n_heads_q = model.config.num_attention_heads;
+    let pfa_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>> = Arc::new(Mutex::new(None));
+    let prefill_attn_stage_name =
+        crate::kv::eviction::stage_registry::find_prefill_attn_stage_name();
+    let arm_prefill_keepset = prefill_attn_stage_name.is_some();
     let mut mf = ModelForward::new(
         backend,
         memory,
@@ -179,6 +192,13 @@ pub fn build_standard_loop(
         }
     }
 
+    // R-P1-1: PFA producer 무장(consumer plugin 발견 시에만). mf 가 move 되기 전 &mut 로 cell + q_window
+    // 주입. 미무장(PR1)이면 미진입 → ModelForward 의 prefill PFA 경로는 wants_prefill_attn=false 로
+    // byte-identical.
+    if arm_prefill_keepset {
+        mf.set_prefill_attn(pfa_cell.clone(), PFA_Q_WINDOW_DEFAULT);
+    }
+
     // KV format handles — eviction stage prune 대상 + resilience heartbeat + eviction 후
     // pos-환류(with_kv_pos_handle). mf 가 with_forward 로 move 되기 전에 읽는다.
     let kv_handles: Vec<Arc<crate::kv::standard_format::StandardFormat>> = mf.fmt_caches().to_vec();
@@ -190,7 +210,10 @@ pub fn build_standard_loop(
     // eviction(CM) 또는 resilience 가 있을 때만 registry 를 만든다. 둘 다 없으면(순수 happy-path,
     // eviction none + no-resilience) registry/dispatcher/pos-handle/pressure 미배선 = 기존과
     // byte-identical 조립(INV: 회귀 0).
-    let needs_registry = resilience.is_some() || cache_manager.is_some() || stream_slot.is_some();
+    let needs_registry = resilience.is_some()
+        || cache_manager.is_some()
+        || stream_slot.is_some()
+        || arm_prefill_keepset;
     let registry = needs_registry.then(|| Arc::new(PipelineRegistry::new()));
 
     // score-free eviction(sliding/streaming/`--load-plugin` stage): KV-fill 압력 구동 Persistent
@@ -263,6 +286,27 @@ pub fn build_standard_loop(
         && let Some(registry) = registry.as_ref()
     {
         registry.submit(Arc::new(ChatStreamStage::new(slot)));
+    }
+
+    // R-P1-1: PFA keep-set consumer (PrefillEnd phase). consumer plugin(caps.reads ∋ PrefillAttention)
+    // 이 등록돼 있을 때만 submit — PR1 은 0개라 미진입(dormant, byte-identical). EvictionStage(KvMutate)
+    // 와 phase-disjoint 라 submit 순서 무관. arm 시 needs_registry 가 true → 아래에서 kv_pos_handle 도
+    // 자동 wire(§5.3a reconcile 활성).
+    if arm_prefill_keepset
+        && let Some(registry) = registry.as_ref()
+        && let Some(name) = prefill_attn_stage_name.as_ref()
+        && let Some(plugin) = crate::kv::eviction::stage_registry::make_stage(
+            name,
+            &argus_extension_api::StageParams::default(),
+        )
+    {
+        registry.submit(Arc::new(PrefillKeepSetStage::new(
+            kv_handles.clone(),
+            plugin,
+            pfa_cell.clone(),
+            n_heads_q,
+            eviction_target_ratio,
+        )));
     }
 
     // Phase 4-4.7: sampler 자동 선택. production `sampling::sample`은

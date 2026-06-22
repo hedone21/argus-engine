@@ -50,17 +50,41 @@ pub enum TensorKind {
     /// usable). `Some` only on the score-active path (decode-step RoPE-applied Q capture); `None` otherwise
     /// (MQ-3/MQ-4 hot-path gate). discriminant 4 — existing 0–3 unchanged (C-ABI additive, MQ-5).
     QueryStats,
+    /// Per-ATTENTION-head (PRE-GQA, NOT n_kv_heads) attention probabilities computed at prefill from
+    /// a trailing query window (`q_window`) to all prefix keys, SUM-aggregated over the window.
+    /// shape = `{ rows: n_heads_q, cols: prefix_len (== cache_seq_len), per_head: false }`.
+    /// per_head=false ⇒ read_row(row, _kv_head, out) IGNORES kv_head and addresses by `row`
+    /// (= attention head). Row→kv_head GQA grouping is `kv_head = row / (n_heads_q / n_kv_heads)`;
+    /// GQA/key-pooling/`q_window`/mean-vs-sum reduction are PLUGIN policy. SUM is the neutral engine
+    /// choice (mean = sum/q_window recoverable; MAX-over-window is NOT). Distinct from
+    /// [`TensorKind::Scores`] (disc 3: decode-time, `[n_kv_heads x max_seq]`, cols=1, per_head:true).
+    /// `Some` only on the prefill-end PFA-active path; `None` at KvMutate/decode and when unarmed.
+    /// discriminant 5 — 0–4 unchanged (C-ABI additive, fieldless repr(u32)).
+    PrefillAttention,
 }
+
+/// Discriminant pins — the `#[repr(u32)]` values are the wire format (`kind as u32`), so any
+/// reorder/insertion silently renumbers the C-ABI. These compile-time asserts freeze 0–5.
+const _: () = assert!(TensorKind::Key as u32 == 0);
+const _: () = assert!(TensorKind::Value as u32 == 1);
+const _: () = assert!(TensorKind::AttnWeights as u32 == 2);
+const _: () = assert!(TensorKind::Scores as u32 == 3);
+const _: () = assert!(TensorKind::QueryStats as u32 == 4);
+const _: () = assert!(TensorKind::PrefillAttention as u32 == 5);
 
 /// dtype-agnostic tensor shape (POD). Only flat fields that can cross a future FFI boundary as-is (`#[repr(C)]`-able).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TensorShape {
-    /// number of valid rows (usually `current_pos`; QueryStats=2 = mean row + var row, MQ-1).
+    /// number of valid rows (usually `current_pos`; QueryStats=2 = mean row + var row, MQ-1;
+    /// PrefillAttention=n_heads_q = attention heads pre-GQA).
     pub rows: usize,
-    /// number of f32 elements per row (Key/Value=head_dim, AttnWeights/Scores=1, QueryStats=head_dim).
+    /// number of f32 elements per row (Key/Value=head_dim, AttnWeights/Scores=1, QueryStats=head_dim;
+    /// PrefillAttention=prefix_len).
     pub cols: usize,
-    /// whether rows are split per-kv-head (true for all 5 current kinds; layer-wide flat goes through the separate `importance()` path).
+    /// whether rows are split per-kv-head (true for all kinds **except** PrefillAttention, which is
+    /// per-attention-head pre-GQA and addressed by `row`; layer-wide flat goes through the separate
+    /// `importance()` path).
     pub per_head: bool,
 }
 
@@ -590,9 +614,11 @@ impl TensorHandle for AbiTensorHandle {
 /// KVCacheStage::plan(&dyn StageCtx)`.
 pub struct AbiStageCtx {
     abi: *const StageCtxAbi,
-    // TensorKind (repr u32: Key=0/Value=1/AttnWeights=2/Scores=3/QueryStats=4) index. shape is probed
-    // at construction. Adding QueryStats (disc 4) is a C-ABI addition (MQ-5) — fn-ptr signatures unchanged, no effect on existing .so files.
-    handles: [Option<AbiTensorHandle>; 5],
+    // TensorKind (repr u32: Key=0/Value=1/AttnWeights=2/Scores=3/QueryStats=4/PrefillAttention=5)
+    // index. shape is probed at construction. Adding QueryStats (disc 4) / PrefillAttention (disc 5)
+    // is a C-ABI addition (MQ-5) — fn-ptr signatures unchanged, no effect on existing .so files.
+    // Array length MUST equal the TensorKind variant count (6); see the probe loop / `tensor()` index.
+    handles: [Option<AbiTensorHandle>; 6],
 }
 
 impl AbiStageCtx {
@@ -607,8 +633,9 @@ impl AbiStageCtx {
             TensorKind::AttnWeights,
             TensorKind::Scores,
             TensorKind::QueryStats,
+            TensorKind::PrefillAttention,
         ];
-        let mut handles: [Option<AbiTensorHandle>; 5] = [None, None, None, None, None];
+        let mut handles: [Option<AbiTensorHandle>; 6] = [None, None, None, None, None, None];
         for kind in kinds {
             let mut shape = TensorShape {
                 rows: 0,
@@ -2906,6 +2933,31 @@ mod tests {
         // Existing kinds unaffected.
         assert!(ctx.tensor(TensorKind::Key).is_none());
         assert!(ctx.tensor(TensorKind::Scores).is_none());
+    }
+
+    #[test]
+    fn abi_stage_ctx_prefill_attention_none_until_edit6() {
+        // R-P1-1 (design §2.7/§6.4): AbiStageCtx::new probes ALL of disc 0..=5 (incl.
+        // PrefillAttention). EDIT 6 (the host h_tensor_shape PFA branch) is deferred — PR1 is
+        // static-only — so disc 5 falls to `else { false }` and tensor(PrefillAttention) is None
+        // (documented-dead, not accidentally-dead). Because that probe indexes handles[5], this
+        // also guards the array length (6): a length-5 array would panic here (§2.2 OOB gotcha).
+        let host = HostCtx {
+            cur: 8,
+            tgt: 4,
+            imp: vec![],
+            key: vec![],
+            qstats: vec![],
+            qstats_cols: 0,
+        };
+        let abi = make_abi(&host);
+        // SAFETY: abi/host outlive the ctx; new() probes disc 0..=5 (handles[5] in-bounds).
+        let ctx = unsafe { AbiStageCtx::new(&abi) };
+        assert!(
+            ctx.tensor(TensorKind::PrefillAttention).is_none(),
+            "disc 5 must degrade to None on the .so path until EDIT 6 lands (R-P1-2)"
+        );
+        assert_eq!(TensorKind::PrefillAttention as u32, 5, "discriminant pin");
     }
 
     #[test]
