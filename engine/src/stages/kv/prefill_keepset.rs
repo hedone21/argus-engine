@@ -286,4 +286,141 @@ mod tests {
         assert!(matches!(outcome, StageOutcome::Consumed));
         assert_eq!(handle.current_pos(), 8, "unarmed → no prune");
     }
+
+    // ───────────────── R-P1-2 per-head (HeadMajor) mechanism ─────────────────
+
+    /// HeadMajor F32 cache, current_pos=n. head h pos p 의 모든 원소 = `h*1000 + p + 1`
+    /// (per-head compaction 후 어느 (head,pos)가 살았는지 값으로 디코드). HeadMajor offset =
+    /// `(h*capacity + p)*head_dim` (kv_cache.rs:186).
+    fn make_head_major_cache(n_kv_heads: usize, n: usize) -> KVCache {
+        use crate::kv_cache_ops::KVLayout;
+        let total = MAX_SEQ * n_kv_heads * HEAD_DIM;
+        let kb = Arc::new(SharedBuffer::new(total * 4, DType::F32));
+        let vb = Arc::new(SharedBuffer::new(total * 4, DType::F32));
+        // SAFETY: kb total*4 바이트 F32; HeadMajor offset 은 capacity(=MAX_SEQ) 내.
+        unsafe {
+            let kp = kb.as_mut_ptr() as *mut f32;
+            for h in 0..n_kv_heads {
+                for p in 0..n {
+                    let base = (h * MAX_SEQ + p) * HEAD_DIM;
+                    for d in 0..HEAD_DIM {
+                        *kp.add(base + d) = (h * 1000 + p + 1) as f32;
+                    }
+                }
+            }
+        }
+        let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let sh = Shape::new(vec![1, MAX_SEQ, n_kv_heads, HEAD_DIM]);
+        let mut c = KVCache::new(
+            Tensor::new(sh.clone(), kb, be.clone()),
+            Tensor::new(sh, vb, be),
+            MAX_SEQ,
+        )
+        .with_layout(KVLayout::HeadMajor);
+        c.current_pos = n;
+        c
+    }
+
+    /// 테스트용 per-head keep-set plugin: PFA(n_heads_q 행)를 kv-head 로 GQA-reduce(group 합) →
+    /// kv-head 별 top-`target` 위치 → `KeepSpec::PerHead`(동일 길이, ascending). R-P1-2 SnapKV per-head
+    /// 의 축소판(executor 의 per-head 분기 = HeadMajor 전제를 검증).
+    struct PerHeadTopKStage;
+    impl KVCacheStage for PerHeadTopKStage {
+        fn name(&self) -> &str {
+            "test.perhead_topk_pfa"
+        }
+        fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+            let prefix_len = ctx.current_pos();
+            let n_kv_heads = ctx.n_kv_heads();
+            let target = ctx.target_len().min(prefix_len);
+            let h = ctx.tensor(TensorKind::PrefillAttention)?;
+            let n_heads_q = h.shape().rows;
+            let cols = h.shape().cols; // prefix_len
+            let gqa = n_heads_q / n_kv_heads;
+            let mut heads: Vec<Vec<usize>> = Vec::with_capacity(n_kv_heads);
+            let mut row = vec![0.0f32; cols];
+            for kv in 0..n_kv_heads {
+                // GQA-reduce: sum the gqa attention-head rows mapping to this kv-head.
+                let mut imp = vec![0.0f32; cols];
+                for g in 0..gqa {
+                    h.read_row(kv * gqa + g, kv, &mut row);
+                    for (acc, &x) in imp.iter_mut().zip(row.iter()) {
+                        *acc += x;
+                    }
+                }
+                let mut idx: Vec<usize> = (0..prefix_len).collect();
+                idx.sort_by(|&a, &b| imp[b].partial_cmp(&imp[a]).unwrap());
+                let mut keep: Vec<usize> = idx.into_iter().take(target).collect();
+                keep.sort_unstable();
+                heads.push(keep);
+            }
+            Some(KVCachePlan {
+                keep: KeepSpec::PerHead(heads),
+                merges: Vec::new(),
+            })
+        }
+    }
+
+    /// kv-head 별 divergent PFA: kv_head0(attn 0,1)→even 선호, kv_head1(attn 2,3)→odd 선호.
+    fn divergent_pfa(n_heads_q: usize, n_kv_heads: usize, prefix_len: usize) -> Vec<f32> {
+        let gqa = n_heads_q / n_kv_heads;
+        let mut layer = vec![0.0f32; n_heads_q * prefix_len];
+        for h in 0..n_heads_q {
+            let kv = h / gqa;
+            for kp in 0..prefix_len {
+                // kv 0 → even high, kv 1 → odd high.
+                let favored = if kv == 0 { kp % 2 == 0 } else { kp % 2 == 1 };
+                layer[h * prefix_len + kp] = if favored { 1.0 } else { 0.01 };
+            }
+        }
+        layer
+    }
+
+    #[test]
+    fn prefill_end_applies_perhead_keepset_headmajor() {
+        // R-P1-2 mechanism: HeadMajor cache + per-head PFA plugin → KeepSpec::PerHead → executor
+        // per-head 분기(stage_registry.rs:113) → compact_keep_positions_for_head. kv-head 별로 다른
+        // 위치가 살아남음(divergence) + HeadMajor 압축 byte-exact. (이 경로는 이전엔 dead — 첫 e2e 검증.)
+        let n_kv_heads = 2;
+        let n_heads_q = 4; // GQA 2:1.
+        let prefix_len = 8;
+        let target = 4; // ratio 0.5.
+        let handle = Arc::new(StandardFormat::new(
+            0,
+            make_head_major_cache(n_kv_heads, prefix_len),
+        ));
+        let cell = Arc::new(Mutex::new(Some(vec![divergent_pfa(
+            n_heads_q, n_kv_heads, prefix_len,
+        )])));
+        let stage = PrefillKeepSetStage::new(
+            vec![handle.clone()],
+            Box::new(PerHeadTopKStage),
+            cell,
+            n_heads_q,
+            0.5,
+        );
+
+        let mut profiler = OpProfiler::new();
+        let mut ctx = make_ctx(&mut profiler);
+        let outcome = stage
+            .on_phase(&LifecyclePhase::PrefillEnd, &mut ctx)
+            .unwrap();
+        assert!(matches!(outcome, StageOutcome::Consumed));
+        assert_eq!(handle.current_pos(), target, "per-head keep len");
+
+        // 압축 후 head h pos i 값 = (h*1000 + kept_h[i] + 1). kv0 keeps even {0,2,4,6}, kv1 odd {1,3,5,7}.
+        let inner = handle.take_inner();
+        let k = inner.k_buffer.as_slice::<f32>();
+        let expected: [[usize; 4]; 2] = [[0, 2, 4, 6], [1, 3, 5, 7]];
+        for (kv, kept) in expected.iter().enumerate() {
+            for (i, &orig) in kept.iter().enumerate() {
+                let off = (kv * MAX_SEQ + i) * HEAD_DIM; // HeadMajor offset.
+                assert_eq!(
+                    k[off],
+                    (kv * 1000 + orig + 1) as f32,
+                    "kv-head {kv} compacted pos {i} should hold original pos {orig}"
+                );
+            }
+        }
+    }
 }
