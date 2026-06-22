@@ -57,6 +57,15 @@ pub fn run_quant_window_experiment_path(ctx: QuantWindowBenchCtx) -> anyhow::Res
         initial_bits,
     );
 
+    // R-P0-3: quant-window KV bytes per token ≈ quantized element size (initial_bits/8) across all
+    // layers, captured before the model is consumed. First-order — ignores the small fixed f16
+    // residual window; the quantized portion dominates at scale. `final_cache_pos * this` is peak_kv_mb.
+    let per_token_kv_bytes = model.config.num_hidden_layers as f64
+        * 2.0
+        * model.config.num_key_value_heads as f64
+        * model.config.head_dim as f64
+        * (initial_bits as f64 / 8.0);
+
     let decode_loop = build_bench_quant_window_loop(
         backend,
         memory,
@@ -77,6 +86,7 @@ pub fn run_quant_window_experiment_path(ctx: QuantWindowBenchCtx) -> anyhow::Res
         max_seq_len,
         &sampling_config,
         vocab_size,
+        per_token_kv_bytes,
     )
 }
 
@@ -148,6 +158,17 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         }
     };
 
+    // R-P0-3: KV bytes per occupied token, captured before build_bench_loop consumes kv_caches.
+    // A buffer holds `capacity` token slots, so `(k+v bytes) / capacity` is the exact per-token
+    // cost — reading real buffer sizes accounts for f16 / q4_0 / opaque formats alike, and is
+    // independent of how much of `max_seq_len` is currently allocated. `final_cache_pos * this`
+    // is peak_kv_mb.
+    let per_token_kv_bytes: f64 = kv_caches
+        .iter()
+        .filter(|c| c.capacity() > 0)
+        .map(|c| (c.k_buffer.size() + c.v_buffer.size()) as f64 / c.capacity() as f64)
+        .sum();
+
     // bin_setup이 dispatch한 kv_caches를 소비(과거엔 drop 후 typed 재할당).
     let decode_loop = build_bench_loop(
         backend.clone(),
@@ -183,6 +204,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         max_seq_len,
         &sampling_config,
         vocab_size,
+        per_token_kv_bytes,
     )
 }
 
@@ -197,6 +219,9 @@ fn run_decode_loop_experiment(
     max_seq_len: usize,
     sampling_config: &SamplingConfig,
     vocab_size: usize,
+    // R-P0-3: KV-cache bytes per occupied token (across all layers). `peak_kv_mb` is
+    // `final_cache_pos * per_token_kv_bytes`. 0.0 → `peak_kv_mb` is omitted.
+    per_token_kv_bytes: f64,
 ) -> anyhow::Result<()> {
     let mut sys_sampler = SystemSampler::new(args.experiment_sample_interval);
     let sys_start = args
@@ -226,7 +251,13 @@ fn run_decode_loop_experiment(
     let decoded = tokenizer
         .decode(&final_tokens, true)
         .unwrap_or_else(|_| String::from("[decode error]"));
-    println!("{}", decoded);
+    // `--bench-json`: keep stdout pure JSON (emitted below), so the generated text and the
+    // human-readable metric lines go to stderr. Without it, behavior is unchanged.
+    if args.bench_json {
+        eprintln!("{}", decoded);
+    } else {
+        println!("{}", decoded);
+    }
 
     let decode_tokens = result.tokens_generated.len();
     let total_gen = 1 + decode_tokens;
@@ -236,20 +267,48 @@ fn run_decode_loop_experiment(
         0.0
     };
     let avg_tbt = (prefill_ms + decode_total_ms) / total_gen as f64;
-    println!("TTFT: {:.2} ms", prefill_ms);
+    let decode_tok_s = 1000.0 / decode_per_tok.max(0.001);
+    macro_rules! metric_line {
+        ($($arg:tt)*) => {
+            if args.bench_json { eprintln!($($arg)*) } else { println!($($arg)*) }
+        };
+    }
+    metric_line!("TTFT: {:.2} ms", prefill_ms);
     if decode_tokens > 0 {
-        println!(
+        metric_line!(
             "Decode: {:.2} ms/tok ({:.1} tok/s) [{} tokens]",
             decode_per_tok,
-            1000.0 / decode_per_tok.max(0.001),
+            decode_tok_s,
             decode_tokens,
         );
     }
-    println!(
+    metric_line!(
         "Avg TBT: {:.2} ms ({:.1} tokens/sec)",
         avg_tbt,
         1000.0 / avg_tbt.max(0.001),
     );
+
+    // R-P0-3: single-line metrics JSON to stdout for the validation harness (Gate 3).
+    // `tokens_per_sec` is the steady-state decode throughput (reciprocal of decode_ms_per_tok);
+    // `peak_kv_mb` is the KV-cache footprint at final occupancy (omitted when geometry is unknown).
+    if args.bench_json {
+        let mut metrics = serde_json::json!({
+            "decode_ms_per_tok": decode_per_tok,
+            "prefill_ms": prefill_ms,
+            "tokens_per_sec": decode_tok_s,
+            "avg_tbt_ms": avg_tbt,
+            "decode_tokens": decode_tokens,
+            "prompt_len": tokens.len(),
+            "final_cache_pos": result.final_pos,
+            "eviction_policy": args.eviction_policy(),
+            "kv_mode": args.effective_kv_mode(),
+        });
+        if per_token_kv_bytes > 0.0 {
+            let peak_kv_mb = result.final_pos as f64 * per_token_kv_bytes / (1024.0 * 1024.0);
+            metrics["peak_kv_mb"] = serde_json::json!(peak_kv_mb);
+        }
+        println!("{}", serde_json::to_string(&metrics)?);
+    }
 
     // ── experiment JSONL: per-token record + _summary ──
     if let Some(path) = args.experiment_output.as_ref() {
