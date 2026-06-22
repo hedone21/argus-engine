@@ -1517,6 +1517,18 @@ fn gather_selected_kv(cache: &KVCache, select: &[usize]) -> Result<(Vec<f32>, Ve
     use crate::quant::{BlockQ4_0, QK4_0};
     use half::f16;
 
+    // SelectiveRead gathers via host `as_slice()`; a GPU-resident cache exposes a null
+    // host pointer (device buffer), so this path would deref null → segfault. Read-stage
+    // selective read is host-only — guard with a clean error rather than UB (full read is
+    // the fallback). Host caches report `is_gpu_buffer() == false`, so this is a no-op for
+    // the existing CPU SelectiveRead path (byte-identical).
+    if cache.k_buffer.buffer().is_gpu_buffer() || cache.v_buffer.buffer().is_gpu_buffer() {
+        anyhow::bail!(
+            "SelectiveRead (read-stage) gather requires a host-resident KV cache; got a \
+             GPU-resident cache. Selective read is not supported on GPU caches — use full read."
+        );
+    }
+
     let kv_heads = cache.kv_heads();
     let head_dim = cache.head_dim();
     let capacity = cache.capacity();
@@ -3027,6 +3039,22 @@ mod tests {
         // current_pos 갱신
         cache.current_pos = n_tokens;
         cache.high_water_pos = n_tokens;
+    }
+
+    /// Area 3 guard: a host-resident cache reports `is_gpu_buffer() == false`, so the
+    /// GPU guard at the top of `gather_selected_kv` must NOT trip (no false positive) and
+    /// gather must succeed. (The GPU-resident rejection path is on-device-only.)
+    #[test]
+    fn gather_selected_kv_allows_host_cache() {
+        let mut cache = make_head_major_cache(8, 2, 4);
+        write_tokens_headmajor(&mut cache, 4);
+        let r = gather_selected_kv(&cache, &[0, 1, 2]);
+        assert!(r.is_ok(), "host cache gather must succeed: {:?}", r.err());
+        let (k, v) = r.unwrap();
+        assert_eq!(k.len(), 2 * 3 * 4, "kv_heads * n_sel * head_dim");
+        assert_eq!(v.len(), 2 * 3 * 4);
+        // head 0, pos 1 → K = 1.0 (pos + 0.1*head); spot-check first element of (h=0, si=1).
+        assert!((k[4] - 1.0).abs() < 1e-6, "h0 pos1 K = {}", k[4]);
     }
 
     /// SelectiveRead: select=전체 토큰 → attention_into 와 bit-identical (F32/HeadMajor).

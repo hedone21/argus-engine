@@ -116,6 +116,8 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
         "q4" => DType::Q4_0,
         other => bail!("Unsupported KV type: {other}. Use f32, f16, or q4."),
     };
+    let kv_layout = KVLayout::from_cli(&args.kv_layout)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported --kv-layout: '{}'", args.kv_layout))?;
 
     let initial_kv_capacity = if args.initial_kv_capacity() > 0 {
         args.initial_kv_capacity().min(max_seq_len)
@@ -146,6 +148,7 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
                     kv_heads,
                     head_dim,
                     dt,
+                    kv_layout,
                 )?
             }
             None => {
@@ -175,6 +178,7 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
                             kv_heads,
                             head_dim,
                             dt,
+                            kv_layout,
                         )?
                     }
                     None => {
@@ -188,6 +192,7 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
                             kv_heads,
                             head_dim,
                             desc,
+                            kv_layout,
                         )?
                     }
                 }
@@ -202,6 +207,7 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
             kv_heads,
             head_dim,
             kv_type,
+            kv_layout,
         )?,
     };
 
@@ -313,7 +319,25 @@ pub fn check_vocab_compatibility(
     Ok(())
 }
 
-/// HeadMajor layout + dynamic grow-on-demand KV cache 를 num_layers 만큼 할당.
+/// Resolve the requested KV layout against the backend. GPU flash decode is
+/// HeadMajor-only (SeqMajor would silently fall back to CPU attention per token),
+/// so a GPU backend forces HeadMajor and warns when `seq` was requested. CPU
+/// honours the request as-is. Pure (takes `is_gpu`, not the backend) so the
+/// policy is unit-testable without a GPU backend.
+fn resolve_kv_layout(is_gpu: bool, requested: KVLayout) -> KVLayout {
+    if is_gpu && requested == KVLayout::SeqMajor {
+        eprintln!(
+            "[KV layout] WARNING: GPU backend requires HeadMajor (flash decode is HeadMajor-only); \
+             ignoring --kv-layout seq, using HeadMajor."
+        );
+        KVLayout::HeadMajor
+    } else {
+        requested
+    }
+}
+
+/// Dynamic grow-on-demand KV cache 를 num_layers 만큼 할당. `layout` 으로 메모리
+/// 레이아웃 선택(GPU 는 HeadMajor 강제 — [`resolve_kv_layout`]).
 #[allow(clippy::too_many_arguments)]
 pub fn alloc_standard_kv_caches(
     backend: &Arc<dyn Backend>,
@@ -324,7 +348,9 @@ pub fn alloc_standard_kv_caches(
     kv_heads: usize,
     head_dim: usize,
     kv_type: DType,
+    layout: KVLayout,
 ) -> anyhow::Result<Vec<KVCache>> {
+    let layout = resolve_kv_layout(backend.is_gpu(), layout);
     let n_values = initial_kv_capacity * kv_heads * head_dim;
     let kv_buf_size = match kv_type {
         DType::Q4_0 => {
@@ -334,8 +360,8 @@ pub fn alloc_standard_kv_caches(
         _ => n_values * kv_type.size(),
     };
     eprintln!(
-        "KV cache type: {:?}, layout: HeadMajor (initial capacity: {} tokens, {}B per layer, max: {})",
-        kv_type, initial_kv_capacity, kv_buf_size, max_seq_len
+        "KV cache type: {:?}, layout: {:?} (initial capacity: {} tokens, {}B per layer, max: {})",
+        kv_type, layout, initial_kv_capacity, kv_buf_size, max_seq_len
     );
     let mut kv_caches = Vec::with_capacity(num_layers);
     for _ in 0..num_layers {
@@ -354,7 +380,7 @@ pub fn alloc_standard_kv_caches(
                 head_dim,
                 memory.clone(),
             )
-            .with_layout(KVLayout::HeadMajor),
+            .with_layout(layout),
         );
     }
     Ok(kv_caches)
@@ -374,10 +400,12 @@ pub fn alloc_opaque_kv_caches(
     kv_heads: usize,
     head_dim: usize,
     desc: KVLayoutDesc,
+    layout: KVLayout,
 ) -> anyhow::Result<Vec<KVCache>> {
     use crate::buffer::Buffer;
     use crate::buffer::opaque::OpaqueBuffer;
 
+    let layout = resolve_kv_layout(backend.is_gpu(), layout);
     let block_elems = desc.block_elems as usize;
     if block_elems == 0 || !head_dim.is_multiple_of(block_elems) {
         bail!("opaque KV: head_dim {head_dim} is not a multiple of block_elems {block_elems}");
@@ -387,8 +415,8 @@ pub fn alloc_opaque_kv_caches(
         anyhow::anyhow!("opaque KV: bytes_for_elems({n_values}) failed (block-aligned?)")
     })?;
     eprintln!(
-        "KV cache: opaque (block_elems={}, bits={}, {}B per layer, HeadMajor, initial cap: {}, max: {})",
-        desc.block_elems, desc.bits, nbytes, initial_kv_capacity, max_seq_len
+        "KV cache: opaque (block_elems={}, bits={}, {}B per layer, {:?}, initial cap: {}, max: {})",
+        desc.block_elems, desc.bits, nbytes, layout, initial_kv_capacity, max_seq_len
     );
     let mut kv_caches = Vec::with_capacity(num_layers);
     for _ in 0..num_layers {
@@ -410,7 +438,7 @@ pub fn alloc_opaque_kv_caches(
                 head_dim,
                 memory.clone(),
             )
-            .with_layout(KVLayout::HeadMajor),
+            .with_layout(layout),
         );
     }
     Ok(kv_caches)
@@ -515,4 +543,75 @@ pub fn build_quant_window_bench_ctx(args: Args) -> anyhow::Result<QuantWindowBen
         residual_size,
         resilience,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::cpu::CpuBackend;
+    use crate::memory::galloc::Galloc;
+
+    #[test]
+    fn kv_layout_from_cli_parses_known_values() {
+        assert_eq!(KVLayout::from_cli("head"), Some(KVLayout::HeadMajor));
+        assert_eq!(KVLayout::from_cli("seq"), Some(KVLayout::SeqMajor));
+        assert_eq!(KVLayout::from_cli("bogus"), None);
+    }
+
+    #[test]
+    fn resolve_kv_layout_cpu_honours_request() {
+        // CPU honours the requested layout as-is (both directions).
+        assert_eq!(
+            resolve_kv_layout(false, KVLayout::SeqMajor),
+            KVLayout::SeqMajor
+        );
+        assert_eq!(
+            resolve_kv_layout(false, KVLayout::HeadMajor),
+            KVLayout::HeadMajor
+        );
+    }
+
+    #[test]
+    fn resolve_kv_layout_gpu_forces_head_major() {
+        // GPU flash decode is HeadMajor-only: `seq` is upgraded to `head`, `head` stays.
+        assert_eq!(
+            resolve_kv_layout(true, KVLayout::SeqMajor),
+            KVLayout::HeadMajor
+        );
+        assert_eq!(
+            resolve_kv_layout(true, KVLayout::HeadMajor),
+            KVLayout::HeadMajor
+        );
+    }
+
+    #[test]
+    fn alloc_standard_kv_caches_selects_layout_on_cpu() {
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let memory: Arc<dyn Memory> = Arc::new(Galloc::new());
+        // Default `head` stays HeadMajor (byte-identical to the previous hardcoded path);
+        // `seq` now actually selects SeqMajor on CPU (the dead flag is live).
+        for (req, want) in [
+            (KVLayout::HeadMajor, KVLayout::HeadMajor),
+            (KVLayout::SeqMajor, KVLayout::SeqMajor),
+        ] {
+            let caches = alloc_standard_kv_caches(
+                &backend,
+                memory.clone(),
+                2,  // num_layers
+                64, // initial_kv_capacity
+                64, // max_seq_len
+                4,  // kv_heads
+                8,  // head_dim
+                DType::F32,
+                req,
+            )
+            .unwrap();
+            assert_eq!(caches.len(), 2);
+            assert_eq!(
+                caches[0].layout(),
+                want,
+                "CPU must honour requested layout {req:?}"
+            );
+        }
+    }
 }
