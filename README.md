@@ -32,7 +32,7 @@ to configure, and simple to add new techniques to without touching the engine co
 **StreamingLLM KV-cache eviction**, streaming on a phone's Adreno GPU (Galaxy S25,
 OpenCL). A multi-turn `argus-chat --interactive` session capped at `--max-seq-len 512`:
 without the eviction stage the KV cache fills and overflows, so generation stops. With
-`eviction streaming --sink 4 --recent-window 256` the cache is pruned each turn and the
+`eviction plugin --name streaming --set sink=4 --set recent_window=256` the cache is pruned each turn and the
 chat keeps going:
 
 ![Left (no plugin): the KV cache overflows at the sequence-length limit and generation stops. Right (StreamingLLM plugin): the cache is pruned each turn and the chat keeps streaming.](docs/demo/plugin.gif)

@@ -463,8 +463,8 @@ argus-eval  ... eviction plugin --name my_stage
 
 `eviction plugin --name <name>`은 `eviction` 서브커맨드의 자유 문자열 탈출구로, `--kv-format`의
 stage-축 짝입니다. 이름은 `make_stage`(정적 `KV_CACHE_STAGES` 먼저, 그다음 `--load-plugin` 동적
-레지스트리)로 풀리므로, 등록된 어떤 stage든 엔진 수정 0으로 선택됩니다. (내장 정책은 자기
-타입 서브커맨드를 그대로 유지합니다: `eviction sliding`, `eviction h2o`, ….)
+레지스트리)로 풀리므로, 등록된 어떤 stage든 엔진 수정 0으로 선택됩니다. (내장 정책도 같은
+방식으로 레지스트리 이름으로 고릅니다: `eviction plugin --name sliding`, `--name h2o`, ….)
 
 범위 메모 둘:
 
@@ -475,8 +475,7 @@ stage-축 짝입니다. 이름은 `make_stage`(정적 `KV_CACHE_STAGES` 먼저, 
   새 `argus-shared` 커맨드가 필요해 오늘은 범위 밖입니다.
 
 > 일부 `argus-extension-api` 문서 주석은 선택자를 여전히 `--eviction-policy <name>`이라 부릅니다. 낡은
-> 이름입니다. 실제 CLI 형태는 `eviction plugin --name <name>`(또는 내장 `eviction <policy>`
-> 서브커맨드)입니다.
+> 이름입니다. 실제 CLI 형태는 `eviction plugin --name <name>`입니다.
 
 ---
 

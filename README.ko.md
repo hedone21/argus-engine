@@ -29,7 +29,7 @@ Adreno-OpenCL·CUDA GPU 백엔드, zero-copy UMA 메모리 경로, KV-cache·pre
 
 폰의 Adreno GPU(Galaxy S25, OpenCL)에서 스트리밍으로 도는 **StreamingLLM KV-cache eviction**.
 `--max-seq-len 512`로 제한한 멀티턴 `argus-chat --interactive` 세션입니다. eviction stage가 없으면 KV cache가
-차서 오버플로로 생성이 멈추고, `eviction streaming --sink 4 --recent-window 256`을 주면
+차서 오버플로로 생성이 멈추고, `eviction plugin --name streaming --set sink=4 --set recent_window=256`을 주면
 매 턴 캐시를 프루닝하며 계속됩니다:
 
 ![좌(no plugin): KV cache가 seq-len 한계에서 오버플로해 생성 중단. 우(StreamingLLM plugin): 매 턴 캐시를 프루닝하며 계속 스트리밍.](docs/demo/plugin.gif)
@@ -78,7 +78,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
 GGUF·AUF 변환은 [설치 / 소스에서 빌드](#설치--소스에서-빌드)에 있습니다.
 
 4번이 정밀도 format 플러그인 경로입니다. 로드한 `.so`가 지금도 `argus-cli`의 실제 decode
-경로까지 닿습니다. score-free KV-cache eviction stage(`eviction sliding|streaming`,
+경로까지 닿습니다. score-free KV-cache eviction stage(`eviction plugin --name <sliding|streaming>`,
 그리고 `--load-plugin` stage)도 `argus-cli`에서 돌고, attention 점수 누산기가 필요한 score-based
 H2O·D2O와 KIVI 정밀도 패킹은 `argus-bench`·`argus-eval`로 돌립니다.
 
@@ -309,7 +309,7 @@ cargo build --release -p my-kv-format --features plugin-cdylib
 
 - **stage**(eviction/merge 종류) — `KVCacheStage::plan(&ctx) -> Option<KVCachePlan>`을 구현해 어떤
   토큰을 `keep`·`merge`할지 돌려주고, `register_kv_stage!`로 등록한 뒤 `eviction plugin --name
-  <name>` 서브커맨드(빌트인: `eviction h2o|d2o|streaming|sliding`)로 고릅니다. 템플릿은
+  <name>` 서브커맨드(빌트인 이름: `h2o`/`d2o`/`streaming`/`sliding`)로 고릅니다. 템플릿은
   `example-keep-recent`. *score-free stage는 `argus-cli`에서(`--load-plugin <.so> eviction
   plugin --name <name>`, KV-fill 트리거), attention 점수가 필요한 score-based stage는
   `argus-bench`·`argus-eval`로 돕니다.*
