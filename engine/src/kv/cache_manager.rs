@@ -492,8 +492,11 @@ impl CacheManager {
         for (layer_idx, cache) in caches.iter_mut().enumerate() {
             if let (Some(flat), Some(head_imp)) = (importance, head_importance) {
                 if n_kv_heads > 0 {
-                    // Per-head (h2o_plus) — not a layer-aware stage; keep the dedicated path.
-                    policy.evict_with_head_scores(cache, target_len, flat, head_imp, n_kv_heads)?;
+                    // Per-head (h2o_plus) — not a layer-aware stage, but the real (layer_idx,
+                    // n_layers) is threaded through so the keep-set dump (R-P0-2) keys by layer.
+                    policy.evict_with_head_scores(
+                        cache, target_len, flat, head_imp, n_kv_heads, layer_idx, n_layers,
+                    )?;
                 } else {
                     // last_attn does not vary by layer (last-layer last-step approximation),
                     // so the same slice is threaded into every layer's plan.

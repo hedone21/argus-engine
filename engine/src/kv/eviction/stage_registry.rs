@@ -89,7 +89,16 @@ use rkv as _;
 ///
 /// pub(crate): the `d2o` plugin's WeightedMerge plan flows through here (apply_weighted_merges +
 /// compact) — the production merge-application path.
-pub(crate) fn execute_kv_plan(cache: &mut KVCache, plan: &KVCachePlan) -> Result<()> {
+pub(crate) fn execute_kv_plan(
+    cache: &mut KVCache,
+    plan: &KVCachePlan,
+    layer_idx: usize,
+    n_layers: usize,
+) -> Result<()> {
+    // R-P0-2: optional keep-set dump (no-op unless `ARGUS_DUMP_KEEPSET` is set).
+    // Recorded before any compaction so the kept positions are absolute indices
+    // into the pre-eviction `[0, current_pos)` range.
+    super::keepset_dump::record(cache, plan, layer_idx, n_layers);
     match &plan.keep {
         KeepSpec::LayerWide(keep) => {
             if !plan.merges.is_empty() {
@@ -397,7 +406,7 @@ impl StageBackedPolicy {
             self.stage.plan(&ctx)
         };
         if let Some(plan) = plan {
-            execute_kv_plan(cache, &plan)?;
+            execute_kv_plan(cache, &plan, layer_idx, n_layers)?;
         }
         Ok(())
     }
@@ -452,6 +461,8 @@ impl EvictionPolicy for StageBackedPolicy {
         flat_importance: &[f32],
         head_importance: &[f32],
         _n_kv_heads: usize,
+        layer_idx: usize,
+        n_layers: usize,
     ) -> Result<()> {
         let plan = {
             let ctx = KVStageCtx::new(
@@ -465,7 +476,7 @@ impl EvictionPolicy for StageBackedPolicy {
             self.stage.plan(&ctx)
         };
         if let Some(plan) = plan {
-            execute_kv_plan(cache, &plan)?;
+            execute_kv_plan(cache, &plan, layer_idx, n_layers)?;
         }
         Ok(())
     }
@@ -1099,7 +1110,7 @@ mod tests {
             KeepSpec::PerHead(_) => panic!("v1 value-aware 는 LayerWide"),
         }
         assert!(plan.merges.is_empty());
-        execute_kv_plan(&mut c, &plan).unwrap();
+        execute_kv_plan(&mut c, &plan, 0, 1).unwrap();
         assert_eq!(c.current_pos(), 4, "executor 가 keep.len() 로 compact");
     }
 
@@ -1311,7 +1322,7 @@ mod tests {
                 !plan.merges.is_empty(),
                 "d2o[{dt:?}] merge enabled → WeightedMerges present"
             );
-            execute_kv_plan(&mut c, &plan).unwrap();
+            execute_kv_plan(&mut c, &plan, 0, 1).unwrap();
             assert_eq!(
                 c.current_pos(),
                 12,
@@ -1384,7 +1395,7 @@ mod tests {
         let policy = StageBackedPolicy::new(stage);
         // target=10, prefix=4, keep_ratio=0.5 → keep=10, hh_budget=3, recent_start=17.
         policy
-            .evict_with_head_scores(&mut c, 10, &flat, &head_imp, n_kv_heads)
+            .evict_with_head_scores(&mut c, 10, &flat, &head_imp, n_kv_heads, 0, 1)
             .expect("per-head executor runs without bail");
 
         // All heads compacted to the same count (prefix 4 + HH 3 + recent 3 = 10).

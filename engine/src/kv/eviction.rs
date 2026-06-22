@@ -39,6 +39,7 @@ pub trait EvictionPolicy: Send + Sync {
     ///
     /// Default: ignores head scores, delegates to `evict_with_scores()`.
     /// Override in GQA-aware policies like heavy-hitter+.
+    #[allow(clippy::too_many_arguments)]
     fn evict_with_head_scores(
         &self,
         cache: &mut KVCache,
@@ -46,6 +47,8 @@ pub trait EvictionPolicy: Send + Sync {
         flat_importance: &[f32],
         _head_importance: &[f32],
         _n_kv_heads: usize,
+        _layer_idx: usize,
+        _n_layers: usize,
     ) -> Result<()> {
         self.evict_with_scores(cache, target_len, flat_importance)
     }
@@ -79,4 +82,5 @@ pub trait EvictionPolicy: Send + Sync {
 // (registers via linkme, force-linked in stage_registry.rs): `streaming` → `streaming-llm`,
 // `h2o` → `h2o`, `d2o` → `d2o`, `sliding` → `sliding-window`, `none` → `no-eviction`,
 // `rkv` → `rkv` (feature-gated). The engine retains only the generic plumbing here.
+pub(crate) mod keepset_dump;
 pub mod stage_registry;
