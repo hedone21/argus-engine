@@ -340,6 +340,12 @@ pub struct TransformerModelForwardArgs<'a> {
     /// full read 폴백(D4). `None`(production 기본 / 빌트인 0개 시작)이면 layer 당 `Option::is_some`
     /// branch 1회만 추가 — INV-147 zero-overhead, α-K frozen byte-identical 게이트 대상.
     pub read_stage: Option<&'a dyn argus_extension_api::KVReadStage>,
+    /// R-P1-1 PFA producer target. `Some((buf, q_window))` — `ModelForward` 가 **최종 prefill 청크**
+    /// 에서 무장 시에만 설정(chunk gating 은 caller 책임) → 실제 prefill(seq_len>1) layer 루프가 layer
+    /// `i` 슬라이스 `buf[i]`(`[n_heads_q * prefix_len]`, caller pre-zeroed)에 trailing q_window 의
+    /// per-attention-head attention 확률을 SUM-누적. `None`(decode / 미무장 / production·eval·ppl 기본)
+    /// = byte-identical(layer 당 `is_some` branch 1회).
+    pub prefill_attn: Option<(&'a mut Vec<Vec<f32>>, usize)>,
 }
 
 impl TransformerModel {
@@ -1469,6 +1475,9 @@ impl TransformerModel {
         // read stage 핸들을 per-step 1회 캡처 → layer loop 가 재사용.
         // None(production 기본)이면 decode arm 이 layer 당 `is_some` branch 1회만(INV-147 동형).
         let read_stage = args.read_stage;
+        // R-P1-1 PFA producer target (최종 prefill 청크에서만 Some). None=byte-identical(prefill arm
+        // 이 layer 당 `as_mut` branch 1회). prefix_len 은 caller(ModelForward)가 buf 크기로 박음.
+        let mut prefill_attn = args.prefill_attn;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -1610,6 +1619,8 @@ impl TransformerModel {
                         use_gelu_tanh: is_gemma3,
                         is_local_attn: is_local,
                         local_attn_window: self.config.sliding_window,
+                        // R-P1-1: degenerate 1-token fall-through(warmup/qcf decode-X)는 PFA 미산출.
+                        pfa_target: None,
                     },
                 )?;
             } else if is_decode {
@@ -1671,6 +1682,11 @@ impl TransformerModel {
                 let pws = owned_prefill_ws
                     .as_mut()
                     .expect("forward_into prefill requires PrefillWorkspace (seq_len>1)");
+                // R-P1-1: 무장 시 이 layer 의 PFA target((buf[i] 슬라이스, q_window)). `prefill_attn` 은
+                // 최종 청크에서만 Some(ModelForward 가 chunk-gating) → 여기서 layer 슬라이스 reborrow.
+                let pfa_target = prefill_attn
+                    .as_mut()
+                    .map(|(buf, qw)| (buf[i].as_mut_slice(), *qw));
                 layer.forward_prefill_fmt(
                     crate::layers::transformer_layer::ForwardPrefillFmtArgs {
                         x: &mut x,
@@ -1690,6 +1706,7 @@ impl TransformerModel {
                         use_gelu_tanh: is_gemma3,
                         is_local_attn: is_local,
                         local_attn_window: self.config.sliding_window,
+                        pfa_target,
                     },
                 )?;
             }

@@ -48,6 +48,10 @@ pub(crate) struct ForwardPrefillFmtArgs<'a> {
     pub is_local_attn: Option<bool>,
     /// Gemma3: local attention window.
     pub local_attn_window: Option<usize>,
+    /// R-P1-1 PFA producer target: `Some((out_scores, q_window))` 면 `attention_into` 의 prefill arm 이
+    /// trailing q_window attention 확률을 `out_scores`(이 layer 슬라이스 `[n_heads_q * prefix_len]`,
+    /// caller pre-zeroed)에 SUM-누적. `None`(decode-fallthrough / 미무장) = byte-identical.
+    pub pfa_target: Option<(&'a mut [f32], usize)>,
 }
 
 impl TransformerLayer {
@@ -152,6 +156,8 @@ impl TransformerLayer {
             &mut ws.out_attn,
             AttnDims { n_heads_q, window },
             None,
+            // R-P1-1: 무장 시 이 layer 의 PFA target((out_scores, q_window)). None=byte-identical.
+            args.pfa_target,
         )?;
 
         // 6. Output projection.

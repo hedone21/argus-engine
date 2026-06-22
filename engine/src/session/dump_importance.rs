@@ -104,6 +104,7 @@ pub fn run_dump_importance(mut ctx: DumpImportanceCtx) -> anyhow::Result<()> {
             cache_self_need_scores: false,
             layer_boundary_hook: None,
             read_stage: None,
+            prefill_attn: None,
         })
     })?;
 
@@ -277,6 +278,7 @@ fn run_head_concentration_decode(
                 cache_self_need_scores: false,
                 layer_boundary_hook: None,
                 read_stage: None,
+                prefill_attn: None,
             })
         })?;
 

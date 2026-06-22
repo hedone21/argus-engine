@@ -119,6 +119,8 @@ impl KVCacheFormat for QuantWindowFormat {
         out: &mut Tensor,
         dims: AttnDims,
         scores: Option<&mut [f32]>,
+        // R-P1-1: quant-window format 은 PFA 미산출(None pass-through) — StandardFormat 만 producer.
+        _prefill_scores: Option<(&mut [f32], usize)>,
     ) -> Result<()> {
         let mut cache = self.inner.lock().unwrap();
         let n_heads_q = dims.n_heads_q;
@@ -159,6 +161,7 @@ impl KVCacheFormat for QuantWindowFormat {
                 q_start_pos,
                 dims.window,
                 backend,
+                None,
             );
         }
 
@@ -412,6 +415,7 @@ mod tests {
                 window: None,
             },
             Some(&mut scores),
+            None,
         )
         .unwrap();
 
@@ -479,6 +483,7 @@ mod tests {
                 window: None,
             },
             None,
+            None,
         )
         .unwrap();
 
@@ -520,6 +525,7 @@ mod tests {
                 n_heads_q,
                 window: None,
             },
+            None,
             None,
         )
         .unwrap();

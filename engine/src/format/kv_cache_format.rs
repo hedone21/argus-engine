@@ -92,6 +92,11 @@ pub trait KVCacheFormat: Send + Sync {
     /// `scores` 가 `Some` 이면 raw post-softmax score 를 기록한다(생산 seam — 누적·소비는 밖).
     /// quant-window AWQE 자기-need 는 impl 내부에서 자가 흡수한다(base trait 에 `needs_attn_scores` 없음,
     /// §4.1 R4 ③).
+    ///
+    /// `prefill_scores` (R-P1-1): `Some((out_scores, q_window))` 면 prefill 시 trailing q_window 의
+    /// per-attention-head attention 확률을 `out_scores` 에 SUM-누적한다(side-channel, `out` 불변).
+    /// `None`(decode / producer 미무장) = 기존과 byte-identical. `StandardFormat` 만 실제 산출하고
+    /// 나머지 format 은 None pass-through(prefill arm 의 free fn 에 None 전달).
     fn attention_into(
         &self,
         q: &Tensor,
@@ -99,6 +104,7 @@ pub trait KVCacheFormat: Send + Sync {
         out: &mut Tensor,
         dims: AttnDims,
         scores: Option<&mut [f32]>,
+        prefill_scores: Option<(&mut [f32], usize)>,
     ) -> Result<()>;
 
     // ── capability-handle (default) ──

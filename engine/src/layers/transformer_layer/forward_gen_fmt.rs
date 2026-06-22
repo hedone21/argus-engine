@@ -197,6 +197,7 @@ impl TransformerLayer {
                     &mut ws.out_attn,
                     AttnDims { n_heads_q, window },
                     scores_arg,
+                    None, // R-P1-1: decode 는 PFA 미산출.
                 )?;
             }
         }

@@ -214,6 +214,10 @@ impl DecodeLoop {
         // PrefillEnd: prefill 산출(logits) 직후, Ok(logits) 직전 (β-7: v1 on_prefill_end
         // observer 루프 제거 — prefill-end 관찰은 PrefillEnd stage 구독으로 수렴).
         let _ = self.dispatch_phase(LifecyclePhase::PrefillEnd);
+        // R-P1-1: PrefillEnd stage(PrefillKeepSetStage)가 prefix 를 prune 했으면 self.pos 를 held
+        // handle 의 current_pos 로 보정(+ GPU plan invalidate). kv_pos_handle==None(prune 없음/
+        // 미무장)이면 거동-0(검증된 no-op) — prune 미적용 시 current_pos==pos.
+        self.reconcile_kv_pos_after_eviction();
         Ok(logits)
     }
 

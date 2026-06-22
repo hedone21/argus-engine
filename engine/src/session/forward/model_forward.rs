@@ -88,6 +88,14 @@ pub struct ModelForward {
     // stage) → forward arg None → seam `is_some` gate skips the per-step cost (INV-147).
     query_stats_accumulator: Option<QueryStatsAccumulator>,
 
+    // R-P1-1 PFA producer. assembly 가 생성해 PrefillKeepSetStage 와 공유하는 cell(score_cell 패턴).
+    // `wants_prefill_attn` 이면 prefill 최종 청크가 layer 별 `[n_heads_q * prefix_len]` SUM-pooled
+    // attention 확률을 채워 이 cell 에 넣고, stage 가 PrefillEnd 에서 읽는다. 미무장 시 더미 None cell +
+    // false → prefill 비용 0(byte-identical). `q_window` 는 plugin policy(arming 시 주입).
+    prefill_attn_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+    wants_prefill_attn: bool,
+    q_window: usize,
+
     decode_workspace: LayerWorkspace,
     // Phase 4-4.5: paradigm equivalence requires `prefill_workspace: None`
     // in `forward_into` args so production owned-ws path is hit. These two
@@ -184,6 +192,9 @@ impl ModelForward {
             score_cell,
             read_stage: None,
             query_stats_accumulator: None,
+            prefill_attn_cell: Arc::new(Mutex::new(None)),
+            wants_prefill_attn: false,
+            q_window: 0,
             decode_workspace,
             prefill_workspace: None,
             max_seq_len,
@@ -230,6 +241,15 @@ impl ModelForward {
             acc.set_active(true);
             self.query_stats_accumulator = Some(acc);
         }
+    }
+
+    /// R-P1-1: prefill-end PFA producer 무장(`set_read_stage` 미러). assembly 가 PrefillKeepSetStage 와
+    /// 공유하는 `cell` Arc + plugin policy `q_window` 를 주입한다. 미호출(production 기본)이면 PFA 미산출
+    /// → prefill byte-identical(`wants_prefill_attn=false`).
+    pub fn set_prefill_attn(&mut self, cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>, q_window: usize) {
+        self.prefill_attn_cell = cell;
+        self.wants_prefill_attn = true;
+        self.q_window = q_window;
     }
 
     /// Phase 4-4.7 (A1): plan eligibility 검사 + build 시도.
@@ -458,6 +478,24 @@ impl Forward for ModelForward {
                 .iter()
                 .map(|f| f.clone() as Arc<dyn KVCacheFormat>)
                 .collect();
+            // R-P1-1: 최종 prefill 청크 + 무장 시에만 PFA buffer 할당(layer 별 `[n_heads_q * prefix_len]`,
+            // pre-zero SUM 누적용). CPU(PR1)는 단일 청크라 항상 여기서 1회. forward 후 cell 적재 → stage
+            // 가 PrefillEnd 에서 소비. 미무장/비최종 청크면 None → byte-identical.
+            let is_final_chunk = chunk_end == seq_len;
+            let q_window = self.q_window;
+            let mut pfa_buf: Option<Vec<Vec<f32>>> = if self.wants_prefill_attn && is_final_chunk {
+                let cfg = &self.model.config;
+                let n_heads_q = cfg.num_attention_heads;
+                let n_layers = cfg.num_hidden_layers;
+                let prefix_len = start_pos + seq_len;
+                Some(
+                    (0..n_layers)
+                        .map(|_| vec![0.0f32; n_heads_q * prefix_len])
+                        .collect(),
+                )
+            } else {
+                None
+            };
             self.model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &input_tensor,
                 start_pos: start_pos + chunk_start,
@@ -478,7 +516,13 @@ impl Forward for ModelForward {
                 // hook 주입 안 함 — 항상 None.
                 layer_boundary_hook: None,
                 read_stage: None,
+                // R-P1-1: 최종 청크 무장 시에만 Some — layer loop 가 buf[i] 슬라이스에 PFA 누적.
+                prefill_attn: pfa_buf.as_mut().map(|b| (b, q_window)),
             })?;
+            // R-P1-1: forward 산출된 PFA buffer 를 공유 cell 에 적재(stage 가 PrefillEnd 에서 read).
+            if let Some(buf) = pfa_buf {
+                *self.prefill_attn_cell.lock().unwrap() = Some(buf);
+            }
 
             chunk_start = chunk_end;
         }
@@ -622,6 +666,8 @@ impl Forward for ModelForward {
             layer_boundary_hook: hook.as_deref(),
             // decode read-plan seam. None(production) 이면 transformer.rs seam 1회 분기.
             read_stage: read_stage_slot,
+            // R-P1-1: decode 는 PFA 미산출(prefill-only producer).
+            prefill_attn: None,
         })?;
         drop(score_guard); // guard 명시 해제 (end_step 이미 완료)
         self.read_logits(&self.logits_decode)

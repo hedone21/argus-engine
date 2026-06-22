@@ -390,6 +390,7 @@ pub fn run_quant_window_ppl(
                 cache_self_need_scores,
                 layer_boundary_hook: None,
                 read_stage: None,
+                prefill_attn: None,
             })
         })?;
 
@@ -475,6 +476,7 @@ pub fn run_quant_window_ppl(
                 cache_self_need_scores,
                 layer_boundary_hook: None,
                 read_stage: None,
+                prefill_attn: None,
             })
         })?;
 
@@ -819,6 +821,7 @@ pub fn run_ppl(
                 cache_self_need_scores: false,
                 layer_boundary_hook: None,
                 read_stage: None,
+                prefill_attn: None,
             })
         })?;
 
@@ -984,6 +987,7 @@ pub fn run_ppl(
                 cache_self_need_scores: false,
                 layer_boundary_hook: None,
                 read_stage: None,
+                prefill_attn: None,
             })
         })?;
 

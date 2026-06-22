@@ -282,6 +282,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
                     cache_self_need_scores: probe_need,
                     layer_boundary_hook: None,
                     read_stage: None,
+                    prefill_attn: None,
                 })
             })?;
 
@@ -375,6 +376,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
                             cache_self_need_scores: dec_need,
                             layer_boundary_hook: None,
                             read_stage: None,
+                            prefill_attn: None,
                         })
                     })?;
 
@@ -595,6 +597,7 @@ fn run_importance_pass<C: EvalCacheKind>(
             cache_self_need_scores: false,
             layer_boundary_hook: None,
             read_stage: None,
+            prefill_attn: None,
         })
     })?;
 
@@ -735,6 +738,7 @@ fn run_token_by_token_prefill<C: EvalCacheKind>(
                 cache_self_need_scores: tbt_need,
                 layer_boundary_hook: None,
                 read_stage: None,
+                prefill_attn: None,
             })
         })?;
     }
@@ -805,6 +809,7 @@ fn run_full_prefill<C: EvalCacheKind>(
             cache_self_need_scores: fp_need,
             layer_boundary_hook: None,
             read_stage: None,
+            prefill_attn: None,
         })
     })?;
 
@@ -897,6 +902,7 @@ fn run_chunked_prefill<C: EvalCacheKind>(
             cache_self_need_scores: fp_need,
             layer_boundary_hook: None,
             read_stage: None,
+            prefill_attn: None,
         })
     })?;
 
@@ -955,6 +961,7 @@ fn run_chunked_prefill<C: EvalCacheKind>(
                 cache_self_need_scores: cp_need,
                 layer_boundary_hook: None,
                 read_stage: None,
+                prefill_attn: None,
             })
         })?;
         start_pos += 1;

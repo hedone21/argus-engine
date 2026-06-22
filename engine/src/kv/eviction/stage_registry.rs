@@ -254,6 +254,42 @@ impl TensorHandle for QueryStatsHandle<'_> {
     }
 }
 
+/// `tensor(PrefillAttention)` 핸들 — per-ATTENTION-head(pre-GQA) prefill attention 확률, q_window SUM-pooled.
+/// 레이아웃 `[n_heads x prefix_len]` row-major: `data[row*cols + key_pos]`,
+/// row=attention head(NOT kv_head), cols=prefix_len. 이 핸들만 per_head:false → kv_head 인자 무시,
+/// head 정체성은 `row`. (Key/Value/Scores/AttnWeights/QueryStats 는 kv_head 인덱싱 + per_head:true.)
+struct PrefillAttnHandle<'a> {
+    data: &'a [f32],
+    rows: usize, // = n_heads_q (attention heads, pre-GQA)
+    cols: usize, // = prefix_len
+}
+impl TensorHandle for PrefillAttnHandle<'_> {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: self.rows,
+            cols: self.cols,
+            per_head: false,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        TensorDtype::F32
+    }
+    fn read_row(&self, row: usize, _kv_head: usize, out: &mut [f32]) {
+        debug_assert_eq!(
+            out.len(),
+            self.cols,
+            "PrefillAttention read_row: out.len must == cols(prefix_len)"
+        );
+        let base = row * self.cols;
+        let n = self.cols.min(out.len());
+        if base + n <= self.data.len() {
+            out[..n].copy_from_slice(&self.data[base..base + n]);
+        } else {
+            out[..n].fill(0.0);
+        }
+    }
+}
+
 /// `&KVCache`(+ budget + scores) 위로 구현한 [`StageCtx`].
 ///
 /// 모든 텐서/스코어 읽기는 [`StageCtx::tensor`] 단일 경로로 흐른다: Key/Value 핸들은 항상,
@@ -277,6 +313,9 @@ pub(crate) struct KVStageCtx<'a> {
     scores_handle: Option<ScalarHandle<'a>>,
     attn_handle: Option<ScalarHandle<'a>>,
     query_stats_handle: Option<QueryStatsHandle<'a>>,
+    /// R-P1-1: prefill-end producer 가 채운 `[n_heads_q x prefix_len]` SUM-pooled PFA 슬라이스.
+    /// `None`=미공급(`tensor(PrefillAttention)`→None, byte-identical disabled path).
+    prefill_attn_handle: Option<PrefillAttnHandle<'a>>,
 }
 
 impl<'a> KVStageCtx<'a> {
@@ -316,6 +355,9 @@ impl<'a> KVStageCtx<'a> {
                 max_seq,
             }),
             query_stats_handle: query_stats.map(|data| QueryStatsHandle { data, head_dim }),
+            // R-P1-1: producer 가 채울 때만 `with_prefill_attn` 으로 Some (signature 불변 → 기존
+            // caller 전부 무수정 + disabled path 자동 byte-identical).
+            prefill_attn_handle: None,
         }
     }
 
@@ -324,6 +366,22 @@ impl<'a> KVStageCtx<'a> {
     pub(crate) fn with_layer(mut self, layer_idx: usize, n_layers: usize) -> Self {
         self.layer_idx = layer_idx;
         self.n_layers = n_layers;
+        self
+    }
+
+    /// R-P1-1: prefill-end producer 가 채운 `[n_heads x prefix_len]` SUM-pooled PFA 슬라이스 주입.
+    /// 미호출 시 `tensor(PrefillAttention)==None` (byte-identical disabled path).
+    pub(crate) fn with_prefill_attn(
+        mut self,
+        data: &'a [f32],
+        n_heads: usize,
+        prefix_len: usize,
+    ) -> Self {
+        self.prefill_attn_handle = Some(PrefillAttnHandle {
+            data,
+            rows: n_heads,
+            cols: prefix_len,
+        });
         self
     }
 }
@@ -363,6 +421,10 @@ impl StageCtx for KVStageCtx<'_> {
             TensorKind::AttnWeights => self.attn_handle.as_ref().map(|h| h as &dyn TensorHandle),
             TensorKind::QueryStats => self
                 .query_stats_handle
+                .as_ref()
+                .map(|h| h as &dyn TensorHandle),
+            TensorKind::PrefillAttention => self
+                .prefill_attn_handle
                 .as_ref()
                 .map(|h| h as &dyn TensorHandle),
         }
@@ -810,6 +872,25 @@ pub fn make_stage(name: &str, params: &StageParams) -> Option<Box<dyn KVCacheSta
     make_stage_with_args(name, params, &[])
 }
 
+/// R-P1-1: 등록된 KV stage 중 `TensorKind::PrefillAttention` 을 읽는 첫 stage 이름(없으면 `None`).
+/// `build_standard_loop` 의 PFA producer arming gate — **caps-driven**(plugin-name 무지, `wants_query_stats`
+/// 와 동형). PR1 은 그런 builtin 이 0개라 항상 `None`(arming dormant → byte-identical). R-P1-2 의
+/// per-head keep-set plugin 이 `caps.reads ∋ PrefillAttention` 으로 등록되면 그때 활성화된다.
+pub fn find_prefill_attn_stage_name() -> Option<String> {
+    // 정적(linkme) 빌트인.
+    if let Some(reg) = argus_extension_api::KV_CACHE_STAGES
+        .iter()
+        .find(|r| r.caps.reads.contains(&TensorKind::PrefillAttention))
+    {
+        return Some(reg.name.to_string());
+    }
+    // 동적(dlopen) plugin — caps 는 stage_caps(name) 로 해석.
+    dynamic_registered_stage_names().into_iter().find(|name| {
+        argus_extension_api::stage_caps(name)
+            .is_some_and(|c| c.reads.contains(&TensorKind::PrefillAttention))
+    })
+}
+
 /// 동적 plugin stage 의 host 측 어댑터 — vtable 마샬링으로 [`KVCacheStage`] 를 구현(D2).
 struct DynStage {
     handle: *mut c_void,
@@ -932,6 +1013,7 @@ fn tensor_kind_from_u32(k: u32) -> Option<TensorKind> {
         2 => Some(TensorKind::AttnWeights),
         3 => Some(TensorKind::Scores),
         4 => Some(TensorKind::QueryStats),
+        5 => Some(TensorKind::PrefillAttention),
         _ => None,
     }
 }
@@ -1213,6 +1295,44 @@ mod tests {
     }
 
     #[test]
+    fn kvstagectx_prefill_attn_handle_round_trip() {
+        // R-P1-1 seam: with_prefill_attn → tensor(PrefillAttention) Some, shape
+        // {rows:n_heads_q, cols:prefix_len, per_head:false}, read_row(row, _kv_head) = data[row*cols..].
+        // 미공급 ctx → None(distinctness: decode/unarmed 에서 wrong-tensor 아닌 loud None).
+        let c = mk(DType::F32, 4);
+        let n_heads_q = 2;
+        let prefix_len = c.current_pos(); // 4
+        // [n_heads_q x prefix_len] row-major: data[row*prefix_len + key_pos].
+        let pfa: Vec<f32> = (0..n_heads_q * prefix_len)
+            .map(|i| i as f32 + 0.5)
+            .collect();
+        let ctx = KVStageCtx::new(&c, 0, None, None, None, None)
+            .with_prefill_attn(&pfa, n_heads_q, prefix_len);
+        let h = ctx
+            .tensor(TensorKind::PrefillAttention)
+            .expect("PrefillAttention handle Some when supplied");
+        let shape = h.shape();
+        assert_eq!(shape.rows, n_heads_q);
+        assert_eq!(shape.cols, prefix_len);
+        assert!(
+            !shape.per_head,
+            "PFA per_head must be false (per-attention-head)"
+        );
+        assert_eq!(h.dtype(), TensorDtype::F32);
+        // read_row: per-attention-head row, kv_head 인자 무시(per_head=false).
+        let mut out = vec![0.0f32; prefix_len];
+        h.read_row(1, 999 /* kv_head ignored */, &mut out);
+        for kp in 0..prefix_len {
+            assert_eq!(out[kp], (prefix_len + kp) as f32 + 0.5, "row 1 key {kp}");
+        }
+        // 미공급 → None (decode/unarmed distinctness).
+        let bare = KVStageCtx::new(&c, 0, None, None, None, None);
+        assert!(bare.tensor(TensorKind::PrefillAttention).is_none());
+        // u32 round-trip 역매핑(disc 5).
+        assert_eq!(tensor_kind_from_u32(5), Some(TensorKind::PrefillAttention));
+    }
+
+    #[test]
     fn kvstagectx_scores_and_attn_handles() {
         // (M-D) Scores/AttnWeights 핸들 — 공급 시 per-(kv_head,pos) 스칼라 읽기, 미공급 시 None.
         let c = mk(DType::F32, 4); // kv_heads=1
@@ -1277,7 +1397,7 @@ mod tests {
         assert!(bare.tensor(TensorKind::QueryStats).is_none());
     }
 
-    /// TQS-9: `tensor_kind_from_u32(4)==Some(QueryStats)`, `(5)==None` + 0~3 불변 (MQ-5 역매핑).
+    /// TQS-9: `(4)==Some(QueryStats)`, `(5)==Some(PrefillAttention)`(R-P1-1), `(6)==None` + 0~3 불변.
     #[test]
     fn tensor_kind_from_u32_query_stats() {
         assert_eq!(tensor_kind_from_u32(0), Some(TensorKind::Key));
@@ -1285,7 +1405,8 @@ mod tests {
         assert_eq!(tensor_kind_from_u32(2), Some(TensorKind::AttnWeights));
         assert_eq!(tensor_kind_from_u32(3), Some(TensorKind::Scores));
         assert_eq!(tensor_kind_from_u32(4), Some(TensorKind::QueryStats));
-        assert_eq!(tensor_kind_from_u32(5), None);
+        assert_eq!(tensor_kind_from_u32(5), Some(TensorKind::PrefillAttention));
+        assert_eq!(tensor_kind_from_u32(6), None);
     }
 
     #[test]
@@ -1544,6 +1665,7 @@ mod tests {
                 TensorKind::Scores => &self.h_scores,
                 TensorKind::AttnWeights => &self.h_attn,
                 TensorKind::QueryStats => &self.h_qstats,
+                TensorKind::PrefillAttention => return None,
             })
         }
     }
