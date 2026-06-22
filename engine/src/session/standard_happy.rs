@@ -4,6 +4,7 @@
 //! `bin/generate.rs::main()` L1764~1844 분기를 외과적으로 이동.
 //! DecodeLoop + ModelForward 위임 경로.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use tokenizers::Tokenizer;
@@ -18,6 +19,7 @@ use crate::kv::standard_format::StandardFormat;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::session::assembly::build_standard_loop;
+use crate::session::chat::stream_stage::{ChatStreamSlot, IncDetok};
 use crate::session::cli::Args;
 use crate::session::prefix_cache::{RestoredPrefix, try_restore_prefix};
 use crate::session::resilience_adapter::ResilienceAdapter;
@@ -186,6 +188,11 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
     // 이미 reject 되므로 여기 도달하는 정책은 항상 score-free.
     let cache_manager = crate::session::assembly::build_resilience_cache_manager(&args, &backend)?;
 
+    // Per-token streaming slot: the decode loop's ChatStreamStage emits each kept token into it.
+    // Armed below for the synchronous run() so tokens print as they land (instead of one batch
+    // decode+println after the loop). build_standard_loop forces a registry when this is Some.
+    let stream_slot = ChatStreamSlot::new();
+
     // bin_setup이 --kv-format/--kv-type dispatch로 할당한 kv_caches를
     // 그대로 소비한다(과거엔 drop 후 build_standard_loop이 typed로 재할당 →
     // --kv-format opaque 선택이 decode 경로에 도달 못 했다).
@@ -202,6 +209,7 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         args.effective_read_stage(),
         cache_manager,
         args.eviction_target_ratio(),
+        Some(Arc::clone(&stream_slot)),
     )?;
 
     // ── prefill / restore 분기 ────────────────────────────────────────────────
@@ -279,17 +287,51 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         None,
     );
 
+    // ── per-token streaming output ────────────────────────────────────────────
+    // Echo the prompt, print the first sampled token, then arm the stream slot so every token the
+    // decode loop produces is detokenized and flushed as it lands (the chat repl/server pattern).
+    // `IncDetok` decodes the growing id vec and emits only newly-completed UTF-8, so the bytes
+    // written equal the previous `decode(prompt + first + generated)` + '\n' exactly — same final
+    // output, just delivered live. (detok+flush runs inside the decode-timed region, but its cost is
+    // ~µs/token, negligible against per-token forward.)
+    let mut detok = IncDetok::new();
+    let mut out = std::io::stdout().lock();
+    for &t in &tokens {
+        let piece = detok.push(t, &tokenizer);
+        if !piece.is_empty() {
+            let _ = write!(out, "{piece}");
+        }
+    }
+    let piece = detok.push(first_token, &tokenizer);
+    if !piece.is_empty() {
+        let _ = write!(out, "{piece}");
+    }
+    let _ = out.flush();
+
     let t_decode = std::time::Instant::now();
-    let result = decode_loop.run(args.num_tokens - 1, first_token)?;
+    let result = {
+        let detok_ref = &mut detok;
+        let out_ref = &mut out;
+        let mut cb = |tok: u32| {
+            let piece = detok_ref.push(tok, &tokenizer);
+            if !piece.is_empty() {
+                let _ = write!(out_ref, "{piece}");
+                let _ = out_ref.flush();
+            }
+        };
+        let _guard = stream_slot.arm(&mut cb);
+        decode_loop.run(args.num_tokens - 1, first_token)?
+    };
     let decode_total_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
 
-    let mut final_tokens: Vec<u32> = tokens.clone();
-    final_tokens.push(first_token);
-    final_tokens.extend_from_slice(&result.tokens_generated);
-    let decoded = tokenizer
-        .decode(&final_tokens, true)
-        .unwrap_or_else(|_| String::from("[decode error]"));
-    println!("{}", decoded);
+    // Flush bytes held back at a multi-byte boundary, then end the line (matches the old println).
+    let tail = detok.flush(&tokenizer);
+    if !tail.is_empty() {
+        let _ = write!(out, "{tail}");
+    }
+    let _ = writeln!(out);
+    let _ = out.flush();
+    drop(out); // release the stdout lock before the summary println!s below
 
     let decode_tokens = result.tokens_generated.len();
     let total_gen = 1 + decode_tokens;

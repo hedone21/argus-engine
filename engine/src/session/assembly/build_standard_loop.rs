@@ -32,6 +32,7 @@ use crate::kv::kv_cache::KVCache;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::pipeline::PressureSource;
+use crate::session::chat::stream_stage::{ChatStreamSlot, ChatStreamStage};
 use crate::session::cli::Args;
 use crate::session::command_dispatcher::CommandDispatcher;
 use crate::session::forward::ModelForward;
@@ -115,6 +116,9 @@ pub fn build_standard_loop(
     cache_manager: Option<CacheManager>,
     // force_evict target ratio(CLI `--eviction-target-ratio`). `cache_manager=None` 이면 무시.
     eviction_target_ratio: f32,
+    // argus-cli per-token streaming subscriber. `Some(slot)` submits a DecodeEnd `ChatStreamStage`
+    // (and forces a registry to exist); `None` = no streaming = byte-identical to before (bench/eval).
+    stream_slot: Option<Arc<ChatStreamSlot>>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고한다.
@@ -186,7 +190,7 @@ pub fn build_standard_loop(
     // eviction(CM) 또는 resilience 가 있을 때만 registry 를 만든다. 둘 다 없으면(순수 happy-path,
     // eviction none + no-resilience) registry/dispatcher/pos-handle/pressure 미배선 = 기존과
     // byte-identical 조립(INV: 회귀 0).
-    let needs_registry = resilience.is_some() || cache_manager.is_some();
+    let needs_registry = resilience.is_some() || cache_manager.is_some() || stream_slot.is_some();
     let registry = needs_registry.then(|| Arc::new(PipelineRegistry::new()));
 
     // score-free eviction(sliding/streaming/`--load-plugin` stage): KV-fill 압력 구동 Persistent
@@ -251,6 +255,15 @@ pub fn build_standard_loop(
         }
         None => (None, None),
     };
+
+    // argus-cli per-token streaming: a DecodeEnd subscriber forwarding each kept token to the armed
+    // callback. Submitted after the eviction stage (phase-disjoint → order immaterial); a no-op
+    // until the slot is armed for the synchronous run(). bench/eval pass `None` = nothing submitted.
+    if let Some(slot) = stream_slot
+        && let Some(registry) = registry.as_ref()
+    {
+        registry.submit(Arc::new(ChatStreamStage::new(slot)));
+    }
 
     // Phase 4-4.7: sampler 자동 선택. production `sampling::sample`은
     // temperature=0 + repetition_penalty=1.0이면 raw argmax와 동치이므로 두 조건이
