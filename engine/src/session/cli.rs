@@ -796,8 +796,9 @@ pub struct Args {
     #[arg(long)]
     pub tbt_log: Option<String>,
 
-    /// KV cache memory layout: "head" (head-major) or "seq" (seq-major)
-    #[arg(long, default_value = "head")]
+    /// KV cache memory layout: "head" (head-major, GPU flash-decode default) or
+    /// "seq" (seq-major, CPU). GPU forces "head" (flash decode is HeadMajor-only).
+    #[arg(long, value_parser = ["head", "seq"], default_value = "head")]
     pub kv_layout: String,
 
     /// Override eviction target_ratio from resilience signals (experiment mode).

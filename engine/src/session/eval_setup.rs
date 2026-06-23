@@ -386,6 +386,8 @@ pub fn build_eval_ll_ctx(args: Args) -> Result<EvalLlRunCtx> {
     let score_based_eviction = is_score_based_eviction(&args);
 
     // eval 모드는 grow() 스파이크 회피로 capacity=max_seq_len 전량 선할당 (legacy:408).
+    let kv_layout = crate::kv_cache_ops::KVLayout::from_cli(&args.kv_layout)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported --kv-layout: '{}'", args.kv_layout))?;
     let kv_caches = alloc_standard_kv_caches(
         &backend,
         memory.clone(),
@@ -395,6 +397,7 @@ pub fn build_eval_ll_ctx(args: Args) -> Result<EvalLlRunCtx> {
         kv_heads,
         head_dim,
         kv_type,
+        kv_layout,
     )?;
 
     let cache_manager = build_eval_cache_manager(&args, &backend, actual_protected_prefix)?;
@@ -464,6 +467,8 @@ pub fn build_ppl_ctx(args: Args) -> Result<PplRunCtx> {
     let score_based_eviction = is_score_based_eviction(&args);
     let auto_eviction = args.eviction_policy() != "none" && args.experiment_schedule.is_none();
 
+    let kv_layout = crate::kv_cache_ops::KVLayout::from_cli(&args.kv_layout)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported --kv-layout: '{}'", args.kv_layout))?;
     let mut kv_caches = alloc_standard_kv_caches(
         &backend,
         memory.clone(),
@@ -473,6 +478,7 @@ pub fn build_ppl_ctx(args: Args) -> Result<PplRunCtx> {
         kv_heads,
         head_dim,
         kv_type,
+        kv_layout,
     )?;
 
     let cache_manager = build_eval_cache_manager(&args, &backend, actual_protected_prefix)?;
@@ -566,6 +572,8 @@ pub fn build_dump_importance_ctx(args: Args) -> Result<DumpImportanceCtx> {
     let vocab_size = base.model.config.vocab_size;
     let model_path = args.model_path.clone();
     // KV capacity=max_seq_len 선할당 (eval 모드 일관 — grow 스파이크 회피).
+    let kv_layout = crate::kv_cache_ops::KVLayout::from_cli(&args.kv_layout)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported --kv-layout: '{}'", args.kv_layout))?;
     let kv_caches = alloc_standard_kv_caches(
         &base.backend,
         base.memory.clone(),
@@ -575,6 +583,7 @@ pub fn build_dump_importance_ctx(args: Args) -> Result<DumpImportanceCtx> {
         base.model.config.num_key_value_heads,
         base.model.config.head_dim,
         base.kv_type,
+        kv_layout,
     )?;
     Ok(DumpImportanceCtx {
         backend: base.backend,

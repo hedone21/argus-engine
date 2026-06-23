@@ -20,6 +20,18 @@ pub enum KVLayout {
     HeadMajor,
 }
 
+impl KVLayout {
+    /// Parse the `--kv-layout` CLI value (`"head"`/`"seq"`). Returns `None` for
+    /// any other value (clap already restricts the surface via `value_parser`).
+    pub fn from_cli(s: &str) -> Option<Self> {
+        match s {
+            "head" => Some(KVLayout::HeadMajor),
+            "seq" => Some(KVLayout::SeqMajor),
+            _ => None,
+        }
+    }
+}
+
 /// Raw GPU buffer references for native quant-window fused attention.
 ///
 /// Provides direct access to quantized KV blocks and F32 residual buffers

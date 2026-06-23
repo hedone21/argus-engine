@@ -71,6 +71,10 @@ impl CachePressureHandler for EvictionHandler {
             ctx.caches,
             target_len,
             scores,
+            // Per-layer KV budget (R-P1-6) is not yet armed from the eviction signal — the
+            // mechanism lives in `run_policy_eviction`; production arming (CLI + warmup compute)
+            // is a follow-up. `None` keeps this path byte-identical to the uniform behavior.
+            None,
         )?;
 
         if result.evicted {

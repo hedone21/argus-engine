@@ -433,6 +433,7 @@ impl CacheManager {
         caches: &mut [KVCache],
         target_len: usize,
         scores: ScoreContext,
+        per_layer_target_len: Option<&[usize]>,
     ) -> Result<EvictionResult> {
         if caches.is_empty() {
             return Ok(EvictionResult {
@@ -443,28 +444,35 @@ impl CacheManager {
         }
 
         let current_pos = max_cache_pos(caches);
-        if target_len > 0 && current_pos <= target_len {
-            return Ok(EvictionResult {
-                evicted: false,
-                tokens_removed: 0,
-                new_pos: current_pos,
-            });
-        }
 
-        if target_len > 0 {
-            let tokens_to_remove = current_pos - target_len;
-            if tokens_to_remove < MIN_EVICT_TOKENS {
-                log::debug!(
-                    "[CacheManager] skip: policy='{}', tokens_to_remove={} < MIN_EVICT_TOKENS={}",
-                    policy.name(),
-                    tokens_to_remove,
-                    MIN_EVICT_TOKENS,
-                );
+        // Global guards apply only to the uniform (scalar `target_len`) path. With per-layer
+        // budgets (R-P1-6) each layer self-guards inside the loop, since layers have different
+        // targets, so the global early-returns are skipped. When `per_layer_target_len` is
+        // `None` this is byte-identical to the previous behavior (Gate-0).
+        if per_layer_target_len.is_none() {
+            if target_len > 0 && current_pos <= target_len {
                 return Ok(EvictionResult {
                     evicted: false,
                     tokens_removed: 0,
                     new_pos: current_pos,
                 });
+            }
+
+            if target_len > 0 {
+                let tokens_to_remove = current_pos - target_len;
+                if tokens_to_remove < MIN_EVICT_TOKENS {
+                    log::debug!(
+                        "[CacheManager] skip: policy='{}', tokens_to_remove={} < MIN_EVICT_TOKENS={}",
+                        policy.name(),
+                        tokens_to_remove,
+                        MIN_EVICT_TOKENS,
+                    );
+                    return Ok(EvictionResult {
+                        evicted: false,
+                        tokens_removed: 0,
+                        new_pos: current_pos,
+                    });
+                }
             }
         }
 
@@ -490,19 +498,42 @@ impl CacheManager {
 
         let n_layers = caches.len();
         for (layer_idx, cache) in caches.iter_mut().enumerate() {
+            // Per-layer KV budget (R-P1-6): with a per-layer target vector each layer uses its
+            // own target_len (an out-of-range index falls back to the scalar); with `None` every
+            // layer uses the shared scalar `target_len` (byte-identical to the prior behavior).
+            let layer_target_len = match per_layer_target_len {
+                Some(v) => v.get(layer_idx).copied().unwrap_or(target_len),
+                None => target_len,
+            };
+
+            // Per-layer self-guard (only on the per-layer path; the uniform path was guarded above).
+            if per_layer_target_len.is_some() && layer_target_len > 0 {
+                let layer_pos = cache.current_pos;
+                if layer_pos <= layer_target_len || layer_pos - layer_target_len < MIN_EVICT_TOKENS
+                {
+                    continue;
+                }
+            }
+
             if let (Some(flat), Some(head_imp)) = (importance, head_importance) {
                 if n_kv_heads > 0 {
                     // Per-head (h2o_plus) — not a layer-aware stage, but the real (layer_idx,
                     // n_layers) is threaded through so the keep-set dump (R-P0-2) keys by layer.
                     policy.evict_with_head_scores(
-                        cache, target_len, flat, head_imp, n_kv_heads, layer_idx, n_layers,
+                        cache,
+                        layer_target_len,
+                        flat,
+                        head_imp,
+                        n_kv_heads,
+                        layer_idx,
+                        n_layers,
                     )?;
                 } else {
                     // last_attn does not vary by layer (last-layer last-step approximation),
                     // so the same slice is threaded into every layer's plan.
                     policy.evict_layer(
                         cache,
-                        target_len,
+                        layer_target_len,
                         Some(flat),
                         last_attn,
                         layer_idx,
@@ -513,26 +544,36 @@ impl CacheManager {
                 // flat-score or score-free: route through the per-layer entry so a layer-aware
                 // adapter (StageBackedPolicy → d2o) sees the real (layer_idx, n_layers).
                 policy.evict_layer(
-                    cache, target_len, importance, last_attn, layer_idx, n_layers,
+                    cache,
+                    layer_target_len,
+                    importance,
+                    last_attn,
+                    layer_idx,
+                    n_layers,
                 )?;
             }
         }
 
         let new_pos = max_cache_pos(caches);
         let tokens_removed = current_pos - new_pos;
-        let expected_removed = current_pos - target_len;
 
-        // Warn when eviction achieved significantly less than requested.
-        // This catches silent clamping by policies (e.g. protected_prefix > target_len).
-        if expected_removed > 0 && tokens_removed < expected_removed / 2 {
-            log::warn!(
-                "[CacheManager] policy='{}': eviction undershot — removed {} tokens but target was {} ({}% of request). \
-                 Check protected_prefix or policy constraints.",
-                policy.name(),
-                tokens_removed,
-                expected_removed,
-                tokens_removed * 100 / expected_removed,
-            );
+        // The undershoot warning compares against the single scalar target, so it is meaningful
+        // only on the uniform path (per-layer budgets have no single "expected" total). Gating it
+        // keeps the `None` path byte-identical.
+        if per_layer_target_len.is_none() {
+            let expected_removed = current_pos - target_len;
+            // Warn when eviction achieved significantly less than requested.
+            // This catches silent clamping by policies (e.g. protected_prefix > target_len).
+            if expected_removed > 0 && tokens_removed < expected_removed / 2 {
+                log::warn!(
+                    "[CacheManager] policy='{}': eviction undershot — removed {} tokens but target was {} ({}% of request). \
+                     Check protected_prefix or policy constraints.",
+                    policy.name(),
+                    tokens_removed,
+                    expected_removed,
+                    tokens_removed * 100 / expected_removed,
+                );
+            }
         }
 
         Ok(EvictionResult {
@@ -648,6 +689,68 @@ mod tests {
         let pos = caches[0].current_pos;
         for cache in &caches {
             assert_eq!(cache.current_pos, pos);
+        }
+    }
+
+    /// R-P1-6 end-to-end: SqueezeAttention budgets (`compute_squeeze_budgets`) flow through the
+    /// real `run_policy_eviction` per-layer path and produce *per-layer-independent* decisions —
+    /// low-budget (important-prefix-light) layers evict while higher-budget layers are preserved by
+    /// the per-layer self-guard. Exercises the budget math + the eviction mechanism together.
+    #[test]
+    fn per_layer_budget_evicts_layers_independently() {
+        use crate::kv::squeeze_budget::compute_squeeze_budgets;
+
+        let start = 100usize;
+        // Increasing per-layer importance → non-decreasing tier budgets. With pos=100 and
+        // MIN_EVICT_TOKENS=64, only budgets ≤ 36 trigger eviction; larger budgets are skipped by
+        // the per-layer self-guard. tiers low/low/mid/mid/high/high → weights 1,1,2,2,3,3 (wsum=12),
+        // total 360 → [30,30,60,60,90,90].
+        let importance = [0.05f32, 0.05, 0.5, 0.5, 0.95, 0.95];
+        let budgets = compute_squeeze_budgets(&importance, 360, 1);
+        assert_eq!(budgets, vec![30, 30, 60, 60, 90, 90], "tier allocation");
+
+        let policy = sliding_backed_policy(0, 0);
+        let mut caches = make_caches(importance.len(), start);
+        let res = CacheManager::run_policy_eviction(
+            policy.as_ref(),
+            &mut caches,
+            0, // scalar fallback unused — every index is in range
+            ScoreContext::None,
+            Some(&budgets),
+        )
+        .unwrap();
+        assert!(res.evicted);
+
+        // budget 30: 100-30=70 ≥ 64 → evicted.
+        assert!(caches[0].current_pos < start, "low-budget layer evicts");
+        assert!(caches[1].current_pos < start);
+        // budget 60: 100-60=40 < 64 → per-layer self-guard skips → preserved.
+        assert_eq!(caches[2].current_pos, start, "mid-budget layer preserved");
+        assert_eq!(caches[3].current_pos, start);
+        // budget 90: 100-90=10 < 64 → preserved.
+        assert_eq!(caches[4].current_pos, start, "high-budget layer preserved");
+        assert_eq!(caches[5].current_pos, start);
+    }
+
+    /// R-P1-6 Gate-0: with `per_layer_target_len = None` every layer uses the scalar target_len
+    /// uniformly — the pre-R-P1-6 behavior (no per-layer differentiation).
+    #[test]
+    fn per_layer_budget_none_is_uniform() {
+        let policy = sliding_backed_policy(0, 0);
+        let mut caches = make_caches(4, 100);
+        let res = CacheManager::run_policy_eviction(
+            policy.as_ref(),
+            &mut caches,
+            30,
+            ScoreContext::None,
+            None,
+        )
+        .unwrap();
+        assert!(res.evicted);
+        let p = caches[0].current_pos;
+        assert!(p < 100);
+        for c in &caches {
+            assert_eq!(c.current_pos, p, "None path must be uniform across layers");
         }
     }
 

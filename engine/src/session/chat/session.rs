@@ -528,6 +528,8 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
             256.min(max_seq_len)
         }
     };
+    let kv_layout = crate::kv_cache_ops::KVLayout::from_cli(&args.kv_layout)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported --kv-layout: '{}'", args.kv_layout))?;
     let kv_caches = crate::session::bin_setup::alloc_standard_kv_caches(
         &ctx.backend,
         ctx.memory.clone(),
@@ -537,6 +539,7 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
         ctx.kv_heads,
         ctx.head_dim,
         kv_dtype,
+        kv_layout,
     )?;
 
     // eviction setup — generate.rs build_chat_eviction 로직 이관
