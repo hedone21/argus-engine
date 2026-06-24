@@ -370,8 +370,9 @@ pub(crate) struct KVStageCtx<'a> {
     /// `None`=미공급(`tensor(PrefillAttention)`→None, byte-identical disabled path).
     prefill_attn_handle: Option<PrefillAttnHandle<'a>>,
     /// (D2) raw current-step Q `[n_kv_heads * head_dim]`, fed via [`with_query`](Self::with_query)
-    /// when a read/eviction consumer requested it (`wants_query`). `None`=미공급
-    /// (`tensor(Query)`→None, byte-identical disabled path; faithful Quest falls back to QueryStats).
+    /// on the faithful read-plan path (`StandardFormat::read_plan` calls `with_query` whenever the
+    /// forward seam supplied a current Q). `None`=미공급 (`tensor(Query)`→None, byte-identical
+    /// disabled path — production decode / offload proxy / device-degraded path).
     query_handle: Option<QueryHandle<'a>>,
 }
 
@@ -447,13 +448,12 @@ impl<'a> KVStageCtx<'a> {
     /// (D2) Inject the raw current-step Q `[n_kv_heads * head_dim]` so `tensor(Query)` returns it.
     /// Uncalled ⇒ `tensor(Query)==None` (byte-identical disabled path), mirroring `with_prefill_attn`.
     ///
-    /// DORMANT SEAM: this is the consumer-facing accessor for faithful Quest's current-Q criticality.
-    /// Its production producer — capturing the RoPE-applied Q and feeding it here — requires computing
-    /// Q BEFORE the `read_plan` seam (transformer.rs:1650 calls read_plan, then forward_gen_fmt
-    /// computes Q), i.e. a forward-pass reorder. That is the deferred ON-DEVICE execution layer; until
-    /// it lands no production site calls this (so `#[allow(dead_code)]` for the non-test build), and
-    /// faithful Quest falls back to the QueryStats running-mean. Exercised by the accessor host test.
-    #[allow(dead_code)]
+    /// LIVE SEAM (W-SIGNAL-Q): the consumer-facing accessor for faithful Quest's current-Q criticality.
+    /// Its production producer is now wired — `forward_gen_fmt` computes the RoPE-applied Q (decode,
+    /// KV-write 이전), GQA-reduces it, and `StandardFormat::read_plan` feeds it here via this method
+    /// (the seam moved INTO `forward_gen_fmt`, i.e. the forward-pass reorder that was deferred). When
+    /// fed, faithful Quest reads the current Q from `tensor(Query)`; when not (proxy/offload paths) it
+    /// falls back to the QueryStats running-mean / symmetric proxy.
     pub(crate) fn with_query(mut self, data: &'a [f32], head_dim: usize) -> Self {
         self.query_handle = Some(QueryHandle { data, head_dim });
         self
@@ -501,9 +501,8 @@ impl StageCtx for KVStageCtx<'_> {
                 .prefill_attn_handle
                 .as_ref()
                 .map(|h| h as &dyn TensorHandle),
-            // (D2) raw current-Q accessor — `Some` only when a consumer requested it (`wants_query`)
-            // and the forward-time capture fed it via `with_query`; else `None` (faithful Quest then
-            // falls back to the QueryStats running-mean approximation).
+            // (D2) raw current-Q accessor — `Some` when the forward-time capture fed it via
+            // `with_query` (faithful read-plan path); else `None` (production/offload/device-degraded).
             TensorKind::Query => self.query_handle.as_ref().map(|h| h as &dyn TensorHandle),
         }
     }

@@ -1670,9 +1670,21 @@ impl SelectiveRead for StandardFormat {
         let kv_heads = cache.kv_heads();
         let head_dim = cache.head_dim();
 
-        // gather selected tokens into F32 temporary buffers
-        let (k_f32, v_f32) = gather_selected_kv(cache, positions)?;
-        drop(guard); // lock 해제 (attention_gen 호출 전)
+        // W-DEVKV: GPU 버퍼면(`is_gpu_buffer()` — `gather_selected_kv` 가드와 동일 predicate) gather(host
+        // as_slice 필요)를 위해 host snapshot 위에서 모은다. host-native(CPU) 캐시만 직접(snapshot 없음, 비용
+        // 0). ★`as_ptr().is_null()` 이 아니라 `is_gpu_buffer()` 여야 rpcmem/mapped-UMA(host ptr 非null인
+        // GPU 버퍼)가 gather guard 와 어긋나지 않는다.
+        let needs_snapshot = cache.k_buffer.buffer().is_gpu_buffer();
+        let snapshot = if needs_snapshot {
+            Some(cache.host_snapshot()?)
+        } else {
+            None
+        };
+        let gather_cache = snapshot.as_ref().unwrap_or(cache);
+        // gather selected tokens into F32 temporary buffers (SeqMajor [1, n_sel, kv_heads, head_dim]).
+        let (k_f32, v_f32) = gather_selected_kv(gather_cache, positions)?;
+        drop(snapshot); // host mirror 해제
+        drop(guard); // lock 해제 (attention 호출 전)
 
         // gather 결과를 byte Vec으로 변환
         let k_bytes = {
@@ -1689,36 +1701,62 @@ impl SelectiveRead for StandardFormat {
             }
             b
         };
-
-        // 임시 Tensor 생성 (SeqMajor: [1, n_sel, kv_heads, head_dim] — gathered 텐서)
         let k_buf = Arc::new(SharedBuffer::from_vec(k_bytes, DType::F32));
         let v_buf = Arc::new(SharedBuffer::from_vec(v_bytes, DType::F32));
-        // gather 결과는 SeqMajor [1, n_sel, kv_heads, head_dim] 으로 배치됨.
-        // backend.attention_gen 은 SeqMajor 전제로 동작하므로 직접 위임 가능.
-        let backend_arc = q.backend().clone();
-        let k_tmp = Tensor::new(
-            Shape::new(vec![1, n_sel, kv_heads, head_dim]),
-            k_buf,
-            backend_arc.clone(),
-        );
-        let v_tmp = Tensor::new(
-            Shape::new(vec![1, n_sel, kv_heads, head_dim]),
-            v_buf,
-            backend_arc,
-        );
+        let seq_shape = Shape::new(vec![1, n_sel, kv_heads, head_dim]);
 
-        // 기존 attention_gen 재사용 (SeqMajor gathered 텐서)
-        backend.attention_gen(
-            q,
-            &k_tmp,
-            &v_tmp,
-            out,
-            dims.n_heads_q,
-            kv_heads,
-            head_dim,
-            n_sel,
-            scores,
-        )
+        if needs_snapshot {
+            // W-DEVKV Part 2: gathered subset attention 을 CPU(reference-correct)로 계산한 뒤 device `out`
+            // 으로 upload. gathered K/V 는 host F32 SeqMajor 라 GPU attention_gen(device cl_mem 전제)에
+            // 직접 못 넘긴다 → q(device)를 host 로 읽고 CpuBackend.attention_gen 으로 계산(검증된 정본
+            // 경로 — host SelectiveRead 와 동일 커널), 결과를 write_buffer 로 device out 에 쓴다. opt-in
+            // read-stage 경로만 진입(production 미진입). 정확성은 host select-all==full read 테스트가 고정.
+            use crate::backend::cpu::CpuBackend;
+            let cpu: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+            let mut q_host_bytes = vec![0u8; q.size()];
+            backend.read_buffer(q, &mut q_host_bytes)?;
+            let q_host = Tensor::new(
+                q.shape().clone(),
+                Arc::new(SharedBuffer::from_vec(q_host_bytes, q.dtype())),
+                cpu.clone(),
+            );
+            let k_tmp = Tensor::new(seq_shape.clone(), k_buf, cpu.clone());
+            let v_tmp = Tensor::new(seq_shape, v_buf, cpu.clone());
+            let mut out_host = Tensor::new(
+                out.shape().clone(),
+                Arc::new(SharedBuffer::new(out.size(), out.dtype())),
+                cpu.clone(),
+            );
+            cpu.attention_gen(
+                &q_host,
+                &k_tmp,
+                &v_tmp,
+                &mut out_host,
+                dims.n_heads_q,
+                kv_heads,
+                head_dim,
+                n_sel,
+                scores,
+            )?;
+            backend.write_buffer(out, out_host.as_slice::<u8>())?;
+            Ok(())
+        } else {
+            // host-resident: gathered SeqMajor 텐서를 backend.attention_gen 에 직접 위임(기존 경로).
+            let backend_arc = q.backend().clone();
+            let k_tmp = Tensor::new(seq_shape.clone(), k_buf, backend_arc.clone());
+            let v_tmp = Tensor::new(seq_shape, v_buf, backend_arc);
+            backend.attention_gen(
+                q,
+                &k_tmp,
+                &v_tmp,
+                out,
+                dims.n_heads_q,
+                kv_heads,
+                head_dim,
+                n_sel,
+                scores,
+            )
+        }
     }
 
     /// read stage 를 자기 `Mutex<KVCache>` 위에서 호출. ctx 구성·borrow 가
@@ -1728,15 +1766,36 @@ impl SelectiveRead for StandardFormat {
         &self,
         rs: &dyn KVReadStage,
         _layer_idx: usize,
+        query: Option<&[f32]>,
         query_stats: Option<&[f32]>,
     ) -> Option<KVReadPlan> {
         use crate::kv::eviction::stage_registry::KVStageCtx;
         let guard = self.inner.lock().unwrap();
+        // W-DEVKV: read stage 가 K/V 내용을 읽으려면(`tensor(Key)`→dequantize_k→as_slice / gather)
+        // host-resident 버퍼가 필요하다. **GPU 버퍼면(`is_gpu_buffer()` — device-only OpenCLBuffer /
+        // UMA UnifiedBuffer(mapped 여부 무관) / rpcmem 모두 포함)** device→host snapshot 을 1회 떠서 그
+        // 위에 ctx 를 만든다(geometry 동일 → dequantize_* byte-identical, snapshot 은 host SharedBuffer →
+        // gather guard 통과). ★predicate 는 `gather_selected_kv` 의 `is_gpu_buffer()` 가드와 반드시 일치해야
+        // 한다 — `as_ptr().is_null()` 로 판정하면 rpcmem/mapped-UMA(host ptr 非null이지만 GPU 버퍼)가 direct
+        // 경로로 새서 gather 가 bail(decode abort). host-native(CPU) 캐시만 direct(비용 0). snapshot 실패 시
+        // None(full read 폴백). production decode(read_stage=None)는 이 메서드 미진입이라 비용 0.
+        let needs_snapshot = guard.cache.k_buffer.buffer().is_gpu_buffer();
+        let snapshot = if needs_snapshot {
+            Some(guard.cache.host_snapshot().ok()?)
+        } else {
+            None
+        };
+        let cache_ref = snapshot.as_ref().unwrap_or(&guard.cache);
         // read stage 는 budget(target_len) 을 읽지 않는다(읽기 범위 결정 ≠ keep budget). importance/
         // scores 미공급(None) — read stage 는 `tensor(Key)`/`tensor(Value)` 로 자기 page 메타를
-        // incremental 갱신한다(D5). query_stats 는 read-stage 가 wants_query_stats 일 때 디코드 루프가
-        // `QueryStatsAccumulator::layer_stats` 를 공급(read stage 의 future-attention), 아니면 None.
-        let ctx = KVStageCtx::new(&guard.cache, 0, None, None, None, query_stats);
+        // incremental 갱신한다(D5). query_stats 는 dormant fallback(현재 production producer 없음).
+        let head_dim = cache_ref.head_dim();
+        let mut ctx = KVStageCtx::new(cache_ref, 0, None, None, None, query_stats);
+        // faithful: 현재 step Q `[n_kv_heads*head_dim]` 를 `tensor(Query)` 로 노출(Quest 정본 current-Q).
+        // `None`(proxy/offload) 이면 호출 안 함 → `tensor(Query)==None` (byte-identical disabled path).
+        if let Some(q) = query {
+            ctx = ctx.with_query(q, head_dim);
+        }
         rs.read_plan(&ctx)
     }
 }
@@ -3310,7 +3369,7 @@ mod tests {
             plan_none: false,
         };
         let plan = fmt_seam
-            .read_plan(&rs, 0, None)
+            .read_plan(&rs, 0, None, None)
             .expect("mock 전체 select plan 반환");
         assert_eq!(plan.select, (0..n_tokens).collect::<Vec<_>>());
 
@@ -3354,7 +3413,7 @@ mod tests {
             plan_none: true,
         };
         assert!(
-            fmt.read_plan(&rs, 0, None).is_none(),
+            fmt.read_plan(&rs, 0, None, None).is_none(),
             "mock plan_none=true → read_plan None → 엔진 full read 폴백"
         );
     }
@@ -3378,7 +3437,7 @@ mod tests {
             fixed_select: Some(vec![0, 2, 4]),
             plan_none: false,
         };
-        let plan = fmt.read_plan(&rs, 0, None).expect("부분 select plan");
+        let plan = fmt.read_plan(&rs, 0, None, None).expect("부분 select plan");
         assert_eq!(plan.select, vec![0, 2, 4]);
         let mut out = f32_tensor(vec![1, 1, 1, 4], &vec![0.0; 4]);
         fmt.attention_into_selected(

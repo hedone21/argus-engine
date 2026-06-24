@@ -60,7 +60,55 @@ pub struct KVCache {
     memory: Option<Arc<dyn Memory>>,
 }
 
+/// W-DEVKV helper: copy a (possibly device-only) tensor's bytes to a fresh host-backed Tensor of
+/// identical shape/dtype via `read_buffer` (INV-191 device→host). CpuBackend wrapper → `as_slice`
+/// (used by `dequantize_*`/gather) reads the host bytes directly.
+fn read_device_tensor_to_host(t: &Tensor) -> Result<Tensor> {
+    use crate::backend::cpu::CpuBackend;
+    use crate::memory::host::shared::SharedBuffer;
+    let bytes = t.size();
+    let host_buf = SharedBuffer::new(bytes, t.dtype());
+    // SAFETY: `host_buf` was just allocated with exactly `bytes` bytes; `read_buffer` writes exactly
+    // `bytes` from the source tensor and does not retain the pointer past the call.
+    let dst = unsafe { std::slice::from_raw_parts_mut(host_buf.as_mut_ptr(), bytes) };
+    t.backend().read_buffer(t, dst)?;
+    Ok(Tensor::new(
+        t.shape().clone(),
+        Arc::new(host_buf),
+        Arc::new(CpuBackend::new()),
+    ))
+}
+
 impl KVCache {
+    /// W-DEVKV: device→host snapshot of this cache for read-stage page-meta + selective-attention
+    /// gather on GPU backends.
+    ///
+    /// On device-only backends (Adreno: `k_buffer`/`v_buffer` host ptr = null), a read stage that
+    /// inspects K/V content (`tensor(Key)`/`dequantize_k`/`gather_selected_kv` → `as_slice`) would
+    /// null-deref. This copies both buffers to host via `read_buffer` and rebuilds a geometry-
+    /// identical host-backed cache, so handles/gather read the host snapshot. All geometry
+    /// (capacity/kv_heads/head_dim/layout/current_pos) is preserved verbatim → `offset()` and
+    /// `dequantize_*`/gather are byte-identical to a native host cache.
+    ///
+    /// Cost: a full K+V `read_buffer` per call (opt-in read-stage path only; never on production
+    /// decode). The caller calls `backend.synchronize()` first so prior writes are visible.
+    pub(crate) fn host_snapshot(&self) -> Result<KVCache> {
+        let k_host = read_device_tensor_to_host(&self.k_buffer)?;
+        let v_host = read_device_tensor_to_host(&self.v_buffer)?;
+        Ok(KVCache {
+            k_buffer: k_host,
+            v_buffer: v_host,
+            current_pos: self.current_pos,
+            high_water_pos: self.high_water_pos,
+            max_seq_len: self.max_seq_len,
+            capacity: self.capacity,
+            kv_heads: self.kv_heads,
+            head_dim: self.head_dim,
+            layout: self.layout,
+            memory: None,
+        })
+    }
+
     /// Create a KVCache with full pre-allocation (capacity = max_seq_len).
     /// Growth is disabled. Layout defaults to SeqMajor for backward compatibility.
     pub fn new(k: Tensor, v: Tensor, max_seq_len: usize) -> Self {
