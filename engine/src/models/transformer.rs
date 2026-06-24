@@ -37,6 +37,26 @@ pub(crate) fn is_local_layer(layer_idx: usize, pattern: Option<usize>) -> bool {
     }
 }
 
+/// Read the residual hidden state into a host `Vec<f32>` for layer-importance capture.
+///
+/// `x` may be GPU-resident: a device-only `OpenCLBuffer` (host ptr always null), or a
+/// `UnifiedBuffer` whose host ptr is null while unmapped (which is its state right after the
+/// layer's GPU compute). `x.as_slice::<f32>()` on either null-derefs on Adreno (W-DEVKV). The
+/// universal device→host primitive is `synchronize()` + `read_buffer` (a memcpy on the CPU
+/// backend, so host runs stay byte-identical). This is only ever reached when an
+/// `importance_collector` is attached — the offline warmup / `--dump-importance` / qcf paths,
+/// never production decode (collector `None` there → the call site is skipped entirely).
+fn read_hidden_for_importance(backend: &dyn Backend, x: &Tensor) -> Result<Vec<f32>> {
+    backend.synchronize()?;
+    let n = x.numel();
+    let mut host = vec![0.0f32; n];
+    // SAFETY: `host` is `n` initialized f32; `read_buffer` writes exactly `n * 4` bytes
+    // (the f32 byte image of `x`) into it.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, n * 4) };
+    backend.read_buffer(x, bytes)?;
+    Ok(host)
+}
+
 /// Map one weight tensor so the CPU backend can read it via `as_ptr()`
 /// (host-access mapping for SwitchHw / tensor partition).
 ///
@@ -1576,9 +1596,11 @@ impl TransformerModel {
             };
 
             // importance snapshot before layer (forward_into:1733 미러) — prefill 2-pass 전용.
+            // Device-safe read (W-DEVKV): `x` is GPU-resident on Adreno; `as_slice` would
+            // null-deref. Gated by `is_some` → production (collector None) skips this entirely.
             if let Some(ref mut coll) = importance_collector {
-                let x_data = x.as_slice::<f32>();
-                coll.snapshot_before(x_data, seq_len, hidden_size);
+                let x_data = read_hidden_for_importance(backend.as_ref(), &x)?;
+                coll.snapshot_before(&x_data, seq_len, hidden_size);
             }
 
             if is_decode && workspace.is_none() {
@@ -1708,10 +1730,12 @@ impl TransformerModel {
             }
 
             // importance record after layer (forward_into:1882-1891 미러) — prefill 2-pass 전용.
+            // Device-safe read (W-DEVKV): see `read_hidden_for_importance`. Production (collector
+            // None) skips this; host-CPU `read_buffer` is a memcpy so the captured bytes are identical.
             if let Some(ref mut coll) = importance_collector {
-                let x_data = x.as_slice::<f32>();
+                let x_data = read_hidden_for_importance(backend.as_ref(), &x)?;
                 coll.record_after(
-                    x_data,
+                    &x_data,
                     seq_len,
                     hidden_size,
                     i,

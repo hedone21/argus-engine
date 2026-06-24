@@ -70,6 +70,31 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         args.num_tokens
     );
 
+    // ── W-SIGNAL-H (SqueezeAttention) importance capture ─────────────────────
+    // `--kv-squeeze`: capture each layer's `1 − cos(h_in, h_out)` importance with one warmup
+    // prefill over the prompt, on the still-clean kv_caches (BEFORE any prefix-cache restore — the
+    // warmup resets the cache to empty afterwards). Held until the eviction CacheManager is built,
+    // then converted to per-layer budgets and armed. Off-by-default → skipped entirely (byte-identical).
+    let squeeze_importance: Option<Vec<f32>> = if args.kv_squeeze {
+        let imp = crate::session::squeeze_warmup::capture_layer_importance_via_warmup(
+            &model,
+            &backend,
+            memory.as_ref(),
+            &mut kv_caches,
+            &tokens,
+            vocab_size,
+            &args.kv_squeeze_formula,
+        )?;
+        eprintln!(
+            "[Squeeze] captured per-layer importance ({} layers, formula={})",
+            imp.len(),
+            args.kv_squeeze_formula,
+        );
+        Some(imp)
+    } else {
+        None
+    };
+
     // ── prefix cache restore 배선 (ENG-082, INV-190) ─────────────────────────
     // --prefix-cache 가 있고 opaque KV가 아닌 경우, kv_caches를 임시 StandardFormat으로
     // wrap → try_restore_prefix → KVCache 재조립 → build_standard_loop에 넘긴다.
@@ -202,6 +227,54 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
     // 회귀 0). score-based(h2o/d2o)·offload(--swap-dir)·기타 미지원 모드는 argus_cli 진입부에서
     // 이미 reject 되므로 여기 도달하는 정책은 항상 score-free.
     let cache_manager = crate::session::assembly::build_resilience_cache_manager(&args, &backend)?;
+
+    // W-SIGNAL-H: convert the captured per-layer importance into per-layer KV budgets and arm the
+    // eviction CacheManager (set-once, before the decode loop). `--kv-squeeze` needs a score-free
+    // eviction policy to have built a CacheManager; if none is active, surface it (rather than
+    // silently dropping the budgets).
+    if let Some(importance) = squeeze_importance {
+        let Some(cm) = cache_manager.as_ref() else {
+            anyhow::bail!(
+                "--kv-squeeze requires a score-free eviction policy so per-layer budgets have an \
+                 eviction to drive (e.g. `eviction sliding`); none is active"
+            );
+        };
+        // No-silent-no-op contract: an empty importance vector (degenerate warmup — empty prompt /
+        // zero layers) would arm `Some(&[])`, which the eviction path treats as "all layers fall
+        // back to the scalar target" = uniform eviction while the warmup cost was already paid.
+        // Surface it instead of silently degrading the technique.
+        if importance.is_empty() {
+            anyhow::bail!(
+                "--kv-squeeze captured 0 layers of importance (empty prompt or no decoder layers); \
+                 refusing to arm a degenerate uniform budget"
+            );
+        }
+        // total_budget = Σ per-layer keep counts. Anchor the average per-layer keep at the uniform
+        // target (`max_seq_len * eviction_target_ratio`); importance redistributes it so important
+        // layers keep more, unimportant fewer (the per-layer self-guard + min_floor bound the rest).
+        let n_layers = importance.len();
+        let per_layer_avg = ((max_seq_len as f32) * args.eviction_target_ratio()).round() as usize;
+        let total_budget = n_layers.saturating_mul(per_layer_avg);
+        // Cap budgets at the largest *evictable* keep-count. The global KV-fill pressure trigger
+        // fires at `KV_FILL_HIGH_WATER_PCT` (85%) of max_seq_len; a per-layer budget above
+        // `high_water − MIN_EVICT_TOKENS` is skipped by the per-layer self-guard at the trigger and
+        // would let that layer grow unbounded → KV cache overflow. Subtract an extra
+        // `MIN_EVICT_TOKENS` of headroom for the 8-step pressure poll interval.
+        let high_water = max_seq_len.saturating_mul(85) / 100;
+        let max_budget = high_water
+            .saturating_sub(crate::kv::MIN_EVICT_TOKENS)
+            .saturating_sub(crate::kv::MIN_EVICT_TOKENS / 4);
+        let budgets = cm.arm_squeeze_budgets(
+            &importance,
+            total_budget,
+            args.kv_squeeze_min_floor,
+            max_budget,
+        );
+        eprintln!(
+            "[Squeeze] armed per-layer KV budgets (total={total_budget}, floor={}, cap={max_budget}): {budgets:?}",
+            args.kv_squeeze_min_floor,
+        );
+    }
 
     // Per-token streaming slot: the decode loop's ChatStreamStage emits each kept token into it.
     // Armed below for the synchronous run() so tokens print as they land (instead of one batch

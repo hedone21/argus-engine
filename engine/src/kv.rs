@@ -102,6 +102,15 @@ pub trait CachePressureHandler: Send + Sync {
 
     /// Handler name for logging and debugging.
     fn name(&self) -> &str;
+
+    /// Arm per-layer KV eviction budgets (SqueezeAttention, R-P1-6 / W-SIGNAL-H).
+    ///
+    /// Default no-op: only the eviction handler stores them. `budgets[i]` is the token count
+    /// layer `i` should keep; the live eviction path reads them via `HandlerContext`-free interior
+    /// state and routes them to `run_policy_eviction`'s per-layer budget. Called once, before the
+    /// decode loop runs, so the hot path stays lock-free. Handlers that don't do per-layer eviction
+    /// ignore it.
+    fn set_per_layer_budgets(&self, _budgets: &[usize]) {}
 }
 
 // ── Stage config ───────────────────────────────────────────────────
@@ -191,6 +200,16 @@ impl CachePressurePipeline {
     /// Whether the pipeline has no stages.
     pub fn is_empty(&self) -> bool {
         self.stages.is_empty()
+    }
+
+    /// Broadcast per-layer KV eviction budgets to every stage (SqueezeAttention / W-SIGNAL-H).
+    ///
+    /// Only the eviction handler stores them (the trait method is a no-op elsewhere). Called once
+    /// before the decode loop, so the per-stage interior state is set before any `handle` runs.
+    pub fn set_per_layer_budgets(&self, budgets: &[usize]) {
+        for stage in &self.stages {
+            stage.handler.set_per_layer_budgets(budgets);
+        }
     }
 }
 

@@ -26,6 +26,7 @@ pub mod resilience_adapter;
 pub mod resilience_init;
 pub mod samplers;
 pub mod score_decay_dump;
+pub mod squeeze_warmup;
 pub mod standard_happy;
 pub mod swap_runtime;
 
