@@ -1,0 +1,16 @@
+[package]
+name = "mixed-precision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Per-layer mixed-precision KV format-policy technique crate (the W-ALLOC executable: N-way mixed
+# precision / KVTuner-shape). Self-registering `KVFormatPolicy` — the layer-importance / quest / h2o
+# precedent: depends only on `argus-extension-api` + `linkme` (no engine reference = proof of additive
+# extension cost). Force-linked via one `use mixed_precision as _;`; the engine resolves it by name
+# through `find_format_policy`. Per-layer assignment is read from the `ARGUS_KV_MIXED` env var.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

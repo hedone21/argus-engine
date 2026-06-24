@@ -25,7 +25,10 @@ use crate::session::resilience_init::build_command_executor;
 use crate::session::standard_happy::StandardHappyCtx;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
-use argus_extension_api::KVLayoutDesc;
+use argus_extension_api::{
+    KVFormatPolicy, KVLayoutDesc, StageCtx, StageParams, TensorHandle, TensorKind,
+    find_format_policy,
+};
 
 /// `build_inference_ctx` / `build_quant_window_bench_ctx` 공통 prelude 산출물 (AB-2 §5.7.7).
 ///
@@ -51,6 +54,10 @@ pub fn build_inference_prelude(args: &Args) -> anyhow::Result<InferencePrelude> 
     // fat-LTO self-test(C3 배선): 내장 KV format 4종 링크 확인 — --gc-sections silent
     // drop 시 --kv-format 미해석 폴백 대신 fail-fast.
     crate::format::ensure_builtin_kv_formats_registered()?;
+    // 같은 self-test 의 format-policy 짝: 내장 policy(mixed_precision)가 KV_FORMAT_POLICIES 에
+    // 링크됐는지 확인 — drop 시 `--kv-format mixed_precision` 미해석(single-format arm 으로 조용한
+    // 폴백) 대신 fail-fast (W-ALLOC per-layer mixed precision 의 등록 가시성 보장).
+    crate::format::ensure_builtin_format_policies_registered()?;
     // 같은 self-test 의 KV-mode 짝: 내장 mode 3종(standard/kivi/offload)이 KV_MODES 에
     // 링크됐는지 확인 — drop 시 mode_caps 가 silent None(폴백) 대신 fail-fast.
     crate::session::mode::ensure_builtin_kv_modes_registered()?;
@@ -136,6 +143,33 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
         // 이름 기반 typed/opaque 분기. 내장 typed 이름이 아니면 make_format(정적 우선
         // → 동적 .so fallback)로 해소 후, descriptor 가 내장 DType 과 bit-equivalent 면 typed fast
         // path 로(layout_desc_to_builtin_dtype), 아니면 opaque floor 로 라우팅(2026-06-09 결정).
+        // W-ALLOC: a registered KVFormatPolicy name routes to per-layer mixed precision (each layer
+        // stored in its policy-assigned base format). Guarded before the single-format arm so a
+        // policy name is never resolved as a format name. The construction-time consumer of the
+        // (previously dormant) KVFormatPolicy producer — "expressible per-layer plan → executable".
+        Some(fmt_name) if find_format_policy(fmt_name).is_some() => {
+            eprintln!("KV format policy: {fmt_name} (per-layer mixed precision)");
+            let pol_reg =
+                find_format_policy(fmt_name).expect("guarded by find_format_policy().is_some()");
+            let policy = (pol_reg.make)(StageParams::default());
+            let per_layer = per_layer_storage_from_policy(
+                &*policy,
+                num_layers,
+                kv_heads,
+                head_dim,
+                LayerStorage::Typed(kv_type),
+            )?;
+            alloc_mixed_kv_caches(
+                &backend,
+                memory.clone(),
+                &per_layer,
+                initial_kv_capacity,
+                max_seq_len,
+                kv_heads,
+                head_dim,
+                kv_layout,
+            )?
+        }
         Some(fmt_name) => match crate::format::builtin_format_dtype(fmt_name) {
             Some(dt) => {
                 eprintln!("KV format: {fmt_name} (typed dtype {dt:?})");
@@ -444,6 +478,212 @@ pub fn alloc_opaque_kv_caches(
     Ok(kv_caches)
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// W-ALLOC — construction-time per-layer KV precision (N-way mixed precision / KVTuner)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The alloc functions above store ONE format for every layer, so a `KVFormatPolicy` that assigns a
+// different base format per layer was *expressible* (it returns a per-layer `KVFormatPlan`) but not
+// *executable*. This section closes that gap for the static per-layer case: the engine queries the
+// policy once per layer at allocation time and stores each layer in its assigned base format. No new
+// kernels — each `KVCache` self-describes its dtype and the per-cache compute path already dispatches
+// f16/q4_0/opaque. Per-region/head/token overrides are the runtime re-encode concern (`format_apply`),
+// deliberately out of scope here (alloc consumes only the per-layer base).
+
+/// One layer's resolved KV storage: a builtin typed dtype (fast path) or an opaque descriptor (floor).
+#[derive(Clone, Copy, Debug)]
+pub enum LayerStorage {
+    /// Builtin typed dtype (f32/f16/q4_0) — typed NEON/GPU compute.
+    Typed(DType),
+    /// Opaque block-quant descriptor (e.g. a `.so` format) — descriptor-driven floor.
+    Opaque(KVLayoutDesc),
+}
+
+/// Minimal construction-time [`StageCtx`]: exposes only geometry + the layer position. No tokens or
+/// runtime signals exist at allocation time, so every tensor/score accessor is empty. A policy that
+/// needs runtime signals to choose precision therefore sees nothing here and keeps its base — only
+/// layer-index-driven assignment (KVTuner / N-way fixed precision) is honored on this static path.
+struct AllocCtx {
+    layer: usize,
+    n_layers: usize,
+    kv_heads: usize,
+    head_dim: usize,
+}
+
+impl StageCtx for AllocCtx {
+    fn current_pos(&self) -> usize {
+        0
+    }
+    fn target_len(&self) -> usize {
+        0
+    }
+    fn layer_idx(&self) -> usize {
+        self.layer
+    }
+    fn importance(&self) -> Option<&[f32]> {
+        None
+    }
+    fn n_kv_heads(&self) -> usize {
+        self.kv_heads
+    }
+    fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+    fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+        None
+    }
+    fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+}
+
+/// Resolve a registered format **name** to a concrete [`LayerStorage`] (mirror of the single-format
+/// dispatch in [`build_inference_ctx`]): builtin typed → `Typed`; else `make_format(name).layout()`,
+/// then bit-equivalent-to-builtin → `Typed` (fast path) else `Opaque`. Unknown name → `Err`.
+fn resolve_format_id(name: &str) -> anyhow::Result<LayerStorage> {
+    if let Some(dt) = crate::format::builtin_format_dtype(name) {
+        return Ok(LayerStorage::Typed(dt));
+    }
+    let fmt = crate::format::dynamic_format_registry::make_format(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "per-layer KV format '{name}' is not a builtin and not registered (static KV_FORMATS or --load-plugin)"
+        )
+    })?;
+    let desc = fmt.layout();
+    match crate::format::layout_desc_to_builtin_dtype(&desc) {
+        Some(dt) => Ok(LayerStorage::Typed(dt)),
+        None => Ok(LayerStorage::Opaque(desc)),
+    }
+}
+
+/// Query `policy` once per layer to build the per-layer storage vector (the W-ALLOC executable seam).
+///
+/// For each layer the engine builds a construction-time [`AllocCtx`] (geometry + layer index only)
+/// and reads `policy.assign(ctx)`; the **base** `FormatId` of the returned plan is that layer's
+/// storage format. `None` (no change) falls back to `default`. Per-region/head/token overrides are
+/// ignored here — they are the runtime re-encode concern (`format_apply`), not construction storage.
+pub fn per_layer_storage_from_policy(
+    policy: &dyn KVFormatPolicy,
+    num_layers: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    default: LayerStorage,
+) -> anyhow::Result<Vec<LayerStorage>> {
+    let mut per_layer = Vec::with_capacity(num_layers);
+    for layer in 0..num_layers {
+        let ctx = AllocCtx {
+            layer,
+            n_layers: num_layers,
+            kv_heads,
+            head_dim,
+        };
+        let storage = match policy.assign(&ctx) {
+            Some(plan) => {
+                // Honesty (lib.rs KVFormatPlan contract + no-silent-no-op): construction-time
+                // per-layer alloc can store only a uniform-per-layer BASE format. A plan carrying
+                // per-region/head/token overrides is heterogeneous-within-layer and unholdable here —
+                // REJECT it (not silently drop to base), exactly as the runtime executor rejects it.
+                if !plan.overrides.is_empty() {
+                    bail!(
+                        "KVFormatPolicy '{}' returned {} override(s) for layer {layer}; \
+                         construction-time per-layer allocation honors only a uniform base format. \
+                         Heterogeneous-within-layer precision is unsupported (would need a runtime \
+                         re-encode store) — rejected rather than silently dropped.",
+                        policy.name(),
+                        plan.overrides.len()
+                    );
+                }
+                resolve_format_id(&plan.base.0)?
+            }
+            None => default,
+        };
+        per_layer.push(storage);
+    }
+    Ok(per_layer)
+}
+
+/// Allocate one dynamic KV cache per layer, each in its own (possibly different) [`LayerStorage`] —
+/// the per-layer twin of [`alloc_standard_kv_caches`] / [`alloc_opaque_kv_caches`]. Each layer routes
+/// to the typed or opaque alloc body per its assigned format.
+#[allow(clippy::too_many_arguments)]
+pub fn alloc_mixed_kv_caches(
+    backend: &Arc<dyn Backend>,
+    memory: Arc<dyn Memory>,
+    per_layer: &[LayerStorage],
+    initial_kv_capacity: usize,
+    max_seq_len: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    layout: KVLayout,
+) -> anyhow::Result<Vec<KVCache>> {
+    use crate::buffer::Buffer;
+    use crate::buffer::opaque::OpaqueBuffer;
+
+    let layout = resolve_kv_layout(backend.is_gpu(), layout);
+    let n_values = initial_kv_capacity * kv_heads * head_dim;
+    let shape = || Shape::new(vec![1, kv_heads, initial_kv_capacity, head_dim]);
+    let mut kv_caches = Vec::with_capacity(per_layer.len());
+
+    for (layer, storage) in per_layer.iter().enumerate() {
+        let (k, v) = match storage {
+            LayerStorage::Typed(kv_type) => {
+                let kv_buf_size = match kv_type {
+                    DType::Q4_0 => {
+                        use crate::quant::{BlockQ4_0, QK4_0};
+                        (n_values / QK4_0) * std::mem::size_of::<BlockQ4_0>()
+                    }
+                    _ => n_values * kv_type.size(),
+                };
+                let k_buf = memory.alloc_kv(kv_buf_size, *kv_type)?;
+                let v_buf = memory.alloc_kv(kv_buf_size, *kv_type)?;
+                (
+                    Tensor::new(shape(), k_buf, backend.clone()),
+                    Tensor::new(shape(), v_buf, backend.clone()),
+                )
+            }
+            LayerStorage::Opaque(desc) => {
+                let block_elems = desc.block_elems as usize;
+                if block_elems == 0 || !head_dim.is_multiple_of(block_elems) {
+                    bail!(
+                        "opaque KV (layer {layer}): head_dim {head_dim} not a multiple of block_elems {block_elems}"
+                    );
+                }
+                let nbytes = desc.bytes_for_elems(n_values).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "opaque KV (layer {layer}): bytes_for_elems({n_values}) failed (block-aligned?)"
+                    )
+                })?;
+                let mk = || -> anyhow::Result<Tensor> {
+                    let inner = memory.alloc_kv(nbytes, DType::U8)?;
+                    let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, *desc));
+                    Ok(Tensor::new(shape(), op, backend.clone()))
+                };
+                (mk()?, mk()?)
+            }
+        };
+        kv_caches.push(
+            KVCache::new_dynamic(
+                k,
+                v,
+                initial_kv_capacity,
+                max_seq_len,
+                kv_heads,
+                head_dim,
+                memory.clone(),
+            )
+            .with_layout(layout),
+        );
+    }
+    eprintln!(
+        "KV cache: per-layer mixed precision ({} layers, layout {:?}, initial cap: {}, max: {})",
+        per_layer.len(),
+        layout,
+        initial_kv_capacity,
+        max_seq_len
+    );
+    Ok(kv_caches)
+}
+
 /// AB-2 §5.7.7: argus-bench quant-window 분기 컨텍스트.
 ///
 /// Standard [`StandardHappyCtx`] 와 달리 quant-window 는 `Vec<QuantizedRecentWindowCache>`(typed `KVCache` 아님) + caps
@@ -476,6 +716,18 @@ pub struct QuantWindowBenchCtx {
 /// `--kv-dynamic-quant`(orphan flag 재배선) → initial_bits=16(F16 등가 진입), residual=
 /// `(max_seq_len/32)*32`. verify YAML baseline 은 `--kv-dynamic-quant` 로 진입한다.
 pub fn build_quant_window_bench_ctx(args: Args) -> anyhow::Result<QuantWindowBenchCtx> {
+    // W-ALLOC honesty: the quant-window KV mode (--kv-mode kivi / --kv-dynamic-quant) uses its own
+    // KV path and does not consult a KVFormatPolicy. Fail fast on a per-layer mixed-precision policy
+    // name instead of silently allocating its own uniform quant-window cache (no-silent-no-op).
+    if let Some(fmt) = args.kv_format.as_deref().filter(|s| !s.is_empty())
+        && find_format_policy(fmt).is_some()
+    {
+        bail!(
+            "argus-bench: --kv-format '{fmt}' (per-layer mixed precision) is not supported under the \
+             quant-window KV mode (--kv-mode kivi / --kv-dynamic-quant), which uses its own KV path. \
+             Run mixed precision in the standard KV mode."
+        );
+    }
     let InferencePrelude {
         init,
         tokenizer,
@@ -550,6 +802,129 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::memory::galloc::Galloc;
+
+    /// W-ALLOC test policy: assigns a different builtin format per layer purely by layer index.
+    struct PerLayerMixPolicy;
+    impl KVFormatPolicy for PerLayerMixPolicy {
+        fn name(&self) -> &str {
+            "test-per-layer-mix"
+        }
+        fn assign(
+            &self,
+            ctx: &dyn argus_extension_api::StageCtx,
+        ) -> Option<argus_extension_api::KVFormatPlan> {
+            // even layers → q4_0, odd layers → f16 (layer-index driven; KVTuner / N-way shape).
+            let fmt = if ctx.layer_idx() % 2 == 0 {
+                "q4_0"
+            } else {
+                "f16"
+            };
+            Some(argus_extension_api::KVFormatPlan {
+                base: argus_extension_api::FormatId(fmt.into()),
+                overrides: vec![],
+            })
+        }
+    }
+
+    /// The (formerly dormant) KVFormatPolicy producer is consumed per layer → per-layer storage.
+    #[test]
+    fn per_layer_storage_from_policy_assigns_per_layer_format() {
+        let per_layer = per_layer_storage_from_policy(
+            &PerLayerMixPolicy,
+            4,
+            2,
+            8,
+            LayerStorage::Typed(DType::F16),
+        )
+        .unwrap();
+        assert!(matches!(per_layer[0], LayerStorage::Typed(DType::Q4_0)));
+        assert!(matches!(per_layer[1], LayerStorage::Typed(DType::F16)));
+        assert!(matches!(per_layer[2], LayerStorage::Typed(DType::Q4_0)));
+        assert!(matches!(per_layer[3], LayerStorage::Typed(DType::F16)));
+    }
+
+    /// N-way mixed precision EXECUTES: alloc materializes each layer's cache in its own dtype
+    /// (the W-ALLOC wall was a single uniform dtype loop). Proof the engine runs the expressible plan.
+    #[test]
+    fn alloc_mixed_kv_caches_materializes_per_layer_dtype() {
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let memory: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let per_layer = per_layer_storage_from_policy(
+            &PerLayerMixPolicy,
+            4,
+            2,
+            8,
+            LayerStorage::Typed(DType::F16),
+        )
+        .unwrap();
+        let caches = alloc_mixed_kv_caches(
+            &backend,
+            memory,
+            &per_layer,
+            16,
+            64,
+            2,
+            8,
+            KVLayout::HeadMajor,
+        )
+        .unwrap();
+        assert_eq!(caches.len(), 4);
+        assert_eq!(caches[0].kv_dtype(), DType::Q4_0);
+        assert_eq!(caches[1].kv_dtype(), DType::F16);
+        assert_eq!(caches[2].kv_dtype(), DType::Q4_0);
+        assert_eq!(caches[3].kv_dtype(), DType::F16);
+    }
+
+    /// Test policy that emits a per-region override — must be REJECTED, not silently downgraded.
+    struct OverridePolicy;
+    impl KVFormatPolicy for OverridePolicy {
+        fn name(&self) -> &str {
+            "test-override"
+        }
+        fn assign(
+            &self,
+            _ctx: &dyn argus_extension_api::StageCtx,
+        ) -> Option<argus_extension_api::KVFormatPlan> {
+            Some(argus_extension_api::KVFormatPlan {
+                base: argus_extension_api::FormatId("f16".into()),
+                overrides: vec![argus_extension_api::FormatOverride {
+                    region: argus_extension_api::KeepSpec::LayerWide(vec![0]),
+                    format: argus_extension_api::FormatId("q4_0".into()),
+                    side: argus_extension_api::MergeAxis::Both,
+                }],
+            })
+        }
+    }
+
+    /// Honesty: an override-bearing plan is rejected (Err), not silently dropped to base.
+    #[test]
+    fn override_bearing_plan_is_rejected_not_dropped() {
+        let res = per_layer_storage_from_policy(
+            &OverridePolicy,
+            2,
+            2,
+            8,
+            LayerStorage::Typed(DType::F16),
+        );
+        assert!(res.is_err(), "override-bearing plan must be rejected");
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("override"), "error names the override: {msg}");
+    }
+
+    /// The shipped builtin `mixed_precision` policy is registered AND consumable through the production
+    /// calls (`find_format_policy` → `make` → `per_layer_storage_from_policy`) — i.e. the W-ALLOC
+    /// routing arm has a reachable trigger (no longer a dead arm). Env-free: unset `ARGUS_KV_MIXED`
+    /// makes the policy a no-op (all layers keep the default), which is deterministic for CI.
+    #[test]
+    fn registered_mixed_precision_policy_is_consumable() {
+        let reg = find_format_policy("mixed_precision")
+            .expect("mixed_precision registered in KV_FORMAT_POLICIES (dead-arm fixed)");
+        let policy = (reg.make)(StageParams::default());
+        let per_layer =
+            per_layer_storage_from_policy(&*policy, 6, 2, 8, LayerStorage::Typed(DType::F16))
+                .expect("registered policy consumes without error");
+        assert_eq!(per_layer.len(), 6);
+    }
 
     #[test]
     fn kv_layout_from_cli_parses_known_values() {

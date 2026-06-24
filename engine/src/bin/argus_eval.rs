@@ -217,6 +217,18 @@ fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
     if args.tensor_partition > 0.0 {
         bail!("argus-eval: --tensor-partition is a decode-only measurement mode, not eval");
     }
+    // W-ALLOC honesty: `--kv-format` is a global Args flag but only argus-cli/argus-bench honor a
+    // per-layer KV format POLICY (N-way mixed precision); eval allocates a uniform KV dtype. Fail
+    // fast on a policy name instead of silently dropping it to uniform (no-silent-no-op contract).
+    if let Some(fmt) = args.kv_format.as_deref().filter(|s| !s.is_empty())
+        && argus_engine::format::is_registered_kv_format_policy(fmt)
+    {
+        bail!(
+            "argus-eval: --kv-format '{fmt}' is a per-layer KV format policy (N-way mixed precision) \
+             supported only by argus-cli / argus-bench; eval uses a uniform KV dtype. Use --kv-type \
+             for eval, or run mixed precision via argus-cli / argus-bench."
+        );
+    }
     Ok(())
 }
 
@@ -288,6 +300,22 @@ mod tests {
         let args = make_args(&["--eval-ll", "--profile"]);
         let err = reject_unsupported_modes_eval(&args).unwrap_err();
         assert!(err.to_string().contains("--profile"));
+    }
+
+    /// W-ALLOC honesty: a per-layer KV format policy name is rejected (fail-fast), not silently
+    /// dropped to a uniform dtype (eval does not honor `--kv-format` policies).
+    #[test]
+    fn reject_blocks_kv_format_policy() {
+        let args = make_args(&["--eval-ll", "--kv-format", "mixed_precision"]);
+        let err = reject_unsupported_modes_eval(&args).unwrap_err();
+        assert!(err.to_string().contains("mixed_precision"));
+    }
+
+    /// A plain builtin format name is NOT a policy → not rejected by this guard.
+    #[test]
+    fn reject_allows_non_policy_kv_format() {
+        let args = make_args(&["--eval-ll", "--kv-format", "f16"]);
+        assert!(reject_unsupported_modes_eval(&args).is_ok());
     }
 
     #[test]
