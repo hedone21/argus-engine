@@ -299,12 +299,14 @@ fn run_decode_loop_experiment(
             "avg_tbt_ms": avg_tbt,
             "decode_tokens": decode_tokens,
             "prompt_len": tokens.len(),
-            "final_cache_pos": result.final_pos,
+            "final_cache_pos": result.final_cache_pos,
             "eviction_policy": args.eviction_policy(),
             "kv_mode": args.effective_kv_mode(),
         });
         if per_token_kv_bytes > 0.0 {
-            let peak_kv_mb = result.final_pos as f64 * per_token_kv_bytes / (1024.0 * 1024.0);
+            // peak_kv_mb 는 KV-cache 점유(final_cache_pos) 기반 — eviction 후 누적 final_pos 로
+            // 계산하면 over-report 된다(eviction-후 RoPE-drift 수정으로 둘이 분리됨).
+            let peak_kv_mb = result.final_cache_pos as f64 * per_token_kv_bytes / (1024.0 * 1024.0);
             metrics["peak_kv_mb"] = serde_json::json!(peak_kv_mb);
         }
         println!("{}", serde_json::to_string(&metrics)?);
@@ -355,7 +357,7 @@ fn run_decode_loop_experiment(
             total_throttle_ms: 0,
             eviction_count: 0,
             evicted_tokens_total: 0,
-            final_cache_pos: result.final_pos,
+            final_cache_pos: result.final_cache_pos,
             max_seq_len,
             prompt: prompt_text,
             schedule_name: String::new(),
@@ -577,7 +579,7 @@ pub fn run_experiment_schedule_path(
             total_throttle_ms: 0,
             eviction_count: 0,
             evicted_tokens_total: 0,
-            final_cache_pos: result.final_pos,
+            final_cache_pos: result.final_cache_pos,
             max_seq_len,
             prompt: prompt_text,
             schedule_name: String::new(),

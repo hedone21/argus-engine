@@ -50,7 +50,15 @@ pub enum StopReason {
 #[derive(Debug, Clone)]
 pub struct DecodeResult {
     pub tokens_generated: Vec<u32>,
+    /// True cumulative sequence position (= the next RoPE `start_pos`). This is **not**
+    /// collapsed when an in-loop eviction compacts the KV cache — surviving keys keep the RoPE
+    /// phase baked at their original absolute positions, so the position the loop continues from
+    /// must stay cumulative. Hence `final_pos >= final_cache_pos` whenever eviction fired.
     pub final_pos: usize,
+    /// KV-cache occupancy at exit (== `final_pos` when no eviction handle is wired). Memory
+    /// telemetry (e.g. `peak_kv_mb`) must use this occupancy, not the cumulative `final_pos`,
+    /// otherwise it over-reports KV footprint after an eviction-decrease.
+    pub final_cache_pos: usize,
     pub stopped_by: StopReason,
 }
 
@@ -95,6 +103,11 @@ pub struct DecodeLoop {
     // source 재query, 그 외 step 은 이 캐시값을 재사용한다. source 부재 시 항상 default(0).
     cached_pressure: Pressure,
     pos: usize,
+    // eviction-후 RoPE-drift 수정: 마지막으로 관측한 KV-cache 점유(`kv_pos_handle.current_pos()`).
+    // `pos`(진짜 누적 RoPE 위치)와 **분리**된 값이다 — eviction 이 cache 를 compaction 하면 occupancy 는
+    // 줄지만 `pos` 는 누적값을 유지한다. 직전 관측 대비 점유 감소(shrink)를 감지해 GPU plan invalidation
+    // 을 1회만 트리거하는 용도(handle 미배선 happy/chat 경로에선 사용 안 됨).
+    kv_occupancy: usize,
     decode_step: usize,
     prev_token: u32,
     kv_capacity: usize,
@@ -154,28 +167,37 @@ impl DecodeLoop {
         }
     }
 
-    /// β-3/AB-3 pos-환류 (§5.2.1 (가), §5.10.4 A안): KvMutate dispatch 후 held handle 의
-    /// `current_pos` 를 읽어 loop `pos` 를 동기화한다.
+    /// β-3/AB-3 KV-occupancy 추적 + GPU plan invalidation (§5.2.1 (가), §5.10.4 A안):
+    /// eviction/offload stage dispatch 후 held handle 의 `current_pos`(= KV-cache 점유)가 직전 관측
+    /// 대비 줄었으면, 보유 중인 GPU kernel plan 의 geometry 가 stale 해지므로 invalidate 한다.
     ///
-    /// - 감소(eviction/offload prune): `self.pos = new_pos` + `forward.on_kv_prune` — GPU plan
-    ///   invalidate. v1 (a.5) on_kv_prune 등가, byte-identical 유지.
-    /// - 증가(recall): `self.pos = new_pos`, `on_kv_prune` **미호출** — recall 후 plan 은 다음 step
-    ///   forward 가 증가된 pos 로 자연 재빌드(v1 try_recall 시 on_kv_prune 미호출 등가, §5.10.4).
+    /// ★`self.pos` 는 **건드리지 않는다**. (이전엔 감소 시 `self.pos = current_pos` 로 collapse 했으나
+    /// 그것이 eviction-후 RoPE-drift 버그였다.) compaction 은 생존 키를 낮은 연속 슬롯으로 **memmove**
+    /// 할 뿐 재회전하지 않으므로(W-REROTATE), 생존 키는 원 절대위치의 RoPE phase 를 유지한다. 따라서
+    /// 다음 토큰의 RoPE `start_pos`(= `self.pos`)는 **진짜 누적 시퀀스 위치**를 유지해야 한다 — 압축된
+    /// `current_pos` 로 collapse 하면 query 가 생존 키보다 낮은 위치로 회전해 학습된 상대거리가 깨진다
+    /// (`session/eval/eval_loop.rs:299-303`·`session/ppl/runner.rs:1160-1166` 이 같은 메커니즘에서
+    /// 명시적으로 금지: "Do NOT reset start_pos to current_pos after eviction ... severe NLL
+    /// degradation"). write-slot / attention seq_len 은 forward 가 cache 의 `current_pos` 에서 직접
+    /// 읽으므로(CPU `forward_gen_fmt.rs`, GPU `backend/opencl/plan.rs`) `pos` 와 occupancy 는 독립이다.
+    ///
+    /// - 감소(eviction/offload prune): `on_kv_prune(occupancy)` 로 GPU plan invalidate (CPU 는 plan
+    ///   부재라 no-op). occupancy 가 매 step 정상 증가(+1)와 분리돼 shrink 일 때만 1회 발화한다.
+    /// - 증가(recall/offload restore)·불변: occupancy 만 추적, `on_kv_prune` 미호출 — recall 은 새 토큰을
+    ///   추가하지 않으므로 누적 위치(`self.pos`)도 불변, plan 은 다음 step forward 가 자연 재빌드.
     /// - `kv_pos_handle == None`(happy/chat/기존 전부) 이면 즉시 return → **거동-0**.
-    fn reconcile_kv_pos_after_eviction(&mut self) {
+    fn invalidate_plan_on_kv_shrink(&mut self) {
         let Some(h) = &self.kv_pos_handle else {
             return;
         };
-        let new_pos = h.current_pos();
-        if new_pos != self.pos {
-            let old = self.pos;
-            self.pos = new_pos;
-            if new_pos < old {
-                // 감소(eviction/offload): GPU plan invalidate (stale offset 방지).
-                self.forward.on_kv_prune(new_pos);
-            }
-            // 증가(recall): on_kv_prune 미호출 — 다음 step forward 가 증가된 pos 로 자연 재빌드.
+        let occupancy = h.current_pos();
+        if occupancy < self.kv_occupancy {
+            // KV-cache 가 직전 관측 대비 줄었다(eviction/offload prune 으로 생존 키를 낮은 슬롯으로
+            // compaction). 보유 plan 의 geometry 가 stale → 다음 step lazy rebuild 로 강하. self.pos 는
+            // 의도적으로 불변(위 닥 — 원위치 RoPE phase 보존).
+            self.forward.on_kv_prune(occupancy);
         }
+        self.kv_occupancy = occupancy;
     }
 
     /// v2 StopReason(pipeline.rs 4-variant) → v1 StopReason(traits.rs) 수렴 매핑
@@ -213,11 +235,19 @@ impl DecodeLoop {
         }
         // PrefillEnd: prefill 산출(logits) 직후, Ok(logits) 직전 (β-7: v1 on_prefill_end
         // observer 루프 제거 — prefill-end 관찰은 PrefillEnd stage 구독으로 수렴).
+        // eviction-후 RoPE-drift 수정: PrefillEnd(keepset prune) 전에 prefill 점유를 seed 해, prune
+        // 을 shrink 로 감지할 수 있게 한다(첫 decode plan 은 lazy 라 여기 on_kv_prune 은 통상 no-op이나
+        // 정확성을 위해 정확한 직전-점유를 기록). kv_pos_handle==None 이면 self.pos 로 폴백(거동-0).
+        self.kv_occupancy = self
+            .kv_pos_handle
+            .as_ref()
+            .map_or(self.pos, |h| h.current_pos());
         let _ = self.dispatch_phase(LifecyclePhase::PrefillEnd);
-        // R-P1-1: PrefillEnd stage(PrefillKeepSetStage)가 prefix 를 prune 했으면 self.pos 를 held
-        // handle 의 current_pos 로 보정(+ GPU plan invalidate). kv_pos_handle==None(prune 없음/
-        // 미무장)이면 거동-0(검증된 no-op) — prune 미적용 시 current_pos==pos.
-        self.reconcile_kv_pos_after_eviction();
+        // R-P1-1: PrefillEnd stage(PrefillKeepSetStage)가 prefix 를 prune 했으면 GPU plan 만
+        // invalidate 한다(점유 감소 추적). self.pos 는 보정하지 않는다 — 생존 키가 원위치 RoPE phase 를
+        // 유지하므로 첫 decode 토큰의 start_pos 는 진짜 prompt_len 이어야 한다(invalidate_plan_on_kv_shrink
+        // 닥 참조). kv_pos_handle==None(prune 없음/미무장)이면 거동-0.
+        self.invalidate_plan_on_kv_shrink();
         Ok(logits)
     }
 
@@ -305,7 +335,7 @@ impl DecodeLoop {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
-            self.reconcile_kv_pos_after_eviction();
+            self.invalidate_plan_on_kv_shrink();
 
             // WeightMutate: KvMutate 직후, forward 직전 (§5.2.1 (나)). pressure band-driven
             // Persistent EvictionStage 등 eviction 후속 발화 슬롯. dispatch 후 pos-환류로 loop pos
@@ -315,7 +345,7 @@ impl DecodeLoop {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
-            self.reconcile_kv_pos_after_eviction();
+            self.invalidate_plan_on_kv_shrink();
 
             // PreForward: WeightMutate 후, (d) forward 직전.
             if let Some(r) = self.dispatch_phase(LifecyclePhase::PreForward) {
@@ -404,9 +434,16 @@ impl DecodeLoop {
             }
         }
 
+        // final_pos = 진짜 누적 위치(self.pos). 메모리 telemetry 용 점유는 cache 에서 직접 읽는다
+        // (handle 미배선 시 둘은 동일 = 거동-0).
+        let final_cache_pos = self
+            .kv_pos_handle
+            .as_ref()
+            .map_or(self.pos, |h| h.current_pos());
         Ok(DecodeResult {
             tokens_generated: generated,
             final_pos: self.pos,
+            final_cache_pos,
             stopped_by,
         })
     }
@@ -684,6 +721,7 @@ impl DecodeLoopBuilder<HasForward> {
             pressure_source: self.pressure_source,
             cached_pressure: Pressure::default(),
             pos: 0,
+            kv_occupancy: 0,
             decode_step: 0,
             prev_token: 0,
             kv_capacity: self.kv_capacity,
@@ -1278,32 +1316,66 @@ mod tests {
         );
     }
 
-    // ── β-3 loop-level pos-환류 테스트 ─────────────────────────────────────
+    // ── eviction-후 RoPE-position drift 회귀 테스트 ────────────────────────
 
-    /// OneShot EvictionStage 가 KvMutate 에서 발화 → cache prune → driver 가
-    /// `reconcile_kv_pos_after_eviction` 으로 loop pos 를 handle.current_pos() 와 동기화.
-    /// Consumed → registry GC (len==0). β-7: v1 observer.on_eviction 통지가 제거됐으므로
-    /// prune 은 pos 환류(new_pos < N_TOKENS, final_pos == new_pos+1)로 직접 검증한다.
+    /// 회귀: in-loop eviction(KvMutate, sliding prefix+window = non-contiguous keep)이 KV-cache 를
+    /// compaction 한 뒤에도 driver 의 `self.pos`(= 다음 forward 의 RoPE `start_pos`)는 **압축된
+    /// current_pos 로 collapse 되지 않고 진짜 누적 위치를 유지**해야 한다. compaction 은 생존 키를
+    /// memmove 만 하고 재회전하지 않으므로(원위치 RoPE phase 보존), 압축 count 로 collapse 하면 다음
+    /// 토큰 query 가 생존 키보다 낮은 위치로 회전해 학습된 상대거리가 깨진다(eval/ppl 이 명시 금지하는
+    /// "severe NLL degradation"). 동시에 GPU plan invalidation(`on_kv_prune`)은 점유 shrink 시 1회
+    /// 발화해야 한다.
+    ///
+    /// **비-tautology**: forward 가 받은 `ctx.pos` 를 기록해 검증한다. 구 collapse 동작에선 이 값이
+    /// 압축 count(≈14)였고, 본 단언(== N_TOKENS=120)은 그때 FAIL 한다.
     #[test]
-    fn eviction_stage_pos_reconcile() {
+    fn eviction_keeps_cumulative_rope_pos_not_collapsed_to_compacted() {
         use crate::backend::Backend;
         use crate::backend::cpu::CpuBackend;
         use crate::buffer::DType;
         use crate::format::KVCacheFormat;
+        use crate::inference::sampling::StepCtx;
         use crate::kv::cache_manager::CacheManager;
         use crate::kv::eviction::stage_registry::sliding_backed_policy;
         use crate::kv::kv_cache::KVCache;
         use crate::kv::standard_format::StandardFormat;
         use crate::memory::host::shared::SharedBuffer;
         use crate::resilience::sys_monitor::NoOpMonitor;
+        use crate::session::forward::Forward;
         use crate::shape::Shape;
         use crate::stages::kv::eviction::EvictionStage;
         use crate::tensor::Tensor;
+        use std::sync::Mutex as StdMutex;
 
         const KV_HEADS: usize = 1;
         const HEAD_DIM: usize = 32;
         const MAX_SEQ: usize = 128;
         const N_TOKENS: usize = 120; // ratio=0.3 → remove=84 ≥ MIN_EVICT_TOKENS(64).
+
+        // forward 가 매 step 받는 `ctx.pos`(= RoPE start_pos)와 `on_kv_prune(new_pos)` 호출을 기록하는
+        // forward stub. step 은 KVCache 를 advance 하지 않으므로(mock) handle.current_pos 는 eviction
+        // 후 값으로 고정 — 단일-step(budget=1) 검증과 함께 reconcile 재발동 아티팩트를 회피한다.
+        struct RecordingForward {
+            vocab: usize,
+            step_positions: Arc<StdMutex<Vec<usize>>>,
+            prune_calls: Arc<StdMutex<Vec<usize>>>,
+        }
+        impl Forward for RecordingForward {
+            fn prefill(&mut self, _tokens: &[u32], _start_pos: usize) -> anyhow::Result<Vec<f32>> {
+                let mut l = vec![0.0_f32; self.vocab];
+                l[0] = 1.0;
+                Ok(l)
+            }
+            fn step(&mut self, ctx: &StepCtx, _token: u32) -> anyhow::Result<Vec<f32>> {
+                self.step_positions.lock().unwrap().push(ctx.pos);
+                let mut l = vec![0.0_f32; self.vocab];
+                l[1] = 1.0;
+                Ok(l)
+            }
+            fn on_kv_prune(&mut self, new_pos: usize) {
+                self.prune_calls.lock().unwrap().push(new_pos);
+            }
+        }
 
         // 실물 F32 KVCache (current_pos = N_TOKENS) 를 StandardFormat 으로 wrap.
         let total = MAX_SEQ * KV_HEADS * HEAD_DIM;
@@ -1317,42 +1389,202 @@ mod tests {
         cache.current_pos = N_TOKENS;
         let handle = Arc::new(StandardFormat::new(0, cache));
 
-        // OneShot EvictionStage: sliding(window=10, prefix=4) → prune.
+        // OneShot EvictionStage: sliding(window=10, prefix=4) → prefix[0..4)+recent[110..120) keep =
+        // non-contiguous(중간 구멍) → 생존자의 원위치 ≠ 압축 슬롯.
         let policy = sliding_backed_policy(10, 4);
         let cm = CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, 0.3);
-        // β-4: EvictionStage::one_shot 은 Arc<Mutex<CacheManager>> 를 받는다 (시그니처만 적응 — 검증 무변).
         let stage = EvictionStage::one_shot(vec![handle.clone()], Arc::new(Mutex::new(cm)), 0.3);
 
         let registry = Arc::new(PipelineRegistry::new());
         registry.submit(Arc::new(stage));
         assert_eq!(registry.len(), 1);
 
+        let step_positions = Arc::new(StdMutex::new(Vec::<usize>::new()));
+        let prune_calls = Arc::new(StdMutex::new(Vec::<usize>::new()));
         let pos_handle: Arc<dyn KVCacheFormat> = handle.clone();
         let mut loop_ = DecodeLoopBuilder::new()
-            .with_forward(MockForward {
+            .with_forward(RecordingForward {
                 vocab: 16,
-                step_count: 0,
+                step_positions: step_positions.clone(),
+                prune_calls: prune_calls.clone(),
             })
             .with_kv_capacity(2048)
             .with_pipeline(Arc::clone(&registry))
             .with_kv_pos_handle(pos_handle)
             .build();
 
-        // prefill N_TOKENS → driver pos = N_TOKENS (handle.current_pos 와 일치).
-        // budget=1: 첫 step 의 KvMutate 발화로 prune·reconcile 만 검증한다 (MockForward 는
-        // KVCache 를 advance 하지 않아 step ≥2 에서 handle.current_pos < loop pos 가 누적되며
-        // reconcile 이 재발동하는 테스트-아티팩트를 회피 — production forward.step 은 advance).
+        // prefill N_TOKENS → driver pos = N_TOKENS. budget=1: 첫 step 의 KvMutate 가 eviction 을 발화.
         let prompt: Vec<u32> = (0..N_TOKENS as u32).collect();
         loop_.prefill(&prompt).unwrap();
         let result = loop_.run(1, 0).unwrap();
 
-        // EvictionStage 발화 후 handle.current_pos < N_TOKENS (sliding prune).
-        let new_pos = handle.current_pos();
-        assert!(new_pos < N_TOKENS, "eviction prune (got pos={new_pos})");
-        // 첫 step 의 KvMutate prune 으로 loop pos 가 new_pos 로 동기화된 뒤 step 진행으로 +1
-        // → final_pos == new_pos + 1.
-        assert_eq!(result.final_pos, new_pos + 1, "pos 환류 후 step 진행 정합");
+        // 비-vacuous 가드: eviction 이 실제로 cache 를 compaction 했다.
+        let occupancy = handle.current_pos();
+        assert!(
+            occupancy < N_TOKENS,
+            "eviction 이 cache 를 prune 해야 함 (occupancy={occupancy})"
+        );
+
+        // ★핵심(비-tautology): eviction 직후 step 의 RoPE start_pos 는 압축 count 가 아니라 진짜 누적
+        // 위치(N_TOKENS)다. 구 collapse 동작에선 occupancy(≈14)였다 → 본 단언이 FAIL.
+        let seen = step_positions.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![N_TOKENS],
+            "eviction-후 forward start_pos == 진짜 누적 위치(압축 count 아님)"
+        );
+        assert!(
+            seen[0] > occupancy,
+            "start_pos(누적, {}) 와 cache occupancy(압축, {occupancy}) 는 분리되어야 함",
+            seen[0]
+        );
+
+        // GPU plan invalidation: 점유 shrink 1회 → on_kv_prune 1회(압축 occupancy 로).
+        let prunes = prune_calls.lock().unwrap().clone();
+        assert_eq!(
+            prunes,
+            vec![occupancy],
+            "on_kv_prune 은 shrink 당 1회, 압축 occupancy 로 발화"
+        );
+
+        // loop pos 는 누적 유지 → step 진행으로 +1.
+        assert_eq!(
+            result.final_pos,
+            N_TOKENS + 1,
+            "final_pos 는 누적 위치(collapse 아님)에서 진행"
+        );
+        // telemetry 점유는 누적이 아니라 압축 occupancy.
+        assert_eq!(
+            result.final_cache_pos, occupancy,
+            "final_cache_pos 는 cache 점유(occupancy) 여야 함"
+        );
         // OneShot Consumed → registry GC.
         assert_eq!(registry.len(), 0, "OneShot Consumed 후 registry GC");
+    }
+
+    /// 회귀(강화): eviction 1회 후 후속 step 들에서 cache 가 정상 성장(+1/step)할 때
+    /// `on_kv_prune` 이 **재발화하지 않는다**. 이게 shrink-detection 설계의 핵심 — 단순히
+    /// "collapse 금지"만 하고 트리거를 `new_pos < self.pos` 로 두면 eviction 후 pos·occupancy 가
+    /// 영구 분리돼 매 step on_kv_prune 이 발화(= GPU plan 매 step 무효화) 한다. budget>=2 + cache 를
+    /// 실제로 advance 하는 forward 로 그 trap 부재를 핀한다.
+    #[test]
+    fn on_kv_prune_fires_once_per_eviction_not_every_step() {
+        use crate::backend::Backend;
+        use crate::backend::cpu::CpuBackend;
+        use crate::buffer::DType;
+        use crate::format::KVCacheFormat;
+        use crate::inference::sampling::StepCtx;
+        use crate::kv::cache_manager::CacheManager;
+        use crate::kv::eviction::stage_registry::sliding_backed_policy;
+        use crate::kv::kv_cache::KVCache;
+        use crate::kv::standard_format::StandardFormat;
+        use crate::memory::host::shared::SharedBuffer;
+        use crate::resilience::sys_monitor::NoOpMonitor;
+        use crate::session::forward::Forward;
+        use crate::shape::Shape;
+        use crate::stages::kv::eviction::EvictionStage;
+        use crate::tensor::Tensor;
+        use std::sync::Mutex as StdMutex;
+
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 32;
+        const MAX_SEQ: usize = 256;
+        const N_TOKENS: usize = 120;
+        const BUDGET: usize = 4;
+
+        // step() 가 실제 KVCache 를 +1 advance 하는 forward(= production write_kv 의 점유 증가 모사).
+        // 이로써 eviction 후 후속 step 에서 occupancy 가 kv_occupancy 위로 자라며, shrink 미감지 →
+        // on_kv_prune 미발화를 검증할 수 있다.
+        struct AdvancingForward {
+            vocab: usize,
+            cache: Arc<StandardFormat>,
+            prune_calls: Arc<StdMutex<Vec<usize>>>,
+        }
+        impl Forward for AdvancingForward {
+            fn prefill(&mut self, _tokens: &[u32], _start_pos: usize) -> anyhow::Result<Vec<f32>> {
+                let mut l = vec![0.0_f32; self.vocab];
+                l[0] = 1.0;
+                Ok(l)
+            }
+            fn step(&mut self, _ctx: &StepCtx, _token: u32) -> anyhow::Result<Vec<f32>> {
+                // production forward.step 의 write_kv 처럼 점유를 1 늘린다.
+                self.cache.with_cache_mut(|c| c.current_pos += 1);
+                let mut l = vec![0.0_f32; self.vocab];
+                l[1] = 1.0;
+                Ok(l)
+            }
+            fn on_kv_prune(&mut self, new_pos: usize) {
+                self.prune_calls.lock().unwrap().push(new_pos);
+            }
+        }
+
+        let total = MAX_SEQ * KV_HEADS * HEAD_DIM;
+        let k_buf = Arc::new(SharedBuffer::new(total * 4, DType::F32));
+        let v_buf = Arc::new(SharedBuffer::new(total * 4, DType::F32));
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let shape = Shape::new(vec![1, MAX_SEQ, KV_HEADS, HEAD_DIM]);
+        let k = Tensor::new(shape.clone(), k_buf, backend.clone());
+        let v = Tensor::new(shape, v_buf, backend);
+        let mut cache = KVCache::new(k, v, MAX_SEQ);
+        cache.current_pos = N_TOKENS;
+        let handle = Arc::new(StandardFormat::new(0, cache));
+
+        // OneShot eviction: 첫 KvMutate 에서 1회만 prune (Consumed→GC). 후속 step 엔 eviction 없음.
+        let policy = sliding_backed_policy(10, 4);
+        let cm = CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, 0.3);
+        let stage = EvictionStage::one_shot(vec![handle.clone()], Arc::new(Mutex::new(cm)), 0.3);
+        let registry = Arc::new(PipelineRegistry::new());
+        registry.submit(Arc::new(stage));
+
+        let prune_calls = Arc::new(StdMutex::new(Vec::<usize>::new()));
+        let pos_handle: Arc<dyn KVCacheFormat> = handle.clone();
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(AdvancingForward {
+                vocab: 16,
+                cache: handle.clone(),
+                prune_calls: prune_calls.clone(),
+            })
+            .with_kv_capacity(MAX_SEQ)
+            .with_pipeline(Arc::clone(&registry))
+            .with_kv_pos_handle(pos_handle)
+            .build();
+
+        let prompt: Vec<u32> = (0..N_TOKENS as u32).collect();
+        loop_.prefill(&prompt).unwrap();
+        let result = loop_.run(BUDGET, 0).unwrap();
+
+        // eviction 이 실제로 발생(비-vacuous): 첫 step 후 점유는 prune 값 + 후속 advance.
+        let prunes = prune_calls.lock().unwrap().clone();
+        // ★핵심: on_kv_prune 은 eviction 1회에 대해 정확히 1회. budget=4 step 중 후속 3 step 은
+        // cache 가 성장(occupancy > kv_occupancy)하므로 재발화하지 않는다.
+        assert_eq!(
+            prunes.len(),
+            1,
+            "on_kv_prune 은 eviction 당 1회만 (매 step 재발화 금지) — got {prunes:?}"
+        );
+        // 첫 prune 은 압축 occupancy(< N_TOKENS)로 발화.
+        assert!(
+            prunes[0] < N_TOKENS,
+            "prune occupancy 는 압축값(<{N_TOKENS}) — got {}",
+            prunes[0]
+        );
+        // self.pos 는 누적 유지: prefill(120) + budget(4) step.
+        assert_eq!(
+            result.final_pos,
+            N_TOKENS + BUDGET,
+            "final_pos 누적(collapse 아님)"
+        );
+        // 최종 점유 = prune 후 occupancy + 후속 step advance 수.
+        assert_eq!(
+            result.final_cache_pos,
+            handle.current_pos(),
+            "final_cache_pos == 실제 cache 점유"
+        );
+        assert!(
+            result.final_cache_pos < result.final_pos,
+            "eviction 후 점유({}) < 누적 위치({})",
+            result.final_cache_pos,
+            result.final_pos
+        );
     }
 }
