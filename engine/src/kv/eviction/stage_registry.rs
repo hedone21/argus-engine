@@ -144,15 +144,18 @@ pub(crate) fn execute_kv_plan(
             // All heads keep the same NUMBER of tokens (the engine's single-current_pos invariant);
             // the new position is that shared length.
             let new_pos = heads.first().map_or(0, |h| h.len());
+            // Validate ALL heads BEFORE mutating any. The engine has a single shared current_pos, so
+            // every head MUST keep the same number of tokens. An unequal list would set current_pos to
+            // head[0]'s length while each head compacts to its own keep.len(), so a shorter head's slots
+            // [keep.len()..new_pos) hold stale pre-compaction KV that attention then over-reads as valid
+            // — silent corruption. This was a `debug_assert_eq!` (compiled OUT of release builds), so
+            // release reached the corruption path; reject cleanly instead (the fn returns Result and
+            // already bails above). The check runs over every head FIRST because compaction mutates in
+            // place: a non-contiguous earlier head would already be physically shifted by the time a
+            // later head's length mismatch was found, leaving the cache partially compacted on the error
+            // path. Pre-validating keeps the bail clean (cache untouched). Faithful unequal per-head
+            // budgets (Ada-KV / DuoAttention) need a varlen executor + per-head valid-len kernel (R-P1-2).
             for (kv_head, keep) in heads.iter().enumerate() {
-                // The engine has a single shared current_pos, so every head MUST keep the same
-                // number of tokens. An unequal list would set current_pos to head[0]'s length while
-                // each head compacts to its own keep.len(), so a shorter head's slots [keep.len()..
-                // new_pos) hold stale pre-compaction KV that attention then over-reads as valid —
-                // silent corruption. This was a `debug_assert_eq!` (compiled OUT of release builds),
-                // so release reached the corruption path; reject cleanly instead (the fn returns
-                // Result and already bails above). Faithful unequal per-head budgets (Ada-KV /
-                // DuoAttention) need a varlen executor + per-head valid-len kernel (R-P1-2).
                 if keep.len() != new_pos {
                     anyhow::bail!(
                         "PerHead keep-lists must be equal length (head {kv_head}: {} != {new_pos}); \
@@ -160,6 +163,8 @@ pub(crate) fn execute_kv_plan(
                         keep.len()
                     );
                 }
+            }
+            for (kv_head, keep) in heads.iter().enumerate() {
                 cache.compact_keep_positions_for_head(kv_head, keep, 0)?;
             }
             cache.set_current_pos(new_pos);
@@ -1712,6 +1717,136 @@ mod tests {
         assert!(
             err.to_string().contains("equal length"),
             "expected an equal-length rejection, got: {err}"
+        );
+    }
+
+    /// (W-VARLEN clean-bail regression) The in-process unequal per-head bail must leave the cache
+    /// BYTE-UNCHANGED on the error path — not merely return `Err`. The equal-length check now runs over
+    /// ALL heads before any compaction, so an unequal plan whose FIRST head's keep is NON-CONTIGUOUS
+    /// (head 0 = `[0,2,3]`, which `compact_keep_positions_for_head` would physically shift) does NOT
+    /// partially mutate head 0 before head 1's length mismatch is caught. Without the validate-before-
+    /// mutate ordering, head 0 would already be compacted (and `current_pos` left stale) on the bail
+    /// path — a partial mutation that contradicts the "clean bail / no silent corruption" guarantee the
+    /// per-head executor relies on.
+    #[test]
+    fn per_head_unequal_bail_leaves_cache_unmutated() {
+        use crate::kv_cache_ops::KVLayout;
+
+        const MAX_SEQ: usize = 32;
+        const HD: usize = 4;
+        let n_kv_heads = 2;
+
+        let backend = Arc::new(CpuBackend::new());
+        let buf = || {
+            Arc::new(SharedBuffer::new(
+                n_kv_heads * MAX_SEQ * HD * std::mem::size_of::<f32>(),
+                DType::F32,
+            ))
+        };
+        let shape = Shape::new(vec![1, MAX_SEQ, n_kv_heads, HD]);
+        let mut c = KVCache::new(
+            Tensor::new(shape.clone(), buf(), backend.clone()),
+            Tensor::new(shape, buf(), backend),
+            MAX_SEQ,
+        )
+        .with_layout(KVLayout::HeadMajor);
+        c.current_pos = 4;
+
+        // Distinct marker per (head, pos, dim) so any physical shift is observable.
+        let marker = |head: usize, pos: usize, d: usize| {
+            (pos + 1) as f32 + head as f32 * 100.0 + d as f32 * 0.01
+        };
+        for head in 0..n_kv_heads {
+            for pos in 0..4 {
+                let off = c.offset(pos, head);
+                let kb = c.k_buffer.as_mut_slice::<f32>();
+                for d in 0..HD {
+                    kb[off + d] = marker(head, pos, d);
+                }
+                let vb = c.v_buffer.as_mut_slice::<f32>();
+                for d in 0..HD {
+                    vb[off + d] = marker(head, pos, d) + 0.5;
+                }
+            }
+        }
+        let k_before = c.k_buffer.as_slice::<f32>().to_vec();
+        let v_before = c.v_buffer.as_slice::<f32>().to_vec();
+        let pos_before = c.current_pos();
+
+        // head 0 keep [0,2,3] is NON-CONTIGUOUS (drops pos 1 → compaction would shift it); head 1 keep
+        // [0,1] is the unequal one. Mutate-then-check ordering would shift head 0 before bailing.
+        let plan = KVCachePlan {
+            keep: KeepSpec::PerHead(vec![vec![0, 2, 3], vec![0, 1]]),
+            merges: vec![],
+            channels: None,
+        };
+        let err = execute_kv_plan(&mut c, &plan, 0, 1).expect_err("unequal per-head must bail");
+        assert!(
+            err.to_string().contains("equal length"),
+            "expected an equal-length rejection, got: {err}"
+        );
+
+        // The bail must be CLEAN: buffers and current_pos byte-unchanged (no partial compaction).
+        assert_eq!(
+            c.current_pos(),
+            pos_before,
+            "current_pos must be unchanged on a clean bail"
+        );
+        assert_eq!(
+            c.k_buffer.as_slice::<f32>(),
+            k_before.as_slice(),
+            "K buffer must be unmutated on a clean bail"
+        );
+        assert_eq!(
+            c.v_buffer.as_slice::<f32>(),
+            v_before.as_slice(),
+            "V buffer must be unmutated on a clean bail"
+        );
+    }
+
+    /// (W-VARLEN / R-P1-2 regression) The DYNAMIC (`.so`, C-ABI) plugin path must REJECT a per-head
+    /// (varlen) plan cleanly at the marshalling boundary, never silently coerce it to layer-wide or
+    /// emit garbage. The in-process path is covered by `per_head_unequal_keep_lengths_bail_not_corrupt`
+    /// above; this is the path a real out-of-tree Ada-KV / DuoAttention technique (unequal per-head KV
+    /// budgets) would actually traverse via a runtime `.so` → [`DynStage`] → [`planabi_to_plan`].
+    ///
+    /// It proves the boundary is honest end-to-end: the producer side ([`PlanArena`]) FAITHFULLY
+    /// preserves the ragged (unequal-length) per-head shape into `keep_outer_lens` (no silent
+    /// equalize/truncate), and only then does the host reject it at execution-admission
+    /// (`keep_kind == 1` is unsupported before a promotion-trigger). Faithful varlen execution needs a
+    /// varlen executor + per-head valid-len kernel (R-P1-2, engine-core/L3); the engine's single shared
+    /// `current_pos` and non-ragged container cannot store it, so a clean bail is the correct behaviour.
+    #[test]
+    fn dyn_plugin_perhead_varlen_plan_bails_at_abi_not_silent() {
+        use argus_extension_api::PlanArena;
+
+        // A ragged (unequal-length) per-head plan = the Ada-KV / DuoAttention varlen shape: head 0
+        // keeps 3 tokens, head 1 keeps 2. A faithful varlen producer emits exactly this.
+        let plan = KVCachePlan {
+            keep: KeepSpec::PerHead(vec![vec![0, 1, 2], vec![0, 1]]),
+            merges: Vec::new(),
+            channels: None,
+        };
+        // Marshal through the REAL C-ABI producer (what a `.so` plugin's plan thunk does).
+        let abi = PlanArena::into_abi(plan);
+        assert_eq!(abi.keep_kind, 1, "PerHead must flatten to keep_kind == 1");
+        // Producer must NOT silently equalize: the ragged per-head lengths survive into the ABI.
+        let lens =
+            unsafe { core::slice::from_raw_parts(abi.keep_outer_lens, abi.keep_outer_count) };
+        assert_eq!(
+            lens,
+            &[3usize, 2],
+            "producer must preserve the ragged (varlen) per-head shape, not equalize it"
+        );
+        // Host-side reconstruction must bail cleanly — no silent LayerWide coercion, no garbage.
+        let result = unsafe { planabi_to_plan(&abi) };
+        // Reclaim the plugin arena regardless of outcome (the host always frees it; mirrors DynStage).
+        unsafe { PlanArena::free(abi.owner) };
+        let err = result
+            .expect_err("dynamic PerHead (varlen) plan must bail, not silently coerce/corrupt");
+        assert!(
+            err.to_string().contains("PerHead"),
+            "expected a PerHead rejection, got: {err}"
         );
     }
 
