@@ -107,8 +107,23 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
     ) = (&args.prefix_cache, &prefix_hashes)
     {
         let is_opaque = kv_caches.first().is_some_and(|c| c.is_opaque());
-        if is_opaque {
-            eprintln!("[PrefixCache] opaque KV format — snapshot unsupported, fresh prefill");
+        // W-ALLOC: a per-layer mixed-precision set has heterogeneous byte layouts across layers, but
+        // the snapshot stamps ONE format_id (fmts.first()) for the whole save — restoring it would
+        // mis-describe the non-first layers. Reject the snapshot (fresh prefill) for a mixed set
+        // rather than silently round-trip a per-layer layout mismatch.
+        let is_mixed = kv_caches.first().is_some_and(|first| {
+            let d0 = first.kv_dtype();
+            kv_caches.iter().any(|c| c.kv_dtype() != d0)
+        });
+        if is_opaque || is_mixed {
+            eprintln!(
+                "[PrefixCache] {} KV format — snapshot unsupported, fresh prefill",
+                if is_mixed {
+                    "per-layer mixed"
+                } else {
+                    "opaque"
+                }
+            );
             None
         } else {
             let n_layers = kv_caches.len();

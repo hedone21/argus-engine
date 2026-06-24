@@ -109,6 +109,18 @@ fn reject_unsupported_for_chat(args: &Args) -> anyhow::Result<()> {
     if args.skip_ratio.unwrap_or(0.0) > 0.0 {
         bail!("argus-chat: --skip-ratio not supported");
     }
+    // W-ALLOC honesty: `--kv-format` is a global Args flag but only argus-cli/argus-bench honor a
+    // per-layer KV format POLICY (N-way mixed precision); chat allocates a uniform KV dtype. Fail
+    // fast on a policy name instead of silently dropping it to uniform (no-silent-no-op contract).
+    if let Some(fmt) = args.kv_format.as_deref().filter(|s| !s.is_empty())
+        && argus_engine::format::is_registered_kv_format_policy(fmt)
+    {
+        bail!(
+            "argus-chat: --kv-format '{fmt}' is a per-layer KV format policy (N-way mixed precision) \
+             supported only by argus-cli / argus-bench; chat uses a uniform KV dtype. Use --kv-type \
+             for chat, or run mixed precision via argus-cli / argus-bench."
+        );
+    }
     // (`--d2o-layer-alloc` is a d2o-private knob that rides the StageArgs blob now; the d2o plugin
     // ignores it — the per-layer variance machinery is runtime-dead — so chat no longer special-cases
     // it. The engine names no plugin knob here.)

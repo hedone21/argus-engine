@@ -103,6 +103,17 @@ impl StandardFormat {
     }
 
     #[cfg(feature = "opencl")]
+    /// 이 레이어 KV 캐시의 저장 dtype (fused GPU plan 의 F16-only invariant 가드용).
+    ///
+    /// fused plan 의 KV scatter(`kernel_kv_scatter_f32_to_f16`)/attention 은 F16 전용이라
+    /// q4_0 등 비-F16 캐시가 plan 경로를 타면 block 바이트를 F16 으로 오독한다(plan.rs 의 미강제
+    /// invariant). `try_build_plan` 이 이 값으로 전 레이어 F16 여부를 확인해 mixed/비-F16 면
+    /// dyn forward 폴백시킨다(W-ALLOC per-layer mixed precision correctness).
+    pub(crate) fn kv_dtype(&self) -> crate::buffer::DType {
+        self.inner.lock().unwrap().cache.kv_dtype()
+    }
+
+    #[cfg(feature = "opencl")]
     /// plan 빌드용 lock guard (Phase α-K (3p) ④-a `build_plan`).
     ///
     /// `build_plan` 는 모든 핸들의 guard 를 동시에 잡고 `&KVCache` 슬라이스를 만들어

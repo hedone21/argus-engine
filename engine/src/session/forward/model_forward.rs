@@ -298,6 +298,19 @@ impl ModelForward {
             .fmt_caches
             .as_ref()
             .expect("fmt_caches Some after ensure_fmt_wrapped (5-F: fmt-only)");
+        // W-ALLOC F16-invariant 가드: fused plan 의 KV scatter/attention 은 F16 전용
+        // (plan.rs 의 미강제 invariant). per-layer mixed precision 으로 비-F16(q4_0 등) 캐시가
+        // 하나라도 있으면 plan 이 block 바이트를 F16 으로 오독 → garbage. 이 경우 plan 을 거부해
+        // dyn forward_into 폴백(레이어별 dtype-correct 경로)으로 보낸다. all-F16(통상 경로)은 무영향.
+        if !handles.iter().all(|h| h.kv_dtype() == DType::F16) {
+            if trace {
+                eprintln!(
+                    "[fwd-trace] skip: non-F16 KV cache present (mixed precision → dyn path)"
+                );
+            }
+            self.sticky_disabled = true;
+            return None;
+        }
         let plan = self.model.build_plan(
             &self.decode_x_gen,
             &self.logits_decode,
@@ -807,6 +820,20 @@ impl Forward for ModelForward {
         };
         if fmts.is_empty() {
             return Ok(());
+        }
+        // W-ALLOC: a per-layer mixed-precision (heterogeneous-dtype) set cannot be described by the
+        // single `format_id` this snapshot stamps (fmts.first()), so saving it would mis-describe the
+        // non-first layers on restore. Refuse to save a heterogeneous set rather than write a
+        // mis-described snapshot (the save-side twin of the restore-side mixed guard in standard_happy).
+        let d0 = fmts[0].with_cache_mut(|c| c.kv_dtype());
+        if fmts
+            .iter()
+            .any(|f| f.with_cache_mut(|c| c.kv_dtype()) != d0)
+        {
+            anyhow::bail!(
+                "prefix-cache save is unsupported for a per-layer mixed-precision KV set \
+                 (heterogeneous dtypes across layers); the snapshot format is single-format. Not saved."
+            );
         }
         // 첫 번째 cache의 geometry를 사용
         let (kv_heads, head_dim) = fmts

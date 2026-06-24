@@ -73,6 +73,9 @@ synth-q4-format = { path = "../crates/techniques/synth-q4-format" }
 # Quest (query-aware selective read): the first KVReadStage builtin. Non-optional,
 # force-linked, with a startup self-test that fails fast on fat-LTO drop.
 quest = { path = "../crates/techniques/quest" }
+# Mixed-precision (per-layer KV format policy — N-way mixed precision / KVTuner shape): the first
+# KVFormatPolicy builtin. Non-optional, force-linked so `--kv-format mixed_precision` resolves it.
+mixed-precision = { path = "../crates/techniques/mixed-precision" }
 # StreamingLLM (attention-sink + recent-window KVCacheStage). Extracted from the engine
 # core; non-optional, force-linked so `eviction streaming` resolves the out-of-tree plugin.
 streaming-llm = { path = "../crates/techniques/streaming-llm" }

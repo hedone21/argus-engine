@@ -15,6 +15,7 @@
 pub mod builtin_kv_formats;
 pub mod dtype_layout;
 pub mod dynamic_format_registry;
+pub mod format_policy_registry;
 pub mod kv_cache_format;
 pub mod kv_snapshot;
 pub mod selective_read;
@@ -24,6 +25,9 @@ pub use builtin_kv_formats::{builtin_format_dtype, ensure_builtin_kv_formats_reg
 pub use dtype_layout::{
     decode_via_descriptor, dequant_to_f32_tensor, dequant_via_descriptor, dtype_to_layout_desc,
     encode_via_descriptor, layout_desc_to_builtin_dtype,
+};
+pub use format_policy_registry::{
+    ensure_builtin_format_policies_registered, is_registered_kv_format_policy,
 };
 pub use kv_cache_format::{AttnDims, KVCacheFormat, Merge};
 pub use kv_snapshot::SnapshotRestore;
