@@ -476,6 +476,7 @@ impl KVCacheStage for D2OStage {
         Some(KVCachePlan {
             keep: KeepSpec::LayerWide(retain_all),
             merges,
+            channels: None,
         })
     }
 }

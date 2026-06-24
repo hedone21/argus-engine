@@ -34,6 +34,7 @@ impl KVCacheStage for KeepRecent {
         Some(KVCachePlan {
             keep: KeepSpec::LayerWide(keep),
             merges: Vec::new(),
+            channels: None,
         })
     }
 }

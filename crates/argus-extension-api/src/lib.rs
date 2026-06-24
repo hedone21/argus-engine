@@ -61,6 +61,14 @@ pub enum TensorKind {
     /// `Some` only on the prefill-end PFA-active path; `None` at KvMutate/decode and when unarmed.
     /// discriminant 5 — 0–4 unchanged (C-ABI additive, fieldless repr(u32)).
     PrefillAttention,
+    /// (D2) raw CURRENT-step Q (query) vector, RoPE-applied. `shape = {rows:1, cols:head_dim,
+    /// per_head:true}`: `read_row(0, kv_head, out)` = that kv_head's current Q (GQA-reduced to kv_head
+    /// coordinates, like [`TensorKind::QueryStats`]). This is the exact per-channel `q_d` faithful
+    /// Quest needs for `Σ_d max(q_d·min_d, q_d·max_d)` — [`TensorKind::QueryStats`] only carries a
+    /// retrospective running mean+var, never the live query. `Some` only when a read/eviction consumer
+    /// requested it (`wants_query` handshake) on the decode hot path; `None` otherwise.
+    /// discriminant 6 — 0–5 unchanged (C-ABI additive, fieldless repr(u32)).
+    Query,
 }
 
 /// Discriminant pins — the `#[repr(u32)]` values are the wire format (`kind as u32`), so any
@@ -71,6 +79,7 @@ const _: () = assert!(TensorKind::AttnWeights as u32 == 2);
 const _: () = assert!(TensorKind::Scores as u32 == 3);
 const _: () = assert!(TensorKind::QueryStats as u32 == 4);
 const _: () = assert!(TensorKind::PrefillAttention as u32 == 5);
+const _: () = assert!(TensorKind::Query as u32 == 6);
 
 /// dtype-agnostic tensor shape (POD). Only flat fields that can cross a future FFI boundary as-is (`#[repr(C)]`-able).
 #[repr(C)]
@@ -274,6 +283,21 @@ pub enum KeepSpec {
     PerHead(Vec<Vec<usize>>),
 }
 
+/// (D1) The channel-axis (head_dim index) selection — the orthogonal twin of [`KeepSpec`] (which
+/// selects token POSITIONS). ThinK and KVCompose prune KEY head_dim CHANNELS, an axis [`KeepSpec`]
+/// cannot express (channel ⊥ token). This is a DORMANT typed surface: a plugin can DESCRIBE channel
+/// intent, but no current container can store a narrowed/ragged head_dim (head_dim is a single
+/// per-cache scalar woven through every offset/alloc/attention-kernel call), so the engine executor
+/// REJECTS any `Some(ChannelKeep)` plan cleanly rather than silently ignoring it. Faithful channel
+/// pruning needs a narrowed-head_dim container + paired attention kernel (L3 / engine-core).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChannelKeep {
+    /// Kept head_dim channel indices shared by all heads (ascending).
+    LayerWide(Vec<usize>),
+    /// Per-kv-head kept channel indices (`[n_kv_heads][channels]`, each ascending).
+    PerHead(Vec<Vec<usize>>),
+}
+
 /// The plan a technique produces. `keep` (exclusive) ⊥ `merges` (orthogonal). `new_pos` is not carried — the engine
 /// derives it from `keep.len()` (assuming all heads of [`KeepSpec::PerHead`] are of equal length).
 #[derive(Clone, Debug, PartialEq)]
@@ -282,6 +306,12 @@ pub struct KVCachePlan {
     pub keep: KeepSpec,
     /// Weighted merge instructions (empty Vec if none).
     pub merges: Vec<WeightedMerge>,
+    /// (D1) Optional channel-axis (head_dim index) selection — the orthogonal twin of `keep`
+    /// (ThinK-style key-channel pruning). `None` = all channels kept (byte-identical, the default for
+    /// every token-axis technique). `Some` is a DORMANT surface today: no container can store a
+    /// narrowed/ragged head_dim, so the engine executor (`execute_kv_plan`) REJECTS it cleanly — it
+    /// never silently no-ops. See [`ChannelKeep`].
+    pub channels: Option<ChannelKeep>,
 }
 
 /// The stage-axis extension technique surface — it adjusts resident tokens (a sibling of the engine-side storage-representation trait `KVCacheFormat`).
@@ -1175,6 +1205,123 @@ pub fn find_kv_format(name: &str) -> Option<&'static KVFormatReg> {
 /// All registered format names (for self-test / diagnostics).
 pub fn registered_kv_format_names() -> Vec<&'static str> {
     KV_FORMATS.iter().map(|r| r.name).collect()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// D3 — KVFormatPlan: the dual of KVCachePlan (format/precision assignment)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// KVCachePlan answers "which tokens stay" (residency); KVFormatPlan answers "in what format is each
+// region stored" (precision/layout) — a near-uniform total function over layer x head x token x {K,V}.
+// Static-linkme only (no C-ABI yet; a repr(C) projection is a separate tail-append PR when a real
+// `.so` codec author appears). The executor (`apply_format_plan`) and its `FormatApplyError` live
+// engine-side (applying a format touches engine container types); this api surface is plan-only.
+//
+// HONESTY (verified): the value types below are fully constructible, but on current containers only a
+// uniform-per-layer assignment is even a candidate for execution — per-head / per-token heterogeneous
+// precision is structurally unholdable (one dtype per `KVCache` layer buffer; one bit-width per
+// quant-window layer), so the engine executor REJECTS such plans rather than silently mis-storing.
+// "Expressible (a well-formed plan value) != executable (the engine can re-materialize it)".
+
+/// A storage-format identity = a registry **name** only — not an enum, not a `{name,bits}` pair.
+/// Every precision detail (bit-width, scale layout, codebook/LUT, per-channel scale, pre-RoPE) lives
+/// BEHIND the name (inside the codec), which keeps the format set open to novel codecs (e.g. a
+/// backend-cap GPU decoder) without engine-core edits. Bit variants are distinct names
+/// (`"q2"`/`"q4_0"`/`"f16"`), exactly as the floor already distinguishes them via [`KVFormatReg::name`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormatId(pub String);
+
+/// Pins one region to one registered storage `format` on one K/V `side`. Reuses [`KeepSpec`] for the
+/// token region and [`MergeAxis`] for the side — zero new selector/side vocabulary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormatOverride {
+    /// The token region this override covers (the same selector the eviction axis uses).
+    pub region: KeepSpec,
+    /// The registered storage format applied to `region`.
+    pub format: FormatId,
+    /// Which of K / V / both this override applies to.
+    pub side: MergeAxis,
+}
+
+/// The dual of [`KVCachePlan`]: `base` + an ordered, last-wins `overrides` list encodes a
+/// near-uniform total function over layer x head x token x {K,V}. Empty `overrides` <=> uniform
+/// `base` <=> today's behavior (Gate-0: byte-identical when `base` equals the current stored format).
+#[derive(Clone, Debug, PartialEq)]
+pub struct KVFormatPlan {
+    /// The default format applied where no override matches.
+    pub base: FormatId,
+    /// Ordered overrides; later entries win (see [`KVFormatPlan::format_of`]).
+    pub overrides: Vec<FormatOverride>,
+}
+
+impl KVFormatPlan {
+    /// Resolver: the last override matching `(head, token, side)`, else `base`. Total + deterministic
+    /// — this is the semantics of the base+override encoding, and it is what makes the Gate-0 identity
+    /// hold (empty overrides => `base` everywhere).
+    pub fn format_of(&self, head: usize, token: usize, side: MergeAxis) -> &FormatId {
+        self.overrides
+            .iter()
+            .rev()
+            .find(|o| side_matches(o.side, side) && region_contains(&o.region, head, token))
+            .map(|o| &o.format)
+            .unwrap_or(&self.base)
+    }
+}
+
+/// `Both` matches any queried side; otherwise the override side must equal the queried side.
+fn side_matches(over: MergeAxis, queried: MergeAxis) -> bool {
+    matches!(over, MergeAxis::Both) || over == queried
+}
+
+/// Whether a [`KeepSpec`] region contains `token` for `head` (token-position membership).
+fn region_contains(region: &KeepSpec, head: usize, token: usize) -> bool {
+    match region {
+        KeepSpec::LayerWide(positions) => positions.contains(&token),
+        KeepSpec::PerHead(per_head) => per_head.get(head).is_some_and(|p| p.contains(&token)),
+    }
+}
+
+/// The dynamic format-assignment producer — the third sibling of [`KVCacheStage::plan`] and
+/// `WeightStage::plan`, reusing the SAME [`StageCtx`] read seam. `assign` returns `None` for "no
+/// change" (uniform base kept), the safe default.
+pub trait KVFormatPolicy: Send + Sync {
+    /// Policy name (unique within the slice; CLI selector / logging).
+    fn name(&self) -> &str;
+
+    /// Computes the format assignment from read-only ctx. `None` = no change (base kept).
+    fn assign(&self, ctx: &dyn StageCtx) -> Option<KVFormatPlan>;
+
+    /// (g2) The formats the current backend can decode; the engine rejects a plan that names an
+    /// unsupported format rather than silently mis-storing. Default = empty = unconstrained (the
+    /// engine validates against the registries).
+    fn supported_formats(&self, _ctx: &dyn StageCtx) -> Vec<FormatId> {
+        Vec::new()
+    }
+}
+
+/// Registration entry for one format policy — the 4th per-axis producer registry (mirror of
+/// [`KVCacheStageReg`] / [`KVFormatReg`]). Its register symbol is never unified with the others (D6).
+pub struct KVFormatPolicyReg {
+    /// Policy name. Unique within the slice.
+    pub name: &'static str,
+    /// Policy factory from the common params.
+    pub make: fn(StageParams) -> Box<dyn KVFormatPolicy>,
+    /// The tensor kinds this policy reads (producer<->consumer handshake; mirror of `StageCaps.reads`).
+    pub reads: &'static [TensorKind],
+}
+
+/// Global format-policy registration slice — one of the parallel per-axis producer registries.
+#[distributed_slice]
+pub static KV_FORMAT_POLICIES: [KVFormatPolicyReg] = [..];
+
+/// Looks up a registered format policy by name.
+pub fn find_format_policy(name: &str) -> Option<&'static KVFormatPolicyReg> {
+    KV_FORMAT_POLICIES.iter().find(|r| r.name == name)
+}
+
+/// All registered format-policy names (for self-test / diagnostics).
+pub fn registered_format_policy_names() -> Vec<&'static str> {
+    KV_FORMAT_POLICIES.iter().map(|r| r.name).collect()
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2645,6 +2792,101 @@ pub fn registered_score_reducer_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    /// (D3 proof) `KVFormatPlan` values are constructible and `format_of` resolves last-wins over
+    /// layer/token/head/side, with the Gate-0 identity (empty overrides => base everywhere). This is
+    /// the interface-expressibility evidence for per-layer/head/token/importance quantization; the
+    /// engine-side execution/rejection is proven separately in `kv::format_apply`.
+    #[test]
+    fn kv_format_plan_format_of_resolves_last_wins_and_gate0() {
+        // Gate-0: empty overrides => base everywhere (the byte-identical no-op anchor).
+        let base_only = KVFormatPlan {
+            base: FormatId("q4_0".into()),
+            overrides: vec![],
+        };
+        assert_eq!(base_only.format_of(0, 5, MergeAxis::Both).0, "q4_0");
+        assert_eq!(base_only.format_of(3, 99, MergeAxis::KeyOnly).0, "q4_0");
+
+        // Per-token two-tier (e.g. importance-top tokens kept f16, rest q2).
+        let two_tier = KVFormatPlan {
+            base: FormatId("q2".into()),
+            overrides: vec![FormatOverride {
+                region: KeepSpec::LayerWide(vec![5, 6]),
+                format: FormatId("f16".into()),
+                side: MergeAxis::Both,
+            }],
+        };
+        assert_eq!(two_tier.format_of(0, 5, MergeAxis::ValueOnly).0, "f16");
+        assert_eq!(two_tier.format_of(0, 7, MergeAxis::ValueOnly).0, "q2");
+
+        // Side-asymmetric (KIVI-style: key f16 on token 5, value stays base).
+        let sided = KVFormatPlan {
+            base: FormatId("q2".into()),
+            overrides: vec![FormatOverride {
+                region: KeepSpec::LayerWide(vec![5]),
+                format: FormatId("f16".into()),
+                side: MergeAxis::KeyOnly,
+            }],
+        };
+        assert_eq!(sided.format_of(0, 5, MergeAxis::KeyOnly).0, "f16");
+        assert_eq!(sided.format_of(0, 5, MergeAxis::ValueOnly).0, "q2");
+
+        // Per-head (head 1 gets f16 at token 2, head 0 does not) — last-wins over an earlier override.
+        let per_head = KVFormatPlan {
+            base: FormatId("q4_0".into()),
+            overrides: vec![
+                FormatOverride {
+                    region: KeepSpec::LayerWide(vec![2]),
+                    format: FormatId("q8_0".into()),
+                    side: MergeAxis::Both,
+                },
+                FormatOverride {
+                    region: KeepSpec::PerHead(vec![vec![], vec![2]]),
+                    format: FormatId("f16".into()),
+                    side: MergeAxis::Both,
+                },
+            ],
+        };
+        assert_eq!(per_head.format_of(1, 2, MergeAxis::Both).0, "f16"); // later override wins
+        assert_eq!(per_head.format_of(0, 2, MergeAxis::Both).0, "q8_0"); // head 0 falls to earlier
+    }
+
+    /// (D1 proof) `ChannelKeep` constructs and rides `KVCachePlan.channels`. It is a dormant typed
+    /// surface — the engine executor rejects `Some(..)` cleanly (proven engine-side in `stage_registry`)
+    /// — so here we assert only that the interface value is constructible and `None` is the default.
+    #[test]
+    fn channel_keep_rides_kv_cache_plan() {
+        let token_only = KVCachePlan {
+            keep: KeepSpec::LayerWide(vec![0, 1, 2]),
+            merges: vec![],
+            channels: None,
+        };
+        assert!(token_only.channels.is_none());
+
+        let with_channels = KVCachePlan {
+            keep: KeepSpec::LayerWide(vec![0, 1, 2]),
+            merges: vec![],
+            channels: Some(ChannelKeep::PerHead(vec![vec![0, 2], vec![1, 3]])),
+        };
+        match with_channels.channels {
+            Some(ChannelKeep::PerHead(h)) => assert_eq!(h.len(), 2),
+            _ => panic!("ChannelKeep round-trip"),
+        }
+    }
+
+    /// (D2 ABI invariant) `TensorKind` discriminants ARE the C-ABI wire format (`kind as u32`), so
+    /// adding `Query` must keep 0–5 byte-identical and place `Query` at 6 (additive). Compile-time
+    /// `const _` asserts already pin these; this test surfaces the invariant in the test output too.
+    #[test]
+    fn tensor_kind_discriminants_are_additive() {
+        assert_eq!(TensorKind::Key as u32, 0);
+        assert_eq!(TensorKind::Value as u32, 1);
+        assert_eq!(TensorKind::AttnWeights as u32, 2);
+        assert_eq!(TensorKind::Scores as u32, 3);
+        assert_eq!(TensorKind::QueryStats as u32, 4);
+        assert_eq!(TensorKind::PrefillAttention as u32, 5);
+        assert_eq!(TensorKind::Query as u32, 6); // additive — never renumbers 0–5
+    }
+
     /// `KVLayoutDesc` byte accounting matches the engine block struct sizes.
     /// Zero engine dependency (argus-extension-api is isolated), so verified against literals — the engine side
     /// cross-checks `size_of::<Block*>()` (dtype_layout.rs).
@@ -2986,6 +3228,7 @@ mod tests {
         let plan = KVCachePlan {
             keep: KeepSpec::LayerWide(vec![70, 71, 72]),
             merges: Vec::new(),
+            channels: None,
         };
         let abi = PlanArena::into_abi(plan.clone());
         assert_eq!(abi.keep_kind, 0);
@@ -3007,6 +3250,7 @@ mod tests {
                 from: vec![(5, 0.2), (6, 0.2)],
                 apply_to: MergeAxis::ValueOnly,
             }],
+            channels: None,
         };
         let abi = PlanArena::into_abi(plan.clone());
         // Host-side reconstruct mirror (C2 performs the identical logic).
@@ -3027,6 +3271,7 @@ mod tests {
         let reconstructed = KVCachePlan {
             keep: KeepSpec::LayerWide(keep),
             merges,
+            channels: None,
         };
         assert_eq!(reconstructed, plan);
         unsafe { PlanArena::free(abi.owner) };
@@ -3037,6 +3282,7 @@ mod tests {
         let plan = KVCachePlan {
             keep: KeepSpec::PerHead(vec![vec![1, 2], vec![3, 4, 5]]),
             merges: Vec::new(),
+            channels: None,
         };
         let abi = PlanArena::into_abi(plan);
         assert_eq!(abi.keep_kind, 1);

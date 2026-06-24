@@ -100,6 +100,7 @@ impl KVCacheStage for H2o {
         Some(KVCachePlan {
             keep: KeepSpec::LayerWide(keep_list),
             merges: Vec::new(),
+            channels: None,
         })
     }
 }

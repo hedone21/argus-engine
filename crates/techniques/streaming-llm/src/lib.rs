@@ -69,6 +69,7 @@ impl KVCacheStage for StreamingLlm {
         Some(KVCachePlan {
             keep: KeepSpec::LayerWide(keep_list),
             merges: Vec::new(),
+            channels: None,
         })
     }
 }

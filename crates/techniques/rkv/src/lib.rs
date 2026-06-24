@@ -197,6 +197,7 @@ impl KVCacheStage for RkvStage {
         Some(KVCachePlan {
             keep: KeepSpec::LayerWide(keep),
             merges: Vec::new(),
+            channels: None,
         })
     }
 }
