@@ -65,8 +65,8 @@ pub enum TensorKind {
     /// per_head:true}`: `read_row(0, kv_head, out)` = that kv_head's current Q (GQA-reduced to kv_head
     /// coordinates, like [`TensorKind::QueryStats`]). This is the exact per-channel `q_d` faithful
     /// Quest needs for `Σ_d max(q_d·min_d, q_d·max_d)` — [`TensorKind::QueryStats`] only carries a
-    /// retrospective running mean+var, never the live query. `Some` only when a read/eviction consumer
-    /// requested it (`wants_query` handshake) on the decode hot path; `None` otherwise.
+    /// retrospective running mean+var, never the live query. `Some` when the forward seam fed the
+    /// current Q on the faithful read-plan path; `None` otherwise (production decode feeds no Query).
     /// discriminant 6 — 0–5 unchanged (C-ABI additive, fieldless repr(u32)).
     Query,
 }

@@ -12,13 +12,14 @@
 //! (`KVCache`)는 page 를 모른다(무수정). eviction 후 ctx 의 `current_pos` 가 메타 토큰 수보다 작아지면
 //! (축소 감지) 전체 재계산.
 //!
-//! **query 신호원 (현 StageCtx 표면에 실재하는 TensorKind 만 사용)**:
-//! Quest 정본은 *현 step 의 query* 이나 [`StageCtx`] 에 query 텐서가 없다. 대신:
-//! - `tensor(QueryStats)` 가용(score-active e2e seam) → running **mean** 을 query 근사로 써서
-//!   상한 내적 점수(Quest 의 query-aware 선택에 가장 근접).
-//! - 미가용(production decode — `read_plan` 이 QueryStats=None 공급, standard_format.rs) → query 가
-//!   전혀 없으므로 **query-agnostic proxy**: page 별 K channel magnitude(`max(|min|,|max|)`) 합으로
-//!   점수. 이는 Quest 의 *근사의 근사* 이며 query-무관이라 page 활성도 추정의 한계가 있다(보고 명시).
+//! **query 신호원 (우선순위, 가용한 가장 충실한 신호 선택)**:
+//! Quest 정본은 *현 step 의 query* 로 page 를 고른다. 신호 우선순위:
+//! - `tensor(Query)` 가용(W-SIGNAL-Q faithful seam — `forward_gen_fmt` 가 이 step·layer 의 RoPE-적용
+//!   현재 Q 를 GQA 환원해 KV write 이전에 공급) → **Quest 정본 그대로**(current-Q 상한 내적 선택).
+//! - `tensor(QueryStats)` 가용(**dormant** — 현재 빌트인 producer 없음; ctx 가 직접 공급할 때만) →
+//!   running **mean** 을 query 근사로 써서 상한 내적(현재 Q 다음으로 근접). faithful Q 도입으로 대체됨.
+//! - 둘 다 미가용(예: offload proxy path) → query 가 없으므로 **query-agnostic proxy**: page 별 K
+//!   channel magnitude(`max(|min|,|max|)`) 합으로 점수(근사의 근사, query-무관 한계는 보고 명시).
 //!
 //! 두 경우 모두 **page 0(attention sink) + 최근 window page 는 무조건 포함**(Quest 논문 — 최신
 //! 토큰은 항상 attend, sink 보존). 선택 page 가 전체이면 `None` 반환(full read 와 동일 → plan 불요).
@@ -150,19 +151,24 @@ impl Quest {
             return scores;
         }
 
-        // query 신호: QueryStats running mean(가용 시) — kv_head 별 mean[head_dim].
-        let qstats = ctx.tensor(TensorKind::QueryStats);
-        let mut q_mean = vec![0.0f32; head_dim];
+        // query 신호 우선순위: faithful 현재 Q(`tensor(Query)`, 이 step·layer 의 RoPE-적용 Q) >
+        // QueryStats running mean(`tensor(QueryStats)`) > query-agnostic proxy. Query/QueryStats 둘 다
+        // `read_row(0, kv_head) → [head_dim]`(mean row) 계약을 공유하므로 동일 코드로 상한 내적을 쓴다.
+        // 현재 Q 가 있으면 Quest 정본(current-Q 선택)을 충실히 실행, 없으면 running-mean 근사로 폴백.
+        let query_src = ctx
+            .tensor(TensorKind::Query)
+            .or_else(|| ctx.tensor(TensorKind::QueryStats));
+        let mut q_vec = vec![0.0f32; head_dim];
 
         for (p, pm) in st.pages.iter().take(n_pages).enumerate() {
             let mut s = 0.0f32;
             for h in 0..n_kv_heads {
                 let base = h * head_dim;
-                if let Some(qs) = qstats {
-                    // row 0 = mean (stage_registry QueryStatsHandle 계약).
-                    qs.read_row(0, h, &mut q_mean);
+                if let Some(qs) = query_src {
+                    // row 0 = mean/current-Q (QueryHandle/QueryStatsHandle 공통 계약).
+                    qs.read_row(0, h, &mut q_vec);
                     // Quest 상한 내적: Σ_d max(q_d·min_d, q_d·max_d).
-                    for (d, &q) in q_mean.iter().enumerate() {
+                    for (d, &q) in q_vec.iter().enumerate() {
                         let lo = q * pm.min[base + d];
                         let hi = q * pm.max[base + d];
                         s += lo.max(hi);
@@ -231,6 +237,9 @@ impl KVReadStage for Quest {
     }
 
     fn read_plan(&self, ctx: &dyn StageCtx) -> Option<KVReadPlan> {
+        // W-DEVKV: device-only 캐시는 엔진(StandardFormat::read_plan)이 host snapshot 위에 ctx 를 만들어
+        // 주므로(ctx.kv_on_device()==false) 이 stage 는 backend 무관하게 host-resident K/V 를 읽는다.
+        // (snapshot 실패 시 엔진이 read_plan 자체를 호출하지 않고 full read 로 폴백.)
         let cur = ctx.current_pos();
         let n_pages = cur.div_ceil(self.page_size);
         // page 가 top_k 하한 이하면 selection 의미 없음 → full read.
@@ -259,9 +268,13 @@ impl KVReadStage for Quest {
 static QUEST: KVReadStageReg = KVReadStageReg {
     name: "quest",
     make: |p: ReadStageParams| Box::new(Quest::new(p)),
-    // Quest's read_plan reads QueryStats (running Q mean) for the Expected-Attention page score
-    // when supplied, falling back to the symmetric min/max proxy otherwise.
-    wants_query_stats: true,
+    // W-SIGNAL-Q: Quest now uses the *faithful current-step Q* (`tensor(Query)`, fed by the
+    // forward_gen_fmt seam) for the Expected-Attention page score, falling back to the symmetric
+    // min/max proxy when no query is supplied. The running-mean QueryStats approximation is no
+    // longer requested: it was strictly dominated by the current Q, and arming the accumulator
+    // both added per-(layer,step) Welford overhead and read `ws.q` on the host — a device-only
+    // null deref on GPU backends. So `wants_query_stats=false` (no accumulator armed).
+    wants_query_stats: false,
 };
 
 #[cfg(test)]
@@ -552,11 +565,13 @@ mod tests {
         }
     }
 
-    /// ctx supplying Key + (optionally) QueryStats — exercises quest's Expected-Attention path.
+    /// ctx supplying Key + (optionally) faithful Query and/or QueryStats. `MockQStats` exposes
+    /// `read_row(0) = mean`, the shared contract of both `QueryHandle` and `QueryStatsHandle`.
     struct QStatsCtx {
         cur: usize,
         head_dim: usize,
         key: MockKey,
+        query: Option<MockQStats>,
         qstats: Option<MockQStats>,
     }
     impl StageCtx for QStatsCtx {
@@ -581,6 +596,7 @@ mod tests {
         fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
             match kind {
                 TensorKind::Key => Some(&self.key),
+                TensorKind::Query => self.query.as_ref().map(|q| q as &dyn TensorHandle),
                 TensorKind::QueryStats => self.qstats.as_ref().map(|q| q as &dyn TensorHandle),
                 _ => None,
             }
@@ -591,7 +607,8 @@ mod tests {
     /// 10 single-token pages, head_dim=1, base = [0,10,9,8,7,-6,-5,-4,-3,1]:
     ///   proxy score = |base| → top-4 {1,2,3,4}; QueryStats q_mean=-1 → score = q·base → top-4
     ///   {5,6,7,8}. select = {0 sink} ∪ top-4 ∪ {9 recent}. Asserting the two differ proves the
-    ///   QueryStats path (now production-fed via QueryStatsAccumulator) actually drives selection.
+    ///   QueryStats path (a dormant fallback — no production producer feeds it now) drives selection
+    ///   when supplied directly, distinct from the proxy.
     #[test]
     fn query_stats_path_diverges_from_proxy() {
         let bases = vec![0.0, 10.0, 9.0, 8.0, 7.0, -6.0, -5.0, -4.0, -3.0, 1.0];
@@ -604,6 +621,7 @@ mod tests {
                 n_kv_heads: 1,
                 bases: bases.clone(),
             },
+            query: None,
             qstats,
         };
 
@@ -629,6 +647,54 @@ mod tests {
         assert_ne!(
             proxy.select, qa.select,
             "QueryStats must change the selection"
+        );
+    }
+
+    /// W-SIGNAL-Q: faithful `tensor(Query)` takes priority over `tensor(QueryStats)`. Feeding BOTH
+    /// with OPPOSITE-sign queries must make the selection follow Query (current Q), not QueryStats
+    /// (running mean). Proves the faithful seam — not just any query signal — drives page choice.
+    #[test]
+    fn faithful_query_overrides_query_stats() {
+        let bases = vec![0.0, 10.0, 9.0, 8.0, 7.0, -6.0, -5.0, -4.0, -3.0, 1.0];
+        let mk_ctx = |query, qstats| QStatsCtx {
+            cur: 10,
+            head_dim: 1,
+            key: MockKey {
+                current_pos: 10,
+                head_dim: 1,
+                n_kv_heads: 1,
+                bases: bases.clone(),
+            },
+            query,
+            qstats,
+        };
+
+        // Query q=-1 (prefers most-negative base → {5,6,7,8}) while QueryStats q=+1 (prefers most-
+        // positive base → {1,2,3,4}). Quest must follow Query.
+        let faithful = Quest::new(params(1))
+            .read_plan(&mk_ctx(
+                Some(MockQStats { mean: vec![-1.0] }),
+                Some(MockQStats { mean: vec![1.0] }),
+            ))
+            .expect("faithful plan");
+        assert_eq!(
+            faithful.select,
+            vec![0, 5, 6, 7, 8, 9],
+            "selection follows faithful Query (q=-1), not QueryStats (q=+1)"
+        );
+
+        // Sanity: with ONLY QueryStats (q=+1), selection flips to the positive-base pages.
+        let stats_only = Quest::new(params(1))
+            .read_plan(&mk_ctx(None, Some(MockQStats { mean: vec![1.0] })))
+            .expect("query-stats plan");
+        assert_eq!(
+            stats_only.select,
+            vec![0, 1, 2, 3, 4, 9],
+            "QueryStats (q=+1) alone = positive-base ranking"
+        );
+        assert_ne!(
+            faithful.select, stats_only.select,
+            "faithful Query must override QueryStats"
         );
     }
 }

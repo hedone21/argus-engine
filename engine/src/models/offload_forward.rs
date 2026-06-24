@@ -236,21 +236,26 @@ impl TransformerModel {
                 let ws = workspace
                     .as_deref_mut()
                     .expect("decode arm: workspace.is_some() checked just before");
-                // S6: read_stage=Some 이면 layer i 의 fmt 가 SelectiveRead 를 지원할 때
-                // read_plan 을 산출해 read_select 로 forward_gen_fmt 에 전달한다.
-                // OffloadFormat 은 현재 SelectiveRead 미구현(as_selective_read==None) → plan=None →
-                // read_select=None → full read 폴백(D4 byte-identical).
-                // plan.select 는 layer i+1 의 prefetch 우선 힌트로 PrefetchController 에 저장한다(D3).
-                // read_stage=None(기본) 이면 and_then 이 단락 → plan=None → hint 미발화(INV-147).
-                // offload path does not collect QueryStats (no QueryStatsAccumulator threaded) → None.
+                // S6: read_stage=Some 이면 layer i 의 fmt 가 SelectiveRead 를 지원할 때 read_plan 을
+                // 산출해 Precomputed 라우팅으로 forward_gen_fmt 에 전달 + plan.select 를 layer i+1 prefetch
+                // 우선 힌트로 저장한다(D3). offload 는 plan 을 forward_gen_fmt *이전*에 돌려야(prefetch
+                // 선행) 해서 현재 Q 가 아직 없다 → query=None(query-agnostic proxy). standard decode 의
+                // faithful current-Q 경로(ReadRouting::Faithful)와 구분된다.
+                // ⚠ 현재 production: 이 bin 의 OffloadForward 세션은 read_stage=None 으로 배선(offload_forward.rs
+                // session) + OffloadFormat 은 as_selective_read()==None → 이 Precomputed 경로는 아직
+                // live consumer 가 없다(read_stage 배선 + OffloadFormat SelectiveRead 구현 시 활성).
                 let read_plan = read_stage.and_then(|rs| {
                     dyn_fmts[i]
                         .as_selective_read()
-                        .and_then(|sr| sr.read_plan(rs, i, None))
+                        .and_then(|sr| sr.read_plan(rs, i, None, None))
                 });
-                let read_select = read_plan.as_ref().and_then(|plan| {
-                    Self::validate_read_plan(plan, dyn_fmts[i].current_pos())
-                        .map(|sel| (sel, plan.granularity))
+                let read_routing = read_plan.as_ref().and_then(|plan| {
+                    Self::validate_read_plan(plan, dyn_fmts[i].current_pos()).map(|sel| {
+                        crate::layers::transformer_layer::ReadRouting::Precomputed {
+                            select: sel,
+                            granularity: plan.granularity,
+                        }
+                    })
                 });
                 // S6 prefetch 보강 채널: plan 이 있으면 next layer 의 prefetch 우선 힌트를 저장.
                 // 현재 preload_locked 는 선입선출이라 hint 가 I/O 순서를 변경하지 않는다.
@@ -278,7 +283,7 @@ impl TransformerModel {
                     is_local_attn: is_local_i,
                     local_attn_window: self.config.sliding_window,
                     layer_idx: i,
-                    read_select,
+                    read_routing,
                 })?;
             } else {
                 // prefill(seq_len>1) 또는 **발산 A**(seq_len==1 + workspace=None). 후자는 BOS-only

@@ -25,6 +25,26 @@
 use super::*;
 use crate::format::{AttnDims, KVCacheFormat};
 
+/// decode read-plan 라우팅. 활성 read stage 가 어디서 `read_plan` 을 산출했는지 구분한다.
+///
+/// `ForwardGenFmtArgs::read_routing == None`(production 기본)이면 full read(byte-identical).
+pub(crate) enum ReadRouting<'a> {
+    /// 호출 측이 이미 `read_plan` 을 산출·검증해 `select` 를 넘긴다. offload decode 가 layer i 의 plan 을
+    /// layer i+1 prefetch 힌트로 써야 해서 `forward_gen_fmt` *이전*에 read_plan 을 돌리는 경로 — query 가
+    /// 아직 없어 **query-agnostic proxy(또는 QueryStats)** 로 선택된 plan 이다.
+    Precomputed {
+        select: &'a [usize],
+        granularity: argus_extension_api::ReadGranularity,
+    },
+    /// faithful: `forward_gen_fmt` 가 이 step·이 layer 의 **RoPE-적용 현재 Q** 를 GQA 환원해
+    /// `read_plan` 을 내부에서(KV write *이전*, 기존 seam 과 동일한 캐시 뷰로) 호출한다. Quest 정본의
+    /// current-Q 선택을 충실히 실행한다. (QueryStats running-mean 은 faithful Q 로 대체되어 더는 공급되지
+    /// 않는다 — read_plan 에 query_stats=None 전달; QueryStats seam 은 dormant.)
+    Faithful {
+        stage: &'a dyn argus_extension_api::KVReadStage,
+    },
+}
+
 /// `forward_gen_fmt` 인자 — `ForwardGenArgs` 의 `kv_cache: &mut C` 만 `fmt: &Arc<dyn KVCacheFormat>`
 /// 로 교체. profiler/memory/is_last_layer 는 fmt 경로에서 불요(instrumentation·partition_fused 전용)
 /// 라 드롭.
@@ -50,10 +70,11 @@ pub(crate) struct ForwardGenFmtArgs<'a> {
     /// Gemma3: local attention window.
     pub local_attn_window: Option<usize>,
     pub layer_idx: usize,
-    /// KV read-plan 라우팅. `Some((select, granularity))` 면 활성 format 의
-    /// `SelectiveRead::attention_into_selected` 로 선택적 읽기, `None`(production 기본)이면 기존
-    /// `attention_into`(full read). 분기 1회 외 happy path 비용 0(INV-147 동형).
-    pub read_select: Option<(&'a [usize], argus_extension_api::ReadGranularity)>,
+    /// KV read-plan 라우팅. `Some(..)` 면 활성 format 의 `SelectiveRead::attention_into_selected` 로
+    /// 선택적 읽기, `None`(production 기본)이면 기존 `attention_into`(full read). 분기 1회 외 happy path
+    /// 비용 0(INV-147 동형). [`ReadRouting::Faithful`] 은 현재 Q 를 host 로 1회 읽어(opt-in) read_plan 을
+    /// 내부 산출, [`ReadRouting::Precomputed`] 는 호출 측이 넘긴 select 를 그대로 쓴다.
+    pub read_routing: Option<ReadRouting<'a>>,
 }
 
 impl TransformerLayer {
@@ -139,6 +160,49 @@ impl TransformerLayer {
         backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
 
+        // 3.5 faithful read-plan seam (Quest 정본 current-Q). KV write *이전*에 산출 → read_plan 이 보는
+        // 캐시 뷰(current_pos=P, 현재 토큰 미반영)와 검증 상한이 기존 seam(transformer.rs:1650)과 동일.
+        // 바뀌는 것은 query 신호뿐: running-mean 근사 → 이 step·layer 의 RoPE-적용 현재 Q. read_routing 이
+        // Faithful 이고 format 이 SelectiveRead 면, 현재 Q 를 host 로 1회 읽어 GQA 환원([n_kv_heads*head_dim])
+        // 한 뒤 read_plan→검증해 owned select 를 만든다. production(read_routing=None)은 미진입(비용 0,
+        // byte-identical).
+        //
+        // ★호스트 읽기 = `synchronize()`(GPU=clFinish, CPU=no-op) 로 RoPE 커널 완료를 보장한 뒤
+        // `read_buffer` 로 현재 Q 를 host Vec 으로 복사한다(= `read_logits`/standard_format INV-191 과 동일한
+        // 라이브 GPU→host 패턴). ⚠ decode workspace 의 `ws.q`/`q_rope` 버퍼는 Adreno 에서 device-only
+        // (host ptr=null) → `as_slice` 직접 읽기는 null deref(SEGV) → 반드시 read_buffer 경유(INV-191).
+        let faithful_select: Option<(Vec<usize>, argus_extension_api::ReadGranularity)> =
+            if let Some(ReadRouting::Faithful { stage }) = args.read_routing.as_ref() {
+                fmt.as_selective_read()
+                    .and_then(|sr| {
+                        // RoPE 커널 완료 보장 후 device→host 복사. sync/read 실패 시 None → full read 폴백
+                        // (plan 은 best-effort 힌트, 정확성 계약 아님).
+                        backend.synchronize().ok()?;
+                        let mut q_host = vec![0.0f32; q_rope.size() / 4];
+                        // SAFETY: q_host 는 막 할당한 f32 슬라이스 — [u8] 재해석은 read_buffer 가 GPU 버퍼
+                        // 바이트를 host 로 쓰는 데 안전하고, backend 는 호출 후 포인터를 보유하지 않는다.
+                        let q_bytes = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                q_host.as_mut_ptr() as *mut u8,
+                                q_host.len() * 4,
+                            )
+                        };
+                        backend.read_buffer(&q_rope, q_bytes).ok()?;
+                        let reduced = gqa_reduce_query(&q_host, n_heads_q, n_heads_kv, head_dim);
+                        // query_stats=None: faithful current-Q 가 running-mean 을 대체(QueryStats dormant).
+                        sr.read_plan(*stage, layer_idx, Some(&reduced), None)
+                    })
+                    .and_then(|plan| {
+                        crate::models::transformer::TransformerModel::validate_read_plan(
+                            &plan,
+                            fmt.current_pos(),
+                        )
+                        .map(|sel| (sel.to_vec(), plan.granularity))
+                    })
+            } else {
+                None
+            };
+
         // 4. KV cache update → fmt.write_kv (3a/3b 흡수: GPU F16/F32 scatter / 비-F32 cast / F32 update).
         fmt.write_kv(&k_rope, &ws.v, backend.as_ref())?;
 
@@ -172,10 +236,19 @@ impl TransformerLayer {
         } else {
             None
         };
-        // read-plan 라우팅. read_select=Some 이고 활성 format 이 SelectiveRead
-        // capability 를 노출하면 선택적 읽기, 아니면(미지원 format) plan 무시 + full read 폴백(D4). happy
-        // path(read_select=None)는 `Option::is_some` branch 1회 — full read 직행(INV-147 byte-identical).
-        match args.read_select {
+        // read-plan 라우팅. Precomputed(offload, 호출 측 산출 select) 또는 Faithful(위 3.5 에서 현재 Q 로
+        // 산출한 owned select). 활성 format 이 SelectiveRead capability 를 노출하면 선택적 읽기, 아니면
+        // (미지원 format) plan 무시 + full read 폴백(D4). happy path(read_routing=None)는 분기 1회 —
+        // full read 직행(INV-147 byte-identical).
+        let read_select: Option<(&[usize], argus_extension_api::ReadGranularity)> =
+            match args.read_routing.as_ref() {
+                Some(ReadRouting::Precomputed {
+                    select,
+                    granularity,
+                }) => Some((select, *granularity)),
+                _ => faithful_select.as_ref().map(|(s, g)| (s.as_slice(), *g)),
+            };
+        match read_select {
             Some((select, granularity)) if fmt.as_selective_read().is_some() => {
                 let sr = fmt
                     .as_selective_read()
@@ -267,5 +340,80 @@ impl TransformerLayer {
         backend.add_assign(x, &ws.down)?;
 
         Ok(())
+    }
+}
+
+/// decode seq_len=1 의 RoPE-적용 Q `[n_heads_q*head_dim]` 를 per-kv_head `[n_kv_heads*head_dim]` 로 GQA
+/// 환원한다. 식은 [`QueryStatsAccumulator::accumulate_layer`](crate::inference::query_stats) 의 per-step
+/// 환원과 **동일**(kv_head 그룹 `n_rep=n_heads_q/n_kv_heads` 개 Q-head 의 element-wise 평균) — 그래서
+/// faithful 현재 Q 는 QueryStats 의 1-sample(count=1) mean 과 일치하고, 누적될수록 둘이 갈린다(검증 기준).
+/// 출력 레이아웃 `out[kv_head*head_dim + d]` 는 `QueryHandle::read_row(0, kv_head)` 계약과 일치.
+fn gqa_reduce_query(q: &[f32], n_heads_q: usize, n_kv_heads: usize, head_dim: usize) -> Vec<f32> {
+    let n_kv_heads = n_kv_heads.max(1);
+    let n_rep = (n_heads_q / n_kv_heads).max(1);
+    let inv_rep = 1.0 / n_rep as f32;
+    let mut out = vec![0.0f32; n_kv_heads * head_dim];
+    for kv_h in 0..n_kv_heads {
+        let out_base = kv_h * head_dim;
+        for d in 0..head_dim {
+            let mut x = 0.0f32;
+            for r in 0..n_rep {
+                x += q[(kv_h * n_rep + r) * head_dim + d];
+            }
+            out[out_base + d] = x * inv_rep;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gqa_reduce_query;
+    use crate::inference::query_stats::QueryStatsAccumulator;
+
+    /// 단순 GQA 환원 산술: n_heads_q=4, n_kv_heads=2, head_dim=2, n_rep=2.
+    #[test]
+    fn gqa_reduce_simple_average() {
+        // Q0=[1,2] Q1=[3,4] → kv0=[2,3]; Q2=[10,20] Q3=[30,40] → kv1=[20,30].
+        let q = [1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let out = gqa_reduce_query(&q, 4, 2, 2);
+        assert_eq!(out, vec![2.0, 3.0, 20.0, 30.0]);
+    }
+
+    /// MHA (n_rep=1): 환원은 identity.
+    #[test]
+    fn gqa_reduce_mha_identity() {
+        let q = [5.0, 6.0, 7.0, 8.0];
+        let out = gqa_reduce_query(&q, 2, 2, 2);
+        assert_eq!(out, vec![5.0, 6.0, 7.0, 8.0]);
+    }
+
+    /// ★정확성 기준(reference): faithful 현재 Q 의 GQA 환원은 `QueryStatsAccumulator` 가 같은 Q 를
+    /// 1-sample 누적했을 때의 per-kv_head mean(row0)과 **정확히 일치**한다 — faithful Q 가 QueryStats 의
+    /// count=1 mean 과 같은 환원 식을 쓰며, 차이는 오직 시간 누적(현재 vs running-mean)임을 증명한다.
+    #[test]
+    fn gqa_reduce_matches_query_stats_count1_mean() {
+        let n_heads_q = 4;
+        let n_kv_heads = 2;
+        let head_dim = 2;
+        let q = [1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+
+        let faithful = gqa_reduce_query(&q, n_heads_q, n_kv_heads, head_dim);
+
+        let mut acc = QueryStatsAccumulator::new(1, n_heads_q, n_kv_heads, head_dim);
+        acc.set_active(true);
+        acc.accumulate_layer(&q, 0);
+        let stats = acc.layer_stats(0); // [kv_head * 2 * head_dim + row*head_dim + d], row0=mean.
+
+        for kv_h in 0..n_kv_heads {
+            for d in 0..head_dim {
+                let mean = stats[kv_h * 2 * head_dim + d]; // row0 = mean.
+                let faith = faithful[kv_h * head_dim + d];
+                assert!(
+                    (mean - faith).abs() < 1e-6,
+                    "kv{kv_h} d{d}: faithful {faith} != QueryStats count=1 mean {mean}"
+                );
+            }
+        }
     }
 }
