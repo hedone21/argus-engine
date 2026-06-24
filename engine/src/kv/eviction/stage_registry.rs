@@ -95,6 +95,18 @@ pub(crate) fn execute_kv_plan(
     layer_idx: usize,
     n_layers: usize,
 ) -> Result<()> {
+    // (D1) Channel-axis (head_dim index) selection is a DORMANT typed surface: a plugin can describe
+    // it, but no current container can store a narrowed/ragged head_dim (head_dim is a single
+    // per-cache scalar woven through every offset/alloc/attention-kernel call), so reject cleanly
+    // rather than silently ignore the request (the honesty invariant — no silent no-op). Faithful
+    // channel pruning (ThinK/KVCompose) needs a narrowed-head_dim container + kernel (L3/engine-core).
+    if plan.channels.is_some() {
+        anyhow::bail!(
+            "channel-axis selection (KVCachePlan.channels / ChannelKeep) is unsupported: no current \
+             KV container can store a narrowed head_dim (needs a narrowed-head_dim container + kernel, \
+             L3/engine-core)"
+        );
+    }
     // R-P0-2: optional keep-set dump (no-op unless `ARGUS_DUMP_KEEPSET` is set).
     // Recorded before any compaction so the kept positions are absolute indices
     // into the pre-eviction `[0, current_pos)` range.
@@ -133,11 +145,21 @@ pub(crate) fn execute_kv_plan(
             // the new position is that shared length.
             let new_pos = heads.first().map_or(0, |h| h.len());
             for (kv_head, keep) in heads.iter().enumerate() {
-                debug_assert_eq!(
-                    keep.len(),
-                    new_pos,
-                    "PerHead keep-lists must be equal length (head {kv_head})"
-                );
+                // The engine has a single shared current_pos, so every head MUST keep the same
+                // number of tokens. An unequal list would set current_pos to head[0]'s length while
+                // each head compacts to its own keep.len(), so a shorter head's slots [keep.len()..
+                // new_pos) hold stale pre-compaction KV that attention then over-reads as valid —
+                // silent corruption. This was a `debug_assert_eq!` (compiled OUT of release builds),
+                // so release reached the corruption path; reject cleanly instead (the fn returns
+                // Result and already bails above). Faithful unequal per-head budgets (Ada-KV /
+                // DuoAttention) need a varlen executor + per-head valid-len kernel (R-P1-2).
+                if keep.len() != new_pos {
+                    anyhow::bail!(
+                        "PerHead keep-lists must be equal length (head {kv_head}: {} != {new_pos}); \
+                         unequal per-head budgets are unsupported (need a varlen executor, R-P1-2)",
+                        keep.len()
+                    );
+                }
                 cache.compact_keep_positions_for_head(kv_head, keep, 0)?;
             }
             cache.set_current_pos(new_pos);
@@ -254,6 +276,37 @@ impl TensorHandle for QueryStatsHandle<'_> {
     }
 }
 
+/// (D2) `tensor(Query)` 핸들 — raw CURRENT-step Q (RoPE-applied), GQA-reduced to kv_head coords.
+/// `shape = {rows:1, cols:head_dim, per_head:true}`: `read_row(0, kv_head, out)` = that kv_head's
+/// live Q. Layout `[n_kv_heads * head_dim]` row-major (`data[kv_head*head_dim + d]`). Distinct from
+/// [`QueryStatsHandle`] (rows:2 = retrospective mean/var) — this is the live query faithful Quest
+/// needs for `Σ_d max(q_d·min_d, q_d·max_d)`, not a historical statistic.
+struct QueryHandle<'a> {
+    data: &'a [f32],
+    head_dim: usize,
+}
+impl TensorHandle for QueryHandle<'_> {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: 1,
+            cols: self.head_dim,
+            per_head: true,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        TensorDtype::F32
+    }
+    fn read_row(&self, _row: usize, kv_head: usize, out: &mut [f32]) {
+        let base = kv_head * self.head_dim;
+        let hd = self.head_dim.min(out.len());
+        if base + hd <= self.data.len() {
+            out[..hd].copy_from_slice(&self.data[base..base + hd]);
+        } else {
+            out[..hd].fill(0.0);
+        }
+    }
+}
+
 /// `tensor(PrefillAttention)` 핸들 — per-ATTENTION-head(pre-GQA) prefill attention 확률, q_window SUM-pooled.
 /// 레이아웃 `[n_heads x prefix_len]` row-major: `data[row*cols + key_pos]`,
 /// row=attention head(NOT kv_head), cols=prefix_len. 이 핸들만 per_head:false → kv_head 인자 무시,
@@ -316,6 +369,10 @@ pub(crate) struct KVStageCtx<'a> {
     /// R-P1-1: prefill-end producer 가 채운 `[n_heads_q x prefix_len]` SUM-pooled PFA 슬라이스.
     /// `None`=미공급(`tensor(PrefillAttention)`→None, byte-identical disabled path).
     prefill_attn_handle: Option<PrefillAttnHandle<'a>>,
+    /// (D2) raw current-step Q `[n_kv_heads * head_dim]`, fed via [`with_query`](Self::with_query)
+    /// when a read/eviction consumer requested it (`wants_query`). `None`=미공급
+    /// (`tensor(Query)`→None, byte-identical disabled path; faithful Quest falls back to QueryStats).
+    query_handle: Option<QueryHandle<'a>>,
 }
 
 impl<'a> KVStageCtx<'a> {
@@ -358,6 +415,8 @@ impl<'a> KVStageCtx<'a> {
             // R-P1-1: producer 가 채울 때만 `with_prefill_attn` 으로 Some (signature 불변 → 기존
             // caller 전부 무수정 + disabled path 자동 byte-identical).
             prefill_attn_handle: None,
+            // D2: producer 가 채울 때만 `with_query` 로 Some (signature 불변, disabled=byte-identical).
+            query_handle: None,
         }
     }
 
@@ -382,6 +441,21 @@ impl<'a> KVStageCtx<'a> {
             rows: n_heads,
             cols: prefix_len,
         });
+        self
+    }
+
+    /// (D2) Inject the raw current-step Q `[n_kv_heads * head_dim]` so `tensor(Query)` returns it.
+    /// Uncalled ⇒ `tensor(Query)==None` (byte-identical disabled path), mirroring `with_prefill_attn`.
+    ///
+    /// DORMANT SEAM: this is the consumer-facing accessor for faithful Quest's current-Q criticality.
+    /// Its production producer — capturing the RoPE-applied Q and feeding it here — requires computing
+    /// Q BEFORE the `read_plan` seam (transformer.rs:1650 calls read_plan, then forward_gen_fmt
+    /// computes Q), i.e. a forward-pass reorder. That is the deferred ON-DEVICE execution layer; until
+    /// it lands no production site calls this (so `#[allow(dead_code)]` for the non-test build), and
+    /// faithful Quest falls back to the QueryStats running-mean. Exercised by the accessor host test.
+    #[allow(dead_code)]
+    pub(crate) fn with_query(mut self, data: &'a [f32], head_dim: usize) -> Self {
+        self.query_handle = Some(QueryHandle { data, head_dim });
         self
     }
 }
@@ -427,6 +501,10 @@ impl StageCtx for KVStageCtx<'_> {
                 .prefill_attn_handle
                 .as_ref()
                 .map(|h| h as &dyn TensorHandle),
+            // (D2) raw current-Q accessor — `Some` only when a consumer requested it (`wants_query`)
+            // and the forward-time capture fed it via `with_query`; else `None` (faithful Quest then
+            // falls back to the QueryStats running-mean approximation).
+            TensorKind::Query => self.query_handle.as_ref().map(|h| h as &dyn TensorHandle),
         }
     }
 }
@@ -1002,6 +1080,7 @@ unsafe fn planabi_to_plan(abi: &PlanAbi) -> Result<KVCachePlan> {
     Ok(KVCachePlan {
         keep: KeepSpec::LayerWide(keep),
         merges,
+        channels: None,
     })
 }
 
@@ -1014,6 +1093,7 @@ fn tensor_kind_from_u32(k: u32) -> Option<TensorKind> {
         3 => Some(TensorKind::Scores),
         4 => Some(TensorKind::QueryStats),
         5 => Some(TensorKind::PrefillAttention),
+        6 => Some(TensorKind::Query),
         _ => None,
     }
 }
@@ -1354,6 +1434,39 @@ mod tests {
         assert!(bare.tensor(TensorKind::QueryStats).is_none());
     }
 
+    /// (D2 proof) `tensor(Query)` exposes the raw current-step Q (rows:1, cols:head_dim, per_head)
+    /// when fed via `with_query`; uncalled it is `None` (byte-identical disabled path). This proves the
+    /// accessor seam a faithful-Quest consumer reads. The production forward-capture (computing Q
+    /// before the read_plan seam = a forward-pass reorder) is the deferred on-device execution layer.
+    #[test]
+    fn kvstagectx_query_handle_reads_raw_q() {
+        let c = mk(DType::F32, 4); // kv_heads=1, head_dim=PHD
+        let head_dim = c.head_dim();
+        // raw current Q [n_kv_heads(1) * head_dim]: q[d] = d + 0.25 (distinct from any mean/var).
+        let raw_q: Vec<f32> = (0..head_dim).map(|d| d as f32 + 0.25).collect();
+        let ctx = KVStageCtx::new(&c, 0, None, None, None, None).with_query(&raw_q, head_dim);
+        let h = ctx
+            .tensor(TensorKind::Query)
+            .expect("Query Some after with_query");
+        let sh = h.shape();
+        assert_eq!(
+            sh.rows, 1,
+            "rows=1 (live query, NOT the 2-row mean/var of QueryStats)"
+        );
+        assert_eq!(sh.cols, head_dim, "cols=head_dim");
+        assert!(sh.per_head);
+        assert_eq!(h.dtype(), TensorDtype::F32);
+        let mut out = vec![0.0f32; head_dim];
+        h.read_row(0, 0, &mut out);
+        assert_eq!(
+            out, raw_q,
+            "read_row returns the raw current Q for kv_head 0"
+        );
+        // Uncalled with_query ⇒ None (byte-identical disabled path).
+        let bare = KVStageCtx::new(&c, 0, None, None, None, None);
+        assert!(bare.tensor(TensorKind::Query).is_none());
+    }
+
     /// TQS-7/8: `QueryStatsHandle` shape={2,head_dim,true} + read_row(0)=mean/(1)=var + 공급 시
     /// Some/미공급 None + 기존 0~3 kind 무영향.
     #[test]
@@ -1397,7 +1510,8 @@ mod tests {
         assert!(bare.tensor(TensorKind::QueryStats).is_none());
     }
 
-    /// TQS-9: `(4)==Some(QueryStats)`, `(5)==Some(PrefillAttention)`(R-P1-1), `(6)==None` + 0~3 불변.
+    /// TQS-9: `(4)==Some(QueryStats)`, `(5)==Some(PrefillAttention)`(R-P1-1), `(6)==Some(Query)`(D2),
+    /// `(7)==None` + 0~3 불변.
     #[test]
     fn tensor_kind_from_u32_query_stats() {
         assert_eq!(tensor_kind_from_u32(0), Some(TensorKind::Key));
@@ -1406,7 +1520,8 @@ mod tests {
         assert_eq!(tensor_kind_from_u32(3), Some(TensorKind::Scores));
         assert_eq!(tensor_kind_from_u32(4), Some(TensorKind::QueryStats));
         assert_eq!(tensor_kind_from_u32(5), Some(TensorKind::PrefillAttention));
-        assert_eq!(tensor_kind_from_u32(6), None);
+        assert_eq!(tensor_kind_from_u32(6), Some(TensorKind::Query)); // D2 additive
+        assert_eq!(tensor_kind_from_u32(7), None);
     }
 
     #[test]
@@ -1555,6 +1670,90 @@ mod tests {
         }
     }
 
+    /// (D4a regression) The per-head executor must REJECT unequal per-head keep-lengths cleanly.
+    /// The engine has a single shared `current_pos`; an unequal list would set `current_pos` to
+    /// head[0]'s length while each head compacts to its own length, leaving a shorter head's slots
+    /// `[keep.len()..current_pos)` holding stale pre-compaction KV that attention over-reads as valid
+    /// (silent corruption). The guard was a `debug_assert_eq!` compiled OUT of release builds, so
+    /// release reached the corruption path; it is now a hard `bail!`. Faithful unequal per-head
+    /// budgets (Ada-KV / DuoAttention) need a varlen executor (R-P1-2), not this path.
+    #[test]
+    fn per_head_unequal_keep_lengths_bail_not_corrupt() {
+        use crate::kv_cache_ops::KVLayout;
+
+        const MAX_SEQ: usize = 32;
+        const HD: usize = 4;
+        let n_kv_heads = 2;
+
+        let backend = Arc::new(CpuBackend::new());
+        let buf = || {
+            Arc::new(SharedBuffer::new(
+                n_kv_heads * MAX_SEQ * HD * std::mem::size_of::<f32>(),
+                DType::F32,
+            ))
+        };
+        let shape = Shape::new(vec![1, MAX_SEQ, n_kv_heads, HD]);
+        let mut c = KVCache::new(
+            Tensor::new(shape.clone(), buf(), backend.clone()),
+            Tensor::new(shape, buf(), backend),
+            MAX_SEQ,
+        )
+        .with_layout(KVLayout::HeadMajor);
+        c.current_pos = 8;
+
+        // Unequal per-head keep-lists: head 0 keeps 3 tokens, head 1 keeps 2 — the silent-corruption case.
+        let plan = KVCachePlan {
+            keep: KeepSpec::PerHead(vec![vec![0, 1, 2], vec![0, 1]]),
+            merges: vec![],
+            channels: None,
+        };
+        let err = execute_kv_plan(&mut c, &plan, 0, 1)
+            .expect_err("unequal per-head keep-lists must bail cleanly, not silently corrupt");
+        assert!(
+            err.to_string().contains("equal length"),
+            "expected an equal-length rejection, got: {err}"
+        );
+    }
+
+    /// (D1 proof) A plan carrying channel-axis selection (`KVCachePlan.channels = Some(ChannelKeep)`)
+    /// is REJECTED cleanly by the executor. The channel axis is a dormant typed surface — no current
+    /// container can store a narrowed head_dim — and the honesty invariant requires a clean bail,
+    /// never a silent no-op (which would drop the plugin's channel intent without telling it).
+    #[test]
+    fn channel_keep_plan_bails_not_silent_noop() {
+        use argus_extension_api::ChannelKeep;
+
+        const MAX_SEQ: usize = 16;
+        const HD: usize = 4;
+        let n_kv = 1;
+        let backend = Arc::new(CpuBackend::new());
+        let buf = || {
+            Arc::new(SharedBuffer::new(
+                n_kv * MAX_SEQ * HD * std::mem::size_of::<f32>(),
+                DType::F32,
+            ))
+        };
+        let shape = Shape::new(vec![1, MAX_SEQ, n_kv, HD]);
+        let mut c = KVCache::new(
+            Tensor::new(shape.clone(), buf(), backend.clone()),
+            Tensor::new(shape, buf(), backend),
+            MAX_SEQ,
+        );
+        c.current_pos = 8;
+
+        let plan = KVCachePlan {
+            keep: KeepSpec::LayerWide((0..8).collect()),
+            merges: vec![],
+            channels: Some(ChannelKeep::LayerWide(vec![0, 1])),
+        };
+        let err = execute_kv_plan(&mut c, &plan, 0, 1)
+            .expect_err("channel-axis plan must bail cleanly, not silently no-op");
+        assert!(
+            err.to_string().contains("channel-axis"),
+            "expected a channel-axis rejection, got: {err}"
+        );
+    }
+
     // ── B2-2 handshake precondition: declared `StageCaps.reads` ⊇ what `plan()` reads ──
 
     use std::cell::RefCell;
@@ -1666,6 +1865,7 @@ mod tests {
                 TensorKind::AttnWeights => &self.h_attn,
                 TensorKind::QueryStats => &self.h_qstats,
                 TensorKind::PrefillAttention => return None,
+                TensorKind::Query => return None,
             })
         }
     }

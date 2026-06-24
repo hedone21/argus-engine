@@ -114,6 +114,7 @@ impl KVCacheStage for H2OPlus {
             return Some(KVCachePlan {
                 keep: KeepSpec::PerHead(heads),
                 merges: Vec::new(),
+                channels: None,
             });
         }
 
@@ -133,6 +134,7 @@ impl KVCacheStage for H2OPlus {
         Some(KVCachePlan {
             keep: KeepSpec::LayerWide(keep),
             merges: Vec::new(),
+            channels: None,
         })
     }
 }

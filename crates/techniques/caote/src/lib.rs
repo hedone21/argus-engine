@@ -94,6 +94,7 @@ impl KVCacheStage for Caote {
         Some(KVCachePlan {
             keep: KeepSpec::LayerWide(idx),
             merges: Vec::new(),
+            channels: None,
         })
     }
 }

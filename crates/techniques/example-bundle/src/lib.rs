@@ -25,6 +25,7 @@ impl KVCacheStage for BundleKeep {
         Some(KVCachePlan {
             keep: KeepSpec::LayerWide((current - target..current).collect()),
             merges: Vec::new(),
+            channels: None,
         })
     }
 }
@@ -48,6 +49,7 @@ impl KVCacheStage for BundlePerHead {
         Some(KVCachePlan {
             keep: KeepSpec::PerHead(per_head),
             merges: Vec::new(),
+            channels: None,
         })
     }
 }

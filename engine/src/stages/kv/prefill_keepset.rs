@@ -192,6 +192,7 @@ mod tests {
             Some(KVCachePlan {
                 keep: KeepSpec::LayerWide(keep),
                 merges: Vec::new(),
+                channels: None,
             })
         }
     }
@@ -357,6 +358,7 @@ mod tests {
             Some(KVCachePlan {
                 keep: KeepSpec::PerHead(heads),
                 merges: Vec::new(),
+                channels: None,
             })
         }
     }

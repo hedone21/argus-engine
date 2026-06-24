@@ -22,6 +22,9 @@ pub mod quant_window_cache;
 // EPIC 4 PR3 de-risk: first in-tree QuantCacheBackend over the real cache (host-only harness).
 pub mod quant_window_cache_abi_shim;
 pub mod quant_window_format;
+// D3 — engine-side executor for the format/precision axis (KVFormatPlan). Honest reject of
+// heterogeneous-within-layer plans (no current container holds per-head/per-token precision).
+pub mod format_apply;
 // read 축(KVReadStage) 빌트인 등록 + force-link self-test (Quest).
 pub mod read;
 pub mod standard_format;
