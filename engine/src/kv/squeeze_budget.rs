@@ -7,9 +7,11 @@
 //!
 //! This module is the *budget allocation* policy: importance → per-layer `target_len`. The vector it
 //! returns is consumed by `CacheManager::run_policy_eviction`'s per-layer budget path
-//! (`per_layer_target_len`). Production arming (CLI flag + warmup compute that feeds this into the
-//! live eviction signal) is a follow-up; this function + the eviction mechanism are verified
-//! together by an in-engine end-to-end test.
+//! (`per_layer_target_len`). Production arming is live (W-SIGNAL-H): `--kv-squeeze` runs one warmup
+//! prefill (`session::squeeze_warmup`) to capture per-layer importance, `CacheManager::arm_squeeze_budgets`
+//! calls this function, and the per-layer budgets are broadcast to the eviction handler
+//! (`EvictionHandler::set_per_layer_budgets`) so the live eviction path uses them. This function +
+//! the eviction mechanism are also verified together by an in-engine end-to-end test.
 
 /// Group the layers into three importance tiers (low / mid / high) and assign each layer a KV
 /// budget (target token count) from its tier — higher-importance layers keep more tokens.

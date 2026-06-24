@@ -1093,6 +1093,32 @@ pub struct Args {
     #[arg(long, default_value = "mean_pool")]
     pub importance_formula: String,
 
+    /// W-SIGNAL-H (SqueezeAttention): arm *per-layer* KV eviction budgets from
+    /// per-layer hidden-state importance, so more-important layers keep more KV.
+    ///
+    /// Off by default → byte-identical to uniform eviction. Requires a score-free
+    /// eviction policy (e.g. `eviction sliding`). When set, one warmup prefill over
+    /// the prompt captures each layer's `1 − cos(h_in, h_out)` importance via the
+    /// `importance_collector` seam (read device→host with `read_buffer`), feeds it
+    /// through `compute_squeeze_budgets`, and broadcasts the per-layer budgets to the
+    /// live eviction path (`run_policy_eviction` per-layer budget). The warmup is one
+    /// extra forward pass over the prompt (amortized over the whole decode phase).
+    #[arg(long, default_value_t = false)]
+    pub kv_squeeze: bool,
+
+    /// Layer-importance formula for `--kv-squeeze` (the 1 − cos hidden-state signal).
+    /// `mean_pool` (default) = `1 − cos(mean_pool(h_in), mean_pool(h_out))`;
+    /// `shortgpt_bi` = per-token cosine then mean. Both are SqueezeAttention's
+    /// activation-only layer-importance signal (weight-perturbation formulas are
+    /// rejected here — they need the post-warmup lifecycle, not this streaming pass).
+    #[arg(long, default_value = "mean_pool")]
+    pub kv_squeeze_formula: String,
+
+    /// Minimum per-layer KV budget floor (tokens) for `--kv-squeeze`, so no layer is
+    /// starved below the policy minimum. Defaults to `MIN_EVICT_TOKENS` (64).
+    #[arg(long, default_value_t = 64)]
+    pub kv_squeeze_min_floor: usize,
+
     /// Explicit per-layer swap list (CSV of layer indices) for §4 ground-truth
     /// study. Bypasses `WeightSwapDecider`: when set, the listed layers are
     /// swapped regardless of `--force-swap-ratio` or `--swap-algorithm`.

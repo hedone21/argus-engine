@@ -112,6 +112,41 @@ impl CacheManager {
         self.swap_handler = Some(Arc::new(SwapHandler::with_disk(0.5, swap_dir)));
     }
 
+    /// Arm SqueezeAttention per-layer KV eviction budgets (W-SIGNAL-H / R-P1-6).
+    ///
+    /// Computes per-layer keep-token budgets from per-layer importance via
+    /// [`compute_squeeze_budgets`](crate::kv::squeeze_budget::compute_squeeze_budgets) and
+    /// broadcasts them to the pressure pipeline's eviction handler. `total_budget` is the *sum* of
+    /// per-layer keep counts (importance redistributes it: high-importance layers keep more);
+    /// `min_floor` is the per-layer minimum.
+    ///
+    /// `max_budget` caps each per-layer budget (0 = uncapped). This is REQUIRED for correctness
+    /// under the global KV-fill pressure model: a budget above `high_water − MIN_EVICT_TOKENS` can
+    /// never be reduced when the global trigger fires (the per-layer self-guard skips it), so the
+    /// cache would overflow. Capping keeps every layer evictable while preserving differentiation
+    /// below the cap. Each budget is clamped to `[min_floor, max_budget]`.
+    ///
+    /// Called once before the decode loop (`&self`, the handler stores them set-once), so the live
+    /// eviction path reads them lock-free. Returns the (capped) budgets for logging.
+    pub fn arm_squeeze_budgets(
+        &self,
+        importance: &[f32],
+        total_budget: usize,
+        min_floor: usize,
+        max_budget: usize,
+    ) -> Vec<usize> {
+        let mut budgets =
+            crate::kv::squeeze_budget::compute_squeeze_budgets(importance, total_budget, min_floor);
+        if max_budget > 0 {
+            let cap = max_budget.max(min_floor);
+            for b in &mut budgets {
+                *b = (*b).min(cap);
+            }
+        }
+        self.pipeline.set_per_layer_budgets(&budgets);
+        budgets
+    }
+
     /// Offload `ratio` fraction (LRU prefix) of each layer's KV cache to disk.
     /// No-op + warning when swap is not enabled. Returns the number of tokens
     /// offloaded (summed across layers).

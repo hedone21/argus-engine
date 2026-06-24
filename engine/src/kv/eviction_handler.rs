@@ -23,6 +23,11 @@ pub const MIN_EVICT_TOKENS: usize = 64;
 pub struct EvictionHandler {
     policy: Box<dyn EvictionPolicy>,
     target_ratio: f32,
+    /// Per-layer KV eviction budgets (SqueezeAttention / W-SIGNAL-H). `budgets[i]` is the token
+    /// count layer `i` should keep. Armed once before the decode loop via `set_per_layer_budgets`
+    /// (interior-mutable, set-once → the hot `handle` path reads it lock-free). Empty when unarmed,
+    /// in which case the eviction stays byte-identical to the uniform path.
+    per_layer_budgets: std::sync::OnceLock<Vec<usize>>,
 }
 
 impl EvictionHandler {
@@ -35,6 +40,7 @@ impl EvictionHandler {
         Self {
             policy,
             target_ratio: target_ratio.clamp(0.1, 0.99),
+            per_layer_budgets: std::sync::OnceLock::new(),
         }
     }
 }
@@ -71,10 +77,10 @@ impl CachePressureHandler for EvictionHandler {
             ctx.caches,
             target_len,
             scores,
-            // Per-layer KV budget (R-P1-6) is not yet armed from the eviction signal — the
-            // mechanism lives in `run_policy_eviction`; production arming (CLI + warmup compute)
-            // is a follow-up. `None` keeps this path byte-identical to the uniform behavior.
-            None,
+            // Per-layer KV budget (SqueezeAttention / W-SIGNAL-H): armed once before the decode
+            // loop via `set_per_layer_budgets` (CLI `--kv-squeeze` + warmup importance). Unarmed
+            // (empty OnceLock) → `None` → byte-identical to the uniform behavior.
+            self.per_layer_budgets.get().map(Vec::as_slice),
         )?;
 
         if result.evicted {
@@ -89,6 +95,11 @@ impl CachePressureHandler for EvictionHandler {
 
     fn name(&self) -> &str {
         self.policy.name()
+    }
+
+    fn set_per_layer_budgets(&self, budgets: &[usize]) {
+        // Set once before the decode loop (CLI `--kv-squeeze`). A redundant second arm is ignored.
+        let _ = self.per_layer_budgets.set(budgets.to_vec());
     }
 }
 
@@ -397,5 +408,74 @@ mod tests {
             }
             _ => panic!("Expected Evicted"),
         }
+    }
+
+    /// W-SIGNAL-H arming seam: `set_per_layer_budgets` routes `handle()` to the per-layer budget
+    /// path, so layers with small budgets evict while layers whose budget is within
+    /// `MIN_EVICT_TOKENS` of their position are skipped by the per-layer self-guard — a
+    /// per-layer-independent outcome that the unarmed (uniform) handler cannot produce. The budget
+    /// math + eviction mechanism themselves are covered end-to-end by
+    /// `cache_manager::tests::per_layer_budget_evicts_layers_independently`; this proves only the
+    /// arming seam (OnceLock setter → live `run_policy_eviction(Some(&budgets))`).
+    #[test]
+    fn set_per_layer_budgets_routes_to_per_layer_path() {
+        // pos=100 on both layers. Budgets [30, 95]: layer0 keeps 30 (evicts 70 ≥ 64 → evicted),
+        // layer1 keeps 95 (would evict 5 < MIN_EVICT_TOKENS=64 → per-layer self-guard skips it).
+        let handler = EvictionHandler::new(sliding_backed_policy(0, 0), 0.5);
+        handler.set_per_layer_budgets(&[30, 95]);
+
+        let mut caches = make_caches(2, 100);
+        let mut ctx = HandlerContext {
+            caches: &mut caches,
+            importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
+            last_attn: None,
+            pressure_level: PressureLevel::Critical,
+            mem_available: 0,
+            target_ratio: None,
+            qcf_sink: None,
+        };
+
+        let result = handler.handle(&mut ctx).unwrap();
+        assert!(
+            matches!(result, ActionResult::Evicted { .. }),
+            "per-layer arming should evict the low-budget layer, got {result:?}"
+        );
+        // Per-layer divergence: layer0 (budget 30) shrinks; layer1 (budget 95, self-guarded) stays.
+        assert!(
+            ctx.caches[0].current_pos <= 30,
+            "low-budget layer0 should evict to its budget, pos={}",
+            ctx.caches[0].current_pos
+        );
+        assert_eq!(
+            ctx.caches[1].current_pos, 100,
+            "high-budget layer1 is within MIN_EVICT_TOKENS of its budget → self-guard skips it"
+        );
+    }
+
+    /// Without arming, the handler stays on the uniform path (byte-identical to before W-SIGNAL-H):
+    /// every layer evicts to the same scalar target, no per-layer divergence.
+    #[test]
+    fn unarmed_handler_is_uniform() {
+        let handler = EvictionHandler::new(sliding_backed_policy(0, 0), 0.3);
+        let mut caches = make_caches(2, 100);
+        let mut ctx = HandlerContext {
+            caches: &mut caches,
+            importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
+            last_attn: None,
+            pressure_level: PressureLevel::Critical,
+            mem_available: 0,
+            target_ratio: None,
+            qcf_sink: None,
+        };
+        handler.handle(&mut ctx).unwrap();
+        // Both layers reach the same position (uniform target 100*0.3=30).
+        assert_eq!(
+            ctx.caches[0].current_pos, ctx.caches[1].current_pos,
+            "unarmed handler must evict all layers uniformly"
+        );
     }
 }
