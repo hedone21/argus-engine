@@ -1275,6 +1275,78 @@ mod tests {
         assert_eq!(c.current_pos(), 4, "executor 가 keep.len() 로 compact");
     }
 
+    /// W-REROTATE invariant (Finch / KeyRerotation는 RESTRICTED): production eviction
+    /// executor 는 생존 키를 압축 슬롯으로 옮길 때 **순수 byte memmove** 만 하고 새 위치로
+    /// **재회전(re-rotate)하지 않는다**. 따라서 생존 키는 *원래 절대 write 위치*에 baked-in 된
+    /// RoPE phase 를 그대로 보존하고, 다음 토큰의 RoPE 는 압축된 `current_pos` 가 아니라 진짜
+    /// 시퀀스 위치에서 이어지므로(session/eval/eval_loop.rs:299-303,
+    /// session/ppl/runner.rs:1160-1166) 학습된 상대거리
+    /// (query_pos − key_orig_pos)가 그대로 유지된다 = NLL-correct. 재회전(생존자를 0..keep.len()
+    /// 로 renumber + 그 위치로 RoPE 재적용)은 `KVCachePlan`(keep/merges/channels)에 표현할 verb 가
+    /// 없고 엔진은 어디서도 수행하지 않는다. 이 테스트는 그 부재를 핀한다 — eviction 시 재회전을
+    /// 도입하는 어떤 경로가 생기는 즉시 실패한다.
+    #[test]
+    fn eviction_keeps_survivor_rope_phase_does_not_rerotate() {
+        use crate::backend::Backend;
+        let be = Arc::new(CpuBackend::new());
+        let theta = 10_000.0f32;
+
+        // 고정 base 키를 절대 위치 `p` 로 RoPE 회전 — forward 경로(forward_gen_fmt.rs:160-161
+        // `rope_inplace(&mut k_rope, start_pos, ..)`)와 동일. 결정적이라 같은 p 는 항상 byte-identical.
+        let base: Vec<f32> = (0..PHD).map(|d| (d as f32) * 0.1 + 1.0).collect();
+        let rotated_at = |p: usize| -> Vec<f32> {
+            let buf = Arc::new(SharedBuffer::new(PHD * 4, DType::F32));
+            let mut t = Tensor::new(Shape::new(vec![1, 1, 1, PHD]), buf, be.clone());
+            t.as_mut_slice::<f32>().copy_from_slice(&base);
+            be.rope_inplace(&mut t, p, theta).unwrap();
+            t.as_slice::<f32>().to_vec()
+        };
+
+        // 8 개 키, 각자 자기 절대 위치 0..8 로 회전해 적재.
+        let n = 8usize;
+        let mut c = mk(DType::F32, n);
+        for p in 0..n {
+            let off = c.offset(p, 0);
+            let rk = rotated_at(p);
+            c.k_buffer.as_mut_slice::<f32>()[off..off + PHD].copy_from_slice(&rk);
+        }
+
+        // production executor 로 eviction — 생존자가 물리적으로 이동(slot ≠ 원위치)하도록 흩어진
+        // keep-set 선택.
+        let keep = vec![0usize, 3, 5, 7];
+        let plan = KVCachePlan {
+            keep: KeepSpec::LayerWide(keep.clone()),
+            merges: Vec::new(),
+            channels: None,
+        };
+        execute_kv_plan(&mut c, &plan, 0, 1).unwrap();
+        assert_eq!(c.current_pos(), keep.len(), "keep.len() 로 compact");
+
+        let k = c.k_buffer.as_slice::<f32>().to_vec();
+        for (new_slot, &orig_pos) in keep.iter().enumerate() {
+            let off = c.offset(new_slot, 0);
+            let stored = &k[off..off + PHD];
+
+            // (1) 생존자는 *원래 위치* 의 RoPE phase 를 그대로 유지 — memmove 가 byte-for-byte,
+            //     재회전 없음.
+            assert_eq!(
+                stored,
+                rotated_at(orig_pos).as_slice(),
+                "slot {new_slot} 생존자는 원위치 {orig_pos} 의 RoPE phase 를 보존해야 함"
+            );
+
+            // (2) ...그리고 새(압축) 슬롯으로 재회전됐을 때의 phase 와는 **다르다**. 이동한
+            //     생존자(slot ≠ 원위치)에선 두 phase 가 달라 이게 결정적인 "재회전 없음" 증거다.
+            if new_slot != orig_pos {
+                assert_ne!(
+                    stored,
+                    rotated_at(new_slot).as_slice(),
+                    "slot {new_slot} 생존자가 압축 위치로 재회전되면 안 됨"
+                );
+            }
+        }
+    }
+
     // The rkv visibility/execute test moved to the `rkv` technique crate (it owns RkvStage now); the
     // adapter-vs-plan_keep and World-A↔B sliding parity tests were removed when SlidingWindowPolicy
     // was extracted to the `sliding-window` plugin crate — the plugin is plan-only (no in-place
