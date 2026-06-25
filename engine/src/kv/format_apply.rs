@@ -19,15 +19,17 @@
 //! path swaps the layer's K/V buffers in place. Device-resident (GPU) buffers are deferred: the host
 //! dequant reads via `as_slice`, so a re-encode of a GPU-only buffer is rejected rather than crashing.
 //!
-//! DORMANCY (verified — do not mistake this for a live runtime guarantee): `apply_format_plan` has
-//! **no production caller** today; it is exercised only by the unit tests below. The format-honesty
-//! that production actually relies on is the *construction-time* twin
+//! LIVENESS: `apply_format_plan`'s first production caller is
+//! [`FormatReencodeStage`](crate::stages::kv::format_reencode::FormatReencodeStage) — a `PrefillEnd`
+//! pipeline stage armed when `--kv-format` resolves to a registered `KVFormatPolicy`. This module is
+//! the *runtime* (post-allocation) re-encode executor, the format twin of the eviction executor
+//! `execute_kv_plan` (kv::eviction::stage_registry). Production format-honesty *also* relies, at
+//! construction time, on the twin
 //! [`per_layer_storage_from_policy`](crate::session::bin_setup::per_layer_storage_from_policy)
-//! (bin_setup.rs:565, rejecting override-bearing plans at ~:586 *before* allocation). This module is the
-//! *runtime* (post-allocation) re-encode executor — kept rather than deleted so the L1-deferred shape
-//! stays documented and the format axis retains a structural twin of the eviction executor
-//! `execute_kv_plan` (kv::eviction::stage_registry). Until it is wired to a production caller, its
-//! honesty arms are a *dormant* contract, not a runtime guarantee.
+//! (bin_setup.rs:578, rejecting override-bearing plans at bin_setup.rs:599 *before* allocation). The
+//! stage feeds this fn only typed-floor, host-resident layers (it skips opaque / non-floor / GPU
+//! layers, which the construction-time allocator owns), so the honesty arms below are a live runtime
+//! guarantee on that path — not a dormant contract.
 
 use crate::buffer::DType;
 use crate::kv::dequant::{dequantize_k, dequantize_v};

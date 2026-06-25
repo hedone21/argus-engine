@@ -332,7 +332,8 @@ pub fn build_standard_loop(
     {
         let policy = (reg.make)(argus_extension_api::StageParams::default());
         eprintln!(
-            "[format-reencode] '{name}' active — per-layer KV re-encode applied at PrefillEnd"
+            "[format-reencode] '{name}' active — per-layer KV re-encode runs at PrefillEnd \
+             (no-op when a layer is already in the policy's assigned format)"
         );
         registry.submit(Arc::new(FormatReencodeStage::new(
             kv_handles.clone(),
