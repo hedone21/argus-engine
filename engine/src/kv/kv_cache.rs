@@ -306,9 +306,27 @@ impl KVCache {
                 buf
             }
         };
-        let new_k_buf = wrap(memory.alloc_kv(buf_size, dtype)?);
+        // W-DEVKV: opaque KV is host-resident even on a GPU backend; `alloc_kv` there returns an
+        // unmapped device buffer (null host ptr → SIGSEGV on the opaque host write/read). Keep a regrown
+        // opaque buffer host-backed. Typed buffers keep the device `alloc_kv` path (CPU path unchanged).
+        let opaque_host = self.is_opaque() && backend.is_gpu();
+        let new_k_inner: Arc<dyn Buffer> = if opaque_host {
+            Arc::new(crate::memory::host::shared::SharedBuffer::new(
+                buf_size, dtype,
+            ))
+        } else {
+            memory.alloc_kv(buf_size, dtype)?
+        };
+        let new_k_buf = wrap(new_k_inner);
         let mut new_k = Tensor::new(new_shape.clone(), new_k_buf, backend.clone());
-        let new_v_buf = wrap(memory.alloc_kv(buf_size, dtype)?);
+        let new_v_inner: Arc<dyn Buffer> = if opaque_host {
+            Arc::new(crate::memory::host::shared::SharedBuffer::new(
+                buf_size, dtype,
+            ))
+        } else {
+            memory.alloc_kv(buf_size, dtype)?
+        };
+        let new_v_buf = wrap(new_v_inner);
         let mut new_v = Tensor::new(new_shape, new_v_buf, backend.clone());
 
         // Copy existing data
@@ -331,19 +349,24 @@ impl KVCache {
                 KVLayout::HeadMajor => {
                     if self.is_opaque() {
                         // opaque per-head byte copy (U8 type_size=1, byte stride = cap*bytes_per_head).
+                        // W-DEVKV: opaque buffers are host-resident, so copy on a CpuBackend (host memcpy)
+                        // — OpenCL copy_slice Errs on two host (non-cl_mem) buffers. On a CPU run `backend`
+                        // is already a CpuBackend, so this is a byte-identical host memcpy either way.
+                        let cpu: Arc<dyn crate::backend::Backend> =
+                            Arc::new(crate::backend::cpu::CpuBackend::new());
                         let bph = self.opaque_bytes_per_head();
                         let old_hs = self.capacity * bph;
                         let new_hs = new_cap * bph;
                         let cph = self.current_pos * bph;
                         for h in 0..self.kv_heads {
-                            backend.copy_slice(
+                            cpu.copy_slice(
                                 &self.k_buffer,
                                 &mut new_k,
                                 h * old_hs,
                                 h * new_hs,
                                 cph,
                             )?;
-                            backend.copy_slice(
+                            cpu.copy_slice(
                                 &self.v_buffer,
                                 &mut new_v,
                                 h * old_hs,
@@ -582,8 +605,18 @@ impl KVCache {
             .expect("opaque shrink: block-aligned accounting");
 
         let new_shape = Shape::new(vec![1, self.kv_heads, new_cap, self.head_dim]);
+        // W-DEVKV: keep the shrunk opaque buffer host-backed on a GPU backend (alloc_kv would return an
+        // unmapped device buffer → null host ptr → SIGSEGV on the opaque host write/read).
+        let opaque_host = backend.is_gpu();
         let mk = || -> Result<Tensor> {
-            let inner = memory.alloc_kv(buf_size, DType::U8)?;
+            let inner: Arc<dyn Buffer> = if opaque_host {
+                Arc::new(crate::memory::host::shared::SharedBuffer::new(
+                    buf_size,
+                    DType::U8,
+                ))
+            } else {
+                memory.alloc_kv(buf_size, DType::U8)?
+            };
             let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, desc));
             Ok(Tensor::new(new_shape.clone(), op, backend.clone()))
         };
@@ -591,12 +624,16 @@ impl KVCache {
         let mut new_v = mk()?;
 
         if self.current_pos > 0 {
+            // opaque buffers are host-resident → copy on a CpuBackend (host memcpy; OpenCL copy_slice
+            // Errs on two host buffers). CPU run: `backend` is already a CpuBackend → byte-identical.
+            let cpu: Arc<dyn crate::backend::Backend> =
+                Arc::new(crate::backend::cpu::CpuBackend::new());
             let old_hs = self.capacity * bph;
             let new_hs = new_cap * bph;
             let cph = self.current_pos * bph;
             for h in 0..self.kv_heads {
-                backend.copy_slice(&self.k_buffer, &mut new_k, h * old_hs, h * new_hs, cph)?;
-                backend.copy_slice(&self.v_buffer, &mut new_v, h * old_hs, h * new_hs, cph)?;
+                cpu.copy_slice(&self.k_buffer, &mut new_k, h * old_hs, h * new_hs, cph)?;
+                cpu.copy_slice(&self.v_buffer, &mut new_v, h * old_hs, h * new_hs, cph)?;
             }
         }
         let freed = old_buf_size.saturating_sub(buf_size) * 2; // K + V
@@ -781,7 +818,16 @@ impl KVCache {
         let row = self.kv_heads * self.head_dim; // f32 elements per token (input)
         let base_pos = self.current_pos;
         for (buf, src_t) in [(&self.k_buffer, new_k), (&self.v_buffer, new_v)] {
-            let src = src_t.as_slice::<f32>();
+            // W-DEVKV: new_k/new_v are forward-pass activations (post-RoPE QKV output), device-resident
+            // on a GPU backend (host ptr null → SIGSEGV on `as_slice`). Snapshot to host first; CPU
+            // buffers (is_gpu_buffer()=false) read directly with no copy (byte-identical to before).
+            let host_src;
+            let src = if src_t.buffer().is_gpu_buffer() {
+                host_src = read_device_tensor_to_host(src_t)?;
+                host_src.as_slice::<f32>()
+            } else {
+                src_t.as_slice::<f32>()
+            };
             let total = buf.buffer().size();
             // SAFETY: opaque 버퍼는 total 바이트 유효(self 수명 동안 Arc 보유). 각 (h,pos) sub-slice 는
             // non-overlapping. 같은 token 의 K/V 는 서로 다른 버퍼라 aliasing 없음.

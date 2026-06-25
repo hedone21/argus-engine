@@ -144,6 +144,17 @@ fn unpack_block_via_descriptor(desc: &KVLayoutDesc, block: &[u8], out: &mut [f32
                 *o = q as f32 * scale;
             }
         }
+        Packing::Quad => {
+            // q2_0: 2-bit, 4 elems/byte, asymmetric `quant·scale + min` (always min-bearing —
+            // PerBlockF16WithMin set `min`/`quants` above). Sequential within a byte: byte i holds
+            // out[i*4+0..4] at bit offsets 0/2/4/6. Mirror of `argus_kv_codec::BlockQ2_0::dequantize`.
+            for (i, &b) in quants.iter().enumerate().take(n / 4) {
+                for j in 0..4 {
+                    let q = ((b >> (j * 2)) & 0x03) as f32;
+                    out[i * 4 + j] = q * scale + min;
+                }
+            }
+        }
         // Dense 는 이 함수로 오지 않는다(raw 경로는 dequant_via_descriptor 가 직접 처리).
         Packing::Dense => {
             debug_assert!(
@@ -250,10 +261,14 @@ pub fn dequant_to_f32_tensor(b: &Tensor) -> Result<Tensor> {
         bytes.extend_from_slice(&v.to_ne_bytes());
     }
     let buf = SharedBuffer::from_vec(bytes, DType::F32);
+    // Attach a CpuBackend (not `b.backend()`): the dequanted bytes are host-resident f32, so the
+    // result is self-consistently host (host SharedBuffer + CpuBackend). matmul_transposed_f32 / the
+    // opaque attention floor read it via `as_slice` and never touch its backend, so this is byte-data
+    // identical on CPU runs and prevents a GPU-backend-on-host-buffer mismatch on GPU runs (W-DEVKV).
     Ok(Tensor::new(
         Shape::new(b.shape().dims().to_vec()),
         Arc::new(buf),
-        b.backend().clone(),
+        Arc::new(crate::backend::cpu::CpuBackend::new()),
     ))
 }
 
@@ -285,15 +300,24 @@ pub fn decode_via_descriptor(desc: &KVLayoutDesc, src: &[u8], dst: &mut [f32]) {
 }
 
 pub fn encode_via_descriptor(desc: &KVLayoutDesc, src: &[f32], dst: &mut [u8]) -> Result<()> {
-    if desc.scale_layout != ScaleLayout::PerBlockF16 || desc.packing != Packing::Nibble {
-        return Err(anyhow!(
-            "encode_via_descriptor: only PerBlockF16/Nibble(q4_0 canonical) supported, got {:?}/{:?}",
-            desc.scale_layout,
-            desc.packing
-        ));
-    }
+    // Two canonical writable encoders:
+    //   PerBlockF16 + Nibble        → q4_0 symmetric  (encode_block_perblockf16_nibble)
+    //   PerBlockF16WithMin + Quad   → q2_0 asymmetric (encode_block_perblockf16withmin_quad)
+    // Anything else is outside the writable floor → range-bound Err (no silent mis-encode).
+    let quad = match (desc.scale_layout, desc.packing) {
+        (ScaleLayout::PerBlockF16, Packing::Nibble) => false,
+        (ScaleLayout::PerBlockF16WithMin, Packing::Quad) => true,
+        (sl, pk) => {
+            return Err(anyhow!(
+                "encode_via_descriptor: only PerBlockF16/Nibble(q4_0) or PerBlockF16WithMin/Quad(q2_0) \
+                 supported, got {sl:?}/{pk:?}"
+            ));
+        }
+    };
     let block_elems = desc.block_elems as usize;
-    let block_bytes = desc.block_bytes().expect("Nibble packing has block_bytes");
+    let block_bytes = desc
+        .block_bytes()
+        .expect("block-quant packing (Nibble/Quad) has block_bytes");
     if block_elems == 0 || !src.len().is_multiple_of(block_elems) {
         return Err(anyhow!(
             "encode_via_descriptor: src len {} not a multiple of block_elems {block_elems}",
@@ -311,12 +335,13 @@ pub fn encode_via_descriptor(desc: &KVLayoutDesc, src: &[f32], dst: &mut [u8]) -
         ));
     }
     for bi in 0..n_blocks {
-        encode_block_perblockf16_nibble(
-            desc.bits as u32,
-            block_elems,
-            &src[bi * block_elems..(bi + 1) * block_elems],
-            &mut dst[bi * block_bytes..(bi + 1) * block_bytes],
-        );
+        let s = &src[bi * block_elems..(bi + 1) * block_elems];
+        let d = &mut dst[bi * block_bytes..(bi + 1) * block_bytes];
+        if quad {
+            encode_block_perblockf16withmin_quad(desc.bits as u32, block_elems, s, d);
+        } else {
+            encode_block_perblockf16_nibble(desc.bits as u32, block_elems, s, d);
+        }
     }
     Ok(())
 }
@@ -339,6 +364,34 @@ fn encode_block_perblockf16_nibble(bits: u32, n: usize, src: &[f32], dst: &mut [
         let v0 = (src[i] * id).round().clamp(qmin, qmax) as i32;
         let v1 = (src[i + half] * id).round().clamp(qmin, qmax) as i32;
         dst[2 + i] = ((v0 + zp) as u8) | (((v1 + zp) as u8) << 4);
+    }
+}
+
+/// q2_0-style asymmetric 단일 블록 encode(PerBlockF16WithMin + Quad). `argus_kv_codec::BlockQ2_0::
+/// quantize` 의 descriptor-generic 미러(byte-exact): `d = (max−min) / qmax`, `m = min`,
+/// `q = round((x−min)/d).clamp(0, qmax)`, 4 elems/byte sequential(byte i = out[i*4+0..4], bit offset
+/// 0/2/4/6). `dst` = `[f16 scale][f16 min][n/4 packed quads]`. q4_0 symmetric 과 달리 unsigned
+/// 전범위 [0, qmax] 를 쓰고 zero-point/min 으로 비대칭을 표현한다.
+fn encode_block_perblockf16withmin_quad(bits: u32, n: usize, src: &[f32], dst: &mut [u8]) {
+    let qmax = ((1u32 << bits) - 1) as f32; // bits=2 → 3
+    let per_byte = (8 / bits) as usize; // bits=2 → 4 elems/byte
+
+    let min_val = src.iter().copied().fold(f32::INFINITY, f32::min);
+    let max_val = src.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let d = (max_val - min_val) / qmax;
+    let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+
+    dst[0..2].copy_from_slice(&f16::from_f32(d).to_le_bytes());
+    dst[2..4].copy_from_slice(&f16::from_f32(min_val).to_le_bytes());
+    for i in 0..(n / per_byte) {
+        let mut byte = 0u8;
+        for j in 0..per_byte {
+            let q = ((src[i * per_byte + j] - min_val) * id)
+                .round()
+                .clamp(0.0, qmax) as u8;
+            byte |= q << (j as u32 * bits);
+        }
+        dst[4 + i] = byte;
     }
 }
 
@@ -511,6 +564,176 @@ mod tests {
         // 비-canonical family 는 범위 한정 Err.
         let q4_1 = dtype_to_layout_desc(DType::Q4_1).unwrap();
         assert!(encode_via_descriptor(&q4_1, &src[..QK4_0], &mut dst[..20]).is_err());
+    }
+
+    // ── (q2) sub-Q4 codec: q2_0 비대칭 2-bit (W-CODEC slice 1) ──
+
+    /// q2_0 descriptor (asymmetric 2-bit, Quad). 대응 `DType` 가 없어 literal 로 구성한다.
+    fn q2_0_desc() -> KVLayoutDesc {
+        KVLayoutDesc {
+            block_elems: 32,
+            bits: 2,
+            scale_layout: ScaleLayout::PerBlockF16WithMin,
+            packing: Packing::Quad,
+        }
+    }
+
+    /// LEVEL 1 — ENCODE byte-exact: `encode_via_descriptor(q2)` 가 `BlockQ2_0::quantize` 와
+    /// **byte-identical**. floor 에서 codec drift 를 잡는 게이트(q4_0 byte-exact 게이트의 q2 짝).
+    #[test]
+    fn encode_via_descriptor_q2_0_byte_exact_vs_blockq2_0_quantize() {
+        use crate::quant::{BlockQ2_0, QK2_0};
+        let desc = q2_0_desc();
+        let block_bytes = desc.block_bytes().unwrap(); // 12
+
+        // 0 / 상수(range=0) / 음수 범위 / 양·음 혼합 / 미세값 / 적대(±large, f16 overflow) 블록들.
+        let cases: Vec<[f32; QK2_0]> = vec![
+            [0.0; QK2_0],
+            [42.0; QK2_0],
+            std::array::from_fn(|i| -10.0 + (i as f32 * 9.0 / 31.0)),
+            std::array::from_fn(|i| if i % 2 == 0 { 3.14 } else { -2.71 }),
+            std::array::from_fn(|i| (i as f32) * 1.0e-4),
+            std::array::from_fn(|i| {
+                if i == 0 {
+                    -1.0e30
+                } else if i == 31 {
+                    1.0e30
+                } else {
+                    0.0
+                }
+            }),
+        ];
+        let mut src = Vec::<f32>::new();
+        for c in &cases {
+            src.extend_from_slice(c);
+        }
+        let mut dst = vec![0u8; cases.len() * block_bytes];
+        encode_via_descriptor(&desc, &src, &mut dst).unwrap();
+
+        for (bi, c) in cases.iter().enumerate() {
+            let blk = BlockQ2_0::quantize(c);
+            let want: &[u8] = unsafe {
+                std::slice::from_raw_parts((&blk as *const BlockQ2_0) as *const u8, block_bytes)
+            };
+            let got = &dst[bi * block_bytes..(bi + 1) * block_bytes];
+            assert_eq!(
+                got, want,
+                "block {bi}: encode_via_descriptor != BlockQ2_0::quantize"
+            );
+        }
+
+        // q2 descriptor 는 위드닝된 가드를 통과하나, 인접 family(PerBlockF16WithMin + Nibble = q4_1,
+        // PerBlockF16 + Quad)는 여전히 범위 밖 Err(가드가 정확히 (WithMin,Quad)만 허용).
+        let q4_1 = dtype_to_layout_desc(DType::Q4_1).unwrap();
+        assert!(encode_via_descriptor(&q4_1, &src[..QK2_0], &mut dst[..20]).is_err());
+        let bad = KVLayoutDesc {
+            scale_layout: ScaleLayout::PerBlockF16,
+            ..desc
+        };
+        assert!(encode_via_descriptor(&bad, &src[..QK2_0], &mut dst[..block_bytes]).is_err());
+    }
+
+    /// LEVEL 2 — DECODE bit-identical: `unpack_block_via_descriptor(q2)` 가
+    /// `BlockQ2_0::dequantize` 와 **bit-for-bit** 동일 + byte-회계 drift 가드(== size_of==12).
+    #[test]
+    fn test_generic_unpack_q2_0_bit_identical() {
+        use crate::quant::{BlockQ2_0, QK2_0};
+        let desc = q2_0_desc();
+        // drift 가드: descriptor 회계 == engine BlockQ2_0 크기(12).
+        assert_eq!(
+            desc.bytes_for_elems(QK2_0),
+            Some(std::mem::size_of::<BlockQ2_0>())
+        );
+        assert_eq!(std::mem::size_of::<BlockQ2_0>(), 12);
+
+        let cases: Vec<BlockQ2_0> = vec![
+            BlockQ2_0 {
+                d: f16::from_f32(0.0),
+                m: f16::from_f32(0.0),
+                qs: [0; QK2_0 / 4],
+            },
+            BlockQ2_0 {
+                d: f16::from_f32(2.0),
+                m: f16::from_f32(-1.0),
+                qs: [0b11_10_01_00; QK2_0 / 4], // q = [0,1,2,3] 반복
+            },
+            BlockQ2_0 {
+                d: f16::from_f32(-1.25),
+                m: f16::from_f32(3.5),
+                qs: std::array::from_fn(|i| ((i * 13 + 1) % 256) as u8),
+            },
+            BlockQ2_0 {
+                d: f16::from_f32(0.03125),
+                m: f16::from_f32(-0.5),
+                qs: [0xFF; QK2_0 / 4], // 전부 q=3
+            },
+            BlockQ2_0 {
+                d: f16::from_f32(64.0),
+                m: f16::from_f32(-64.0),
+                qs: std::array::from_fn(|i| (i * 17) as u8),
+            },
+        ];
+        for blk in &cases {
+            let mut want = [0.0f32; QK2_0];
+            blk.dequantize(&mut want);
+            let raw: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    (blk as *const BlockQ2_0) as *const u8,
+                    std::mem::size_of::<BlockQ2_0>(),
+                )
+            };
+            let mut got = [0.0f32; QK2_0];
+            unpack_block_via_descriptor(&desc, raw, &mut got);
+            assert_eq!(got, want, "Q2_0 generic unpack mismatch");
+        }
+    }
+
+    /// LEVEL 3 — ROUND-TRIP fidelity (reference-independent): descriptor codec 의
+    /// encode→decode 가 2-bit 정보이론 한계(요소별 max-error ≤ range/6, 4-level → step=range/3 →
+    /// max=step/2) 안에 든다. **`BlockQ2_0` 를 참조하지 않는** 의미 게이트 — LEVEL 1/2 가 양쪽을
+    /// 함께 mutate 해도(byte/bit 비교가 통과해도) 실제 fidelity 회귀를 잡는다. per-element max-error
+    /// 는 MSE/NMSE 보다 TIGHT(품질지표가 아님): lossy-but-coherent false-pass 차단.
+    #[test]
+    fn q2_0_roundtrip_fidelity_within_2bit_bound() {
+        use crate::quant::QK2_0;
+        let desc = q2_0_desc();
+        let block_bytes = desc.block_bytes().unwrap();
+
+        let cases: Vec<[f32; QK2_0]> = vec![
+            std::array::from_fn(|i| i as f32 * 0.1), // 선형 spread
+            std::array::from_fn(|i| -10.0 + (i as f32 * 9.0 / 31.0)), // 음수 범위
+            std::array::from_fn(|i| ((i * 37 % 23) as f32 - 11.0) * 0.37), // 랜덤풍
+            std::array::from_fn(|i| (i as f32) * 1.0e-4), // 미세값(가장 tight)
+        ];
+        for (ci, c) in cases.iter().enumerate() {
+            let mut dst = vec![0u8; block_bytes];
+            encode_via_descriptor(&desc, c, &mut dst).unwrap();
+            let mut rt = [0.0f32; QK2_0];
+            unpack_block_via_descriptor(&desc, &dst, &mut rt);
+
+            let min = c.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = c.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let range = max - min;
+            // range/6 = 순수 2-bit 한계. f16(d,m) 양자화 여유(상대 ~2^-11)·경계 라운딩 epsilon 가산.
+            let bound = range / 6.0 + range * 2.0e-2 + min.abs() * 1.0e-3 + 1.0e-4;
+            let mut mse = 0.0f64;
+            for i in 0..QK2_0 {
+                let err = (c[i] - rt[i]).abs();
+                assert!(
+                    err <= bound,
+                    "case {ci} elem {i}: src={}, rt={}, err={err}, bound={bound}",
+                    c[i],
+                    rt[i]
+                );
+                mse += (err as f64) * (err as f64);
+            }
+            mse /= QK2_0 as f64;
+            // MSE ≤ (max-error 한계)^2 는 per-element 단언이 이미 함의 — 문서적 하한만 단언.
+            assert!(
+                mse <= (bound as f64) * (bound as f64),
+                "case {ci}: MSE {mse} exceeds bound^2"
+            );
+        }
     }
 
     // ── (a) generic unpacker bit-identical vs quant.rs dequantize ──

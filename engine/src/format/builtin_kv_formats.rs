@@ -24,6 +24,9 @@ use crate::format::dtype_layout::dtype_to_layout_desc;
 // `KV_FORMATS` 에 등록되도록 강제 링크한다. dep 선언만으론 dead-crate elision 으로 미링크
 // (M3/G5 교훈). `--kv-format synth_q4` 가 `find_kv_format` 으로 이 등록을 찾는다.
 use synth_q4_format as _;
+// force-link: 외부 `q2-format` crate(opaque format `q2_0`, 비대칭 2-bit)가 `KV_FORMATS` 에
+// 등록되도록 강제 링크한다(같은 dead-crate elision 이유). `--kv-format q2_0` 가 이 등록을 찾는다.
+use q2_format as _;
 
 /// Stateless descriptor-only `KVFormat` plugin (plugin 은 버퍼 0, descriptor 만).
 ///
