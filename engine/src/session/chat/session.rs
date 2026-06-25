@@ -77,7 +77,13 @@ pub enum ChatKvMode {
 pub struct ChatSession {
     decode_loop: DecodeLoop,
     pub kv_mode: ChatKvMode,
-    /// KV pos 외부 read용 cache. DecodeLoop.pos와 항상 동기화된다.
+    /// KV pos 외부 read용 cache — **capacity 체크(`ensure_capacity`/`on_turn_end`) + `/stats` +
+    /// `pos()` getter 전용 점유 mirror지, RoPE source 가 아니다**. prefill/run_turn 후
+    /// `decode_loop.pos_snapshot()` 로 누적 위치를 mirror 하지만, turn-경계 eviction 후엔 압축 점유
+    /// (`new_pos`)로 collapse 돼 다음 prefill 이 다시 mirror 할 때까지 `DecodeLoop.pos`(누적)와
+    /// 일시적으로 어긋난다. RoPE `start_pos` 는 `DecodeLoop.pos` 가 단독 공급하므로(`prefill`/decode
+    /// step) 이 collapse 는 RoPE-position drift 를 일으키지 않는다 — 회귀 test
+    /// `chat_*_eviction_keeps_cumulative_rope_pos` 가 핀한다(PR #62 형제 경로 검증 = NOT-A-BUG).
     pub pos: usize,
     max_seq_len: usize,
     /// β-6: turn별 stop condition 을 `ChatStopStage`(DecodeEnd 구독)에 전달하는 공유 슬롯.
@@ -1197,6 +1203,174 @@ mod tests {
         if let ChatKvMode::Standard(s) = &session.kv_mode {
             assert_eq!(s.evicted_total, 5, "removed 누적");
         }
+    }
+
+    // ─── chat turn-boundary eviction: RoPE-position drift 검증 (PR #62 형제 경로) ───
+    //
+    // ship-review(PR #62)가 chat `self.pos = new_pos`(eviction 후 ChatSession.pos collapse,
+    // `ensure_capacity` :338 / `on_turn_end` :444)를 PR #62 와 같은 RoPE-collapse bug class 로
+    // flag 했다(비차단). 아래 두 test 가 그것이 **NOT-A-BUG** 임을 핀한다.
+    //
+    // chat 의 RoPE source 는 `decode_loop.pos`(누적; `prefill` 의 `start_pos` 와 decode step 의
+    // `ctx.pos` 가 모두 이 한 필드를 읽는다)이고, turn-경계 eviction 은 그와 **분리된**
+    // `ChatSession.pos`(점유 mirror — capacity 체크 :266/:384 + stats_line + `pos()` getter 전용)만
+    // collapse 한다. `try_evict` 는 `forward_mut()` 가 돌려준 `Forward` 의 메서드라 `decode_loop.pos`
+    // 에 닿을 수 없고(구조적: Forward ≠ DecodeLoop), chat decode_loop 은 `kv_pos_handle` 미배선이라
+    // `invalidate_plan_on_kv_shrink`(PR #62)도 no-op + plan path 비활성이다. 따라서 eviction 후 다음
+    // turn 의 prefill RoPE `start_pos` 는 **진짜 누적 위치**를 유지한다 — 압축 점유로 collapse 하면
+    // query 가 생존 키(compaction=memmove 라 원위치 RoPE phase 유지)보다 낮은 위치로 회전해 학습된
+    // 상대거리가 깨진다(eval/ppl/PR #62 가 금지하는 NLL degradation).
+
+    /// 모든 prefill 의 RoPE `start_pos` 를 누적 기록하는 mock Forward. `try_evict` 는 compaction 을
+    /// 모사해 작은 `new_pos`(압축 점유)를 반환한다(decode_loop.pos 에는 닿지 못함).
+    struct PosRecordingForward {
+        vocab: usize,
+        prefill_start_positions: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+        evict_removed: usize,
+        evict_new_pos: usize,
+    }
+    impl Forward for PosRecordingForward {
+        fn prefill(&mut self, _t: &[u32], start_pos: usize) -> anyhow::Result<Vec<f32>> {
+            self.prefill_start_positions.borrow_mut().push(start_pos);
+            let mut l = vec![0.0f32; self.vocab];
+            l[0] = 1.0;
+            Ok(l)
+        }
+        fn step(&mut self, _c: &StepCtx, _t: u32) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0f32; self.vocab])
+        }
+        fn try_evict(
+            &mut self,
+            _cm: &crate::kv::cache_manager::CacheManager,
+            _scores: Option<&[f32]>,
+            _last_attn: Option<&[f32]>,
+            _force: bool,
+            _target_ratio: f32,
+        ) -> anyhow::Result<(usize, usize)> {
+            // compaction 모사: 캐시 점유가 작은 값으로 압축된다(생존 키 memmove → 낮은 슬롯).
+            Ok((self.evict_removed, self.evict_new_pos))
+        }
+    }
+
+    /// `PosRecordingForward` 기반 Standard-모드 ChatSession + start_pos 기록 핸들.
+    /// cache_manager=Some 이라 `ensure_capacity` overflow / `on_turn_end` 가 try_evict 경로로 진입한다.
+    fn make_pos_recording_session(
+        max_seq_len: usize,
+        evict_new_pos: usize,
+    ) -> (ChatSession, std::rc::Rc<std::cell::RefCell<Vec<usize>>>) {
+        use crate::kv::cache_manager::CacheManager;
+        use crate::kv::eviction::stage_registry::sliding_backed_policy;
+        use crate::resilience::sys_monitor::NoOpMonitor;
+
+        let recorded = std::rc::Rc::new(std::cell::RefCell::new(Vec::<usize>::new()));
+        let fwd = PosRecordingForward {
+            vocab: 8,
+            prefill_start_positions: std::rc::Rc::clone(&recorded),
+            evict_removed: 8,
+            evict_new_pos,
+        };
+        let decode_loop = DecodeLoopBuilder::new()
+            .with_forward(fwd)
+            .with_kv_capacity(max_seq_len)
+            .build();
+        let (decode_loop, stop_slot, stream_slot) = super::install_stop_stage(decode_loop);
+        let policy = sliding_backed_policy(4, 2);
+        let cm = CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, 0.5);
+        let session = ChatSession {
+            decode_loop,
+            kv_mode: ChatKvMode::Standard(Box::new(ChatKvModeStandard {
+                cache_manager: Some(cm),
+                score_accumulator: None,
+                score_based: false,
+                policy_name: "sliding".to_string(),
+                target_ratio: 0.5,
+                evicted_total: 0,
+            })),
+            pos: 0,
+            max_seq_len,
+            stop_slot,
+            stream_slot,
+            sampling: None,
+        };
+        (session, recorded)
+    }
+
+    /// turn-경계 eviction(`ensure_capacity` overflow 경로, session.rs:338)이 RoPE source 를
+    /// collapse 하지 않음을 핀한다.
+    #[test]
+    fn chat_ensure_capacity_eviction_keeps_cumulative_rope_pos() {
+        const COMPACTED_POS: usize = 2;
+        let (mut session, recorded) = make_pos_recording_session(16, COMPACTED_POS);
+
+        // turn 1: 10-token prefill → decode_loop.pos 0→10(누적), ChatSession.pos=10.
+        session
+            .prefill(&[1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+            .unwrap();
+        assert_eq!(
+            session.pos(),
+            10,
+            "turn1 prefill: ChatSession.pos == 누적 decode_loop.pos"
+        );
+
+        // turn 2 시작: ensure_capacity overflow(10+10=20>16) → turn-경계 eviction.
+        // try_evict→(removed=8,new_pos=2) → ChatSession.pos 가 압축 점유(2)로 collapse(:338 경로 실재).
+        // decode_loop.pos(RoPE source)는 불변(10) — try_evict 는 Forward 메서드라 닿지 못함.
+        session.ensure_capacity(10).unwrap();
+        assert_eq!(
+            session.pos(),
+            COMPACTED_POS,
+            "ensure_capacity eviction 이 ChatSession.pos 를 압축 점유로 collapse(:338 경로 실재)"
+        );
+
+        // turn 2: 2-token prefill. RoPE start_pos 는 반드시 진짜 누적 위치(10)여야 한다 — 생존 키는
+        // 원위치 RoPE phase 유지(compaction=memmove). 압축 점유(2)로 회전하면 query 가 생존 키보다
+        // 낮은 위치로 회전해 학습된 상대거리가 깨진다.
+        session.prefill(&[20u32, 21]).unwrap();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![0usize, 10usize],
+            "RoPE start_pos 가 turn-경계 eviction 을 가로질러 누적 유지(압축 점유 아님). \
+             비-tautology: chat 이 PR #62 이전 decode loop 처럼 RoPE source 를 collapse 하면 [0, 2] 가 됨."
+        );
+        // turn2 prefill 후 ChatSession.pos 는 누적(10+2=12)으로 재동기 — 압축 점유 위로 다시 점프한다.
+        // 이는 (별개의 pre-existing) capacity-accounting 우려지 RoPE 정확성 문제가 아니다(아래 별도 핀).
+        assert_eq!(
+            session.pos(),
+            12,
+            "prefill 후 ChatSession.pos 는 누적으로 재동기"
+        );
+    }
+
+    /// turn-경계 eviction(`on_turn_end` 경로, session.rs:444)도 동일하게 RoPE source 를 collapse 하지
+    /// 않음을 핀한다(ship-review 가 flag 한 두 번째 site).
+    #[test]
+    fn chat_on_turn_end_eviction_keeps_cumulative_rope_pos() {
+        const COMPACTED_POS: usize = 3;
+        let (mut session, recorded) = make_pos_recording_session(16, COMPACTED_POS);
+
+        // turn 1: 10-token prefill → decode_loop.pos=10.
+        session
+            .prefill(&[1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+            .unwrap();
+        assert_eq!(session.pos(), 10);
+
+        // turn 1 종료: on_turn_end → try_evict(force=at_pressure) → (removed=8,new_pos=3).
+        // ChatSession.pos collapse(:444), decode_loop.pos 불변(10).
+        session.on_turn_end().unwrap();
+        assert_eq!(
+            session.pos(),
+            COMPACTED_POS,
+            "on_turn_end eviction 이 ChatSession.pos 를 압축 점유로 collapse(:444 경로 실재)"
+        );
+
+        // turn 2 prefill: start_pos == 누적(10), 압축 점유(3) 아님.
+        session.prefill(&[20u32, 21]).unwrap();
+        assert_eq!(
+            *recorded.borrow(),
+            vec![0usize, 10usize],
+            "on_turn_end eviction 후에도 RoPE start_pos 누적 유지. 비-tautology: collapse 시 [0, 3]."
+        );
     }
 
     // ─── D5/G1: stats_line 포맷 보존 ─────────────────────────────────────
