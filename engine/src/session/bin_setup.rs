@@ -706,6 +706,74 @@ pub fn alloc_mixed_kv_caches(
     Ok(kv_caches)
 }
 
+/// Does `args` select a registered per-layer KV format **policy** (N-way mixed precision)? Returns the
+/// policy name if so, else `None` — either no `--kv-format`, or a single builtin/`.so` format name,
+/// which the eval path deliberately does not honor (only `--kv-type` and policies). Pure/deterministic:
+/// the testable routing decision behind [`alloc_eval_kv_caches`].
+pub fn eval_format_policy_name(args: &Args) -> Option<&str> {
+    let name = args.kv_format.as_deref().filter(|s| !s.is_empty())?;
+    find_format_policy(name).map(|_| name)
+}
+
+/// eval/dump-importance 빌더용 KV alloc 디스패치. `--kv-format` 가 등록된 per-layer **정책**이면
+/// 정책별 per-layer mixed precision 으로 할당하고(각 레이어가 정책이 지정한 base 포맷, tail 은 `kv_type`
+/// 기본), 아니면 (정책 미지정 OR 단일 포맷 이름) 기존대로 uniform `kv_type` 으로 할당한다 —
+/// [`build_inference_ctx`] 의 정책 분기를 eval 경로(capacity == max_seq_len 전량 선할당)에서 재사용한다.
+///
+/// `build_inference_ctx` 의 full `--kv-format` 디스패치(typed/opaque 단일 포맷 라우팅)와 달리 eval 은
+/// 단일 포맷 이름을 honor 하지 않는 기존 동작을 보존한다(정책만 새로 honor; 비정책 이름은 uniform 로 떨어짐).
+/// 따라서 `--kv-type ...`(정책 미사용) eval 의 alloc 은 바이트 동일하다.
+#[allow(clippy::too_many_arguments)]
+pub fn alloc_eval_kv_caches(
+    args: &Args,
+    backend: &Arc<dyn Backend>,
+    memory: Arc<dyn Memory>,
+    num_layers: usize,
+    initial_kv_capacity: usize,
+    max_seq_len: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    kv_type: DType,
+    layout: KVLayout,
+) -> anyhow::Result<Vec<KVCache>> {
+    match eval_format_policy_name(args) {
+        Some(fmt_name) => {
+            eprintln!("KV format policy: {fmt_name} (per-layer mixed precision)");
+            let pol_reg = find_format_policy(fmt_name)
+                .expect("guarded by eval_format_policy_name().is_some()");
+            let policy = (pol_reg.make)(StageParams::default());
+            let per_layer = per_layer_storage_from_policy(
+                &*policy,
+                num_layers,
+                kv_heads,
+                head_dim,
+                LayerStorage::Typed(kv_type),
+            )?;
+            alloc_mixed_kv_caches(
+                backend,
+                memory,
+                &per_layer,
+                initial_kv_capacity,
+                max_seq_len,
+                kv_heads,
+                head_dim,
+                layout,
+            )
+        }
+        None => alloc_standard_kv_caches(
+            backend,
+            memory,
+            num_layers,
+            initial_kv_capacity,
+            max_seq_len,
+            kv_heads,
+            head_dim,
+            kv_type,
+            layout,
+        ),
+    }
+}
+
 /// AB-2 §5.7.7: argus-bench quant-window 분기 컨텍스트.
 ///
 /// Standard [`StandardHappyCtx`] 와 달리 quant-window 는 `Vec<QuantizedRecentWindowCache>`(typed `KVCache` 아님) + caps
@@ -824,6 +892,19 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::memory::galloc::Galloc;
+    use crate::session::cli::Args;
+    use clap::Parser;
+
+    /// Serializes the two `ARGUS_KV_MIXED`-reading tests in this binary so a `set_var` never races a
+    /// concurrent `MixedPrecisionPolicy::from_env()` read (the `set_var` UB contract).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Minimal `Args` for routing tests (clap parse only — no model load).
+    fn eval_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["argus-eval", "--model-path", "/tmp/m.gguf"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("Args parse")
+    }
 
     /// W-ALLOC test policy: assigns a different builtin format per layer purely by layer index.
     struct PerLayerMixPolicy;
@@ -939,6 +1020,7 @@ mod tests {
     /// makes the policy a no-op (all layers keep the default), which is deterministic for CI.
     #[test]
     fn registered_mixed_precision_policy_is_consumable() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let reg = find_format_policy("mixed_precision")
             .expect("mixed_precision registered in KV_FORMAT_POLICIES (dead-arm fixed)");
         let policy = (reg.make)(StageParams::default());
@@ -946,6 +1028,86 @@ mod tests {
             per_layer_storage_from_policy(&*policy, 6, 2, 8, LayerStorage::Typed(DType::F16))
                 .expect("registered policy consumes without error");
         assert_eq!(per_layer.len(), 6);
+    }
+
+    /// Routing decision (deterministic, env-free): a registered policy name is detected as a policy,
+    /// while a single builtin format name or no `--kv-format` is not — eval honors only policies
+    /// (+ `--kv-type`), never a single `--kv-format` name (that path stays uniform).
+    #[test]
+    fn eval_format_policy_name_detects_policy_not_single_format() {
+        assert_eq!(
+            eval_format_policy_name(&eval_args(&["--kv-format", "mixed_precision"])),
+            Some("mixed_precision")
+        );
+        assert_eq!(
+            eval_format_policy_name(&eval_args(&["--kv-format", "f16"])),
+            None
+        );
+        assert_eq!(eval_format_policy_name(&eval_args(&[])), None);
+    }
+
+    /// Non-policy branch: no `--kv-format` → `alloc_eval_kv_caches` allocates a UNIFORM `kv_type` for
+    /// every layer (byte-identical to the pre-change `alloc_standard_kv_caches` path).
+    #[test]
+    fn alloc_eval_kv_caches_uniform_without_policy() {
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let memory: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let args = eval_args(&[]); // no --kv-format
+        let caches = alloc_eval_kv_caches(
+            &args,
+            &backend,
+            memory,
+            4,
+            16,
+            64,
+            2,
+            8,
+            DType::F16,
+            KVLayout::HeadMajor,
+        )
+        .unwrap();
+        assert_eq!(caches.len(), 4);
+        for c in &caches {
+            assert_eq!(c.kv_dtype(), DType::F16);
+        }
+    }
+
+    /// MUTATION-PROOF: `alloc_eval_kv_caches` ROUTES a per-layer policy to heterogeneous per-layer
+    /// storage (not uniform). With `ARGUS_KV_MIXED="f16:2,q4_0:2"` and `--kv-format mixed_precision`,
+    /// layers 0-1 store f16 and layers 2-3 store q4_0 — the q4_0 layers are the discriminator vs the
+    /// uniform f16 default. If the eval builders revert to ignoring the policy (always uniform), all
+    /// four layers would read f16 and this fails.
+    #[test]
+    fn alloc_eval_kv_caches_routes_policy_to_per_layer_dtype() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized by ENV_LOCK against the only other in-binary `from_env` reader.
+        unsafe { std::env::set_var("ARGUS_KV_MIXED", "f16:2,q4_0:2") };
+
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let memory: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let args = eval_args(&["--kv-format", "mixed_precision"]);
+        let caches = alloc_eval_kv_caches(
+            &args,
+            &backend,
+            memory,
+            4,
+            16,
+            64,
+            2,
+            8,
+            DType::F16,
+            KVLayout::HeadMajor,
+        )
+        .unwrap();
+
+        // SAFETY: still under ENV_LOCK; restore before any assert can panic out.
+        unsafe { std::env::remove_var("ARGUS_KV_MIXED") };
+
+        assert_eq!(caches.len(), 4);
+        assert_eq!(caches[0].kv_dtype(), DType::F16);
+        assert_eq!(caches[1].kv_dtype(), DType::F16);
+        assert_eq!(caches[2].kv_dtype(), DType::Q4_0);
+        assert_eq!(caches[3].kv_dtype(), DType::Q4_0);
     }
 
     #[test]

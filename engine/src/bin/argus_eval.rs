@@ -217,16 +217,19 @@ fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
     if args.tensor_partition > 0.0 {
         bail!("argus-eval: --tensor-partition is a decode-only measurement mode, not eval");
     }
-    // W-ALLOC honesty: `--kv-format` is a global Args flag but only argus-cli/argus-bench honor a
-    // per-layer KV format POLICY (N-way mixed precision); eval allocates a uniform KV dtype. Fail
-    // fast on a policy name instead of silently dropping it to uniform (no-silent-no-op contract).
+    // W-ALLOC: eval honors a per-layer KV format POLICY (N-way mixed precision) on the Standard KV
+    // path (`build_eval_*_ctx` → `alloc_eval_kv_caches`), matching argus-cli / argus-bench. The
+    // quant-window path (`--kv-mode kivi`) builds its own `QuantizedRecentWindowCache` and never
+    // consults the policy, so reject *that one* combination (no-silent-no-op contract) instead of
+    // silently dropping the policy to a uniform quant-window dtype.
     if let Some(fmt) = args.kv_format.as_deref().filter(|s| !s.is_empty())
         && argus_engine::format::is_registered_kv_format_policy(fmt)
+        && mode_caps(args.effective_kv_mode()).is_some_and(|c| c.is_quantized_kv)
     {
         bail!(
-            "argus-eval: --kv-format '{fmt}' is a per-layer KV format policy (N-way mixed precision) \
-             supported only by argus-cli / argus-bench; eval uses a uniform KV dtype. Use --kv-type \
-             for eval, or run mixed precision via argus-cli / argus-bench."
+            "argus-eval: --kv-format '{fmt}' (per-layer mixed precision) is not supported with \
+             --kv-mode quant-window (kivi) — the quant-window cache ignores per-layer format \
+             policies. Drop --kv-mode to measure a mixed-precision policy on Standard KV."
         );
     }
     // Generic diagnostic dumps (`--dump <kind>`): validate kind names, require an
@@ -359,13 +362,29 @@ mod tests {
         assert!(err.to_string().contains("--profile"));
     }
 
-    /// W-ALLOC honesty: a per-layer KV format policy name is rejected (fail-fast), not silently
-    /// dropped to a uniform dtype (eval does not honor `--kv-format` policies).
+    /// W-ALLOC: a per-layer KV format policy is now ALLOWED on the Standard KV path (eval honors it
+    /// via `build_eval_*_ctx` → `alloc_eval_kv_caches`), no longer fail-fast rejected.
     #[test]
-    fn reject_blocks_kv_format_policy() {
+    fn reject_allows_kv_format_policy_on_standard() {
         let args = make_args(&["--eval-ll", "--kv-format", "mixed_precision"]);
+        assert!(reject_unsupported_modes_eval(&args).is_ok());
+    }
+
+    /// W-ALLOC no-silent-no-op: a policy combined with the quant-window path (`--kv-mode kivi`) IS
+    /// rejected — the quant-window cache ignores per-layer format policies, so we fail fast rather
+    /// than silently drop the policy.
+    #[test]
+    fn reject_blocks_kv_format_policy_with_quant_window() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--kv-format",
+            "mixed_precision",
+            "--kv-mode",
+            "kivi",
+        ]);
         let err = reject_unsupported_modes_eval(&args).unwrap_err();
         assert!(err.to_string().contains("mixed_precision"));
+        assert!(err.to_string().contains("quant-window"));
     }
 
     /// A plain builtin format name is NOT a policy → not rejected by this guard.
