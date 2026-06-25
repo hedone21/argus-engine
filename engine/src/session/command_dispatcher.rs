@@ -17,6 +17,7 @@
 //! OneShot Consumed GC 1회성. directive 1회 = submit 1회 = 발화 1회 = GC. RestoreDefaults →
 //! 재제출 가능 reset. v1 `evict_applied` 는 dispatcher 내부 sticky 상태로 흡수된다.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use argus_extension_api::FormatId;
@@ -177,6 +178,12 @@ pub struct CommandDispatcher {
     /// 와 동형 — 값이 곧 상태). RestoreDefaults 시 `None` 으로 reset(재무장) — 복원 transition 없음
     /// (quant 와 동형: 외부가 명시적으로 다른 format 을 보내야 복원).
     last_reencode_format: Option<String>,
+    /// W-FORMAT-HET L1-runtime: per-step "a mid-decode re-encode actually applied ≥1 layer" signal,
+    /// shared with the `FormatReencodeStage`(KvMutate) this dispatcher submits and read by the
+    /// `DecodeLoop` after the KvMutate dispatch. The stage sets it `true` on a real dtype flip; the
+    /// loop swaps it back to `false` and calls `on_kv_reencode()` (fused-plan invalidation) that step
+    /// only. Owned here (not a ctor param) so the many `CommandDispatcher::new` call sites are unchanged.
+    reencode_fired_cell: Arc<AtomicBool>,
     /// AB-3 §5.10.3: offload 가 한 번이라도 적용됐는가 상태. KvOffload directive 도착 시 true,
     /// RestoreDefaults recall 완료 후(submit_offload_recall) false. RestoreDefaults 시 recall
     /// submit 여부의 게이트 — offload 미적용이면 불필요 disk 접근 0.
@@ -227,8 +234,16 @@ impl CommandDispatcher {
             last_partition_ratio: None,
             last_quant_bits: None,
             last_reencode_format: None,
+            reencode_fired_cell: Arc::new(AtomicBool::new(false)),
             offload_armed: false,
         }
+    }
+
+    /// W-FORMAT-HET L1-runtime: the per-step re-encode-fired signal, for the assembly to hand to the
+    /// `DecodeLoop` (`with_reencode_fired_cell`) so the loop can invalidate the fused plan exactly on
+    /// a step that re-encoded. Returns an `Arc` clone (shared with the submitted stage).
+    pub(crate) fn reencode_fired_cell(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.reencode_fired_cell)
     }
 
     /// 마지막 [`Self::dispatch`] 가 갱신한 누적 [`LoopControl`] 읽기.
@@ -438,7 +453,8 @@ impl CommandDispatcher {
         self.last_reencode_format = Some(format.to_string());
         let policy = Box::new(FixedFormatPolicy::new(FormatId(format.to_string())));
         let stage =
-            FormatReencodeStage::new_at(LifecyclePhase::KvMutate, self.kv_handles.clone(), policy);
+            FormatReencodeStage::new_at(LifecyclePhase::KvMutate, self.kv_handles.clone(), policy)
+                .with_reencode_fired(Arc::clone(&self.reencode_fired_cell));
         self.registry.submit(Arc::new(stage));
     }
 

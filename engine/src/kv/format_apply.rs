@@ -16,8 +16,10 @@
 //! new-format buffer (typed floor formats f32/f16/q4_0). A whole-layer *override* re-encode and any
 //! heterogeneous-within-layer plan remain unexecuted (the latter rejected with
 //! [`FormatApplyError::HeterogeneousUnsupported`]). The signature is `&mut KVCache` because the L1
-//! path swaps the layer's K/V buffers in place. Device-resident (GPU) buffers are deferred: the host
-//! dequant reads via `as_slice`, so a re-encode of a GPU-only buffer is rejected rather than crashing.
+//! path swaps the layer's K/V buffers in place. Device-resident (GPU) buffers are handled by staging
+//! through a host mirror (`reencode_typed_device`): the bytes are downloaded (`host_snapshot` /
+//! `read_buffer`), re-encoded on the CPU, and uploaded to fresh device buffers (`alloc_kv` /
+//! `write_buffer`) — needs the cache's grow allocator (`memory`), else it is skipped upstream.
 //!
 //! LIVENESS: `apply_format_plan`'s first production caller is
 //! [`FormatReencodeStage`](crate::stages::kv::format_reencode::FormatReencodeStage) — a `PrefillEnd`
@@ -27,9 +29,10 @@
 //! construction time, on the twin
 //! [`per_layer_storage_from_policy`](crate::session::bin_setup::per_layer_storage_from_policy)
 //! (bin_setup.rs:578, rejecting override-bearing plans at bin_setup.rs:599 *before* allocation). The
-//! stage feeds this fn only typed-floor, host-resident layers (it skips opaque / non-floor / GPU
-//! layers, which the construction-time allocator owns), so the honesty arms below are a live runtime
-//! guarantee on that path — not a dormant contract.
+//! stage feeds this fn only typed-floor layers it can re-encode — host-resident, or device-resident
+//! with a grow allocator (it skips opaque / non-floor / allocator-less-device layers, which the
+//! construction-time allocator owns), so the honesty arms below are a live runtime guarantee on that
+//! path — not a dormant contract.
 
 use crate::buffer::DType;
 use crate::kv::dequant::{dequantize_k, dequantize_v};
@@ -156,19 +159,14 @@ fn typed_byte_size(n_values: usize, dtype: DType) -> usize {
     }
 }
 
-/// Uniform per-layer re-encode of `cache` to the format named `target_name` (host/CPU path).
+/// Uniform per-layer re-encode of `cache` to the format named `target_name`.
 ///
-/// Rejects (honestly, never silently) what this host path cannot do: a device-resident buffer (the
-/// host dequant reads via `as_slice`), a non-typed-floor source/target (opaque codecs), and a Q4_0
-/// target whose `head_dim` is not a multiple of `QK4_0`.
+/// Host-resident caches re-encode in place (CPU dequant/requant). Device-resident (GPU) caches stage
+/// through a host mirror (`reencode_typed` → `reencode_typed_device`): the bytes are downloaded,
+/// re-encoded on the CPU, and uploaded to fresh device buffers. Rejects (honestly, never silently) a
+/// non-typed-floor source/target (opaque codecs) and a Q4_0 target whose `head_dim` is not a multiple
+/// of `QK4_0`.
 fn reencode_uniform(cache: &mut KVCache, target_name: &str) -> Result<(), FormatApplyError> {
-    // Host-only: a device-only buffer (Adreno: null host ptr) would null-deref in the host dequant.
-    // The GPU device re-encode is deferred (plan invalidation + device verification live elsewhere).
-    if cache.k_buffer.buffer().is_gpu_buffer() {
-        return Err(FormatApplyError::UnsupportedFormat(
-            "device-resident re-encode is host-only (deferred)".into(),
-        ));
-    }
     let source = cache.kv_dtype();
     if !is_typed_floor(source) {
         return Err(FormatApplyError::UnsupportedFormat(format!(
@@ -202,6 +200,14 @@ fn reencode_typed(cache: &mut KVCache, target: DType) -> Result<(), FormatApplyE
         )));
     }
 
+    // Device-resident cache (Adreno UMA: host ptr is null until mapped): the host dequant below reads
+    // via `as_slice`, so stage through a host mirror — download the bytes, re-encode on the CPU, and
+    // upload to fresh device buffers. The result is byte-identical to a construction-time device alloc
+    // of `target` (the host re-encode is deterministic: `BlockQ4_0::quantize` etc.).
+    if cache.k_buffer.buffer().is_gpu_buffer() {
+        return reencode_typed_device(cache, target);
+    }
+
     let backend = cache.k_buffer.backend().clone();
     let shape = cache.k_buffer.shape().clone();
     let n_values = capacity * kv_heads * head_dim;
@@ -232,6 +238,64 @@ fn reencode_typed(cache: &mut KVCache, target: DType) -> Result<(), FormatApplyE
     cache.k_buffer = new_k;
     cache.v_buffer = new_v;
     Ok(())
+}
+
+/// Device-resident re-encode: download the cache to a geometry-identical host mirror
+/// ([`KVCache::host_snapshot`] — a `read_buffer` of both buffers), re-encode that mirror on the CPU
+/// path ([`reencode_typed`] recursion lands in the host branch since the mirror is host-backed), then
+/// upload the new-format host buffers to fresh device buffers via the cache's grow allocator and swap.
+///
+/// The uploaded bytes are byte-identical to a construction-time device alloc of `target`: the host
+/// re-encode is deterministic (`BlockQ4_0::quantize` etc.), and the device alloc + `write_buffer`
+/// reproduces those exact bytes. The fused GPU plan is F16-only, so after a non-F16 re-encode the
+/// caller invalidates it (`on_kv_reencode`) and decode falls to the dyn path (the q4_0-KV-on-GPU
+/// fallback) — see `decode_loop.rs` / `model_forward.rs`.
+fn reencode_typed_device(cache: &mut KVCache, target: DType) -> Result<(), FormatApplyError> {
+    let backend = cache.k_buffer.backend().clone();
+    let memory = cache.memory().ok_or_else(|| {
+        FormatApplyError::UnsupportedFormat(
+            "device re-encode needs the cache's grow allocator (memory=None)".into(),
+        )
+    })?;
+
+    // Flush any pending device writes, then download device → host (read_buffer).
+    backend
+        .synchronize()
+        .map_err(|e| FormatApplyError::UnsupportedFormat(format!("device synchronize: {e}")))?;
+    let mut mirror = cache
+        .host_snapshot()
+        .map_err(|e| FormatApplyError::UnsupportedFormat(format!("device→host snapshot: {e}")))?;
+
+    // Re-encode the host mirror on the CPU path (host buffers → `as_slice` dequant works).
+    reencode_typed(&mut mirror, target)?;
+
+    // Upload the new-format host buffers to fresh device buffers, swap (current_pos/geometry kept).
+    cache.k_buffer = upload_host_to_device(&mirror.k_buffer, memory.as_ref(), &backend, target)?;
+    cache.v_buffer = upload_host_to_device(&mirror.v_buffer, memory.as_ref(), &backend, target)?;
+    Ok(())
+}
+
+/// Allocate a fresh device buffer of `target` format via `memory` and copy `host_t`'s bytes into it
+/// (`write_buffer`), returning a device [`Tensor`] of the same shape. Mirror of
+/// `read_device_tensor_to_host` (the inverse host→device copy).
+fn upload_host_to_device(
+    host_t: &Tensor,
+    memory: &dyn crate::memory::Memory,
+    backend: &Arc<dyn crate::backend::Backend>,
+    target: DType,
+) -> Result<Tensor, FormatApplyError> {
+    let bytes = host_t.size();
+    let dev_buf = memory
+        .alloc_kv(bytes, target)
+        .map_err(|e| FormatApplyError::UnsupportedFormat(format!("device alloc_kv: {e}")))?;
+    let mut dev_t = Tensor::new(host_t.shape().clone(), dev_buf, backend.clone());
+    // SAFETY: `host_t.buffer()` is a host SharedBuffer with exactly `bytes` valid bytes; `write_buffer`
+    // copies exactly `bytes` and does not retain the pointer past the call.
+    let src = unsafe { std::slice::from_raw_parts(host_t.buffer().as_ptr(), bytes) };
+    backend
+        .write_buffer(&mut dev_t, src)
+        .map_err(|e| FormatApplyError::UnsupportedFormat(format!("device write_buffer: {e}")))?;
+    Ok(dev_t)
 }
 
 /// Write one (pos, head) row of `head_dim` f32 values into `buf` encoded as `dtype`, at the same

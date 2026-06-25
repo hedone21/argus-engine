@@ -367,6 +367,9 @@ pub fn build_standard_loop(
     if let Some(registry) = registry {
         builder = builder.with_pipeline(registry);
         if let Some(dispatcher) = dispatcher {
+            // L1-runtime: share the dispatcher's per-step re-encode-fired signal so the loop
+            // invalidates the fused GPU plan exactly on a mid-decode (command-driven) re-encode.
+            builder = builder.with_reencode_fired_cell(dispatcher.reencode_fired_cell());
             builder = builder.with_command_dispatcher(dispatcher);
         }
         if let Some(h) = kv_pos_handle {
