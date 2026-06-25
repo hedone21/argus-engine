@@ -456,7 +456,20 @@ pub fn alloc_opaque_kv_caches(
     for _ in 0..num_layers {
         let shape = Shape::new(vec![1, kv_heads, initial_kv_capacity, head_dim]);
         let mk = || -> anyhow::Result<Tensor> {
-            let inner = memory.alloc_kv(nbytes, DType::U8)?;
+            // W-DEVKV: opaque KV is processed entirely host-side (encode/decode/attention via the
+            // descriptor floor — no GPU kernel ever reads the opaque buffer). On a GPU backend the
+            // device alloc (`memory.alloc_kv`) returns an unmapped UnifiedBuffer / device-only
+            // OpenCLBuffer whose host ptr is null → the opaque host write/read SIGSEGV (verified on
+            // Adreno). Allocate it as a host SharedBuffer instead so `as_mut_ptr`/`as_slice` are always
+            // valid host pointers; the CPU path is unchanged (`alloc_kv` there is already a host buffer).
+            let inner: Arc<dyn Buffer> = if backend.is_gpu() {
+                Arc::new(crate::memory::host::shared::SharedBuffer::new(
+                    nbytes,
+                    DType::U8,
+                ))
+            } else {
+                memory.alloc_kv(nbytes, DType::U8)?
+            };
             let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, desc));
             Ok(Tensor::new(shape.clone(), op, backend.clone()))
         };
@@ -654,7 +667,16 @@ pub fn alloc_mixed_kv_caches(
                     )
                 })?;
                 let mk = || -> anyhow::Result<Tensor> {
-                    let inner = memory.alloc_kv(nbytes, DType::U8)?;
+                    // W-DEVKV: opaque KV is host-resident even on GPU (mirror of alloc_opaque_kv_caches);
+                    // a device alloc_kv buffer's null host ptr would SIGSEGV on the opaque host write/read.
+                    let inner: Arc<dyn Buffer> = if backend.is_gpu() {
+                        Arc::new(crate::memory::host::shared::SharedBuffer::new(
+                            nbytes,
+                            DType::U8,
+                        ))
+                    } else {
+                        memory.alloc_kv(nbytes, DType::U8)?
+                    };
                     let op: Arc<dyn Buffer> = Arc::new(OpaqueBuffer::new(inner, *desc));
                     Ok(Tensor::new(shape(), op, backend.clone()))
                 };

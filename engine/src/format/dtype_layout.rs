@@ -261,10 +261,14 @@ pub fn dequant_to_f32_tensor(b: &Tensor) -> Result<Tensor> {
         bytes.extend_from_slice(&v.to_ne_bytes());
     }
     let buf = SharedBuffer::from_vec(bytes, DType::F32);
+    // Attach a CpuBackend (not `b.backend()`): the dequanted bytes are host-resident f32, so the
+    // result is self-consistently host (host SharedBuffer + CpuBackend). matmul_transposed_f32 / the
+    // opaque attention floor read it via `as_slice` and never touch its backend, so this is byte-data
+    // identical on CPU runs and prevents a GPU-backend-on-host-buffer mismatch on GPU runs (W-DEVKV).
     Ok(Tensor::new(
         Shape::new(b.shape().dims().to_vec()),
         Arc::new(buf),
-        b.backend().clone(),
+        Arc::new(crate::backend::cpu::CpuBackend::new()),
     ))
 }
 

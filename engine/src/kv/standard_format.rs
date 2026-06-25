@@ -401,6 +401,70 @@ impl KVCacheFormat for StandardFormat {
         if cache.is_opaque() {
             let k_f32 = dequant_to_f32_tensor(&cache.k_buffer)?;
             let v_f32 = dequant_to_f32_tensor(&cache.v_buffer)?;
+            // W-DEVKV: opaque codec + attention are host-resident f32 (k_f32/v_f32 above are host
+            // SharedBuffer on CpuBackend). On a GPU backend the query `q` and `out` are device-resident,
+            // so snapshot q→host, run the SAME CpuBackend opaque attention path that the CPU backend
+            // uses (proven correct), and upload the result to the device `out`. Mirrors the W-SIGNAL-Q
+            // host_snapshot→CpuBackend→write_buffer recipe (see read_plan/attention_into_selected).
+            if backend.is_gpu() {
+                use crate::backend::cpu::CpuBackend;
+                let cpu: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+                let mut q_bytes = vec![0u8; q.size()];
+                backend.read_buffer(q, &mut q_bytes)?;
+                let q_host = Tensor::new(
+                    q.shape().clone(),
+                    Arc::new(SharedBuffer::from_vec(q_bytes, q.dtype())),
+                    cpu.clone(),
+                );
+                let mut out_host = Tensor::new(
+                    out.shape().clone(),
+                    Arc::new(SharedBuffer::new(out.size(), out.dtype())),
+                    cpu.clone(),
+                );
+                if seq_len > 1 {
+                    let kv_capacity = cache.capacity();
+                    let kv_layout = cache.layout();
+                    let batch_size = q.shape().dims()[0];
+                    let q_start_pos = cache_seq_len - seq_len;
+                    let _ = scores; // prefill 은 score 누적 안 함(typed prefill 동일).
+                    prefill_attention(
+                        &q_host,
+                        &mut out_host,
+                        &k_f32,
+                        &v_f32,
+                        dims.n_heads_q,
+                        n_heads_kv,
+                        head_dim,
+                        seq_len,
+                        cache_seq_len,
+                        kv_capacity,
+                        batch_size,
+                        kv_layout,
+                        q_start_pos,
+                        dims.window,
+                        &*cpu,
+                        prefill_scores,
+                    )?;
+                } else {
+                    let effective = match dims.window {
+                        Some(w) => cache_seq_len.min(w),
+                        None => cache_seq_len,
+                    };
+                    cpu.attention_gen(
+                        &q_host,
+                        &k_f32,
+                        &v_f32,
+                        &mut out_host,
+                        dims.n_heads_q,
+                        n_heads_kv,
+                        head_dim,
+                        effective,
+                        scores,
+                    )?;
+                }
+                backend.write_buffer(out, out_host.as_slice::<u8>())?;
+                return Ok(());
+            }
             if seq_len > 1 {
                 let kv_capacity = cache.capacity();
                 let kv_layout = cache.layout();
