@@ -160,7 +160,7 @@ dependencies = [
 [[package]]
 name = "argus-shared"
 version = "0.1.0"
-source = "git+https://github.com/hedone21/argus-shared.git?branch=main#acb533512d4ce0b6627dc316e92e1ae5bb719fcd"
+source = "git+https://github.com/hedone21/argus-shared.git?branch=main#32e3c56ba5fbcecc852e1e05d29d6177b9ef86ef"
 dependencies = [
  "serde",
  "serde_json",
