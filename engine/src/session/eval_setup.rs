@@ -39,7 +39,7 @@ use crate::kv::eviction::stage_registry::{
 use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor, SystemMonitor};
 use crate::session::bin_setup::{
-    alloc_standard_kv_caches, check_vocab_compatibility, resolve_tokenizer_path,
+    alloc_eval_kv_caches, check_vocab_compatibility, resolve_tokenizer_path,
 };
 use crate::session::cli::Args;
 use crate::session::dump_importance::DumpImportanceCtx;
@@ -394,9 +394,11 @@ pub fn build_eval_ll_ctx(args: Args) -> Result<EvalLlRunCtx> {
     let score_based_eviction = is_score_based_eviction(&args);
 
     // eval 모드는 grow() 스파이크 회피로 capacity=max_seq_len 전량 선할당 (legacy:408).
+    // `--kv-format <policy>` 면 per-layer mixed precision, 아니면 uniform `kv_type` (alloc_eval_kv_caches).
     let kv_layout = crate::kv_cache_ops::KVLayout::from_cli(&args.kv_layout)
         .ok_or_else(|| anyhow::anyhow!("Unsupported --kv-layout: '{}'", args.kv_layout))?;
-    let kv_caches = alloc_standard_kv_caches(
+    let kv_caches = alloc_eval_kv_caches(
+        &args,
         &backend,
         memory.clone(),
         num_layers,
@@ -475,9 +477,11 @@ pub fn build_ppl_ctx(args: Args) -> Result<PplRunCtx> {
     let score_based_eviction = is_score_based_eviction(&args);
     let auto_eviction = args.eviction_policy() != "none" && args.experiment_schedule.is_none();
 
+    // `--kv-format <policy>` 면 per-layer mixed precision, 아니면 uniform `kv_type` (alloc_eval_kv_caches).
     let kv_layout = crate::kv_cache_ops::KVLayout::from_cli(&args.kv_layout)
         .ok_or_else(|| anyhow::anyhow!("Unsupported --kv-layout: '{}'", args.kv_layout))?;
-    let mut kv_caches = alloc_standard_kv_caches(
+    let mut kv_caches = alloc_eval_kv_caches(
+        &args,
         &backend,
         memory.clone(),
         num_layers,
@@ -580,9 +584,11 @@ pub fn build_dump_importance_ctx(args: Args) -> Result<DumpImportanceCtx> {
     let vocab_size = base.model.config.vocab_size;
     let model_path = args.model_path.clone();
     // KV capacity=max_seq_len 선할당 (eval 모드 일관 — grow 스파이크 회피).
+    // `--kv-format <policy>` 면 per-layer mixed precision, 아니면 uniform `kv_type` (alloc_eval_kv_caches).
     let kv_layout = crate::kv_cache_ops::KVLayout::from_cli(&args.kv_layout)
         .ok_or_else(|| anyhow::anyhow!("Unsupported --kv-layout: '{}'", args.kv_layout))?;
-    let kv_caches = alloc_standard_kv_caches(
+    let kv_caches = alloc_eval_kv_caches(
+        &args,
         &base.backend,
         base.memory.clone(),
         base.model.config.num_hidden_layers,
