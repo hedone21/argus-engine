@@ -25,6 +25,35 @@ use crate::shape::Shape;
 use crate::tensor::Tensor;
 use argus_extension_api::{KVReadPlan, KVReadStage, MergeAxis, WeightedMerge};
 
+/// W-CODEC slice 3 escape hatch: GPU-native q2_0 dequant-attention is ON by default; setting
+/// `ARGUS_Q2_GPU_NATIVE_OFF` forces the host descriptor floor (used for A/B TBT comparison and as a
+/// production fallback). Read once and cached so the per-attention-call check is free.
+fn q2_gpu_native_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| std::env::var("ARGUS_Q2_GPU_NATIVE_OFF").is_err())
+}
+
+/// Minimum KV length (cache_seq_len) at which GPU-native q2 attention engages. The slice-3 1a
+/// design re-uploads the whole q2 KV and re-dequants its valid [0,cache_seq_len) region every
+/// attention call (the whole-buffer upload + per-call f16-mirror alloc are the O(capacity) per-call
+/// tax; the kernel decode itself is O(cache_seq_len)), so it only beats the host descriptor floor
+/// (host dequant + CPU attention, also O(capacity)) past a break-even. Measured on-device (Adreno
+/// 830, qwen2.5-1.5b, head_dim=128): floor wins at
+/// cap≈45 (82 vs 97 ms/tok) and cap≈133 (110 vs 121), GPU-native wins at cap≈405 (193 vs 146 ms/tok,
+/// 1.32x). Below this threshold the (faster, and absolutely cheap) host floor is kept so the default
+/// is never slower than the floor; a persistent device mirror (dequant only the new token — W-CODEC
+/// slice-3 follow-up "1b") would remove the per-call tax and lower/erase this threshold.
+/// `ARGUS_Q2_GPU_MIN_CTX` overrides it (e.g. `0` to always engage for A/B measurement).
+fn q2_gpu_native_min_ctx() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("ARGUS_Q2_GPU_MIN_CTX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256)
+    })
+}
+
 /// 내부 가변 상태 — `KVCache` 와 비-F32 cast scratch 를 **단일 lock** 으로 묶는다.
 ///
 /// scratch(`k_cast`/`v_cast`)는 비-F32 write 경로의 reusable buffer 로, `forward_gen` 의
@@ -399,6 +428,112 @@ impl KVCacheFormat for StandardFormat {
         // opaque(.so block-quant) read = 데이터-구동 floor: descriptor 로 f32 unpack(G3) 후 기존 F32
         // attention 재사용. typed 경로는 아래 무변.
         if cache.is_opaque() {
+            // ── W-CODEC slice 3: GPU-native q2_0 dequant-attention ──
+            // When the backend has the strict-math q2 dequant kernel AND the format is q2_0 AND the
+            // head_dim has an F16 flash kernel, decode the opaque q2 KV into a per-call device F16
+            // mirror and run the EXISTING F16 GPU flash attention on it — eliminating the host
+            // dequant + CPU-attention floor (no q-readback, no out-writeback). q2 stays opaque and
+            // host-resident; only the device F16 mirror is new. Any unmet condition / runtime kernel
+            // absence falls through to the unchanged host floor below (byte-identical fallback).
+            if q2_gpu_native_enabled()
+                && cache_seq_len >= q2_gpu_native_min_ctx()
+                && backend.is_gpu()
+                && backend.supports_opaque_q2_dequant()
+                && (head_dim == 64 || head_dim == 128)
+                && cache.layout() == crate::kv_cache_ops::KVLayout::HeadMajor
+            {
+                let desc = cache.opaque_desc();
+                let is_q2 = desc.bits == 2
+                    && desc.block_elems == 32
+                    && matches!(desc.packing, argus_extension_api::Packing::Quad)
+                    && matches!(
+                        desc.scale_layout,
+                        argus_extension_api::ScaleLayout::PerBlockF16WithMin
+                    );
+                if is_q2 && let Some(mem) = cache.memory() {
+                    let capacity = cache.capacity();
+                    let f16_bytes = n_heads_kv * capacity * head_dim * 2;
+                    let kv_shape = Shape::new(vec![1, n_heads_kv, capacity, head_dim]);
+                    let mut k_dev = Tensor::new(
+                        kv_shape.clone(),
+                        mem.alloc_kv(f16_bytes, DType::F16)?,
+                        q.backend().clone(),
+                    );
+                    let mut v_dev = Tensor::new(
+                        kv_shape,
+                        mem.alloc_kv(f16_bytes, DType::F16)?,
+                        q.backend().clone(),
+                    );
+                    // Raw host q2 bytes (whole capacity) — the opaque inner is a host SharedBuffer
+                    // (W-DEVKV), so `as_ptr()`/`size()` are valid (mirror apply_weighted_merges_opaque).
+                    let k_total = cache.k_buffer.buffer().size();
+                    let v_total = cache.v_buffer.buffer().size();
+                    let k_q2 = unsafe {
+                        std::slice::from_raw_parts(cache.k_buffer.buffer().as_ptr(), k_total)
+                    };
+                    let v_q2 = unsafe {
+                        std::slice::from_raw_parts(cache.v_buffer.buffer().as_ptr(), v_total)
+                    };
+                    let k_ok = backend.dequant_opaque_q2_to_f16(
+                        k_q2,
+                        &mut k_dev,
+                        n_heads_kv,
+                        head_dim,
+                        capacity,
+                        cache_seq_len,
+                    )?;
+                    let v_ok = backend.dequant_opaque_q2_to_f16(
+                        v_q2,
+                        &mut v_dev,
+                        n_heads_kv,
+                        head_dim,
+                        capacity,
+                        cache_seq_len,
+                    )?;
+                    if k_ok && v_ok {
+                        if seq_len > 1 {
+                            let batch_size = q.shape().dims()[0];
+                            let q_start_pos = cache_seq_len - seq_len;
+                            let _ = scores; // prefill 은 score 누적 안 함(host floor 동일).
+                            return prefill_attention(
+                                q,
+                                out,
+                                &k_dev,
+                                &v_dev,
+                                dims.n_heads_q,
+                                n_heads_kv,
+                                head_dim,
+                                seq_len,
+                                cache_seq_len,
+                                capacity,
+                                batch_size,
+                                cache.layout(),
+                                q_start_pos,
+                                dims.window,
+                                backend,
+                                prefill_scores,
+                            );
+                        }
+                        let effective = match dims.window {
+                            Some(w) => cache_seq_len.min(w),
+                            None => cache_seq_len,
+                        };
+                        return backend.attention_gen(
+                            q,
+                            &k_dev,
+                            &v_dev,
+                            out,
+                            dims.n_heads_q,
+                            n_heads_kv,
+                            head_dim,
+                            effective,
+                            scores,
+                        );
+                    }
+                    // dequant declined at runtime → fall through to the host floor below.
+                }
+            }
+
             let k_f32 = dequant_to_f32_tensor(&cache.k_buffer)?;
             let v_f32 = dequant_to_f32_tensor(&cache.v_buffer)?;
             // W-DEVKV: opaque codec + attention are host-resident f32 (k_f32/v_f32 above are host

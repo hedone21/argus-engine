@@ -281,6 +281,9 @@ struct KernelCache {
     /// Decode-specialized flash attention, head_dim=128 variant
     /// (Q=F32, KV=F16, compiled with -DDK=128 -DDV=128).
     kernel_flash_attn_f32_f16_q1_dk128: Option<CoreKernel>,
+    /// GPU-native opaque q2_0 -> F16 dequant (W-CODEC slice 3). `None` when the strict-math
+    /// program failed to compile → `supports_opaque_q2_dequant()` reports false → host floor.
+    kernel_dequant_opaque_q2_to_f16: Option<CoreKernel>,
     // GEMM kernels for prefill (tiled matrix multiply, M > 1)
     kernel_mul_mm_f16_f32: Option<CoreKernel>,
     kernel_mul_mm_q4_0_f32: Option<CoreKernel>,
@@ -362,6 +365,9 @@ pub struct OpenCLBackend {
     /// by `flash_attention_decode_gpu` for models with head_dim=128
     /// (e.g. Qwen 2.5-1.5B).
     pub flash_attn_f32_f16_program_dk128: Option<Program>,
+    /// Strict-math program for the GPU-native opaque q2_0 dequant kernel (W-CODEC slice 3).
+    /// Compiled without fast-math so the dequant is byte-identical to the host descriptor decode.
+    pub dequant_opaque_q2_program: Option<Program>,
 
     // F16 GEMV N_DST=4 for large-N decode (lm_head, FFN)
     pub f16_l4_program: Option<Program>,
@@ -1124,6 +1130,31 @@ impl OpenCLBackend {
             }
         };
 
+        // GPU-native opaque q2_0 dequant (W-CODEC slice 3). Compiled in its OWN program with the
+        // fast-math flags STRIPPED (no -cl-mad-enable / -cl-fast-relaxed-math) so `q*d + m` is two
+        // correctly-rounded f32 ops — byte-identical to the host descriptor decode. See
+        // engine/kernels/dequant_opaque_q2_f16.cl.
+        let dequant_q2_src = include_str!("../../kernels/dequant_opaque_q2_f16.cl");
+        let dequant_q2_strict_opts = cl_opts.replace(CL_FAST_MATH_FLAGS, "");
+        let dequant_opaque_q2_program = match Program::builder()
+            .devices(device)
+            .src(dequant_q2_src)
+            .cmplr_opt(dequant_q2_strict_opts.trim())
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("dequant_opaque_q2_f16.cl compiled (strict math, q2_0 -> F16)");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!(
+                    "dequant_opaque_q2_f16.cl failed: {}. GPU-native q2 KV disabled (host floor fallback).",
+                    e
+                );
+                None
+            }
+        };
+
         // GEMM kernels for prefill — tiled matmul (BM=64, BN=64, BK=16)
         let gemm_f16_src = include_str!("../../kernels/mul_mm_f16_f32_l4_lm.cl");
         let gemm_f16_program = match Program::builder()
@@ -1382,6 +1413,9 @@ impl OpenCLBackend {
             kernel_flash_attn_f32_f16_q1_dk128: flash_attn_f32_f16_program_dk128
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1").ok()),
+            kernel_dequant_opaque_q2_to_f16: dequant_opaque_q2_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_dequant_opaque_q2_to_f16").ok()),
             kernel_mul_mm_f16_f32: gemm_f16_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mm_f16_f32_l4_lm").ok()),
@@ -1468,6 +1502,7 @@ impl OpenCLBackend {
             flash_attn_f32_program_dk256,
             flash_attn_f32_f16_program_dk64,
             flash_attn_f32_f16_program_dk128,
+            dequant_opaque_q2_program,
             f16_l4_program,
             f16_1row_program,
             gemm_f16_program,
@@ -5783,6 +5818,128 @@ impl Backend for OpenCLBackend {
 
     fn supports_kv_scatter_batch(&self) -> bool {
         true
+    }
+
+    fn supports_opaque_q2_dequant(&self) -> bool {
+        let kernels = unsafe { &*self.kernels.get() };
+        kernels.kernel_dequant_opaque_q2_to_f16.is_some()
+    }
+
+    /// GPU-native dequant of opaque q2_0 KV into a device F16 HeadMajor tensor (W-CODEC slice 3).
+    ///
+    /// Uploads the host-resident opaque q2 bytes to a device scratch buffer, then runs the
+    /// strict-math `kernel_dequant_opaque_q2_to_f16` (byte-identical to the host descriptor decode)
+    /// to fill `out_f16` for positions `[0, seq_len)`. The caller then runs the existing F16
+    /// flash-attention kernels on `out_f16`, eliminating the host dequant + CPU-attention floor.
+    /// Returns `Ok(false)` (→ caller falls back to the host floor) when the kernel is unavailable.
+    fn dequant_opaque_q2_to_f16(
+        &self,
+        q2_host: &[u8],
+        out_f16: &mut Tensor,
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        seq_len: usize,
+    ) -> Result<bool> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = match &kernels.kernel_dequant_opaque_q2_to_f16 {
+            Some(k) => k,
+            None => return Ok(false),
+        };
+        if seq_len == 0 || !head_dim.is_multiple_of(32) {
+            return Ok(false);
+        }
+
+        // Upload the (host-resident) opaque q2 KV to a device scratch buffer. q2 is ~5x smaller
+        // than the equivalent f16, so this per-call copy-up is cheaper than the f16 it feeds.
+        let q2_dev = unsafe {
+            ocl::core::create_buffer::<_, u8>(
+                self.context.as_core(),
+                ocl::core::MEM_READ_ONLY,
+                q2_host.len(),
+                None,
+            )?
+        };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &self.queue,
+                &q2_dev,
+                true, // blocking — cold relative to attention; keeps scratch->kernel ordering trivial
+                0,
+                q2_host,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+
+        let out_mem = get_cl_mem(out_f16.buffer().as_ref())?;
+        let blocks_per_pos = head_dim / 32;
+        let total = kv_heads * seq_len * blocks_per_pos;
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(&q2_dev))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(out_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(kv_heads as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&(capacity as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&(seq_len as i32)))?;
+            let gws: [usize; 3] = [total.div_ceil(64) * 64, 1, 1];
+            let lws: [usize; 3] = [64, 1, 1];
+            self.enqueue_kernel_labeled(kernel, "q2_dequant", 1, &gws, Some(lws))?;
+        }
+
+        // Byte-exact verification (W-CODEC slice 3, opt-in via ARGUS_Q2_GPU_VERIFY): read back the
+        // device F16 and assert it is bit-identical to the host q2->f16 reference (the SAME q*d+m,
+        // two non-contracted f32 ops, matching the strict-math kernel). Off by default (zero cost).
+        // SCOPE: this proves the per-block DECODE ARITHMETIC (rounding / fast-math contraction), NOT
+        // the src->dst LAYOUT — it recomputes the reference with the same (h,pos,b) offsets the kernel
+        // uses, so it is index-tautological w.r.t. the mapping. Layout correctness rests on the kernel
+        // offsets matching the opaque write stride ((h*capacity+pos)*bph+b*12, kv_cache.rs) and the F16
+        // flash strides (capacity*head_dim / head_dim), which a transposition would also break, surfacing
+        // as attention garbage in the on-device greedy run.
+        if std::env::var("ARGUS_Q2_GPU_VERIFY").is_ok() {
+            use half::f16;
+            self.synchronize()?;
+            let n_f16 = kv_heads * capacity * head_dim;
+            let mut got = vec![0u8; n_f16 * 2];
+            self.read_buffer(out_f16, &mut got)?;
+            let got_f16 = unsafe { std::slice::from_raw_parts(got.as_ptr() as *const u16, n_f16) };
+            let mut mism = 0usize;
+            let mut first = None;
+            for h in 0..kv_heads {
+                for pos in 0..seq_len {
+                    for b in 0..blocks_per_pos {
+                        let src = (h * capacity + pos) * (blocks_per_pos * 12) + b * 12;
+                        let d = f16::from_le_bytes([q2_host[src], q2_host[src + 1]]).to_f32();
+                        let m = f16::from_le_bytes([q2_host[src + 2], q2_host[src + 3]]).to_f32();
+                        for i in 0..8 {
+                            let byte = q2_host[src + 4 + i];
+                            for j in 0..4 {
+                                let q = ((byte >> (j * 2)) & 0x03) as f32;
+                                let want = f16::from_f32(q * d + m).to_bits();
+                                let idx = (h * capacity + pos) * head_dim + b * 32 + i * 4 + j;
+                                if got_f16[idx] != want {
+                                    mism += 1;
+                                    if first.is_none() {
+                                        first = Some((h, pos, b, i * 4 + j, want, got_f16[idx]));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if mism == 0 {
+                eprintln!(
+                    "[q2-gpu-verify] OK: {} f16 values bit-identical to host q2 decode (h={kv_heads}, seq={seq_len}, hd={head_dim})",
+                    kv_heads * seq_len * head_dim
+                );
+            } else {
+                eprintln!(
+                    "[q2-gpu-verify] MISMATCH: {mism} values differ; first={first:?} (want vs got f16 bits)"
+                );
+            }
+        }
+        Ok(true)
     }
 
     /// Batch F32->F16 KV scatter for prefill: single kernel launch writes
