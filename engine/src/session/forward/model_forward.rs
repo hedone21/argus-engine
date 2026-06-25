@@ -466,8 +466,12 @@ impl ModelForward {
 /// per-layer `kv_dtype() == F16` check, routing a now-non-F16 layer to the dyn forward fallback.
 /// Clearing only `gpu_plan` would re-take a stale plan; clearing only sticky would short-circuit the
 /// rebuild — both are required.
+///
+/// Generic over the plan payload `T` (the call site infers `T = FullKernelPlan`) so a host test can
+/// exercise the `*gpu_plan = None` drop with a host-constructible sentinel (`Some(())`) instead of a
+/// `FullKernelPlan`, which needs a GPU to build.
 #[cfg(feature = "opencl")]
-fn invalidate_plan_for_reencode(gpu_plan: &mut Option<FullKernelPlan>, sticky_disabled: &mut bool) {
+fn invalidate_plan_for_reencode<T>(gpu_plan: &mut Option<T>, sticky_disabled: &mut bool) {
     *gpu_plan = None;
     *sticky_disabled = false;
 }
@@ -1050,8 +1054,10 @@ mod tests {
     #[cfg(feature = "opencl")]
     #[test]
     fn invalidate_plan_for_reencode_drops_plan_and_clears_sticky() {
-        let mut plan: Option<FullKernelPlan> = None; // host CpuBackend never builds one; the reset
-        // is unconditional, so the post-condition (None) holds whether or not a plan was cached.
+        // Seed a non-None sentinel so the `*gpu_plan = None` write carries mutation coverage (a
+        // FullKernelPlan needs a GPU to build; the fn is generic over the payload precisely so this
+        // host test can use `()`). Both writes are now mutation-proof: dropping either fails an assert.
+        let mut plan: Option<()> = Some(());
         let mut sticky = true; // simulate the set-once F16 lock-out from a prior non-F16 cache.
         invalidate_plan_for_reencode(&mut plan, &mut sticky);
         assert!(plan.is_none(), "cached decode plan dropped");
