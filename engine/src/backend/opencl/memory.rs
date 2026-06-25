@@ -6,9 +6,9 @@ use crate::memory::rpcmem::allocator::RpcmemAllocator;
 use anyhow::Result;
 use ocl::flags::MemFlags;
 use ocl::{Context, Queue};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 static KV_ALLOC_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -23,7 +23,11 @@ pub struct OpenCLMemory {
     #[allow(dead_code)]
     context: Context,
     queue: Queue,
-    used_memory: Mutex<usize>,
+    /// Live bytes allocated through this `OpenCLMemory` (telemetry only — no
+    /// production reader; see `used_memory`). Shared with every buffer built by
+    /// `alloc`/`alloc_kv` so the buffer's `Drop` can subtract its size,
+    /// preventing the monotonic inflation the plain `+= size` counter had.
+    used_memory: Arc<AtomicUsize>,
     /// If true, use UnifiedBuffer (zero-copy shared memory)
     /// If false, use OpenCLBuffer (device-only, faster)
     use_zero_copy: bool,
@@ -52,7 +56,7 @@ impl OpenCLMemory {
         Self {
             context,
             queue,
-            used_memory: Mutex::new(0),
+            used_memory: Arc::new(AtomicUsize::new(0)),
             use_zero_copy,
             rpcmem_allocator,
         }
@@ -99,7 +103,9 @@ impl OpenCLMemory {
             }
         };
 
-        let buffer = RpcmemKvBuffer::new(host_ptr, fd, cl_mem, size, dtype, Arc::clone(allocator));
+        let mut buffer =
+            RpcmemKvBuffer::new(host_ptr, fd, cl_mem, size, dtype, Arc::clone(allocator));
+        buffer.attach_mem_accounting(Arc::clone(&self.used_memory));
         Ok(Arc::new(buffer))
     }
 }
@@ -110,7 +116,7 @@ impl Memory for OpenCLMemory {
         // `rpcmem_allocator`. rpcmem heap is KV/secondary only.
         let buffer: Arc<dyn Buffer> = if self.use_zero_copy {
             // Zero-copy shared memory (CPU-GPU accessible, but slower GPU kernels)
-            let ub = UnifiedBuffer::new(self.queue.clone(), size, dtype)?;
+            let mut ub = UnifiedBuffer::new(self.queue.clone(), size, dtype)?;
             if log_weight_vma_enabled() {
                 // cl_mem pointer: obtained via cl_mem().as_ptr() on the Mem wrapper.
                 // host_ptr: map briefly to get the VMA address, then unmap immediately.
@@ -133,6 +139,7 @@ impl Memory for OpenCLMemory {
                      cl_mem={cl_hex} host_ptr={host_hex}"
                 );
             }
+            ub.attach_mem_accounting(Arc::clone(&self.used_memory));
             Arc::new(ub)
         } else {
             // Device-only memory (faster GPU kernels, requires explicit copies)
@@ -141,7 +148,7 @@ impl Memory for OpenCLMemory {
                 .flags(MemFlags::new().read_write())
                 .len(size)
                 .build()?;
-            let ob = OpenCLBuffer::new(self.queue.clone(), ocl_buffer, size, dtype)?;
+            let mut ob = OpenCLBuffer::new(self.queue.clone(), ocl_buffer, size, dtype)?;
             if log_weight_vma_enabled() {
                 let cl_hex = ob
                     .cl_mem()
@@ -152,13 +159,9 @@ impl Memory for OpenCLMemory {
                      cl_mem={cl_hex} host_ptr=null"
                 );
             }
+            ob.attach_mem_accounting(Arc::clone(&self.used_memory));
             Arc::new(ob)
         };
-
-        {
-            let mut mem = self.used_memory.lock().unwrap();
-            *mem += size;
-        }
 
         Ok(buffer)
     }
@@ -168,8 +171,8 @@ impl Memory for OpenCLMemory {
         if let Some(allocator) = self.rpcmem_allocator.as_ref() {
             match self.alloc_kv_rpcmem(size, dtype, allocator) {
                 Ok(buf) => {
-                    let mut mem = self.used_memory.lock().unwrap();
-                    *mem += size;
+                    // Accounting is attached inside `alloc_kv_rpcmem` (the
+                    // `RpcmemKvBuffer` carries the counter and decrements on Drop).
                     return Ok(buf);
                 }
                 Err(e) => {
@@ -188,7 +191,7 @@ impl Memory for OpenCLMemory {
             // Starts UNMAPPED — GPU writes via cl_mem during forward pass.
             // Map for CPU access only during SwitchHw (via kv_migrate).
             // Note: OpenCL spec says writing to a mapped buffer via cl_mem is UB.
-            let buffer = UnifiedBuffer::new(self.queue.clone(), size, dtype)?;
+            let mut buffer = UnifiedBuffer::new(self.queue.clone(), size, dtype)?;
 
             if std::env::var_os("LLMRS_LOG_KV_VMA").is_some() {
                 let idx = KV_ALLOC_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -206,11 +209,8 @@ impl Memory for OpenCLMemory {
                 }
             }
 
+            buffer.attach_mem_accounting(Arc::clone(&self.used_memory));
             let buf: Arc<dyn Buffer> = Arc::new(buffer);
-            {
-                let mut mem = self.used_memory.lock().unwrap();
-                *mem += size;
-            }
             Ok(buf)
         } else {
             self.alloc(size, dtype)
@@ -218,6 +218,96 @@ impl Memory for OpenCLMemory {
     }
 
     fn used_memory(&self) -> usize {
-        *self.used_memory.lock().unwrap()
+        self.used_memory.load(Ordering::Relaxed)
+    }
+}
+
+// `used_memory` decrement-on-drop regression coverage. Requires a working
+// OpenCL device (GPU or POCL CPU). Skips gracefully when none is present, the
+// same contract as `unified.rs`'s buffer tests — so it is a no-op on GPU-less
+// CI but exercises the real alloc→drop path on a developer host.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod tests {
+    use super::*;
+    use crate::buffer::DType;
+    use ocl::{Context, Device, Platform, Queue};
+    use std::panic;
+
+    /// Build an `OpenCLMemory` over a real device, or `None` if no OpenCL
+    /// platform/device is available (test then skips). GPU platforms are
+    /// preferred over a POCL CPU platform, matching `unified.rs`.
+    fn test_memory(use_zero_copy: bool) -> Option<OpenCLMemory> {
+        let platform_list = panic::catch_unwind(|| Platform::list()).ok()?;
+        let platform = platform_list
+            .iter()
+            .copied()
+            .find(|p| {
+                Device::list(*p, Some(ocl::flags::DEVICE_TYPE_GPU))
+                    .map(|d| !d.is_empty())
+                    .unwrap_or(false)
+            })
+            .or_else(|| platform_list.into_iter().next())?;
+        let device = match Device::list(platform, Some(ocl::flags::DEVICE_TYPE_GPU)) {
+            Ok(list) if !list.is_empty() => list[0],
+            _ => Device::first(platform).ok()?,
+        };
+        let context = Context::builder()
+            .platform(platform)
+            .devices(device)
+            .build()
+            .ok()?;
+        let queue = Queue::new(&context, device, None).ok()?;
+        Some(OpenCLMemory::new(context, queue, use_zero_copy))
+    }
+
+    #[test]
+    fn used_memory_returns_to_zero_after_drop_device() {
+        // Device-only path → `OpenCLBuffer`. Covers `alloc` and the
+        // non-zero-copy `alloc_kv` (which delegates to `alloc`).
+        let Some(mem) = test_memory(false) else {
+            eprintln!("[SKIPPED] No OpenCL device");
+            return;
+        };
+        assert_eq!(mem.used_memory(), 0);
+
+        let a = mem.alloc(1024, DType::F32).unwrap();
+        assert_eq!(mem.used_memory(), 1024);
+
+        // non-zero-copy alloc_kv → alloc → OpenCLBuffer
+        let b = mem.alloc_kv(512, DType::F16).unwrap();
+        assert_eq!(mem.used_memory(), 1024 + 512);
+
+        // Partial drop must subtract only `a`'s size (proves per-buffer size
+        // tracking, not a flag/zero reset).
+        drop(a);
+        assert_eq!(mem.used_memory(), 512);
+
+        drop(b);
+        assert_eq!(mem.used_memory(), 0);
+    }
+
+    #[test]
+    fn used_memory_returns_to_zero_after_drop_unified() {
+        // Zero-copy path → `UnifiedBuffer`, covering both `alloc` and the
+        // zero-copy `alloc_kv` branch.
+        let Some(mem) = test_memory(true) else {
+            eprintln!("[SKIPPED] No OpenCL device");
+            return;
+        };
+        assert_eq!(mem.used_memory(), 0);
+
+        let a = mem.alloc(2048, DType::F32).unwrap();
+        assert_eq!(mem.used_memory(), 2048);
+
+        // zero-copy alloc_kv → UnifiedBuffer
+        let b = mem.alloc_kv(256, DType::F16).unwrap();
+        assert_eq!(mem.used_memory(), 2048 + 256);
+
+        drop(b);
+        assert_eq!(mem.used_memory(), 2048);
+
+        drop(a);
+        assert_eq!(mem.used_memory(), 0);
     }
 }

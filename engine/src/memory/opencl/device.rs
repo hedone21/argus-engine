@@ -4,6 +4,7 @@ use ocl::core::Mem;
 use ocl::{Buffer as OclBuffer, Queue};
 use std::any::Any;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Live OpenCLBuffer counters for NVIDIA resource-accumulation diagnosis.
@@ -38,6 +39,12 @@ pub struct OpenCLBuffer {
     queue: Queue,
     dtype: DType,
     size: usize,
+    /// Per-`OpenCLMemory` accounting handle (telemetry only). When `Some`,
+    /// `size` was added to the counter at attach time and is subtracted in
+    /// `Drop`, so `OpenCLMemory::used_memory()` reflects live bytes rather than
+    /// inflating monotonically. `None` for buffers built outside `OpenCLMemory`
+    /// (e.g. `transformer.rs`), matching the previous "uncounted" behaviour.
+    mem_accounting: Option<Arc<AtomicUsize>>,
 }
 
 impl OpenCLBuffer {
@@ -50,7 +57,16 @@ impl OpenCLBuffer {
             queue,
             dtype,
             size,
+            mem_accounting: None,
         })
+    }
+
+    /// Attach a per-`OpenCLMemory` accounting counter: adds `size` now and
+    /// subtracts it once on `Drop`. Idempotent-safe to call at most once
+    /// (`OpenCLMemory::alloc` calls it exactly once, right after construction).
+    pub(crate) fn attach_mem_accounting(&mut self, counter: Arc<AtomicUsize>) {
+        counter.fetch_add(self.size, Ordering::Relaxed);
+        self.mem_accounting = Some(counter);
     }
 }
 
@@ -59,6 +75,9 @@ impl Drop for OpenCLBuffer {
         LIVE_BUFFERS.fetch_sub(1, Ordering::Relaxed);
         LIVE_BYTES.fetch_sub(self.size, Ordering::Relaxed);
         TOTAL_RELEASES.fetch_add(1, Ordering::Relaxed);
+        if let Some(counter) = &self.mem_accounting {
+            counter.fetch_sub(self.size, Ordering::Relaxed);
+        }
     }
 }
 
