@@ -275,10 +275,11 @@ fn g3c_decode_restarts_after_reset() {
 #[test]
 fn g4a_standard_ok_when_capacity_sufficient() {
     let mut session = make_standard_session(10);
-    session.pos = 5;
+    // 5 토큰 prefill → 점유=5 (Standard capacity 는 누적 pos 가 아니라 점유로 회계).
+    session.prefill(&[1u32, 2, 3, 4, 5]).unwrap();
     assert!(
         session.ensure_capacity(3).is_ok(),
-        "pos=5, add=3, max=10 → Ok"
+        "점유=5, add=3, max=10 → Ok"
     );
 }
 
@@ -286,10 +287,11 @@ fn g4a_standard_ok_when_capacity_sufficient() {
 #[test]
 fn g4b_standard_bails_on_overflow_without_cache_manager() {
     let mut session = make_standard_session(10);
-    session.pos = 9;
+    // 9 토큰 prefill → 점유=9 (Standard capacity 는 점유로 회계).
+    session.prefill(&[1u32, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
     assert!(
         session.ensure_capacity(2).is_err(),
-        "pos=9, add=2, max=10 → Err"
+        "점유=9, add=2, max=10 → Err"
     );
 }
 
