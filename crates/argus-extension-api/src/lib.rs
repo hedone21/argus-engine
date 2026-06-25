@@ -1093,6 +1093,9 @@ pub enum ScaleLayout {
 }
 
 /// How a quantization block packs its bits (block-quant family vocabulary).
+///
+/// `#[repr(u32)]`: a future `.so` C-ABI passes the fieldless discriminant through as-is (L1). New
+/// variants are **appended** (existing discriminants unchanged) so the wire layout stays additive.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Packing {
@@ -1102,6 +1105,8 @@ pub enum Packing {
     Nibble,
     /// byte (8-bit) packing (q8_0).
     Byte,
+    /// quad (2-bit, 4 elems/byte) packing (q2_0).
+    Quad,
 }
 
 /// layer-tier boundary POD — the format plugin's **actual contribution**.
@@ -1136,6 +1141,7 @@ impl KVLayoutDesc {
             Packing::Dense => return None,
             Packing::Nibble => self.block_elems as usize / 2,
             Packing::Byte => self.block_elems as usize,
+            Packing::Quad => self.block_elems as usize / 4,
         };
         let scale_bytes = match self.scale_layout {
             ScaleLayout::None => 0,
@@ -2920,6 +2926,18 @@ mod tests {
         };
         assert_eq!(q8_0.block_bytes(), Some(34)); // == size_of::<BlockQ8_0>()
         assert_eq!(q8_0.bytes_for_elems(32), Some(34));
+
+        // q2_0 (asymmetric 2-bit, Quad): scale(2) + min(2) + 32/4 quad bytes(8) = 12.
+        let q2_0 = KVLayoutDesc {
+            block_elems: 32,
+            bits: 2,
+            scale_layout: ScaleLayout::PerBlockF16WithMin,
+            packing: Packing::Quad,
+        };
+        assert_eq!(q2_0.block_bytes(), Some(12)); // == size_of::<BlockQ2_0>()
+        assert_eq!(q2_0.bytes_for_elems(32), Some(12));
+        assert_eq!(q2_0.bytes_for_elems(64), Some(24));
+        assert_eq!(q2_0.bytes_for_elems(31), None); // partial block not allowed
 
         // raw (Dense): no block concept, bits/8 per element.
         let f32 = KVLayoutDesc {

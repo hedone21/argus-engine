@@ -70,6 +70,9 @@ caote = { path = "../crates/techniques/caote", optional = true }
 # Opaque .so format `synth_q4` (block-quant family without a DType) — force-linked
 # into the binary so `--kv-format synth_q4` resolves a real out-of-tree plugin.
 synth-q4-format = { path = "../crates/techniques/synth-q4-format" }
+# Opaque format `q2_0` (asymmetric 2-bit block-quant, W-CODEC slice 1) — force-linked
+# so `--kv-format q2_0` resolves the writable sub-Q4 floor codec via the descriptor.
+q2-format = { path = "../crates/techniques/q2-format" }
 # Quest (query-aware selective read): the first KVReadStage builtin. Non-optional,
 # force-linked, with a startup self-test that fails fast on fat-LTO drop.
 quest = { path = "../crates/techniques/quest" }
