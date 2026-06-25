@@ -115,6 +115,11 @@ pub struct DecodeLoop {
     // forward's fused GPU plan must be invalidated (a dtype flip is invisible to the capacity-keyed
     // guard). `false`(happy/chat/eval/모든 기존 경로) → no invalidation call = 거동-0.
     kv_reencode_armed: bool,
+    // W-FORMAT-HET L1-runtime: per-step "a mid-decode re-encode (command path) actually applied"
+    // signal, shared with the command-driven `FormatReencodeStage`(KvMutate). The loop swaps it to
+    // `false` after each KvMutate dispatch and calls `on_kv_reencode()` iff it was set — invalidating
+    // the fused plan exactly on a re-encoded step (never per-step). `None` → no command path = 거동-0.
+    reencode_fired_cell: Option<Arc<AtomicBool>>,
 }
 
 /// β-5: `PressureSource` query 주기 (N-step 캐시 N). 매 decode step 마다 `/proc/meminfo` 를
@@ -348,6 +353,19 @@ impl DecodeLoop {
                 break;
             }
             self.invalidate_plan_on_kv_shrink();
+            // W-FORMAT-HET L1-runtime: a command-driven FormatReencodeStage can fire at THIS KvMutate
+            // (CommandDispatcher::submit_format_reencode → KvReencodeFormat) and flip a layer's dtype at
+            // unchanged capacity — which `invalidate_plan_on_kv_shrink` (capacity-keyed) misses. The
+            // stage sets `reencode_fired_cell` iff it actually re-encoded ≥1 layer; swap-check it and
+            // invalidate the fused F16 plan exactly that step (so the next step's lazy rebuild re-reads
+            // the re-encoded — now non-F16 — caches and falls to the dyn path). Gated so on_kv_reencode
+            // is NEVER called on a no-op step (it drops the plan → per-step rebuild). `None`/false →
+            // 거동-0 (no command path, or host re-encode with no fused plan to invalidate).
+            if let Some(ref fired) = self.reencode_fired_cell
+                && fired.swap(false, std::sync::atomic::Ordering::Acquire)
+            {
+                self.forward.on_kv_reencode();
+            }
 
             // WeightMutate: KvMutate 직후, forward 직전 (§5.2.1 (나)). pressure band-driven
             // Persistent EvictionStage 등 eviction 후속 발화 슬롯. dispatch 후 pos-환류로 loop pos
@@ -581,6 +599,7 @@ pub struct DecodeLoopBuilder<F = NoForward> {
     pressure_source: Option<Arc<dyn PressureSource>>,
     kv_capacity: usize,
     kv_reencode_armed: bool,
+    reencode_fired_cell: Option<Arc<AtomicBool>>,
 }
 
 impl Default for DecodeLoopBuilder<NoForward> {
@@ -604,6 +623,7 @@ impl DecodeLoopBuilder<NoForward> {
             resilience_tick: None,
             kv_capacity: 0,
             kv_reencode_armed: false,
+            reencode_fired_cell: None,
         }
     }
 
@@ -629,6 +649,7 @@ impl DecodeLoopBuilder<NoForward> {
             resilience_tick: self.resilience_tick,
             kv_capacity: self.kv_capacity,
             kv_reencode_armed: self.kv_reencode_armed,
+            reencode_fired_cell: self.reencode_fired_cell,
         }
     }
 }
@@ -678,6 +699,15 @@ impl<F> DecodeLoopBuilder<F> {
     /// (every other path) → the driver makes no `on_kv_reencode` call = 거동-0.
     pub fn with_kv_reencode_invalidation(mut self) -> Self {
         self.kv_reencode_armed = true;
+        self
+    }
+
+    /// W-FORMAT-HET L1-runtime: supply the per-step "re-encode fired" signal shared with the
+    /// command-driven `FormatReencodeStage`(KvMutate). `build_standard_loop` passes the
+    /// `CommandDispatcher`'s cell so the loop invalidates the fused plan on a mid-decode re-encode.
+    /// Unset → no command path → 거동-0.
+    pub fn with_reencode_fired_cell(mut self, cell: Arc<AtomicBool>) -> Self {
+        self.reencode_fired_cell = Some(cell);
         self
     }
 
@@ -749,6 +779,7 @@ impl DecodeLoopBuilder<HasForward> {
             prev_token: 0,
             kv_capacity: self.kv_capacity,
             kv_reencode_armed: self.kv_reencode_armed,
+            reencode_fired_cell: self.reencode_fired_cell,
         }
     }
 }

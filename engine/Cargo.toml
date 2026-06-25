@@ -56,6 +56,10 @@ path = "src/bin/test_model.rs"
 name = "test_q4_soa_byte_equal"
 path = "src/bin/test_q4_soa_byte_equal.rs"
 
+[[bin]]
+name = "test_kv_reencode_device"
+path = "src/bin/test_kv_reencode_device.rs"
+
 [dependencies]
 # Shared IPC protocol types (manager <-> engine). Separate repo.
 argus-shared = { git = "https://github.com/hedone21/argus-shared.git", branch = "main" }
