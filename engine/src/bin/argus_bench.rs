@@ -123,6 +123,12 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
     if args.dump_importance {
         bail!("argus-bench AB-0: --dump-importance moved to argus-eval --dump-importance");
     }
+    if !args.dump_kinds().is_empty() || args.dump_dir.is_some() {
+        bail!(
+            "argus-bench AB-0: --dump <kinds> / --dump-dir is an argus-eval diagnostic; \
+             use argus-eval --eval-ll --dump <kind> --dump-dir <dir>"
+        );
+    }
     if args.qcf_dump.is_some() {
         bail!(
             "argus-bench AB-0: --qcf-dump moved to argus-eval (--qcf-dump with --eval-ll or --ppl)"

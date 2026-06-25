@@ -52,6 +52,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
     questions: &[EvalQuestion],
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
+    mut evict_dump: Option<&mut super::dump::JsonlDumpWriter>,
 ) -> Result<EvalOutput> {
     let vocab_size = eval_config.vocab_size;
     let hidden_size = eval_config.hidden_size;
@@ -295,6 +296,21 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
 
         // ── post_prefill hook (eviction if cache exceeds budget) ──
         hook.post_prefill(kv_caches);
+
+        // ── IMP-1: drain + write the evict_importance dump record ──
+        // Read-only diagnostic; the hook captured it during post_prefill (above)
+        // without perturbing eviction (INV-147). No record when eviction did not fire.
+        if let Some(writer) = evict_dump.as_deref_mut()
+            && let Some(snap) = hook.take_evict_importance_dump()
+        {
+            super::dump::write_evict_importance_record(
+                writer,
+                &snap,
+                &question.id,
+                question.gold_token_positions.as_deref(),
+                question.needle_token_positions.as_deref(),
+            )?;
+        }
 
         // IMPORTANT: Do NOT update start_pos_after_prompt to current_pos after eviction.
         // After shift_positions(), cached K vectors retain their original RoPE positions.
@@ -1010,6 +1026,7 @@ mod tests {
             id: "q1".to_string(),
             prompt: "The capital of France is".to_string(),
             choices: vec![" Paris".to_string(), " London".to_string()],
+            ..Default::default()
         };
         assert_eq!(q.choices.len(), 2);
         assert_eq!(q.id, "q1");

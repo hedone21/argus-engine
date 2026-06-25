@@ -229,6 +229,63 @@ fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
              for eval, or run mixed precision via argus-cli / argus-bench."
         );
     }
+    // Generic diagnostic dumps (`--dump <kind>`): validate kind names, require an
+    // output directory, and enforce the eval-ll + CPU-backend preconditions.
+    // Read-only (INV-147); a requested-but-unsupported dump must fail fast rather
+    // than be silently dropped (no-silent-no-op contract).
+    let dump_kinds = args.dump_kinds();
+    if !dump_kinds.is_empty() {
+        argus_engine::session::eval::dump::validate_dump_kinds(dump_kinds)?;
+        if args.dump_dir.is_none() {
+            bail!(
+                "argus-eval: --dump <kinds> requires --dump-dir <dir> \
+                 (each kind writes <dir>/<kind>.jsonl)"
+            );
+        }
+        let eval_ll_active =
+            args.eval_ll || args.eval_batch.is_some() || args.eval_continuation.is_some();
+        if !eval_ll_active {
+            bail!(
+                "argus-eval: --dump is only supported with --eval-ll \
+                 (--eval-batch / --eval-continuation)"
+            );
+        }
+        if mode_caps(args.effective_kv_mode()).is_some_and(|c| c.is_quantized_kv) {
+            bail!(
+                "argus-eval: --dump is not supported with a quantized KV mode (--kv-mode); \
+                 use the standard --eval-ll path"
+            );
+        }
+        // Both dumps capture per-layer attention on the CPU path only (the GPU flash /
+        // GPU score kernels short-circuit it), so require a CPU backend rather than
+        // emit a buffer of zeros.
+        if args.backend != "cpu" {
+            bail!(
+                "argus-eval: --dump requires --backend cpu \
+                 (per-layer attention capture is CPU-only)"
+            );
+        }
+        // evict_importance profiles a real eviction event — it needs an eviction policy.
+        if args.dump_enabled(argus_engine::session::eval::dump::DUMP_EVICT_IMPORTANCE) {
+            if args.eviction_policy() == "none" {
+                bail!(
+                    "argus-eval: --dump evict_importance requires an eviction policy \
+                     (e.g. `eviction plugin --name h2o`) and a KV budget to profile"
+                );
+            }
+            // The per-layer-head buffer is filled only for tracked layers; a restricted
+            // tracking window (`--set tracked_layers=N`) would leave untracked layers as
+            // zeros — a structurally-valid but mostly-empty buffer that silently corrupts
+            // the IMP-3 analysis. Require full-layer tracking (the default) rather than
+            // force it (which would change the policy's own ranking → unfaithful dump).
+            if args.h2o_tracked_layers() != 0 {
+                bail!(
+                    "argus-eval: --dump evict_importance requires all layers tracked; \
+                     remove `--set tracked_layers=N` (the dump needs full per-layer resolution)"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -403,5 +460,204 @@ mod tests {
             "/tmp/q.json",
         ]);
         assert_eq!(classify_eval_mode(&args).unwrap(), EvalMode::EvalLl);
+    }
+
+    // ── generic --dump diagnostic guard ──────────────────────────────────
+    #[test]
+    fn reject_dump_unknown_kind() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "bogus",
+            "--dump-dir",
+            "/tmp/d",
+        ]);
+        let err = reject_unsupported_modes_eval(&args).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{}", err);
+    }
+
+    #[test]
+    fn reject_dump_without_dump_dir() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention",
+        ]);
+        let err = reject_unsupported_modes_eval(&args).unwrap_err();
+        assert!(err.to_string().contains("--dump-dir"), "{}", err);
+    }
+
+    #[test]
+    fn reject_dump_answer_attention_requires_cpu_backend() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention",
+            "--dump-dir",
+            "/tmp/d",
+            "--backend",
+            "opencl",
+        ]);
+        let err = reject_unsupported_modes_eval(&args).unwrap_err();
+        assert!(err.to_string().contains("cpu"), "{}", err);
+    }
+
+    #[test]
+    fn reject_dump_requires_eval_ll_mode() {
+        // --ppl is not an eval-ll mode → dump is rejected (no silent no-op).
+        let args = make_args(&[
+            "--ppl",
+            "/tmp/ref.txt",
+            "--dump",
+            "answer_attention",
+            "--dump-dir",
+            "/tmp/d",
+        ]);
+        let err = reject_unsupported_modes_eval(&args).unwrap_err();
+        assert!(err.to_string().contains("--eval-ll"), "{}", err);
+    }
+
+    #[test]
+    fn reject_dump_with_quant_window_kv_mode() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention",
+            "--dump-dir",
+            "/tmp/d",
+            "--kv-mode",
+            "kivi",
+        ]);
+        let err = reject_unsupported_modes_eval(&args).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("quantized") || msg.contains("kv-mode"),
+            "{}",
+            err
+        );
+    }
+
+    /// Happy path: answer_attention on cpu + eval-ll + dump-dir passes the guard,
+    /// and the path accessor resolves to `<dir>/<kind>.jsonl`.
+    #[test]
+    fn accept_dump_answer_attention_cpu_eval_ll() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention",
+            "--dump-dir",
+            "/tmp/d",
+        ]);
+        // Default backend on the host (non-android) is "cpu".
+        assert!(reject_unsupported_modes_eval(&args).is_ok());
+        assert!(args.dump_enabled("answer_attention"));
+        assert_eq!(
+            args.dump_path("answer_attention").unwrap(),
+            std::path::PathBuf::from("/tmp/d/answer_attention.jsonl")
+        );
+    }
+
+    /// No `--dump` → guard is a no-op and the accessors report nothing enabled
+    /// (production path untouched — INV-147).
+    #[test]
+    fn no_dump_is_inert() {
+        let args = make_args(&["--eval-ll", "--eval-continuation", "x"]);
+        assert!(reject_unsupported_modes_eval(&args).is_ok());
+        assert!(args.dump_kinds().is_empty());
+        assert!(!args.dump_enabled("answer_attention"));
+        assert_eq!(args.dump_path("answer_attention"), None);
+    }
+
+    #[test]
+    fn reject_dump_evict_importance_without_eviction_policy() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "evict_importance",
+            "--dump-dir",
+            "/tmp/d",
+        ]);
+        let err = reject_unsupported_modes_eval(&args).unwrap_err();
+        assert!(err.to_string().contains("eviction policy"), "{}", err);
+    }
+
+    #[test]
+    fn accept_dump_evict_importance_with_eviction_policy() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "evict_importance",
+            "--dump-dir",
+            "/tmp/d",
+            "eviction",
+            "plugin",
+            "--name",
+            "h2o",
+        ]);
+        assert!(reject_unsupported_modes_eval(&args).is_ok());
+        assert!(args.dump_enabled("evict_importance"));
+        assert_eq!(
+            args.dump_path("evict_importance").unwrap(),
+            std::path::PathBuf::from("/tmp/d/evict_importance.jsonl")
+        );
+    }
+
+    /// A restricted tracking window would leave untracked layers as zeros in the
+    /// dump → reject (the dump needs full per-layer resolution).
+    #[test]
+    fn reject_dump_evict_importance_with_partial_tracked_layers() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "evict_importance",
+            "--dump-dir",
+            "/tmp/d",
+            "eviction",
+            "plugin",
+            "--name",
+            "h2o",
+            "--set",
+            "tracked_layers=8",
+        ]);
+        let err = reject_unsupported_modes_eval(&args).unwrap_err();
+        assert!(err.to_string().contains("all layers tracked"), "{}", err);
+    }
+
+    /// Both dump kinds require a CPU backend (per-layer capture is CPU-only).
+    #[test]
+    fn reject_dump_evict_importance_requires_cpu() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "evict_importance",
+            "--dump-dir",
+            "/tmp/d",
+            "--backend",
+            "opencl",
+            "eviction",
+            "plugin",
+            "--name",
+            "h2o",
+        ]);
+        let err = reject_unsupported_modes_eval(&args).unwrap_err();
+        assert!(err.to_string().contains("cpu"), "{}", err);
     }
 }

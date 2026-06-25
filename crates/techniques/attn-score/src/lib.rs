@@ -56,6 +56,18 @@ struct AttnScoreProducer {
     normalized: Vec<f32>,
     /// If true, `importance_scores()` returns time-normalized values.
     time_normalize: bool,
+    /// Total decoder layers — sizes the per-(layer, KV-head, token) dump buffer.
+    total_layers: usize,
+    /// Layer index for the next `accumulate_layer*` call. Only meaningful when `dump_layer_head`
+    /// (the engine calls `set_current_layer` before each tracked layer's accumulate).
+    current_layer: usize,
+    /// Whether the non-collapsed per-(layer, KV-head, token) importance dump is active (IMP-1).
+    /// Off by default → no extra buffer, production path byte-identical (`INV-147`).
+    dump_layer_head: bool,
+    /// Non-collapsed per-(layer, KV-head, token) importance from the most recent step:
+    /// `[total_layers * n_kv_heads * max_seq_len]`, row-major
+    /// `(layer * n_kv_heads + kv_head) * max_seq_len + pos`. Empty unless `dump_layer_head`.
+    layer_head: Vec<f32>,
 }
 
 impl AttnScoreProducer {
@@ -94,6 +106,10 @@ impl AttnScoreProducer {
             step_count: vec![0; max_seq_len],
             normalized: vec![0.0; max_seq_len],
             time_normalize: false,
+            total_layers,
+            current_layer: 0,
+            dump_layer_head: false,
+            layer_head: Vec::new(),
         }
     }
 }
@@ -139,6 +155,9 @@ impl ScoreProducer for AttnScoreProducer {
         self.step_importance.fill(0.0);
         self.head_step_importance.fill(0.0);
         self.last_layer_head_attn.fill(0.0);
+        // Per-(layer, KV-head) dump buffer is a most-recent-step snapshot (like
+        // last_layer_head_attn). No-op when the dump is off (buffer is empty).
+        self.layer_head.fill(0.0);
     }
 
     fn accumulate_layer(
@@ -208,6 +227,22 @@ impl ScoreProducer for AttnScoreProducer {
                 } else {
                     group_score
                 };
+
+                // Non-collapsed per-(layer, KV-head, token) dump (IMP-1, opt-in).
+                // Preserves the layer axis the collapsed buffers discard. The
+                // `dump_layer_head` guard keeps the production path branch-only
+                // (buffer never allocated when off → INV-147).
+                if self.dump_layer_head {
+                    let l_idx =
+                        (self.current_layer * self.n_kv_heads + kv_h) * self.max_seq_len + pos;
+                    if l_idx < self.layer_head.len() {
+                        self.layer_head[l_idx] = if group_score.is_nan() {
+                            0.0
+                        } else {
+                            group_score
+                        };
+                    }
+                }
             }
         }
     }
@@ -273,6 +308,7 @@ impl ScoreProducer for AttnScoreProducer {
         self.last_layer_head_attn.fill(0.0);
         self.step_count.fill(0);
         self.normalized.fill(0.0);
+        self.layer_head.fill(0.0);
     }
 
     fn importance_scores(&self) -> &[f32] {
@@ -305,6 +341,30 @@ impl ScoreProducer for AttnScoreProducer {
 
     fn n_kv_heads(&self) -> usize {
         self.n_kv_heads
+    }
+
+    fn set_current_layer(&mut self, layer: usize) {
+        self.current_layer = layer;
+    }
+
+    fn enable_layer_head_dump(&mut self) {
+        // GQA mode only — flat mode has no per-KV-head decomposition to preserve.
+        if self.n_kv_heads == 0 {
+            return;
+        }
+        let size = self.total_layers * self.n_kv_heads * self.max_seq_len;
+        if self.layer_head.len() != size {
+            self.layer_head = vec![0.0; size];
+        }
+        self.dump_layer_head = true;
+    }
+
+    fn layer_head_importance(&self) -> Option<&[f32]> {
+        if self.dump_layer_head && self.n_kv_heads > 0 {
+            Some(&self.layer_head)
+        } else {
+            None
+        }
     }
 }
 
@@ -788,5 +848,142 @@ mod tests {
         });
         assert_eq!(producer.name(), "attn_score");
         assert!(registered_score_producer_names().contains(&"attn_score"));
+    }
+
+    // ── per-(layer, KV-head) importance dump (IMP-1) ──
+
+    /// The non-collapsed buffer preserves DISTINCT per-layer slots — proving the
+    /// layer axis survives (unlike the MAX-collapsed `head_importance`).
+    #[test]
+    fn layer_head_dump_preserves_distinct_layer_slots() {
+        // 4 Q-heads, 2 KV-heads (n_rep=2), 2 layers, max_seq=4.
+        let mut acc = AttnScoreProducer::new(ScoreProducerParams {
+            max_seq_len: 4,
+            n_heads: 4,
+            n_kv_heads: 2,
+            total_layers: 2,
+            last_n_layers: 0,
+            decay: 0.0,
+        });
+        acc.set_active(true);
+        // Off by default → no buffer, accessor None.
+        assert!(acc.layer_head_importance().is_none());
+        acc.enable_layer_head_dump();
+        acc.begin_step();
+
+        // Layer 0: Q0→KV0 puts all mass on tok0 → KV0/tok0 = avg(1,0) = 0.5.
+        let l0 = vec![
+            1.0, 0.0, 0.0, 0.0, // Q0 → KV0
+            0.0, 0.0, 0.0, 0.0, // Q1 → KV0
+            0.0, 0.0, 0.0, 0.0, // Q2 → KV1
+            0.0, 0.0, 0.0, 0.0, // Q3 → KV1
+        ];
+        acc.set_current_layer(0);
+        acc.accumulate_layer_gqa(&l0, 4, 4, 4, 2, 0);
+
+        // Layer 1: Q2→KV1 puts all mass on tok2 → KV1/tok2 = avg(1,0) = 0.5.
+        let l1 = vec![
+            0.0, 0.0, 0.0, 0.0, // Q0 → KV0
+            0.0, 0.0, 0.0, 0.0, // Q1 → KV0
+            0.0, 0.0, 1.0, 0.0, // Q2 → KV1
+            0.0, 0.0, 0.0, 0.0, // Q3 → KV1
+        ];
+        acc.set_current_layer(1);
+        acc.accumulate_layer_gqa(&l1, 4, 4, 4, 2, 0);
+
+        let buf = acc.layer_head_importance().expect("dump enabled");
+        assert_eq!(
+            buf.len(),
+            2 * 2 * 4,
+            "total_layers * n_kv_heads * max_seq_len"
+        );
+
+        let idx = |layer: usize, kv: usize, pos: usize| (layer * 2 + kv) * 4 + pos;
+        // Layer 0 wrote KV0/tok0 = 0.5; layer 1 left that slot at 0.
+        assert!((buf[idx(0, 0, 0)] - 0.5).abs() < 1e-6);
+        assert_eq!(buf[idx(1, 0, 0)], 0.0);
+        // Layer 1 wrote KV1/tok2 = 0.5; layer 0 left that slot at 0.
+        assert!((buf[idx(1, 1, 2)] - 0.5).abs() < 1e-6);
+        assert_eq!(buf[idx(0, 1, 2)], 0.0);
+        // Non-all-zero, and the two per-layer blocks DIFFER (layer axis preserved).
+        assert!(buf.iter().any(|&v| v != 0.0));
+        assert_ne!(&buf[0..2 * 4], &buf[2 * 4..]);
+
+        // reset() clears the buffer.
+        acc.reset();
+        assert!(
+            acc.layer_head_importance()
+                .unwrap()
+                .iter()
+                .all(|&v| v == 0.0)
+        );
+    }
+
+    /// Off by default (no `enable_layer_head_dump`) → accessor None, no buffer allocated.
+    #[test]
+    fn layer_head_dump_off_by_default() {
+        let mut acc = gqa(4, 4, 2, 2, 0, 0.0);
+        acc.set_active(true);
+        acc.begin_step();
+        acc.set_current_layer(0);
+        acc.accumulate_layer_gqa(&[0.0; 16], 4, 4, 4, 2, 0);
+        assert!(acc.layer_head_importance().is_none());
+    }
+
+    /// Flat mode (n_kv_heads = 0): enabling the dump is a no-op (no per-head axis).
+    #[test]
+    fn layer_head_dump_flat_mode_stays_none() {
+        let mut acc = flat(4, 2, 0.0);
+        acc.enable_layer_head_dump();
+        assert!(acc.layer_head_importance().is_none());
+    }
+
+    /// INV-147: enabling the per-layer dump must NOT change the collapsed flat /
+    /// per-head importance the eviction policy ranks on. Identical accumulates with
+    /// the dump ON vs OFF must yield bit-identical collapsed buffers.
+    #[test]
+    fn layer_head_dump_does_not_perturb_collapsed_importance() {
+        let scores_l0 = vec![
+            0.7, 0.1, 0.1, 0.1, // Q0 → KV0
+            0.2, 0.5, 0.2, 0.1, // Q1 → KV0
+            0.1, 0.2, 0.6, 0.1, // Q2 → KV1
+            0.1, 0.1, 0.1, 0.7, // Q3 → KV1
+        ];
+        let scores_l1 = vec![
+            0.3, 0.3, 0.3, 0.1, // Q0 → KV0
+            0.6, 0.2, 0.1, 0.1, // Q1 → KV0
+            0.1, 0.1, 0.1, 0.7, // Q2 → KV1
+            0.4, 0.4, 0.1, 0.1, // Q3 → KV1
+        ];
+        let run = |dump: bool| {
+            let mut acc = AttnScoreProducer::new(ScoreProducerParams {
+                max_seq_len: 4,
+                n_heads: 4,
+                n_kv_heads: 2,
+                total_layers: 2,
+                last_n_layers: 0,
+                decay: 0.0,
+            });
+            acc.set_active(true);
+            if dump {
+                acc.enable_layer_head_dump();
+            }
+            acc.begin_step();
+            acc.set_current_layer(0);
+            acc.accumulate_layer_gqa(&scores_l0, 4, 4, 4, 2, 0);
+            acc.set_current_layer(1);
+            acc.accumulate_layer_gqa(&scores_l1, 4, 4, 4, 2, 0);
+            acc.end_step();
+            (
+                acc.importance_scores().to_vec(),
+                acc.head_importance_scores().unwrap().to_vec(),
+                acc.last_step_head_attn().unwrap().to_vec(),
+            )
+        };
+        let off = run(false);
+        let on = run(true);
+        assert_eq!(off.0, on.0, "dump must not perturb flat importance");
+        assert_eq!(off.1, on.1, "dump must not perturb per-head importance");
+        assert_eq!(off.2, on.2, "dump must not perturb CAOTE last-step attn");
     }
 }

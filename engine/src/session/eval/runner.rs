@@ -42,6 +42,25 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
 
     let questions = load_eval_questions(&args, &prompt)?;
 
+    // ── IMP-2: answer_attention diagnostic dump (read-only; INV-147) ──────
+    // Standalone pass over a fresh uncompressed reference cache — decoupled from
+    // the scoring loop below, so NLL/MC are byte-identical whether it runs or not.
+    if args.dump_enabled(crate::session::eval::dump::DUMP_ANSWER_ATTENTION) {
+        let out_path = args
+            .dump_path(crate::session::eval::dump::DUMP_ANSWER_ATTENTION)
+            .ok_or_else(|| anyhow::anyhow!("--dump <kind> requires --dump-dir"))?;
+        crate::session::eval::run_answer_attention_dump(
+            &model,
+            &tokenizer,
+            &backend,
+            memory.clone(),
+            &questions,
+            max_seq_len,
+            vocab_size,
+            &out_path,
+        )?;
+    }
+
     // ── QCF-dump prelude: --eval-ll + --qcf-dump + --force-swap-ratio ────
     // When all three flags are active we run warmup prefill → ImportanceTable
     // → WeightSwapDecider → SwapExecutor before the eval loop.  This mirrors
@@ -184,6 +203,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         backend.clone(),
         args.enable_qcf_experimental,
         eviction_hook_sample_layers,
+        args.dump_enabled(crate::session::eval::dump::DUMP_EVICT_IMPORTANCE),
     );
 
     // ── Trajectory mode dispatch ──────────────────────────────────────────
@@ -225,6 +245,17 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         );
     }
 
+    // IMP-1: open the evict_importance dump writer (one JSONL record per question
+    // whose eviction fires). The eval loop drains the hook's captured snapshot.
+    let mut evict_writer = if args.dump_enabled(crate::session::eval::dump::DUMP_EVICT_IMPORTANCE) {
+        let path = args
+            .dump_path(crate::session::eval::dump::DUMP_EVICT_IMPORTANCE)
+            .ok_or_else(|| anyhow::anyhow!("--dump <kind> requires --dump-dir"))?;
+        Some(crate::session::eval::dump::JsonlDumpWriter::create(path)?)
+    } else {
+        None
+    };
+
     for step in 0..n_steps {
         if trajectory_mode {
             eprintln!(
@@ -245,6 +276,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
             &questions,
             &eval_config,
             skip_config.as_ref(),
+            evict_writer.as_mut(),
         )?;
         trajectory_outputs.push(step_out);
 
@@ -275,6 +307,16 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
                 layer_to_swap, report.latency_ms
             );
         }
+    }
+
+    if let Some(writer) = evict_writer {
+        let path = writer.path().to_path_buf();
+        let n = writer.finish()?;
+        eprintln!(
+            "[dump:evict_importance] wrote {} record(s) → {}",
+            n,
+            path.display()
+        );
     }
 
     // For downstream non-trajectory stdout printing, expose the last step's

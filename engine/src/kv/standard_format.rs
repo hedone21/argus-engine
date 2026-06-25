@@ -3035,6 +3035,135 @@ mod tests {
         out
     }
 
+    /// Independent EAGER-softmax reference (NOT op-identical to the producer):
+    /// materializes the full causal logit row and runs a textbook softmax in f64,
+    /// sharing no float-rounding path with `prefill_attention_scores`. Validates
+    /// that the producer's fused f32 softmax is *numerically* correct (approx
+    /// equality), complementing the bit-exact op-order pin (`pfa_reference`). This
+    /// is the ground-truth guarantee IMP-2's `answer_attention` dump relies on.
+    #[allow(clippy::too_many_arguments)]
+    fn pfa_eager_reference(
+        q: &[f32],
+        k: &[f32],
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        head_dim: usize,
+        seq_len: usize,
+        cache_seq_len: usize,
+        k_pos_stride: usize,
+        kv_head_stride: usize,
+        q_start_pos: usize,
+        q_window: usize,
+        window: Option<usize>,
+    ) -> Vec<f32> {
+        let prefix_len = cache_seq_len;
+        let scale = 1.0f64 / (head_dim as f64).sqrt();
+        let gqa = n_heads_q / n_heads_kv;
+        let q_row = n_heads_q * head_dim;
+        let qwin = q_window.min(seq_len);
+        let qwin_start = seq_len - qwin;
+        let mut out = vec![0.0f64; n_heads_q * prefix_len];
+        for h in 0..n_heads_q {
+            let kvh = h / gqa;
+            let base = h * prefix_len;
+            for r in qwin_start..seq_len {
+                let p = q_start_pos + r;
+                let lo = match window {
+                    Some(w) => p.saturating_sub(w.saturating_sub(1)),
+                    None => 0,
+                };
+                let qb = r * q_row + h * head_dim;
+                // Materialize all causal logits in f64 (independent of the producer's
+                // fused single-pass online softmax).
+                let logits: Vec<f64> = (lo..=p)
+                    .map(|kp| {
+                        let kb = kp * k_pos_stride + kvh * kv_head_stride;
+                        let mut dot = 0.0f64;
+                        for d in 0..head_dim {
+                            dot += q[qb + d] as f64 * k[kb + d] as f64;
+                        }
+                        dot * scale
+                    })
+                    .collect();
+                let m = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let denom: f64 = logits.iter().map(|&l| (l - m).exp()).sum();
+                for (i, kp) in (lo..=p).enumerate() {
+                    out[base + kp] += (logits[i] - m).exp() / denom;
+                }
+            }
+        }
+        out.iter().map(|&x| x as f32).collect()
+    }
+
+    #[test]
+    fn pfa_matches_eager_softmax_reference() {
+        // IMP-2 ground-truth check: the producer's f32 fused softmax must match an
+        // independent eager (f64, fully-materialized) softmax within tolerance,
+        // over MHA/GQA × SeqMajor/HeadMajor × windowed/full. Approximate (not
+        // bit-exact) — the two reference paths share no rounding.
+        let head_dim = 8;
+        let seq_len = 6;
+        let q_start_pos = 0;
+        let cache_seq_len = seq_len;
+        let q_window = 3;
+        let kv_capacity = 16;
+        for (nq, nkv, layout) in [(4, 4, "seq"), (4, 2, "seq"), (4, 4, "head"), (4, 2, "head")] {
+            for window in [None, Some(4usize)] {
+                let q: Vec<f32> = (0..seq_len * nq * head_dim)
+                    .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
+                    .collect();
+                let (k_pos_stride, kv_head_stride, k_len) = if layout == "seq" {
+                    (nkv * head_dim, head_dim, cache_seq_len * nkv * head_dim)
+                } else {
+                    (
+                        head_dim,
+                        kv_capacity * head_dim,
+                        nkv * kv_capacity * head_dim,
+                    )
+                };
+                let k: Vec<f32> = (0..k_len).map(|i| ((i % 17) as f32 - 8.0) * 0.07).collect();
+
+                let mut got = vec![0.0f32; nq * cache_seq_len];
+                prefill_attention_scores(
+                    &q,
+                    &k,
+                    nq,
+                    nkv,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    k_pos_stride,
+                    kv_head_stride,
+                    q_start_pos,
+                    q_window,
+                    window,
+                    &mut got,
+                );
+                let want = pfa_eager_reference(
+                    &q,
+                    &k,
+                    nq,
+                    nkv,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    k_pos_stride,
+                    kv_head_stride,
+                    q_start_pos,
+                    q_window,
+                    window,
+                );
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert!(
+                        (g - w).abs() < 1e-4,
+                        "PFA != eager softmax at {i} \
+                         (nq={nq}, nkv={nkv}, layout={layout}, window={window:?}): {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn pfa_bit_exact_matches_eager_reference() {
         let head_dim = 8;

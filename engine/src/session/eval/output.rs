@@ -18,11 +18,25 @@ pub struct EvalConfig {
 }
 
 /// A single evaluation question (grouped format).
-#[derive(Debug, Clone)]
+///
+/// The `gold_*` / `needle_*` fields are optional diagnostic metadata supplied by
+/// the batch loader and consumed only by the `--dump` diagnostics (e.g.
+/// `answer_attention`). They default to `None` for batches that omit them, so
+/// scoring is unaffected (INV-147).
+#[derive(Debug, Clone, Default)]
 pub struct EvalQuestion {
     pub id: String,
     pub prompt: String,
     pub choices: Vec<String>,
+    /// Index into `choices` of the gold (correct) answer, if the batch provides
+    /// it. Required for the `answer_attention` dump (it forwards the gold choice).
+    pub gold_index: Option<usize>,
+    /// Context token positions that belong to the gold answer span (host-supplied;
+    /// indices into the prompt). Carried through to dumps for downstream analysis.
+    pub gold_token_positions: Option<Vec<usize>>,
+    /// Context token positions of an inserted "needle" (host-supplied). Carried
+    /// through to dumps for needle-recall analysis.
+    pub needle_token_positions: Option<Vec<usize>>,
 }
 
 /// Unified output from the generic eval loop.

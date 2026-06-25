@@ -194,6 +194,24 @@ impl AttentionScoreAccumulator {
     pub fn last_step_head_attn(&self) -> Option<&[f32]> {
         self.producer.last_step_head_attn()
     }
+
+    /// Set the decode layer the next `accumulate_layer*` belongs to (for the per-layer-head dump).
+    /// See [`ScoreProducer::set_current_layer`].
+    pub fn set_current_layer(&mut self, layer: usize) {
+        self.producer.set_current_layer(layer);
+    }
+
+    /// Enable the non-collapsed per-`(layer, KV-head, token)` importance dump (IMP-1 diagnostics).
+    /// See [`ScoreProducer::enable_layer_head_dump`].
+    pub fn enable_layer_head_dump(&mut self) {
+        self.producer.enable_layer_head_dump();
+    }
+
+    /// Non-collapsed per-`(layer, KV-head, token)` importance from the most recent step, if enabled.
+    /// `[n_layers * n_kv_heads * max_seq_len]`. See [`ScoreProducer::layer_head_importance`].
+    pub fn layer_head_importance(&self) -> Option<&[f32]> {
+        self.producer.layer_head_importance()
+    }
 }
 
 #[cfg(test)]
