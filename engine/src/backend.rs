@@ -478,6 +478,30 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Whether this backend has the GPU-native opaque q2_0 -> F16 dequant kernel (W-CODEC slice 3).
+    /// Default `false` → callers keep the host descriptor floor.
+    fn supports_opaque_q2_dequant(&self) -> bool {
+        false
+    }
+
+    /// GPU-native dequant of an opaque q2_0 KV buffer into a device F16 HeadMajor tensor
+    /// (W-CODEC slice 3). `q2_host` = the host-resident opaque q2 bytes (whole capacity);
+    /// `out_f16` = a device F16 `[1, kv_heads, capacity, head_dim]` tensor; only positions
+    /// `[0, seq_len)` are decoded. The decode is byte-identical to the host descriptor floor, so
+    /// the caller can run the existing F16 flash-attention kernels on `out_f16` instead of the
+    /// host dequant + CPU-attention round-trip. Default: unsupported (`Ok(false)`) → host floor.
+    fn dequant_opaque_q2_to_f16(
+        &self,
+        _q2_host: &[u8],
+        _out_f16: &mut Tensor,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _capacity: usize,
+        _seq_len: usize,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Batch F32->F16 KV scatter for prefill: writes seq_len positions in one kernel launch.
     /// k_src/v_src: contiguous [seq_len, kv_heads * head_dim] F32
     /// k_dst/v_dst: [kv_heads, capacity, head_dim] F16 HeadMajor
