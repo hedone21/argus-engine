@@ -269,15 +269,18 @@ impl ChatSession {
     pub fn ensure_capacity(&mut self, additional: usize) -> Result<()> {
         match &self.kv_mode {
             ChatKvMode::Standard(s) => {
-                if self.pos + additional <= self.max_seq_len {
+                // capacity 는 누적 RoPE pos(`self.pos`)가 아니라 실제 물리 점유로 회계한다 —
+                // turn-경계 eviction 후 `self.pos` 가 누적값으로 재동기해 점유를 과대평가하면
+                // 조기 evict/bail 한다(이 fix 의 핵심). `occupancy()` 참조.
+                if self.occupancy() + additional <= self.max_seq_len {
                     return Ok(());
                 }
                 if s.cache_manager.is_none() {
                     anyhow::bail!(
-                        "context would exceed max_seq_len={} (pos={}, incoming_reserve={}). \
+                        "context would exceed max_seq_len={} (occupancy={}, incoming_reserve={}). \
                          Use /reset or increase --max-seq-len.",
                         self.max_seq_len,
-                        self.pos,
+                        self.occupancy(),
                         additional
                     );
                 }
@@ -344,15 +347,15 @@ impl ChatSession {
                     self.pos = new_pos;
                 }
 
-                // 재확인
-                if self.pos + additional <= self.max_seq_len {
+                // 재확인 (eviction 으로 점유가 줄었는지)
+                if self.occupancy() + additional <= self.max_seq_len {
                     Ok(())
                 } else {
                     anyhow::bail!(
                         "context would exceed max_seq_len={} even after eviction \
-                         (pos={}, incoming_reserve={}). Use /reset or increase --max-seq-len.",
+                         (occupancy={}, incoming_reserve={}). Use /reset or increase --max-seq-len.",
                         self.max_seq_len,
-                        self.pos,
+                        self.occupancy(),
                         additional
                     );
                 }
@@ -385,9 +388,11 @@ impl ChatSession {
             return Ok(());
         }
 
-        // KV capacity는 pos로 근사한다 (ModelForward 내부 cache.capacity()를
-        // 직접 읽는 대신 max_seq_len을 proxy로 사용 — 할당 크기와 동일).
-        let at_pressure = self.pos >= self.max_seq_len.saturating_mul(9) / 10;
+        // KV capacity는 물리 점유로 근사한다 (ModelForward 내부 cache.capacity()를
+        // 직접 읽는 대신 max_seq_len을 proxy로 사용 — 할당 크기와 동일). 누적 RoPE pos
+        // (`self.pos`)가 아니라 `occupancy()` 를 써야 한다 — 그렇지 않으면 대화가 길어져
+        // 누적값이 90%를 넘는 순간 실제 점유와 무관하게 매 turn force_evict 한다.
+        let at_pressure = self.occupancy() >= self.max_seq_len.saturating_mul(9) / 10;
 
         let (target_ratio, score_based) = if let ChatKvMode::Standard(s) = &self.kv_mode {
             (s.target_ratio, s.score_based)
@@ -477,6 +482,24 @@ impl ChatSession {
     /// 현재 KV pos.
     pub fn pos(&self) -> usize {
         self.pos
+    }
+
+    /// 물리 KV **점유**(capacity 회계 전용) = 누적 토큰 수(`decode_loop.pos`, RoPE 누적) −
+    /// 누적 eviction 수(`evicted_total`). 보존 항등식: 토큰 추가마다 둘 다 +1, eviction 은
+    /// `evicted_total` 만 +removed 하고 RoPE 누적은 보존(#62/#63)되므로 그 차가 곧 압축된 물리
+    /// 점유(`kv_cache.current_pos`)와 정확히 일치한다.
+    ///
+    /// `self.pos`(표시/RoPE-mirror)와 구별된다: `self.pos` 는 prefill 직후엔 누적값,
+    /// turn-경계 eviction 직후엔 압축 점유로 **일시적으로 의미가 바뀐다**. 다음 prefill 이
+    /// 누적값으로 재동기하면 capacity 체크가 실제 점유보다 큰 누적값을 읽어 조기 evict/bail 하므로,
+    /// capacity 회계는 반드시 이 `occupancy()` 를 쓴다. NonEvicting 모드는 eviction 이 없어
+    /// 점유 == 누적이다.
+    fn occupancy(&self) -> usize {
+        let cumulative = self.decode_loop.pos_snapshot();
+        match &self.kv_mode {
+            ChatKvMode::Standard(s) => cumulative.saturating_sub(s.evicted_total),
+            ChatKvMode::NonEvicting { .. } => cumulative,
+        }
     }
 
     /// max_seq_len.
@@ -1105,7 +1128,8 @@ mod tests {
     #[test]
     fn g4_standard_no_cache_manager_bails_on_overflow() {
         let mut session = make_mock_session(10);
-        session.pos = 9;
+        // 9 토큰 prefill → 점유=9 (capacity 는 점유로 회계).
+        session.prefill(&[1u32, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
         let result = session.ensure_capacity(2);
         assert!(result.is_err(), "no cache_manager + overflow → bail");
     }
@@ -1114,9 +1138,10 @@ mod tests {
     #[test]
     fn g4_standard_ok_when_capacity_sufficient() {
         let mut session = make_mock_session(10);
-        session.pos = 5;
+        // 5 토큰 prefill → 점유=5.
+        session.prefill(&[1u32, 2, 3, 4, 5]).unwrap();
         let result = session.ensure_capacity(2);
-        assert!(result.is_ok(), "pos=5, additional=2, max=10 → Ok");
+        assert!(result.is_ok(), "점유=5, additional=2, max=10 → Ok");
     }
 
     // ─── β-6 commit A 핀 4: turn-boundary try_evict 직접 호출 보존 ─────────
@@ -1184,14 +1209,17 @@ mod tests {
                 target_ratio: 0.5,
                 evicted_total: 0,
             })),
-            pos: 9,
+            pos: 0,
             max_seq_len: 10,
             stop_slot,
             stream_slot,
             sampling: None,
         };
 
-        // pos=9, additional=2 → 11 > 10 → overflow → try_evict 직접 호출.
+        // 9 토큰 prefill → 점유=9 (decode_loop.pos=9, evicted_total=0). capacity 는 누적 pos 가
+        // 아니라 점유로 회계하므로 일관된 상태를 prefill 로 만든다.
+        session.prefill(&[1u32, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
+        // 점유=9, additional=2 → 11 > 10 → overflow → try_evict 직접 호출.
         session.ensure_capacity(2).unwrap();
         assert_eq!(
             evict_calls.get(),
@@ -1370,6 +1398,58 @@ mod tests {
             *recorded.borrow(),
             vec![0usize, 10usize],
             "on_turn_end eviction 후에도 RoPE start_pos 누적 유지. 비-tautology: collapse 시 [0, 3]."
+        );
+    }
+
+    // ─── capacity 회계: 누적 pos vs 물리 점유 ─────────────────────────────
+    //
+    // turn-경계 eviction 후 `self.pos` 가 다음 prefill 에서 누적값으로 재동기하면 실제 물리
+    // 점유보다 커진다. capacity 체크가 그 누적값을 읽으면 여유가 있어도 조기 evict 한다.
+    // 이 fix 는 capacity 체크를 `occupancy()`(= 누적 − evicted_total) 로 전환한다.
+
+    /// eviction 후 capacity 체크가 누적 pos 가 아니라 물리 점유를 쓰는지 핀한다.
+    /// **비-tautology**: `ensure_capacity` 가 `occupancy()` 대신 `self.pos` 를 쓰면(=fix 이전)
+    /// turn3 에서 누적(12)+5=17>16 으로 불필요하게 evict 해 `evicted_total` 이 16 이 되어 깨진다.
+    #[test]
+    fn ensure_capacity_uses_occupancy_not_cumulative_pos_after_eviction() {
+        // make_pos_recording_session: Standard, cache_manager=Some,
+        // try_evict → (removed=8, new_pos=2) (점유 10→2 로 일관).
+        let (mut session, _recorded) = make_pos_recording_session(16, 2);
+
+        // turn1: 10-token prefill → 점유=10, 누적=10, evicted_total=0.
+        session
+            .prefill(&[1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+            .unwrap();
+        assert_eq!(session.occupancy(), 10, "turn1 prefill 후 점유=10");
+
+        // turn2: ensure_capacity(10) overflow(10+10=20>16) → 1회 eviction(removed=8, new_pos=2).
+        session.ensure_capacity(10).unwrap();
+        let evicted_after_turn2 = match &session.kv_mode {
+            ChatKvMode::Standard(s) => s.evicted_total,
+            _ => unreachable!(),
+        };
+        assert_eq!(evicted_after_turn2, 8, "turn2 ensure_capacity 가 1회 evict");
+
+        // turn2 prefill(2): self.pos 는 누적(12)으로 재동기(표시용)하지만 실제 점유 = 12 − 8 = 4.
+        session.prefill(&[20u32, 21]).unwrap();
+        assert_eq!(
+            session.pos(),
+            12,
+            "self.pos 는 누적으로 재동기(불변·표시용)"
+        );
+        assert_eq!(session.occupancy(), 4, "실제 점유 = 누적(12) − evicted(8)");
+
+        // turn3: ensure_capacity(5). 점유(4)+5=9 ≤ 16 → 여유 충분 → eviction 불필요.
+        // 수정 전(self.pos 기준)이면 12+5=17>16 으로 불필요하게 한 번 더 evict 한다.
+        session.ensure_capacity(5).unwrap();
+        let evicted_after_turn3 = match &session.kv_mode {
+            ChatKvMode::Standard(s) => s.evicted_total,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            evicted_after_turn3, 8,
+            "점유에 여유가 있으므로 turn3 추가 eviction 이 없어야 한다 \
+             (누적 pos 기준이면 17>16 으로 불필요하게 evict → 16)"
         );
     }
 
