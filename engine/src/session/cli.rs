@@ -920,6 +920,19 @@ pub struct Args {
     #[arg(long)]
     pub dump_a2sf: Option<std::path::PathBuf>,
 
+    /// Directory for generic diagnostic dumps. Each kind selected by `--dump`
+    /// writes `<dir>/<kind>.jsonl`, one JSON record per question. Required when
+    /// `--dump` is set. Read-only diagnostics — no effect on scoring (INV-147).
+    #[arg(long)]
+    pub dump_dir: Option<std::path::PathBuf>,
+
+    /// Comma-separated diagnostic dumps to emit (e.g. `--dump answer_attention`,
+    /// or `--dump a,b`). Each kind writes `<dump-dir>/<kind>.jsonl`. Generic by
+    /// design: a new dump kind registers a name, not a new CLI flag. Validated at
+    /// startup against the known kinds (`session::eval::dump::KNOWN_DUMP_KINDS`).
+    #[arg(long, value_delimiter = ',')]
+    pub dump: Vec<String>,
+
     /// Start an interactive multi-turn chat REPL (Llama 3.2 Instruct / Qwen2).
     /// Uses standard (non-quant-window, non-offload) forward path.
     #[arg(long, default_value_t = false)]
@@ -1446,6 +1459,26 @@ impl Args {
                 });
             }
         }
+    }
+
+    /// Diagnostic dump kinds requested via `--dump <kind>[,<kind>...]` (in CLI
+    /// order). Empty when no dump is selected. Validated against the known kinds
+    /// at startup; see [`crate::session::eval::dump`].
+    pub fn dump_kinds(&self) -> &[String] {
+        &self.dump
+    }
+
+    /// True if `kind` was requested via `--dump`.
+    pub fn dump_enabled(&self, kind: &str) -> bool {
+        self.dump.iter().any(|k| k == kind)
+    }
+
+    /// Output path for a dump `kind` = `<dump-dir>/<kind>.jsonl`. `None` when
+    /// `--dump-dir` is unset (the eval guard requires it whenever `--dump` is set).
+    pub fn dump_path(&self, kind: &str) -> Option<std::path::PathBuf> {
+        self.dump_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{kind}.jsonl")))
     }
 
     /// Engine 내부 dispatch default mode 결정.

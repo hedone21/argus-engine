@@ -1731,6 +1731,11 @@ impl TransformerModel {
                 let n_heads_q = self.config.num_attention_heads;
                 let stride = ws.scores.len() / n_heads_q;
 
+                // Attribute this accumulate to layer `i` for the optional per-(layer,
+                // KV-head) importance dump (IMP-1). No-op unless the dump is armed
+                // (the producer only reads it under `dump_layer_head`) → INV-147.
+                acc.set_current_layer(i);
+
                 if acc.n_kv_heads() > 0 {
                     let n_kv_heads = self.config.num_key_value_heads;
                     acc.accumulate_layer_gqa(

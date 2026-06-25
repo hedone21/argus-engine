@@ -2657,6 +2657,31 @@ pub trait ScoreProducer: Send + Sync {
     fn last_step_head_attn(&self) -> Option<&[f32]>;
     /// Number of KV heads (`0` = flat mode).
     fn n_kv_heads(&self) -> usize;
+
+    // ── per-(layer, KV-head) importance dump (IMP-1 diagnostics; opt-in) ──
+    //
+    // These default to no-ops / `None`, so the dump is purely additive: a producer that does
+    // not implement them is unaffected, and production scoring is byte-identical unless
+    // `enable_layer_head_dump` is explicitly called (`INV-147`).
+
+    /// Set the layer index that the *next* `accumulate_layer*` call belongs to, so a producer
+    /// capturing per-layer state can attribute scores to a layer (the per-step driver loses the
+    /// layer index otherwise). Default no-op. Diagnostics-only — never affects scoring.
+    fn set_current_layer(&mut self, _layer: usize) {}
+
+    /// Enable capture of a non-collapsed per-`(layer, KV-head, token)` importance buffer for
+    /// diagnostics (IMP-1). Default no-op; the built-in producer lazily allocates an
+    /// `[n_layers * n_kv_heads * max_seq_len]` buffer (GQA mode only). Off by default so the
+    /// production decode path keeps its MAX-collapsed, memory-light footprint.
+    fn enable_layer_head_dump(&mut self) {}
+
+    /// The non-collapsed per-`(layer, KV-head, token)` importance from the most recent step, if
+    /// [`Self::enable_layer_head_dump`] was called and GQA mode is active. Layout is row-major
+    /// `[n_layers * n_kv_heads * max_seq_len]`, indexed `(layer * n_kv_heads + kv_head) * max_seq_len + pos`.
+    /// Default `None`.
+    fn layer_head_importance(&self) -> Option<&[f32]> {
+        None
+    }
 }
 
 /// Registration entry for one score producer — a mirror of [`LayerScorerReg`], static-linkme only.

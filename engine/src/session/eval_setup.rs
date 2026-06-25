@@ -276,6 +276,14 @@ fn build_eval_score_accumulator(
     acc.set_active(true);
     acc.set_time_normalize(!args.h2o_raw_scores());
 
+    // IMP-1: arm the non-collapsed per-(layer, KV-head) importance buffer when the
+    // `evict_importance` dump is requested. No-op in flat mode; eviction policies use
+    // GQA (use_gqa above), so the dump captures real per-KV-head data. The flat
+    // importance the policy ranks on is unchanged either way (INV-147).
+    if args.dump_enabled(crate::session::eval::dump::DUMP_EVICT_IMPORTANCE) {
+        acc.enable_layer_head_dump();
+    }
+
     // OpenCL backend 면 GPU-side accumulator 초기화 — per-token GPU→CPU readback 제거.
     // Caps-driven arming: only arm the GPU score path when the eviction policy actually consumes
     // scores (`StageCaps.reads` non-empty). A score-free policy (sliding/streaming) or a
@@ -707,6 +715,7 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
         &questions,
         &eval_config,
         None,
+        None, // evict_importance dump: quant-window path has no eviction hook
     )?;
     let mut json_val = serde_json::from_str::<serde_json::Value>(&output.to_json()?)?;
     json_val["config"] = serde_json::json!({

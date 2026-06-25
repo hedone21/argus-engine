@@ -7,7 +7,9 @@
 //! 공유 의존: `session::qcf_runtime::{run_qcf_warmup_workflow, run_layer_swap}`
 //! (Phase 4-B-1에서 lib 이동).
 
+pub mod answer_attention_dump;
 pub mod args;
+pub mod dump;
 pub mod eval_loop;
 pub mod eviction_hook;
 pub mod fmt_bridge;
@@ -18,6 +20,7 @@ pub mod qcf_helpers;
 pub mod quant_window_hook;
 pub mod runner;
 
+pub use answer_attention_dump::run_answer_attention_dump;
 pub use args::EvalLlRunCtx;
 pub use eval_loop::run_eval_ll_generic;
 pub use eviction_hook::EvictionHook;

@@ -161,6 +161,10 @@ pub struct EvictionHook {
     /// Empty → use [0] for backward compat.
     pub qcf_sample_layers: Vec<usize>,
 
+    /// Whether to capture the IMP-1 `evict_importance` dump snapshot at eviction.
+    /// Off by default → no capture, eviction path byte-identical (`INV-147`).
+    dump_evict_importance: bool,
+
     // -- Statistics (reset per question) --
     /// Number of eviction events this question.
     eviction_count: usize,
@@ -170,6 +174,8 @@ pub struct EvictionHook {
     eviction_qcf: Option<EvictionQcfResult>,
     /// Experimental QCF payload (Some when experimental_enabled and prefill happened).
     experimental_qcf: Option<ExpQcfV3>,
+    /// IMP-1 dump snapshot captured at the most recent eviction (drained by the loop).
+    last_evict_dump: Option<crate::session::eval::dump::EvictImportanceSnapshot>,
 }
 
 impl EvictionHook {
@@ -187,6 +193,7 @@ impl EvictionHook {
         backend: std::sync::Arc<dyn crate::backend::Backend>,
         experimental_enabled: bool,
         qcf_sample_layers: Vec<usize>,
+        dump_evict_importance: bool,
     ) -> Self {
         Self {
             cache_manager,
@@ -201,11 +208,57 @@ impl EvictionHook {
             backend,
             experimental_enabled,
             qcf_sample_layers,
+            dump_evict_importance,
             eviction_count: 0,
             evicted_total: 0,
             eviction_qcf: None,
             experimental_qcf: None,
+            last_evict_dump: None,
         }
+    }
+
+    /// Assemble the IMP-1 `evict_importance` snapshot from the accumulator's
+    /// (now non-collapsed) importance + the technique-agnostic captured keep-set.
+    /// Must be called AFTER `force_evict` (so the keep-set is captured) and BEFORE
+    /// `acc.reset()` (which wipes the importance buffers). Returns `None` if the
+    /// per-layer-head buffer or the keep-set is unavailable.
+    fn assemble_evict_importance(
+        &self,
+        before_len: usize,
+        n_layers: usize,
+    ) -> Option<crate::session::eval::dump::EvictImportanceSnapshot> {
+        use crate::session::eval::dump;
+
+        let captured = crate::kv::eviction::keepset_dump::drain_capture();
+        let acc = self.score_accumulator.as_ref()?;
+        let layer_head = acc.layer_head_importance()?; // None unless GQA + dump enabled
+        let max_seq_len = acc.importance_scores().len();
+        let n_kv_heads = acc.n_kv_heads();
+        let prompt_len = before_len.min(max_seq_len);
+
+        // Keep-set is technique-agnostic and (for the LayerWide eval path) uniform
+        // across layers/heads — take the first captured layer's first head's list.
+        let kept_positions: Vec<usize> = captured
+            .first()
+            .and_then(|c| c.keep.first())
+            .cloned()
+            .unwrap_or_default();
+        let evicted_positions = dump::complement_positions(&kept_positions, prompt_len);
+
+        let importance_flat = acc.importance_scores()[..prompt_len].to_vec();
+        let importance_by_layer_head =
+            dump::reshape_layer_head(layer_head, n_layers, n_kv_heads, max_seq_len, prompt_len);
+
+        Some(dump::EvictImportanceSnapshot {
+            prompt_len,
+            budget: self.effective_budget,
+            keep_ratio: self.h2o_keep_ratio,
+            technique: self.cache_manager.policy_name(),
+            kept_positions,
+            evicted_positions,
+            importance_flat,
+            importance_by_layer_head,
+        })
     }
 }
 
@@ -457,6 +510,13 @@ impl StepHook<KVCache> for EvictionHook {
             0.0
         };
 
+        // IMP-1 evict_importance dump: arm the technique-agnostic keep-set capture
+        // around this eviction (drained in `assemble_evict_importance` below).
+        let n_layers = caches.len();
+        if self.dump_evict_importance {
+            crate::kv::eviction::keepset_dump::arm_capture();
+        }
+
         // Perform eviction
         let result = if self.score_based_eviction {
             let active = self
@@ -482,6 +542,13 @@ impl StepHook<KVCache> for EvictionHook {
         {
             self.eviction_count += 1;
             self.evicted_total += evict_result.tokens_removed;
+
+            // IMP-1: snapshot importance + per-(layer, KV-head) buffer + captured
+            // keep-set BEFORE acc.reset() wipes the accumulator.
+            if self.dump_evict_importance {
+                self.last_evict_dump = self.assemble_evict_importance(before_len, n_layers);
+            }
+
             if let Some(acc) = self.score_accumulator.as_mut() {
                 acc.reset();
             }
@@ -492,6 +559,10 @@ impl StepHook<KVCache> for EvictionHook {
                 eviction_ratio,
                 qcf_value_aware,
             });
+        } else if self.dump_evict_importance {
+            // No eviction fired — drop the armed capture so it can't leak into a
+            // later event.
+            crate::kv::eviction::keepset_dump::disarm_capture();
         }
     }
 
@@ -507,6 +578,7 @@ impl StepHook<KVCache> for EvictionHook {
         self.evicted_total = 0;
         self.eviction_qcf = None;
         self.experimental_qcf = None;
+        self.last_evict_dump = None;
     }
 
     fn snapshot(&self, caches: &[KVCache]) -> Box<dyn CacheSnapshot<KVCache>> {
@@ -604,6 +676,12 @@ impl StepHook<KVCache> for EvictionHook {
             "experimental_enabled": self.experimental_enabled,
         })
     }
+
+    fn take_evict_importance_dump(
+        &mut self,
+    ) -> Option<crate::session::eval::dump::EvictImportanceSnapshot> {
+        self.last_evict_dump.take()
+    }
 }
 
 #[cfg(test)]
@@ -655,6 +733,7 @@ mod tests {
             crate::backend::cpu::cpu_singleton(),
             false,
             vec![], // qcf_sample_layers: empty → internal fallback to [0]
+            false,  // dump_evict_importance
         )
     }
 
@@ -762,6 +841,7 @@ mod tests {
             crate::backend::cpu::cpu_singleton(),
             false,
             vec![0, 4, 8, 12, 15],
+            false, // dump_evict_importance
         );
         assert_eq!(hook.qcf_sample_layers, vec![0, 4, 8, 12, 15]);
     }

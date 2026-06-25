@@ -30,6 +30,12 @@ pub fn load_eval_questions(
 
     let mut questions: Vec<crate::session::eval::EvalQuestion> = Vec::new();
     for task in &raw_tasks {
+        // Optional diagnostic metadata (consumed only by `--dump`; absent keys → None,
+        // so scoring is unaffected — INV-147).
+        let gold_index = task["gold_index"].as_u64().map(|v| v as usize);
+        let gold_token_positions = parse_usize_array(task, "gold_token_positions");
+        let needle_token_positions = parse_usize_array(task, "needle_token_positions");
+
         if let Some(choices) = task["choices"].as_array() {
             questions.push(crate::session::eval::EvalQuestion {
                 id: task["id"].as_str().unwrap_or("unknown").to_string(),
@@ -41,6 +47,9 @@ pub fn load_eval_questions(
                     .iter()
                     .filter_map(|c| c.as_str().map(|s| s.to_string()))
                     .collect(),
+                gold_index,
+                gold_token_positions,
+                needle_token_positions,
             });
         } else if let Some(cont) = task["continuation"].as_str() {
             questions.push(crate::session::eval::EvalQuestion {
@@ -50,10 +59,23 @@ pub fn load_eval_questions(
                     .unwrap_or(default_prompt)
                     .to_string(),
                 choices: vec![cont.to_string()],
+                gold_index,
+                gold_token_positions,
+                needle_token_positions,
             });
         }
     }
     Ok(questions)
+}
+
+/// Parse an optional `[usize, ...]` JSON array field. Returns `None` when the key
+/// is absent or not an array; non-integer / negative entries are dropped.
+fn parse_usize_array(task: &serde_json::Value, key: &str) -> Option<Vec<usize>> {
+    task[key].as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_u64().map(|n| n as usize))
+            .collect()
+    })
 }
 
 /// Build a warmup token sequence from the eval-ll question set.
@@ -104,4 +126,49 @@ pub fn build_eval_ll_warmup_text(
     }
 
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn loader_parses_optional_gold_and_needle_metadata() {
+        let dir = std::env::temp_dir().join(format!("argus-loader-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("batch.json");
+        std::fs::write(
+            &path,
+            r#"[
+                {"id":"q1","prompt":"P","choices":[" A"," B"],"gold_index":1,
+                 "gold_token_positions":[3,4],"needle_token_positions":[0]},
+                {"id":"q2","prompt":"P2","choices":[" X"]}
+            ]"#,
+        )
+        .unwrap();
+
+        let args = Args::try_parse_from([
+            "argus-eval",
+            "--model-path",
+            "/tmp/m.gguf",
+            "--eval-ll",
+            "--eval-batch",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let qs = load_eval_questions(&args, "default").unwrap();
+        assert_eq!(qs.len(), 2);
+        // q1 carries all optional metadata.
+        assert_eq!(qs[0].gold_index, Some(1));
+        assert_eq!(qs[0].gold_token_positions, Some(vec![3, 4]));
+        assert_eq!(qs[0].needle_token_positions, Some(vec![0]));
+        // q2 omits the optional keys → None (backward compatible; INV-147).
+        assert_eq!(qs[1].gold_index, None);
+        assert_eq!(qs[1].gold_token_positions, None);
+        assert_eq!(qs[1].needle_token_positions, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

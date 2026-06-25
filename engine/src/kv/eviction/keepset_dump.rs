@@ -31,6 +31,7 @@
 //! a `BTreeMap` for stable ordering.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use argus_extension_api::{KVCachePlan, KeepSpec};
@@ -62,9 +63,89 @@ fn state() -> &'static Mutex<DumpState> {
     S.get_or_init(|| Mutex::new(DumpState::default()))
 }
 
+// ── In-memory keep-set capture (IMP-1 `evict_importance` dump) ──────────────
+//
+// Independent of the env-gated file dump above: the eval eviction hook arms this
+// around a single eviction event (synchronous, single-threaded), then drains the
+// captured per-layer keep-sets to co-locate them with the importance dump. The
+// fast-path cost when disarmed (the default) is one relaxed atomic load → the
+// eviction decision is unchanged (`INV-147`); it never allocates or locks.
+
+static CAPTURE_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// One layer's captured keep-set, in pre-eviction absolute positions. `layer_idx` /
+/// `seq_len` / `n_kv_heads` are captured diagnostic metadata (the consumer only needs
+/// `keep`, but they make the capture self-describing and are asserted by tests).
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct CapturedKeepSet {
+    pub layer_idx: usize,
+    /// Pre-eviction cache length (`current_pos` at plan-apply time).
+    pub seq_len: usize,
+    pub n_kv_heads: usize,
+    /// `[n_kv_heads][kept positions ascending]`. For `LayerWide`, every head shares
+    /// the same list (replicated); for `PerHead`, one list per head.
+    pub keep: Vec<Vec<usize>>,
+}
+
+fn capture_buf() -> &'static Mutex<Vec<CapturedKeepSet>> {
+    static C: OnceLock<Mutex<Vec<CapturedKeepSet>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Arm in-memory keep-set capture (clearing any prior events).
+pub(crate) fn arm_capture() {
+    capture_buf()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    CAPTURE_ARMED.store(true, Ordering::Relaxed);
+}
+
+/// Disarm capture and discard any captured events (e.g. when no eviction fired).
+pub(crate) fn disarm_capture() {
+    CAPTURE_ARMED.store(false, Ordering::Relaxed);
+    capture_buf()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// Disarm and return the captured per-layer keep-sets (in record order).
+pub(crate) fn drain_capture() -> Vec<CapturedKeepSet> {
+    CAPTURE_ARMED.store(false, Ordering::Relaxed);
+    std::mem::take(&mut *capture_buf().lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Push one layer's keep-set into the capture buffer when armed. Called before any
+/// compaction, so positions are absolute indices into `[0, seq_len)`.
+fn capture_if_armed(cache: &KVCache, plan: &KVCachePlan, layer_idx: usize) {
+    if !CAPTURE_ARMED.load(Ordering::Relaxed) {
+        return; // disarmed (default): single atomic load, no behaviour change.
+    }
+    let n_kv_heads = cache.kv_heads();
+    let seq_len = cache.current_pos();
+    let keep: Vec<Vec<usize>> = match &plan.keep {
+        KeepSpec::LayerWide(k) => vec![k.clone(); n_kv_heads.max(1)],
+        KeepSpec::PerHead(heads) => heads.clone(),
+    };
+    capture_buf()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(CapturedKeepSet {
+            layer_idx,
+            seq_len,
+            n_kv_heads,
+            keep,
+        });
+}
+
 /// Record one layer's keep-set, then rewrite the dump file. No-op (cached env read)
 /// when `ARGUS_DUMP_KEEPSET` is unset.
 pub(crate) fn record(cache: &KVCache, plan: &KVCachePlan, layer_idx: usize, n_layers: usize) {
+    // In-memory capture (IMP-1) is independent of the env-gated file dump below.
+    capture_if_armed(cache, plan, layer_idx);
+
     let Some(path) = dump_path() else {
         return; // disabled: byte-identical eviction path.
     };
@@ -161,5 +242,53 @@ mod tests {
             serde_json::to_string(&build_json(&st)).unwrap(),
             serde_json::to_string(&v).unwrap()
         );
+    }
+
+    /// In-memory capture is gated on `arm_capture`: armed → `record` pushes the
+    /// keep-set (LayerWide replicated per head); disarmed → nothing captured.
+    /// Filters by a unique fingerprint so it tolerates any concurrent eviction in
+    /// other tests writing to the shared capture buffer.
+    #[test]
+    fn in_memory_capture_is_arm_gated() {
+        use crate::backend::cpu::CpuBackend;
+        use crate::buffer::DType;
+        use crate::memory::host::shared::SharedBuffer;
+        use crate::shape::Shape;
+        use crate::tensor::Tensor;
+        use std::sync::Arc;
+
+        let mk = |dims: Vec<usize>| {
+            let n: usize = dims.iter().product();
+            let buf = Arc::new(SharedBuffer::new(n * 4, DType::F32));
+            Tensor::new(Shape::new(dims), buf, Arc::new(CpuBackend::new()))
+        };
+        let mut cache = KVCache::new(mk(vec![1, 8, 2, 4]), mk(vec![1, 8, 2, 4]), 8);
+        cache.current_pos = 7; // unique fingerprint seq_len
+        let plan = KVCachePlan {
+            keep: KeepSpec::LayerWide(vec![0, 1, 6]),
+            merges: vec![],
+            channels: None,
+        };
+        let mine =
+            |c: &CapturedKeepSet| c.seq_len == 7 && c.keep == vec![vec![0, 1, 6], vec![0, 1, 6]];
+
+        // Disarmed: record captures nothing of ours.
+        disarm_capture();
+        record(&cache, &plan, 0, 2);
+        assert_eq!(drain_capture().iter().filter(|c| mine(c)).count(), 0);
+
+        // Armed: record captures the (replicated) keep-set per layer.
+        arm_capture();
+        record(&cache, &plan, 0, 2);
+        record(&cache, &plan, 1, 2);
+        let captured = drain_capture();
+        let ours: Vec<_> = captured.into_iter().filter(mine).collect();
+        assert_eq!(ours.len(), 2, "one capture per layer while armed");
+        assert_eq!(ours[0].n_kv_heads, 2);
+        assert_eq!(ours[0].keep, vec![vec![0, 1, 6], vec![0, 1, 6]]);
+
+        // drain disarmed: a further record is not captured.
+        record(&cache, &plan, 0, 2);
+        assert_eq!(drain_capture().iter().filter(|c| mine(c)).count(), 0);
     }
 }

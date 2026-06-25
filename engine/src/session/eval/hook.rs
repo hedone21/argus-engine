@@ -63,4 +63,12 @@ pub trait StepHook<C> {
 
     /// Cache-specific top-level config JSON fields.
     fn extra_config_fields(&self) -> serde_json::Value;
+
+    /// Take the most recent `evict_importance` (IMP-1) dump snapshot captured during
+    /// `post_prefill`, if any. Default `None` (only `EvictionHook` with the dump
+    /// enabled produces one). The eval loop drains it after `post_prefill`, adds the
+    /// per-question metadata, and writes the record.
+    fn take_evict_importance_dump(&mut self) -> Option<super::dump::EvictImportanceSnapshot> {
+        None
+    }
 }
