@@ -14,6 +14,16 @@
 //! reported as not-yet-wired ([`FormatApplyError::UniformReencodeNotWired`]); the per-layer
 //! re-allocation/re-encode execution (L1) is deferred. The signature takes `&KVCache` because the
 //! in-scope behavior only inspects + rejects/no-ops; the L1 mutating path will promote it to `&mut`.
+//!
+//! DORMANCY (verified — do not mistake this for a live runtime guarantee): `apply_format_plan` has
+//! **no production caller** today; it is exercised only by the unit tests below. The format-honesty
+//! that production actually relies on is the *construction-time* twin
+//! [`per_layer_storage_from_policy`](crate::session::bin_setup::per_layer_storage_from_policy)
+//! (bin_setup.rs:565, rejecting override-bearing plans at ~:586 *before* allocation). This module is the
+//! *runtime* (post-allocation) re-encode executor — kept rather than deleted so the L1-deferred shape
+//! stays documented and the format axis retains a structural twin of the eviction executor
+//! `execute_kv_plan` (kv::eviction::stage_registry). Until it is wired to a production caller, its
+//! honesty arms are a *dormant* contract, not a runtime guarantee.
 
 use crate::buffer::DType;
 use crate::kv::kv_cache::KVCache;
@@ -195,6 +205,28 @@ mod tests {
                 side: MergeAxis::Both,
             }],
         };
+        assert_eq!(
+            apply_format_plan(&c, &plan, 0, 1),
+            Err(FormatApplyError::UniformReencodeNotWired)
+        );
+    }
+
+    /// Dormancy pin: a BARE per-layer base swap (no overrides, base != current stored format) is the
+    /// canonical L1 re-encode request. The dormant executor must HONESTLY report it as not-yet-wired
+    /// — never silently return `Ok(())` (a no-op that would falsely claim the swap happened). This is
+    /// a DISTINCT code path from `apply_format_plan_uniform_reencode_not_wired` (which routes through a
+    /// whole-layer override): here `overrides` is empty, so Gate-0 is the only `Ok` gate and it does
+    /// NOT fire (base `q4_0` != current `f16`), the override loop is skipped, and control falls through
+    /// to the `UniformReencodeNotWired` tail. Non-tautological: flipping Gate-0 to ignore the base
+    /// mismatch (a plausible future "optimization") would make this return `Ok`, and this test fails.
+    #[test]
+    fn apply_format_plan_bare_base_change_reports_not_wired_not_silent_noop() {
+        let c = cache_f16(8); // current stored format = f16
+        let plan = KVFormatPlan {
+            base: FormatId("q4_0".into()), // != current f16 → Gate-0 does not fire
+            overrides: vec![],             // no overrides → override loop is skipped entirely
+        };
+        // Must be the honest not-wired report, NOT a silent Ok(()) no-op.
         assert_eq!(
             apply_format_plan(&c, &plan, 0, 1),
             Err(FormatApplyError::UniformReencodeNotWired)
