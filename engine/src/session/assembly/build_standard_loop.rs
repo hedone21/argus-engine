@@ -356,6 +356,11 @@ pub fn build_standard_loop(
     if let Some(adapter) = resilience {
         builder = builder.with_resilience(adapter);
     }
+    // L1-runtime: when a FormatReencodeStage is armed, the driver invalidates the forward's fused GPU
+    // plan after PrefillEnd (a per-layer dtype flip is invisible to the capacity-keyed plan guard).
+    if arm_format_reencode {
+        builder = builder.with_kv_reencode_invalidation();
+    }
     // β-4/eviction: 공유 registry + dispatcher(resilience-on) + pos-환류 handle + KV-fill pressure
     // 배선. needs_registry 일 때만 진입 — 순수 happy-path 는 미배선(기존과 byte-identical).
     if let Some(registry) = registry {
