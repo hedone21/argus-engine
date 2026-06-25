@@ -4,8 +4,8 @@ use ocl::core::Mem;
 use ocl::{Buffer as OclBuffer, Queue, flags};
 use std::any::Any;
 use std::ptr;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// UnifiedBuffer: CPU-GPU Zero-Copy Shared Memory
 ///
@@ -37,6 +37,11 @@ pub struct UnifiedBuffer {
     size: usize,
     dtype: DType,
     is_mapped: AtomicBool,
+    /// Per-`OpenCLMemory` accounting handle (telemetry only). See
+    /// `OpenCLBuffer::mem_accounting` — `size` is added at attach and
+    /// subtracted in `Drop`. `None` for buffers built outside `OpenCLMemory`
+    /// (e.g. `transformer.rs`), which were never counted.
+    mem_accounting: Option<Arc<AtomicUsize>>,
 }
 
 // SAFETY: OpenCL buffer handles are thread-safe.
@@ -65,7 +70,15 @@ impl UnifiedBuffer {
             size,
             dtype,
             is_mapped: AtomicBool::new(false), // Starts unmapped
+            mem_accounting: None,
         })
+    }
+
+    /// Attach a per-`OpenCLMemory` accounting counter: adds `size` now and
+    /// subtracts it once on `Drop`. Called at most once by `OpenCLMemory`.
+    pub(crate) fn attach_mem_accounting(&mut self, counter: Arc<AtomicUsize>) {
+        counter.fetch_add(self.size, Ordering::Relaxed);
+        self.mem_accounting = Some(counter);
     }
 
     /// Map the buffer for CPU access using high-level API.
@@ -211,6 +224,9 @@ impl Drop for UnifiedBuffer {
     fn drop(&mut self) {
         // Sync to ensure any operations are complete
         let _ = self.queue.finish();
+        if let Some(counter) = &self.mem_accounting {
+            counter.fetch_sub(self.size, Ordering::Relaxed);
+        }
     }
 }
 

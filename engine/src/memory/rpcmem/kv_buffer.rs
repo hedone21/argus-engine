@@ -30,6 +30,7 @@ use crate::memory::rpcmem::allocator::RpcmemAllocator;
 use anyhow::Result;
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// rpcmem + OpenCL `CL_MEM_USE_HOST_PTR` dual-backed KV cache buffer.
 ///
@@ -62,6 +63,13 @@ pub struct RpcmemKvBuffer {
 
     size: usize,
     dtype: DType,
+
+    /// Per-`OpenCLMemory` accounting handle (telemetry only). Declared last so
+    /// it does not disturb the documented `cl_mem_obj → _allocator → host_ptr`
+    /// drop order above — an `Arc<AtomicUsize>` drop only decrements a refcount
+    /// and never touches the rpcmem region. `size` is added at attach and
+    /// subtracted in `Drop`.
+    mem_accounting: Option<Arc<AtomicUsize>>,
 }
 
 // SAFETY: production OpenCL queue 는 단일 스레드 접근 보장. rpcmem heap 은
@@ -92,7 +100,16 @@ impl RpcmemKvBuffer {
             fd,
             size,
             dtype,
+            mem_accounting: None,
         }
+    }
+
+    /// Attach a per-`OpenCLMemory` accounting counter: adds `size` now and
+    /// subtracts it once on `Drop`. Called at most once by
+    /// `OpenCLMemory::alloc_kv` (rpcmem path).
+    pub(crate) fn attach_mem_accounting(&mut self, counter: Arc<AtomicUsize>) {
+        counter.fetch_add(self.size, Ordering::Relaxed);
+        self.mem_accounting = Some(counter);
     }
 }
 
@@ -103,6 +120,9 @@ impl Drop for RpcmemKvBuffer {
         // so no live OpenCL alias remains on the rpcmem region.
         if !self.host_ptr.is_null() {
             unsafe { self._allocator.free(self.host_ptr) };
+        }
+        if let Some(counter) = &self.mem_accounting {
+            counter.fetch_sub(self.size, Ordering::Relaxed);
         }
     }
 }
