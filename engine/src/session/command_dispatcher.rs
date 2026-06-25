@@ -19,6 +19,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use argus_extension_api::FormatId;
 use argus_shared::{EngineCapability, EngineCommand, EngineMessage, QcfEstimate, WeightSwapReport};
 
 use crate::hardware::Hardware;
@@ -28,10 +29,12 @@ use crate::kv::quant_window_format::QuantWindowFormat;
 use crate::kv::standard_format::StandardFormat;
 use crate::models::transformer::TransformerModel;
 use crate::models::weights::LayerSlot;
+use crate::pipeline::LifecyclePhase;
 use crate::qcf_collector::ImportanceLookup;
 use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::swap_runtime::EngineSwapRuntime;
 use crate::stages::kv::eviction::EvictionStage;
+use crate::stages::kv::format_reencode::{FixedFormatPolicy, FormatReencodeStage};
 use crate::stages::kv::offload::OffloadStage;
 use crate::stages::kv::quant_window_stage::QuantWindowBitTransitionStage;
 use crate::stages::weight::partition::PartitionStage;
@@ -169,6 +172,11 @@ pub struct CommandDispatcher {
     /// 복사 금지). RestoreDefaults 시 `None` 으로 reset(재무장) — **16bit 복원 transition 없음**
     /// (v1 등가, partition `submit_partition_full` 과 비대칭).
     last_quant_bits: Option<u8>,
+    /// W-FORMAT-HET L1-runtime: format-reencode sticky last-applied 게이트. 같은 format 의 재submit 을
+    /// 막고(Gate-0 no-op 이기도 하나 loop 진입 차단 = 비용 절감), 값 변경 시 재적용한다(`last_quant_bits`
+    /// 와 동형 — 값이 곧 상태). RestoreDefaults 시 `None` 으로 reset(재무장) — 복원 transition 없음
+    /// (quant 와 동형: 외부가 명시적으로 다른 format 을 보내야 복원).
+    last_reencode_format: Option<String>,
     /// AB-3 §5.10.3: offload 가 한 번이라도 적용됐는가 상태. KvOffload directive 도착 시 true,
     /// RestoreDefaults recall 완료 후(submit_offload_recall) false. RestoreDefaults 시 recall
     /// submit 여부의 게이트 — offload 미적용이면 불필요 disk 접근 0.
@@ -218,6 +226,7 @@ impl CommandDispatcher {
             evict_armed: false,
             last_partition_ratio: None,
             last_quant_bits: None,
+            last_reencode_format: None,
             offload_armed: false,
         }
     }
@@ -303,6 +312,9 @@ impl CommandDispatcher {
                 // 재적용). **16bit 복원 transition submit 없음** (v1 등가 — partition
                 // `submit_partition_full` 과 비대칭).
                 self.last_quant_bits = None;
+                // W-FORMAT-HET L1-runtime: format-reencode guard clear (재무장 — 다음
+                // KvReencodeFormat 이 어떤 format 이든 재적용). quant 와 동형으로 복원 transition 없음.
+                self.last_reencode_format = None;
                 // 상태 C 재무장: 다음 KvEvict* directive 가 새 OneShot submit 가능 (2부).
                 self.evict_armed = false;
                 // AB-4 §5.5.2: partition 을 GPU-only(Full)로 복원 + last reset(재무장). v1
@@ -329,6 +341,10 @@ impl CommandDispatcher {
             // ── ① quant → OneShot QuantWindowBitTransitionStage submit (AB-2 §5.7.3) ──
             EngineCommand::KvQuantDynamic { target_bits } => {
                 self.submit_kv_quant(*target_bits);
+            }
+            // ── ① reencode → OneShot KvMutate FormatReencodeStage submit (W-FORMAT-HET L1-runtime) ──
+            EngineCommand::KvReencodeFormat { format } => {
+                self.submit_format_reencode(format);
             }
             // ── ① partition → OneShot PartitionStage submit (AB-4 §5.5.2) ──
             EngineCommand::SetPartitionRatio { ratio } => {
@@ -402,6 +418,27 @@ impl CommandDispatcher {
         self.last_quant_bits = Some(target_bits);
         let stage =
             QuantWindowBitTransitionStage::one_shot(self.quant_window_handles.clone(), target_bits);
+        self.registry.submit(Arc::new(stage));
+    }
+
+    /// ① KvReencodeFormat directive 1건을 OneShot `FormatReencodeStage`(KvMutate phase)로 submit
+    /// (W-FORMAT-HET L1-runtime). `submit_kv_quant` 와 동형이나 대상이 다르다 — quant 가 quant-window
+    /// 캐시의 bit-width 를 바꾼다면, 이쪽은 `StandardFormat` per-layer 재인코딩(resident KV 의 in-place
+    /// 정밀도 다운그레이드)을 구동한다. `kv_handles`(StandardFormat) 가 비면 미구성(quant-window/offload
+    /// 경로) — directive 무시. sticky last-applied 게이트: 같은 format 이면 재submit 0(Gate-0 no-op
+    /// 진입 자체 차단), 값 변경 시 재적용. 호스트 typed-floor 레이어만 실재인코딩되고 device/opaque
+    /// 레이어는 stage 가 skip 한다(GPU 재인코딩 전까지 on-device no-op).
+    fn submit_format_reencode(&mut self, format: &str) {
+        if self.last_reencode_format.as_deref() == Some(format) {
+            return; // 값 무변경 → 재submit 0 (sticky — last_quant_bits 동형).
+        }
+        if self.kv_handles.is_empty() {
+            return; // 미구성 (StandardFormat handle 부재 — quant-window/offload 경로).
+        }
+        self.last_reencode_format = Some(format.to_string());
+        let policy = Box::new(FixedFormatPolicy::new(FormatId(format.to_string())));
+        let stage =
+            FormatReencodeStage::new_at(LifecyclePhase::KvMutate, self.kv_handles.clone(), policy);
         self.registry.submit(Arc::new(stage));
     }
 
@@ -1068,6 +1105,112 @@ mod tests {
             registry.len(),
             3,
             "RestoreDefaults 후 재무장 → 어떤 bits 든 재적용"
+        );
+    }
+
+    // ── W-FORMAT-HET L1-runtime: format-reencode OneShot submit + sticky last-applied 게이트 ──
+
+    /// reencode 미구성(빈 kv_handles) dispatcher 는 KvReencodeFormat 을 무시 (StandardFormat handle
+    /// 부재 — quant-window/offload 경로). panic 없이 inert.
+    #[test]
+    fn reencode_unconfigured_ignores_directive() {
+        let registry = Arc::new(PipelineRegistry::new());
+        let mut d = CommandDispatcher::new(
+            Arc::clone(&registry),
+            Vec::new(), // 빈 kv_handles → StandardFormat handle 부재
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        d.dispatch(vec![EngineCommand::KvReencodeFormat {
+            format: "q4_0".to_string(),
+        }]);
+        assert_eq!(
+            registry.len(),
+            0,
+            "reencode 미구성(빈 kv_handles) → directive 무시"
+        );
+    }
+
+    /// 새 format → OneShot FormatReencodeStage 1개 submit. 같은 format 반복/빈 batch → 재submit 0,
+    /// 값 변경 → 재submit (quant `last_quant_bits` 게이트 동형). RestoreDefaults 후 재무장 (복원
+    /// transition submit 없음 — quant 와 동형).
+    #[test]
+    fn reencode_sticky_resubmits_on_value_change() {
+        let (mut d, registry, _h) = make_dispatcher(); // kv_handles=[handle]
+        assert_eq!(registry.len(), 0);
+        d.dispatch(vec![EngineCommand::KvReencodeFormat {
+            format: "q4_0".to_string(),
+        }]);
+        assert_eq!(
+            registry.len(),
+            1,
+            "첫 reencode directive → OneShot 1개 submit"
+        );
+        d.dispatch(vec![EngineCommand::KvReencodeFormat {
+            format: "q4_0".to_string(),
+        }]);
+        assert_eq!(registry.len(), 1, "같은 format 반복 — 재submit 없음");
+        d.dispatch(vec![]);
+        assert_eq!(registry.len(), 1, "빈 batch — 재submit 없음");
+        d.dispatch(vec![EngineCommand::KvReencodeFormat {
+            format: "f16".to_string(),
+        }]);
+        assert_eq!(registry.len(), 2, "format 변경 → 새 OneShot submit");
+        d.dispatch(vec![EngineCommand::RestoreDefaults]);
+        assert_eq!(
+            registry.len(),
+            2,
+            "RestoreDefaults → 복원 transition submit 없음 (quant 동형)"
+        );
+        d.dispatch(vec![EngineCommand::KvReencodeFormat {
+            format: "f16".to_string(),
+        }]);
+        assert_eq!(
+            registry.len(),
+            3,
+            "RestoreDefaults 후 재무장 → 어떤 format 이든 재적용"
+        );
+    }
+
+    /// 진짜 end-to-end: KvReencodeFormat dispatch → registry 가 KvMutate 를 발화 → handle 이 실제로
+    /// 재인코딩된다. submission(`registry.len()`)만 보는 sticky 테스트와 달리 **phase 까지** 검증한다
+    /// — `submit_format_reencode` 가 잘못된 phase 를 넘기면 KvMutate 에서 발화하지 않아 FAIL 한다.
+    #[test]
+    fn reencode_command_reencodes_handle_at_kvmutate() {
+        use crate::observability::profile::OpProfiler;
+        use crate::pipeline::{PipelineDispatcher, Pressure, StageContext, StepInfo};
+
+        let (mut d, registry, handle) = make_dispatcher(); // kv_handles=[F32 handle, current_pos=120]
+        d.dispatch(vec![EngineCommand::KvReencodeFormat {
+            format: "q4_0".to_string(),
+        }]);
+        assert_eq!(registry.len(), 1, "command → OneShot submit");
+
+        // registry 를 KvMutate 로 발화 — submit 된 stage 가 이 phase 에서 재인코딩한다.
+        let mut profiler = OpProfiler::new();
+        let mut ctx = StageContext {
+            step: StepInfo {
+                pos: 0,
+                decode_step: 0,
+                pressure: Pressure::new(0),
+                prev_token: 0,
+            },
+            profiler: &mut profiler,
+        };
+        registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
+
+        assert_eq!(
+            handle.take_inner().kv_dtype(),
+            DType::Q4_0,
+            "command path: F32 handle 이 KvMutate 발화로 q4_0 재인코딩됨"
         );
     }
 

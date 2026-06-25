@@ -348,6 +348,18 @@ impl DecodeLoop {
                 break;
             }
             self.invalidate_plan_on_kv_shrink();
+            // W-FORMAT-HET L1-runtime: a command-driven FormatReencodeStage can fire at THIS KvMutate
+            // (CommandDispatcher::submit_format_reencode → KvReencodeFormat) and flip a layer's dtype at
+            // unchanged capacity — which `invalidate_plan_on_kv_shrink` (capacity-keyed) misses, so a
+            // fused F16 plan could read re-encoded bytes. No `on_kv_reencode()` is wired here YET, and
+            // that is SAFE for the current slice: the host re-encoder only touches host-resident
+            // SharedBuffers (`is_gpu_buffer()==false`), and the CPU backend builds no fused plan; every
+            // buffer a fused GPU plan reads (UnifiedBuffer/Rpcmem/host_ptr_pool/opencl_alias) returns
+            // `is_gpu_buffer()==true`, so FormatReencodeStage's host_reencodable filter SKIPS it (the
+            // re-encode is a genuine no-op there). "re-encode happened" and "a fused plan reads it" are
+            // thus mutually exclusive. ⚠ When GPU re-encode lands (host_reencodable widened to device
+            // layers), call `self.forward.on_kv_reencode()` here — gated on an actually-fired re-encode,
+            // never unconditionally (it drops the fused plan → per-step rebuild).
 
             // WeightMutate: KvMutate 직후, forward 직전 (§5.2.1 (나)). pressure band-driven
             // Persistent EvictionStage 등 eviction 후속 발화 슬롯. dispatch 후 pos-환류로 loop pos

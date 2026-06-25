@@ -6,12 +6,18 @@
 //! and the engine applies it with [`apply_format_plan`] (a re-encode), instead of an eviction
 //! keep-set. This is the first **production caller** of `apply_format_plan` (until now dormant).
 //!
-//! Fires once at [`LifecyclePhase::PrefillEnd`]: after the prompt is prefilled, each layer's KV may be
-//! re-encoded to the policy's assigned format (the canonical L1-runtime use: downgrade the prefilled
-//! KV to a cheaper precision before decode). A policy returning `None` (no change), or a Gate-0 plan
-//! (`base` == the layer's current stored format), is a no-op — so when the caches were already
-//! allocated in the policy's per-layer format at construction time
-//! (`per_layer_storage_from_policy`), this re-encode pass is a byte-identical no-op.
+//! Fires once at a configurable [`LifecyclePhase`] (default [`LifecyclePhase::PrefillEnd`] via
+//! [`FormatReencodeStage::new`]): after the prompt is prefilled, each layer's KV may be re-encoded to
+//! the policy's assigned format (the canonical L1-runtime use: downgrade the prefilled KV to a cheaper
+//! precision before decode). A policy returning `None` (no change), or a Gate-0 plan (`base` == the
+//! layer's current stored format), is a no-op — so when the caches were already allocated in the
+//! policy's per-layer format at construction time (`per_layer_storage_from_policy`), this re-encode
+//! pass is a byte-identical no-op.
+//!
+//! The command-driven path ([`CommandDispatcher::submit_format_reencode`](crate::session::command_dispatcher))
+//! reuses this stage at [`LifecyclePhase::KvMutate`] via [`FormatReencodeStage::new_at`] with a
+//! [`FixedFormatPolicy`] carrying the command's target format — a mid-session external precision
+//! downgrade of the resident `StandardFormat` KV.
 //!
 //! GPU note: `PrefillEnd` precedes the first decode step, and the fused decode plan is built lazily on
 //! that first step (`decode_loop.rs` — "첫 decode plan 은 lazy"). So a re-encode here is observed by
@@ -21,7 +27,7 @@
 
 use std::sync::Arc;
 
-use argus_extension_api::KVFormatPolicy;
+use argus_extension_api::{FormatId, KVFormatPlan, KVFormatPolicy, StageCtx};
 
 use crate::buffer::DType;
 use crate::kv::eviction::stage_registry::KVStageCtx;
@@ -36,14 +42,61 @@ pub struct FormatReencodeStage {
     /// register-time handles — enumerate order == layer idx (same W1 invariant as `EvictionStage` /
     /// `PrefillKeepSetStage`).
     handles: Vec<Arc<StandardFormat>>,
-    /// per-layer format-assignment producer (`--kv-format <policy>` resolved via `find_format_policy`).
+    /// per-layer format-assignment producer (`--kv-format <policy>` resolved via `find_format_policy`,
+    /// or a [`FixedFormatPolicy`] for the command-driven path).
     policy: Box<dyn KVFormatPolicy>,
+    /// the lifecycle phase this stage fires on. `PrefillEnd` for the construction-time policy path;
+    /// `KvMutate` for the mid-session command-driven path.
+    phase: LifecyclePhase,
 }
 
 impl FormatReencodeStage {
-    /// `handles` enumerate order must equal layer idx. `policy` is the resolved format policy.
+    /// `handles` enumerate order must equal layer idx. `policy` is the resolved format policy. Fires
+    /// at [`LifecyclePhase::PrefillEnd`] (the `--kv-format <policy>` prefill-downgrade path).
     pub fn new(handles: Vec<Arc<StandardFormat>>, policy: Box<dyn KVFormatPolicy>) -> Self {
-        Self { handles, policy }
+        Self::new_at(LifecyclePhase::PrefillEnd, handles, policy)
+    }
+
+    /// As [`Self::new`] but fires at an explicit `phase` — the command-driven re-encode uses
+    /// [`LifecyclePhase::KvMutate`] (the decode-time KV-mutation phase, shared with eviction).
+    pub fn new_at(
+        phase: LifecyclePhase,
+        handles: Vec<Arc<StandardFormat>>,
+        policy: Box<dyn KVFormatPolicy>,
+    ) -> Self {
+        Self {
+            handles,
+            policy,
+            phase,
+        }
+    }
+}
+
+/// A trivial [`KVFormatPolicy`] that assigns one fixed base format to every layer (no overrides) —
+/// the command-driven adapter. `EngineCommand::KvReencodeFormat { format }` carries the decision
+/// itself (the external control plane is the producer), so the engine wraps that target in this
+/// policy and feeds [`FormatReencodeStage`]. Gate-0 (already-in-format) and host-non-re-encodable
+/// layers are filtered downstream exactly as for the registered policies.
+pub(crate) struct FixedFormatPolicy {
+    target: FormatId,
+}
+
+impl FixedFormatPolicy {
+    pub(crate) fn new(target: FormatId) -> Self {
+        Self { target }
+    }
+}
+
+impl KVFormatPolicy for FixedFormatPolicy {
+    fn name(&self) -> &str {
+        "command.fixed_format"
+    }
+
+    fn assign(&self, _ctx: &dyn StageCtx) -> Option<KVFormatPlan> {
+        Some(KVFormatPlan {
+            base: self.target.clone(),
+            overrides: Vec::new(),
+        })
     }
 }
 
@@ -61,8 +114,8 @@ impl PipelineStage for FormatReencodeStage {
         phase: &LifecyclePhase,
         _ctx: &mut StageContext<'_>,
     ) -> anyhow::Result<StageOutcome> {
-        // self-filter: only PrefillEnd.
-        if *phase != LifecyclePhase::PrefillEnd {
+        // self-filter: only the configured phase (PrefillEnd by default; KvMutate for the command path).
+        if *phase != self.phase {
             return Ok(StageOutcome::Continue);
         }
 
@@ -251,6 +304,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn command_fixed_policy_reencodes_at_kvmutate() {
+        // The command-driven config (CommandDispatcher::submit_format_reencode): a FixedFormatPolicy
+        // carrying the command's target format, fired at KvMutate (decode-time) instead of PrefillEnd.
+        // It must no-op at PrefillEnd (off its configured phase) and re-encode at KvMutate. on_phase
+        // takes &self and the self-filter precedes take_inner, so the off-phase call does not consume
+        // the handle.
+        let (cache, _, _) = make_f16_cache(8);
+        let handle = Arc::new(StandardFormat::new(0, cache));
+        let stage = FormatReencodeStage::new_at(
+            LifecyclePhase::KvMutate,
+            vec![handle.clone()],
+            Box::new(FixedFormatPolicy::new(FormatId("q4_0".into()))),
+        );
+        let mut profiler = OpProfiler::new();
+        let mut ctx = make_ctx(&mut profiler);
+        // off the configured phase (PrefillEnd) → Continue, no re-encode.
+        assert!(matches!(
+            stage
+                .on_phase(&LifecyclePhase::PrefillEnd, &mut ctx)
+                .unwrap(),
+            StageOutcome::Continue
+        ));
+        // at KvMutate → re-encode fires.
+        assert!(matches!(
+            stage.on_phase(&LifecyclePhase::KvMutate, &mut ctx).unwrap(),
+            StageOutcome::Consumed
+        ));
+        assert_eq!(
+            handle.take_inner().kv_dtype(),
+            DType::Q4_0,
+            "command path (FixedFormatPolicy @ KvMutate) re-encoded to q4_0"
+        );
     }
 
     #[test]
