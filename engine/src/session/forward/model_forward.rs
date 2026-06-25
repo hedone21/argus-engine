@@ -455,6 +455,27 @@ impl ModelForward {
     }
 }
 
+/// The fused-decode-plan invalidation a KV re-encode requires (see
+/// [`ModelForward::on_kv_reencode`](#impl-Forward-for-ModelForward)). Extracted as a free fn so the
+/// reset logic is unit-testable without constructing a full `ModelForward`.
+///
+/// Why both fields, unconditionally: a dtype-only re-encode keeps capacity AND occupancy, so the
+/// capacity-keyed runtime guard (`plan.rs` `g.capacity != self.kv_capacity`) and `on_kv_prune`
+/// (occupancy-shrink only) both MISS it — `PlanGeometry` carries no dtype. Dropping `gpu_plan` forces
+/// a rebuild, and clearing the set-once F16 `sticky_disabled` lock makes that rebuild re-run the
+/// per-layer `kv_dtype() == F16` check, routing a now-non-F16 layer to the dyn forward fallback.
+/// Clearing only `gpu_plan` would re-take a stale plan; clearing only sticky would short-circuit the
+/// rebuild — both are required.
+///
+/// Generic over the plan payload `T` (the call site infers `T = FullKernelPlan`) so a host test can
+/// exercise the `*gpu_plan = None` drop with a host-constructible sentinel (`Some(())`) instead of a
+/// `FullKernelPlan`, which needs a GPU to build.
+#[cfg(feature = "opencl")]
+fn invalidate_plan_for_reencode<T>(gpu_plan: &mut Option<T>, sticky_disabled: &mut bool) {
+    *gpu_plan = None;
+    *sticky_disabled = false;
+}
+
 impl Forward for ModelForward {
     fn prefill(&mut self, tokens: &[u32], start_pos: usize) -> Result<Vec<f32>> {
         if tokens.is_empty() {
@@ -701,6 +722,16 @@ impl Forward for ModelForward {
         #[cfg(feature = "opencl")]
         {
             self.gpu_plan = None;
+        }
+    }
+
+    fn on_kv_reencode(&mut self) {
+        // A format stage re-encoded a layer's KV (dtype flip at unchanged capacity/occupancy). The
+        // fused decode plan keys only on capacity, so it cannot see this on its own → invalidate it
+        // and clear the set-once F16 sticky lock unconditionally. CPU(host) has no plan → no-op.
+        #[cfg(feature = "opencl")]
+        {
+            invalidate_plan_for_reencode(&mut self.gpu_plan, &mut self.sticky_disabled);
         }
     }
 
@@ -1015,6 +1046,25 @@ mod tests {
     fn wrap_empty_returns_none() {
         let result = wrap_kv_caches(vec![]);
         assert!(result.is_none());
+    }
+
+    /// GPU-guard (state-inspection, no device): a KV re-encode must invalidate the fused decode plan
+    /// AND clear the set-once F16 sticky lock. This pins the reset logic `on_kv_reencode` applies.
+    /// Mutation-proof: dropping the `sticky_disabled = false` line leaves it `true` → fail.
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn invalidate_plan_for_reencode_drops_plan_and_clears_sticky() {
+        // Seed a non-None sentinel so the `*gpu_plan = None` write carries mutation coverage (a
+        // FullKernelPlan needs a GPU to build; the fn is generic over the payload precisely so this
+        // host test can use `()`). Both writes are now mutation-proof: dropping either fails an assert.
+        let mut plan: Option<()> = Some(());
+        let mut sticky = true; // simulate the set-once F16 lock-out from a prior non-F16 cache.
+        invalidate_plan_for_reencode(&mut plan, &mut sticky);
+        assert!(plan.is_none(), "cached decode plan dropped");
+        assert!(
+            !sticky,
+            "set-once F16 sticky lock cleared so the next build re-checks per-layer dtype"
+        );
     }
 
     /// KVCache 3개 wrap → handles[i].with_cache_mut current_pos == i+1, 순서 보존.

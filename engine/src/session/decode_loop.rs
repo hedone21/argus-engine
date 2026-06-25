@@ -111,6 +111,10 @@ pub struct DecodeLoop {
     decode_step: usize,
     prev_token: u32,
     kv_capacity: usize,
+    // A `FormatReencodeStage` is armed (PrefillEnd per-layer KV re-encode). After that phase the
+    // forward's fused GPU plan must be invalidated (a dtype flip is invisible to the capacity-keyed
+    // guard). `false`(happy/chat/eval/모든 기존 경로) → no invalidation call = 거동-0.
+    kv_reencode_armed: bool,
 }
 
 /// β-5: `PressureSource` query 주기 (N-step 캐시 N). 매 decode step 마다 `/proc/meminfo` 를
@@ -248,6 +252,14 @@ impl DecodeLoop {
         // 유지하므로 첫 decode 토큰의 start_pos 는 진짜 prompt_len 이어야 한다(invalidate_plan_on_kv_shrink
         // 닥 참조). kv_pos_handle==None(prune 없음/미무장)이면 거동-0.
         self.invalidate_plan_on_kv_shrink();
+        // L1-runtime: a FormatReencodeStage may have re-encoded layers at PrefillEnd (a dtype flip
+        // the capacity-keyed plan guard cannot see). Invalidate the fused plan + clear the F16 sticky
+        // lock so the first decode step's lazy build re-checks per-layer dtype. The plan is built
+        // lazily *after* this point, so today this is a defensive no-op; it is the correct guard for a
+        // post-plan-build (mid-decode) re-encode. Unarmed (every other path) → no call = 거동-0.
+        if self.kv_reencode_armed {
+            self.forward.on_kv_reencode();
+        }
         Ok(logits)
     }
 
@@ -568,6 +580,7 @@ pub struct DecodeLoopBuilder<F = NoForward> {
     kv_pos_handle: Option<Arc<dyn KVCacheFormat>>,
     pressure_source: Option<Arc<dyn PressureSource>>,
     kv_capacity: usize,
+    kv_reencode_armed: bool,
 }
 
 impl Default for DecodeLoopBuilder<NoForward> {
@@ -590,6 +603,7 @@ impl DecodeLoopBuilder<NoForward> {
             pressure_source: None,
             resilience_tick: None,
             kv_capacity: 0,
+            kv_reencode_armed: false,
         }
     }
 
@@ -614,6 +628,7 @@ impl DecodeLoopBuilder<NoForward> {
             pressure_source: self.pressure_source,
             resilience_tick: self.resilience_tick,
             kv_capacity: self.kv_capacity,
+            kv_reencode_armed: self.kv_reencode_armed,
         }
     }
 }
@@ -655,6 +670,14 @@ impl<F> DecodeLoopBuilder<F> {
     /// `Arc<dyn KVCacheFormat>` coercion). 미주입(None) 이면 환류 skip → 거동-0.
     pub fn with_kv_pos_handle(mut self, h: Arc<dyn KVCacheFormat>) -> Self {
         self.kv_pos_handle = Some(h);
+        self
+    }
+
+    /// Arm post-`PrefillEnd` GPU-plan invalidation for a `FormatReencodeStage` (L1-runtime per-layer
+    /// re-encode). `build_standard_loop` calls this iff a format-reencode stage was submitted. Unset
+    /// (every other path) → the driver makes no `on_kv_reencode` call = 거동-0.
+    pub fn with_kv_reencode_invalidation(mut self) -> Self {
+        self.kv_reencode_armed = true;
         self
     }
 
@@ -725,6 +748,7 @@ impl DecodeLoopBuilder<HasForward> {
             decode_step: 0,
             prev_token: 0,
             kv_capacity: self.kv_capacity,
+            kv_reencode_armed: self.kv_reencode_armed,
         }
     }
 }
@@ -753,6 +777,58 @@ mod tests {
             logits[target] = 1.0;
             Ok(logits)
         }
+    }
+
+    /// commit-3 wiring: `with_kv_reencode_invalidation()` makes the driver call
+    /// `forward.on_kv_reencode()` after PrefillEnd (so a `FormatReencodeStage`'s dtype flip
+    /// invalidates the fused GPU plan); the default leaves it unarmed (거동-0). Pins the live seam
+    /// without a GPU: a recording Forward counts the calls.
+    #[test]
+    fn kv_reencode_armed_invokes_forward_after_prefill() {
+        struct ReencodeRecorder {
+            vocab: usize,
+            calls: Arc<std::sync::Mutex<usize>>,
+        }
+        impl Forward for ReencodeRecorder {
+            fn prefill(&mut self, _t: &[u32], _s: usize) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0_f32; self.vocab])
+            }
+            fn step(&mut self, _c: &StepCtx, _t: u32) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0_f32; self.vocab])
+            }
+            fn on_kv_reencode(&mut self) {
+                *self.calls.lock().unwrap() += 1;
+            }
+        }
+
+        let armed_calls = Arc::new(std::sync::Mutex::new(0usize));
+        let mut armed = DecodeLoopBuilder::new()
+            .with_forward(ReencodeRecorder {
+                vocab: 8,
+                calls: armed_calls.clone(),
+            })
+            .with_kv_reencode_invalidation()
+            .build();
+        armed.prefill(&[1, 2, 3]).unwrap();
+        assert_eq!(
+            *armed_calls.lock().unwrap(),
+            1,
+            "armed → on_kv_reencode called once after PrefillEnd"
+        );
+
+        let unarmed_calls = Arc::new(std::sync::Mutex::new(0usize));
+        let mut unarmed = DecodeLoopBuilder::new()
+            .with_forward(ReencodeRecorder {
+                vocab: 8,
+                calls: unarmed_calls.clone(),
+            })
+            .build();
+        unarmed.prefill(&[1, 2, 3]).unwrap();
+        assert_eq!(
+            *unarmed_calls.lock().unwrap(),
+            0,
+            "unarmed (default) → no on_kv_reencode call (거동-0)"
+        );
     }
 
     #[test]

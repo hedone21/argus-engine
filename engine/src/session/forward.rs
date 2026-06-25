@@ -46,6 +46,11 @@ pub trait Forward {
     /// Notified after an eviction stage pruned KV state.
     fn on_kv_prune(&mut self, _new_pos: usize) {}
 
+    /// Notified after a format stage re-encoded KV state (a per-layer dtype change at unchanged
+    /// capacity/occupancy). Default no-op; `ModelForward` overrides it to invalidate the fused GPU
+    /// decode plan, which keys only on capacity and so cannot otherwise observe a dtype flip.
+    fn on_kv_reencode(&mut self) {}
+
     /// Phase 4-5-d: chat `/reset` 처리용. KV cache를 초기 상태로 reset한다.
     ///
     /// Default no-op — generate 모드는 호출하지 않는다. chat 모드의 각 Forward

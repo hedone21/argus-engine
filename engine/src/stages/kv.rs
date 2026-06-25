@@ -16,6 +16,7 @@
 //! 나머지 입주자(weighted-merge/Swap/TierMove)는 후속 substep 에서 채운다.
 
 pub mod eviction;
+pub mod format_reencode;
 pub mod offload;
 pub mod prefill_keepset;
 pub mod quant_window_stage;
