@@ -225,6 +225,7 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         cache_manager,
         args.eviction_target_ratio(),
         Some(Arc::clone(&stream_slot)),
+        args.kv_format.as_deref(),
     )?;
 
     // ── prefill / restore 분기 ────────────────────────────────────────────────

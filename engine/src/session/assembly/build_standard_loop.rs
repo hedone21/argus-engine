@@ -41,6 +41,7 @@ use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 use crate::stages::kv::eviction::EvictionStage;
+use crate::stages::kv::format_reencode::FormatReencodeStage;
 use crate::stages::kv::prefill_keepset::PrefillKeepSetStage;
 
 /// argus-cli score-free eviction 의 KV-fill high-water (점유율 percent). `pos >= 85% * max_seq_len`
@@ -124,6 +125,10 @@ pub fn build_standard_loop(
     // argus-cli per-token streaming subscriber. `Some(slot)` submits a DecodeEnd `ChatStreamStage`
     // (and forces a registry to exist); `None` = no streaming = byte-identical to before (bench/eval).
     stream_slot: Option<Arc<ChatStreamSlot>>,
+    // `--kv-format <name>`. When it resolves to a registered `KVFormatPolicy` (N-way mixed precision),
+    // a `PrefillEnd` `FormatReencodeStage` is armed; a single format name (f16/q4_0/...) or `None`
+    // arms nothing (byte-identical).
+    kv_format_policy: Option<&str>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고한다.
@@ -157,6 +162,12 @@ pub fn build_standard_loop(
     let prefill_attn_stage_name =
         crate::kv::eviction::stage_registry::find_prefill_attn_stage_name();
     let arm_prefill_keepset = prefill_attn_stage_name.is_some();
+    // L1-runtime format re-encode arming: only when `--kv-format` resolves to a registered
+    // `KVFormatPolicy` (a single format name → `find_format_policy` None → not armed → byte-identical).
+    let format_policy_name = kv_format_policy
+        .filter(|s| !s.is_empty())
+        .filter(|s| argus_extension_api::find_format_policy(s).is_some());
+    let arm_format_reencode = format_policy_name.is_some();
     let mut mf = ModelForward::new(
         backend,
         memory,
@@ -213,7 +224,8 @@ pub fn build_standard_loop(
     let needs_registry = resilience.is_some()
         || cache_manager.is_some()
         || stream_slot.is_some()
-        || arm_prefill_keepset;
+        || arm_prefill_keepset
+        || arm_format_reencode;
     let registry = needs_registry.then(|| Arc::new(PipelineRegistry::new()));
 
     // score-free eviction(sliding/streaming/`--load-plugin` stage): KV-fill 압력 구동 Persistent
@@ -306,6 +318,25 @@ pub fn build_standard_loop(
             pfa_cell.clone(),
             n_heads_q,
             eviction_target_ratio,
+        )));
+    }
+
+    // L1-runtime format re-encode consumer (PrefillEnd phase). Armed only when `--kv-format` resolved
+    // to a registered `KVFormatPolicy` above. Phase-disjoint from EvictionStage(KvMutate) →
+    // submit-order immaterial. The caches are usually pre-allocated in the policy's per-layer format
+    // (construction-time `per_layer_storage_from_policy`), so this runtime pass Gate-0 no-ops.
+    if arm_format_reencode
+        && let Some(registry) = registry.as_ref()
+        && let Some(name) = format_policy_name
+        && let Some(reg) = argus_extension_api::find_format_policy(name)
+    {
+        let policy = (reg.make)(argus_extension_api::StageParams::default());
+        eprintln!(
+            "[format-reencode] '{name}' active — per-layer KV re-encode applied at PrefillEnd"
+        );
+        registry.submit(Arc::new(FormatReencodeStage::new(
+            kv_handles.clone(),
+            policy,
         )));
     }
 
