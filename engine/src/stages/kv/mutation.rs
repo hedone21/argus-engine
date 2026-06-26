@@ -9,6 +9,10 @@
 //! Because every handle op routes to the SAME executor `execute_kv_plan` uses
 //! (`compact_keep_positions` / `apply_weighted_merges` / `apply_format_plan`), a keep applied through
 //! this driver is **byte-identical** to the same keep applied through the plan executor (the s1 gate).
+//! (Byte-identical refers to the cache BUFFERS: the handle path does NOT emit the `keepset_dump`
+//! observability side-channel that `execute_kv_plan` records under `ARGUS_DUMP_KEEPSET`. The
+//! production-wiring follow-up must re-add that record if a handle-driven eviction needs to appear in
+//! keepset dumps.)
 //!
 //! Read/mutate aliasing: a mutation stage reads its cache state through an owned-scalar
 //! [`ScalarStageCtx`] (current_pos / target_len / geometry, copied before the handle is built) and
@@ -204,6 +208,10 @@ impl PipelineStage for KVMutationDriverStage {
                 self.stage.on_phase(&sctx, &mut handle).map_err(|e| {
                     anyhow::anyhow!("mutation stage '{}' failed: {e}", self.stage.name())
                 })?;
+                // commit() returns `mutated` (whether bytes changed). The s1 driver discards it; the
+                // production-wiring follow-up must route it into coalesced plan invalidation (T-6,
+                // mirroring `FormatReencodeStage::reencode_fired`) — which is also why this driver is
+                // not yet pipeline-registered.
                 handle.commit()?;
             }
             Ok(())
