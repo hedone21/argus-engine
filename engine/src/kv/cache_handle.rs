@@ -69,7 +69,11 @@ pub struct EngineCacheHandle<'a> {
     compaction: Option<Compaction>,
     /// Staged re-encode target (position-preserving; last write wins, T-5).
     reencode: Option<FormatId>,
-    /// Whether `commit` mutated any bytes (the driver uses this for coalesced plan invalidation, T-6).
+    /// Whether `commit` mutated any bytes. Intended for the production driver's coalesced plan
+    /// invalidation (T-6) — a mid-decode KV mutation must invalidate the fused decode plan, mirroring
+    /// `FormatReencodeStage::reencode_fired`. NOTE: the s1 `KVMutationDriverStage` does NOT yet consult
+    /// it (it discards `commit`'s return); routing this into plan invalidation is part of the
+    /// production driver-wiring follow-up.
     mutated: bool,
 }
 
@@ -277,12 +281,28 @@ impl CacheHandle for EngineCacheHandle<'_> {
         if self.kv_on_device() {
             return Err(CacheOpError::NotOnHost);
         }
+        // Eager SOURCE-floor check: apply_format_plan's host re-encoder can only READ a typed-floor
+        // source. An opaque/codec-stored cache (e.g. a q2_0-descriptor U8 buffer) would otherwise stage
+        // Ok here and fail deep inside commit — surface it now as a CacheOpError at the call site so the
+        // documented eager-validation contract holds for opaque sources too.
+        if !matches!(
+            self.cache.kv_dtype(),
+            crate::buffer::DType::F32 | crate::buffer::DType::F16 | crate::buffer::DType::Q4_0
+        ) {
+            return Err(CacheOpError::UnsupportedFormat(
+                current_format_name(self.cache).to_string(),
+            ));
+        }
         if !matches!(target.0.as_str(), "f32" | "f16" | "q4_0") {
             return Err(CacheOpError::UnsupportedFormat(target.0));
         }
         // A re-encode to the cache's CURRENT stored format is a byte-identical no-op (apply_format_plan
-        // Gate-0); don't stage it, so commit's `mutated` flag does not falsely report a mutation.
+        // Gate-0). CLEAR any previously staged re-encode (last-write-wins, T-5): "re-encode back to the
+        // current format" is the caller's last word and must CANCEL an earlier staged target, not be
+        // silently overridden by it at commit. (Early-returning Ok without clearing would leave the
+        // earlier target staged, so commit would apply it — the bug this guards against.)
         if target.0 == current_format_name(self.cache) {
+            self.reencode = None;
             return Ok(());
         }
         // q4_0 tiles a head's `head_dim` values into QK4_0-sized blocks; a non-multiple head_dim
@@ -588,6 +608,18 @@ mod tests {
         );
         assert_eq!(h.commit().unwrap(), true);
         assert_eq!(c.current_pos(), 3);
+        // Pass2-TR3: verify WHICH positions survived (not just the count) — the survivors are the
+        // intersection's source positions [1,3,5], compacted to the front in order. A wrong-but-equal-
+        // cardinality intersect (e.g. [0,1,2]) would pass the count check but fail here.
+        for (new_pos, &src) in [1usize, 3, 5].iter().enumerate() {
+            for head in 0..N_KV {
+                let off = c.offset(new_pos, head);
+                let k = c.k_buffer.as_slice::<f32>();
+                for d in 0..HD {
+                    assert_eq!(k[off + d], (src * 100 + head * 10 + d) as f32);
+                }
+            }
+        }
 
         let mut c = cache_f32(8);
         let mut h = EngineCacheHandle::new(&mut c, 0, 1);
@@ -707,5 +739,52 @@ mod tests {
         assert_eq!(h.reencode(FormatId("f16".into())), Ok(()));
         assert_eq!(h.commit().unwrap(), true);
         assert_eq!(c.kv_dtype(), DType::F16);
+    }
+
+    /// Pass2-TX1: "re-encode to the CURRENT format" is the caller's LAST word — it must CANCEL an
+    /// earlier staged re-encode (last-write-wins, T-5), not be silently overridden by it at commit.
+    /// Mutation-proof: without the `self.reencode = None` on the no-op-to-current path, commit applies
+    /// the stale f16 and the cache ends F16 (failing the F32 assert).
+    #[test]
+    fn test_reencode_last_write_to_current_cancels_staged() {
+        let mut c = cache_f32(8);
+        let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+        // Stage a real f32 -> f16, then "reset" by re-encoding to the current (f32) format.
+        assert_eq!(h.reencode(FormatId("f16".into())), Ok(()));
+        assert_eq!(h.reencode(FormatId("f32".into())), Ok(())); // no-op-to-current: cancels the f16.
+        assert_eq!(h.commit().unwrap(), false); // nothing left staged -> no mutation.
+        assert_eq!(c.kv_dtype(), DType::F32); // stayed f32 (the last write), not f16.
+    }
+
+    /// Pass2-TX2: a re-encode of an OPAQUE (non-typed-floor, e.g. U8) source is eager-rejected at the
+    /// call site (UnsupportedFormat), not deferred to a commit-time failure — honoring the documented
+    /// eager-validation contract for opaque sources. Mutation-proof: dropping the source-floor check
+    /// lets it stage Ok, deferring the failure to commit.
+    #[test]
+    fn test_reencode_opaque_source_eager_rejected() {
+        // A minimal U8 (opaque-floor) host cache: the reject fires before any buffer op, so the cache
+        // only needs to report kv_dtype() == U8.
+        let backend = Arc::new(CpuBackend::new());
+        let bytes = N_KV * MAX_SEQ * HD; // 1 byte/elem for U8.
+        let shape = Shape::new(vec![1, MAX_SEQ, N_KV, HD]);
+        let mut c = KVCache::new(
+            Tensor::new(
+                shape.clone(),
+                Arc::new(SharedBuffer::new(bytes, DType::U8)),
+                backend.clone(),
+            ),
+            Tensor::new(
+                shape,
+                Arc::new(SharedBuffer::new(bytes, DType::U8)),
+                backend,
+            ),
+            MAX_SEQ,
+        );
+        c.set_current_pos(4);
+        let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+        assert!(matches!(
+            h.reencode(FormatId("f16".into())),
+            Err(CacheOpError::UnsupportedFormat(_))
+        ));
     }
 }
