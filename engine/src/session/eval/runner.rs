@@ -173,6 +173,16 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         eprintln!("{w}");
     }
 
+    // `--evict-timing prefill_end` only changes anything when an eviction actually
+    // fires, which (like the dump above) needs a KV budget. Warn rather than silently
+    // run today's batched full-prefill under a non-default flag.
+    if args.evict_timing().accumulates_context_scores() && !budget_mode {
+        eprintln!(
+            "[evict-timing] WARNING: --evict-timing prefill_end has no effect without a KV budget \
+             (--kv-budget / --kv-budget-ratio) → no eviction fires → prefill stays batched"
+        );
+    }
+
     // "caote" folds to Attn: the value-aware QcfMode variant was name-only residue and `mode` is
     // dead-stored in QcfConfig (never branched on). --qcf-mode caote still flips needs_caote in
     // eval_setup to build the accumulator (B1-2).
@@ -194,6 +204,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         qcf_mode: args.qcf_mode.clone(),
         vocab_size,
         hidden_size,
+        evict_timing: args.evict_timing(),
     };
 
     // For ratio mode, hook starts with budget=0; eval_loop updates it per-question.

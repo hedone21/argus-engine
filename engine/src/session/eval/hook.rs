@@ -58,6 +58,15 @@ pub trait StepHook<C> {
         false
     }
 
+    /// Whether this hook's eviction ranks tokens on accumulated attention scores
+    /// (vs. position). The loop pairs this with `--evict-timing prefill_end` to
+    /// decide whether prefill must run token-by-token to accumulate query-agnostic
+    /// context importance — a score-free (positional) policy needs no such pass.
+    /// Default `false`.
+    fn ranks_on_scores(&self) -> bool {
+        false
+    }
+
     /// Cache-specific per-question JSON fields (e.g., quant_q2_tokens).
     fn extra_question_fields(&self, caches: &[C]) -> serde_json::Value;
 
