@@ -646,6 +646,50 @@ pub trait KVMutationStage: Send + Sync {
     fn on_phase(&self, ctx: &dyn StageCtx, cache: &mut dyn CacheHandle) -> Result<(), CacheOpError>;
 }
 
+/// The canonical 3-partition keep-set shape (T1): `[0..prefix)` (protected) + the top-`heavy`
+/// scorers over `[prefix..recent_start)` (re-sorted ascending) + `[recent_start..current)` (recent
+/// window), where `recent_start = current.saturating_sub(recent).max(prefix)`.
+///
+/// This is the SINGLE shape the dominant score-based eviction class (H2O / StreamingLLM / sliding /
+/// H2O+ / SnapKV / PyramidKV / …) reduces to. A policy supplies only the budgets (and a per-position
+/// score function); [`compile_keep_top_k`] owns the recency window, the STABLE top-k selection, and
+/// the ascending re-sort — so the policy is "score → budgets", not "hand-roll a keep-list".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeepTopK {
+    /// Resident token count (the entry frame).
+    pub current: usize,
+    /// Protected prefix length (always kept; attention sinks / system prompt).
+    pub prefix: usize,
+    /// Recent-window token count (the trailing tokens always kept).
+    pub recent: usize,
+    /// Number of heavy hitters to keep from the middle `[prefix..recent_start)` by score.
+    pub heavy: usize,
+}
+
+/// Compile the [`KeepTopK`] shape into an ascending, prefix-inclusive keep-list. `score(pos)` is the
+/// per-position ranking key over the heavy-hitter range (use `|_| 0.0` for the score-free case, where
+/// `heavy` is typically 0). The top-k uses a STABLE descending sort (ties keep input/position order),
+/// matching the verbatim heavy-hitter selection the built-in eviction plugins ship — so routing a
+/// plugin's keep-list assembly through this is byte-identical.
+pub fn compile_keep_top_k(spec: KeepTopK, score: impl Fn(usize) -> f32) -> Vec<usize> {
+    let recent_start = spec.current.saturating_sub(spec.recent).max(spec.prefix);
+    // (pos, score) over the evictable middle, STABLE sort desc, take top-`heavy`, re-sort ascending.
+    let mut token_scores: Vec<(usize, f32)> = (spec.prefix..recent_start)
+        .map(|pos| (pos, score(pos)))
+        .collect();
+    token_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
+    let mut heavy: Vec<usize> = token_scores
+        .iter()
+        .take(spec.heavy)
+        .map(|(pos, _)| *pos)
+        .collect();
+    heavy.sort_unstable();
+    let mut keep: Vec<usize> = (0..spec.prefix).collect();
+    keep.extend_from_slice(&heavy);
+    keep.extend(recent_start..spec.current);
+    keep
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // GATE-C — Stage-axis `.so` cdylib dlopen plugin C-ABI
 // ════════════════════════════════════════════════════════════════════════════
@@ -3017,6 +3061,42 @@ pub fn registered_score_reducer_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (T1) `compile_keep_top_k` produces the 3-partition keep-list the built-in eviction plugins
+    /// hand-roll. Pins: prefix-inclusive, heavy hitters by STABLE desc score re-sorted ascending,
+    /// trailing recent window; the whole list is ascending. score-free (`heavy = 0`) degenerates to
+    /// prefix + recent.
+    #[test]
+    fn compile_keep_top_k_three_partition_shape() {
+        // current=20, prefix=4, recent=4 (recent_start = 16), heavy=4 over [4..16).
+        let mut scores = [0.0f32; 20];
+        scores[6] = 10.0;
+        scores[9] = 9.0;
+        scores[12] = 8.0;
+        scores[14] = 7.0;
+        let keep = compile_keep_top_k(
+            KeepTopK {
+                current: 20,
+                prefix: 4,
+                recent: 4,
+                heavy: 4,
+            },
+            |pos| scores[pos],
+        );
+        assert_eq!(keep, vec![0, 1, 2, 3, 6, 9, 12, 14, 16, 17, 18, 19]);
+
+        // score-free: heavy=0 => prefix + recent only.
+        let keep = compile_keep_top_k(
+            KeepTopK {
+                current: 20,
+                prefix: 4,
+                recent: 6,
+                heavy: 0,
+            },
+            |_| 0.0,
+        );
+        assert_eq!(keep, vec![0, 1, 2, 3, 14, 15, 16, 17, 18, 19]);
+    }
 
     /// (D3 proof) `KVFormatPlan` values are constructible and `format_of` resolves last-wins over
     /// layer/token/head/side, with the Gate-0 identity (empty overrides => base everywhere). This is
