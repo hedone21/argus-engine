@@ -93,6 +93,11 @@ no-eviction = { path = "../crates/techniques/no-eviction" }
 # R-KV (cosine redundancy + importance joint eviction) measurement KVCacheStage. Extracted from
 # the engine core; gated by the `rkv` feature, force-linked so `eviction rkv` resolves the plugin.
 rkv = { path = "../crates/techniques/rkv", optional = true }
+# PyramidKV (pyramidal per-layer budget + SnapKV per-head scoring KVCacheStage). Gated by the
+# `pyramidkv` feature, force-linked so its PrefillAttention caps arm the prefill-keepset producer
+# (build_standard_loop). Default OFF — registering it activates the PFA keep-set path, so it is a
+# build-time opt-in (the caote/rkv precedent). cr is taken from --eviction-target-ratio.
+pyramidkv = { path = "../crates/techniques/pyramidkv", optional = true }
 # H2O (Heavy-Hitter Oracle, score-based KVCacheStage). Extracted from the engine core;
 # non-optional, force-linked so `eviction h2o` resolves the out-of-tree plugin.
 h2o = { path = "../crates/techniques/h2o" }
@@ -177,6 +182,10 @@ trybuild = "1.0"
 # Verifies a separate technique crate self-registers into KV_CACHE_STAGES by
 # adding a dependency only (cross-crate linkme). Dev-only (not linked in production).
 example-keep-recent = { path = "../crates/techniques/example-keep-recent" }
+# Byte-identical engine integration test: drives the REAL pyramidkv stage through the PFA →
+# PerHead → per-head-compaction path (prefill_keepset.rs tests). Dev-only — pyramidkv is NOT
+# linked into the production engine binary, so engine default behavior is unchanged.
+pyramidkv = { path = "../crates/techniques/pyramidkv" }
 
 [features]
 default = ["opencl", "profile"]
@@ -190,6 +199,10 @@ caote = ["dep:caote"]
 # R-KV (cosine redundancy + importance joint eviction) measurement prototype.
 # Links + force-links the out-of-tree `rkv` technique crate. Default OFF.
 rkv = ["dep:rkv"]
+# Links + force-links the `pyramidkv` technique crate. When ON, its PrefillAttention caps arm the
+# prefill-keepset path so PyramidKV runs at prefill end (per-layer pyramid budget + per-head SnapKV
+# selection). Default OFF (registering a PFA stage auto-arms it; opt in at build time).
+pyramidkv = ["dep:pyramidkv"]
 cuda = ["cudarc"]               # PC / discrete GPU
 cuda-embedded = ["cudarc"]      # Embedded UMA, e.g. Jetson Xavier
 resilience = ["zbus"]

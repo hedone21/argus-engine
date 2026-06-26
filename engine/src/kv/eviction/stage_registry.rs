@@ -80,6 +80,13 @@ use attn_score as _;
 #[cfg(feature = "rkv")]
 use rkv as _;
 
+// PyramidKV force-link (feature `pyramidkv`). Registers "pyramidkv" with `caps.reads ∋
+// PrefillAttention`, which arms the prefill-keepset producer (`build_standard_loop` /
+// `find_prefill_attn_stage_name`) so PyramidKV runs at prefill end. Feature OFF = unlinked = the
+// PFA path stays dormant (byte-identical to before).
+#[cfg(feature = "pyramidkv")]
+use pyramidkv as _;
+
 // ── KVCachePlan executor + StageBackedPolicy 역어댑터 (World B) ──────────────
 
 /// [`KVCacheStage`] 가 산출한 [`KVCachePlan`] 을 `&mut KVCache` 에 적용한다(변형은
