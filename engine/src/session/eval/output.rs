@@ -1,5 +1,7 @@
 //! Eval output types: unified result structures for all eval-ll modes.
 
+use super::evict_timing::EvictTiming;
+
 /// Configuration for the generic eval loop.
 #[derive(Debug, Clone)]
 pub struct EvalConfig {
@@ -15,6 +17,9 @@ pub struct EvalConfig {
     pub vocab_size: usize,
     /// Model hidden dimension (used for x_gen buffer allocation).
     pub hidden_size: usize,
+    /// When eviction fires and which importance drives it (`--evict-timing`).
+    /// Default [`EvictTiming::PostPrefillProbe`] = today's behavior (INV-147).
+    pub evict_timing: EvictTiming,
 }
 
 /// A single evaluation question (grouped format).

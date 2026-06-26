@@ -653,6 +653,8 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
         qcf_mode: args.qcf_mode.clone(),
         vocab_size,
         hidden_size,
+        // The quant-window path does not evict; eviction timing does not apply.
+        evict_timing: crate::session::eval::EvictTiming::default(),
     };
     let qcf_config = crate::qcf_types::QcfConfig::default();
     let quant_window_bits = args.effective_quant_window_bits();

@@ -639,6 +639,13 @@ impl StepHook<KVCache> for EvictionHook {
         !caches.is_empty() && max_cache_pos(caches) > self.effective_budget
     }
 
+    fn ranks_on_scores(&self) -> bool {
+        // Heavy-hitter / value-aware policies rank on accumulated attention; sliding /
+        // positional policies do not. Only the former benefit from a token-by-token
+        // prefill pass under `--evict-timing prefill_end`.
+        self.score_based_eviction
+    }
+
     fn extra_question_fields(&self, _caches: &[KVCache]) -> serde_json::Value {
         let mut obj = serde_json::json!({
             "effective_budget": self.effective_budget,

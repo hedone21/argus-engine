@@ -374,6 +374,33 @@ mod tests {
         assert_eq!(a.sink_size(), 4);
     }
 
+    /// `--evict-timing` defaults to today's behavior, parses `prefill_end`, and
+    /// rejects unknown / not-yet-implemented modes (no silent fallback).
+    #[test]
+    fn evict_timing_flag_parses_and_defaults() {
+        use crate::session::eval::EvictTiming;
+
+        // Absent flag → INV-147 default (today's post-question probe path).
+        let d = Args::try_parse_from(["test"]).unwrap();
+        assert_eq!(d.evict_timing(), EvictTiming::PostPrefillProbe);
+        assert!(d.evict_timing().runs_query_probe());
+
+        // Explicit default is identical.
+        let p = Args::try_parse_from(["test", "--evict-timing", "post_prefill_probe"]).unwrap();
+        assert_eq!(p.evict_timing(), EvictTiming::PostPrefillProbe);
+
+        // Query-agnostic mode parses and flips both behavior bits.
+        let e = Args::try_parse_from(["test", "--evict-timing", "prefill_end"]).unwrap();
+        assert_eq!(e.evict_timing(), EvictTiming::PrefillEnd);
+        assert!(!e.evict_timing().runs_query_probe());
+        assert!(e.evict_timing().accumulates_context_scores());
+
+        // An unimplemented / unknown mode is rejected at parse time, not silently
+        // coerced to the default.
+        assert!(Args::try_parse_from(["test", "--evict-timing", "prefill_streaming"]).is_err());
+        assert!(Args::try_parse_from(["test", "--evict-timing", "bogus"]).is_err());
+    }
+
     /// B1-3: sliding/streaming POD knobs are read from `--set`, not a typed variant.
     #[test]
     fn plugin_set_form_sliding_streaming_pod_knobs() {
@@ -933,6 +960,22 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub dump: Vec<String>,
 
+    /// eval-LL KV eviction timing (when eviction fires and which importance drives
+    /// it). `post_prefill_probe` (default) = today's behavior: full prefill, a
+    /// post-question probe, one eviction — the importance is query-informed.
+    /// `prefill_end` = accumulate per-step context importance during a token-by-token
+    /// prefill, suppress the probe, then evict query-agnostically. See
+    /// [`crate::session::eval::EvictTiming`]. Use the parsed accessor
+    /// [`Args::evict_timing`].
+    #[arg(
+        long,
+        default_value = crate::session::eval::EvictTiming::POST_PREFILL_PROBE,
+        value_parser = clap::builder::PossibleValuesParser::new(
+            crate::session::eval::EvictTiming::CLI_VALUES
+        )
+    )]
+    pub evict_timing: String,
+
     /// Start an interactive multi-turn chat REPL (Llama 3.2 Instruct / Qwen2).
     /// Uses standard (non-quant-window, non-offload) forward path.
     #[arg(long, default_value_t = false)]
@@ -1471,6 +1514,13 @@ impl Args {
     /// True if `kind` was requested via `--dump`.
     pub fn dump_enabled(&self, kind: &str) -> bool {
         self.dump.iter().any(|k| k == kind)
+    }
+
+    /// Parsed `--evict-timing` mode. The raw string is validated by clap's
+    /// `value_parser`, so the parse is infallible here.
+    pub fn evict_timing(&self) -> crate::session::eval::EvictTiming {
+        crate::session::eval::EvictTiming::from_cli(&self.evict_timing)
+            .expect("--evict-timing validated by clap value_parser")
     }
 
     /// Output path for a dump `kind` = `<dump-dir>/<kind>.jsonl`. `None` when
