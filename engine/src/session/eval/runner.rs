@@ -173,10 +173,25 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         eprintln!("{w}");
     }
 
+    // Budget-unit guard for `prefill_streaming` (variant b). The streaming cap `B`
+    // must be an *absolute* token count (no ratio, non-zero) — see
+    // `EvictTiming::budget_unit_error`. Reject up front rather than silently degrade
+    // to a different operating point.
+    if let Some(msg) = args
+        .evict_timing()
+        .budget_unit_error(args.kv_budget(), ratio_mode)
+    {
+        anyhow::bail!("{msg}");
+    }
+
     // `--evict-timing prefill_end` only changes anything when an eviction actually
     // fires, which (like the dump above) needs a KV budget. Warn rather than silently
-    // run today's batched full-prefill under a non-default flag.
-    if args.evict_timing().accumulates_context_scores() && !budget_mode {
+    // run today's batched full-prefill under a non-default flag. (Streaming already
+    // bailed above if it has no absolute budget, so this only catches prefill_end.)
+    if args.evict_timing().accumulates_context_scores()
+        && !args.evict_timing().evicts_on_overflow()
+        && !budget_mode
+    {
         eprintln!(
             "[evict-timing] WARNING: --evict-timing prefill_end has no effect without a KV budget \
              (--kv-budget / --kv-budget-ratio) → no eviction fires → prefill stays batched"
@@ -237,6 +252,9 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         args.enable_qcf_experimental,
         eviction_hook_sample_layers,
         args.dump_enabled(crate::session::eval::dump::DUMP_EVICT_IMPORTANCE),
+        // variant b: cap the resident cache at the budget and evict per-overflow
+        // during token-by-token prefill (vs. a single post_prefill cut).
+        args.evict_timing().evicts_on_overflow(),
     );
 
     // ── Trajectory mode dispatch ──────────────────────────────────────────

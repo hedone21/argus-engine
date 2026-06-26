@@ -165,6 +165,13 @@ pub struct EvictionHook {
     /// Off by default → no capture, eviction path byte-identical (`INV-147`).
     dump_evict_importance: bool,
 
+    /// `--evict-timing prefill_streaming` (variant b): cap the resident cache at
+    /// `effective_budget` and evict per-overflow during token-by-token prefill (via
+    /// [`on_prefill_step`](StepHook::on_prefill_step)), instead of one cut at
+    /// `post_prefill`. False (the default) leaves `post_prefill` as the sole trigger,
+    /// keeping the other two timings byte-identical (`INV-147`).
+    streaming_overflow: bool,
+
     // -- Statistics (reset per question) --
     /// Number of eviction events this question.
     eviction_count: usize,
@@ -176,6 +183,62 @@ pub struct EvictionHook {
     experimental_qcf: Option<ExpQcfV3>,
     /// IMP-1 dump snapshot captured at the most recent eviction (drained by the loop).
     last_evict_dump: Option<crate::session::eval::dump::EvictImportanceSnapshot>,
+
+    /// Streaming (variant b) original-index map: original prompt token index of each
+    /// resident cache slot, in slot order (`len == resident cache_pos`). Rebuilt across
+    /// eviction-driven compactions so the multi-event dump stays in original token
+    /// space. Maintained only while `streaming_overflow && dump_evict_importance`.
+    resident_orig: Vec<usize>,
+    /// Streaming per-event dump snapshots, drained by the loop after prefill.
+    streaming_dumps: Vec<crate::session::eval::dump::EvictImportanceSnapshot>,
+}
+
+/// Streaming low-water mark: on overflow, evict down to `floor(budget * KEEP)` so
+/// eviction fires in batches (every `~budget * (1 - KEEP)` tokens) instead of
+/// re-triggering on every subsequent token — mirroring how an h2o decode eviction
+/// drops a block. Tunable here as a single constant (the request leaves the exact
+/// low-water as an implementation choice; `cache_pos` stays provably bounded by
+/// `budget` (+ one step's slack) for any value in `(0, 1)`).
+const STREAMING_LOW_WATER_KEEP: f32 = 0.9;
+
+/// Resident low-water target for a streaming overflow eviction: `floor(budget * KEEP)`,
+/// floored at `protected_prefix` and `1`, capped at `budget`. Pure, so the
+/// bounded-residency property is testable without a model.
+fn streaming_low_water_target(budget: usize, protected_prefix: usize) -> usize {
+    let t = ((budget as f32) * STREAMING_LOW_WATER_KEEP).floor() as usize;
+    t.max(protected_prefix).max(1).min(budget)
+}
+
+/// Map a keep-set (slot indices into the pre-eviction resident cache) back to **original**
+/// token indices, returning `(kept_original, evicted_original, compacted_map)`.
+///
+/// `resident_positions[s]` is the original prompt token index currently at slot `s`.
+/// `kept_slots` is the policy's keep-set in ascending slot order (as the engine compacts
+/// it). The compacted map equals `kept_original` — the new resident slots hold exactly the
+/// kept tokens in ascending slot order, so their original indices stay ascending. Pure, so
+/// the original-index translation the streaming dump relies on (and the cross-event map
+/// carry-over) is testable without a cache or model.
+fn map_keepset_to_original(
+    resident_positions: &[usize],
+    kept_slots: &[usize],
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let n = resident_positions.len();
+    let mut kept_flag = vec![false; n];
+    for &s in kept_slots {
+        if s < n {
+            kept_flag[s] = true;
+        }
+    }
+    let kept: Vec<usize> = kept_slots
+        .iter()
+        .filter_map(|&s| resident_positions.get(s).copied())
+        .collect();
+    let evicted: Vec<usize> = (0..n)
+        .filter(|&s| !kept_flag[s])
+        .map(|s| resident_positions[s])
+        .collect();
+    let compacted = kept.clone();
+    (kept, evicted, compacted)
 }
 
 impl EvictionHook {
@@ -194,6 +257,7 @@ impl EvictionHook {
         experimental_enabled: bool,
         qcf_sample_layers: Vec<usize>,
         dump_evict_importance: bool,
+        streaming_overflow: bool,
     ) -> Self {
         Self {
             cache_manager,
@@ -209,11 +273,14 @@ impl EvictionHook {
             experimental_enabled,
             qcf_sample_layers,
             dump_evict_importance,
+            streaming_overflow,
             eviction_count: 0,
             evicted_total: 0,
             eviction_qcf: None,
             experimental_qcf: None,
             last_evict_dump: None,
+            resident_orig: Vec::new(),
+            streaming_dumps: Vec::new(),
         }
     }
 
@@ -261,6 +328,167 @@ impl EvictionHook {
             evicted_positions,
             importance_flat,
             importance_by_layer_head,
+            // Single-shot record (schema v1): no per-event metadata.
+            event: None,
+        })
+    }
+
+    /// Sync GPU-accumulated attention scores into the CPU accumulator before an
+    /// eviction reads them. No-op on CPU backends / without the `opencl` feature, so
+    /// the host path is unchanged. Shared by `post_prefill` and the streaming path.
+    fn sync_gpu_scores_to_cpu(&mut self) {
+        #[cfg(feature = "opencl")]
+        if let Some(ref mut acc) = self.score_accumulator
+            && acc.is_active()
+            && let Some(ocl_be) = self
+                .backend
+                .as_any()
+                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            && let Some(gpu_acc) = ocl_be.gpu_score_acc()
+            && gpu_acc.is_active()
+            && let Ok((flat, head)) = gpu_acc.sync_to_cpu(ocl_be.queue.as_core())
+        {
+            acc.import_gpu_scores(&flat, &head);
+        }
+    }
+
+    /// Streaming (variant b) per-overflow eviction. Evict the resident cache down to
+    /// the low-water mark, reusing the **same** decode-path machinery
+    /// (`force_evict[_with_scores]`) the single-shot `post_prefill` uses, and (when the
+    /// dump is enabled) record one per-event snapshot in original token-index space.
+    /// `cache_pos_before` is the resident length at the moment of overflow; `prefill_pos`
+    /// is the number of original tokens ingested so far.
+    fn streaming_evict(
+        &mut self,
+        caches: &mut [KVCache],
+        cache_pos_before: usize,
+        prefill_pos: usize,
+    ) {
+        let n_layers = caches.len();
+        let target = streaming_low_water_target(self.effective_budget, self.protected_prefix);
+        // Keep `target` of the `cache_pos_before` resident tokens (force_evict reads a
+        // keep-ratio); float floor keeps the survivor count <= target <= budget.
+        let ratio = (target as f32 / cache_pos_before as f32).clamp(0.0, 1.0);
+
+        // Arm the technique-agnostic keep-set capture for this event (drained below).
+        if self.dump_evict_importance {
+            crate::kv::eviction::keepset_dump::arm_capture();
+        }
+        // GPU score sync before a score-based eviction reads importance (no-op on CPU).
+        self.sync_gpu_scores_to_cpu();
+
+        let result = if self.score_based_eviction {
+            let active = self
+                .score_accumulator
+                .as_ref()
+                .is_some_and(|acc| acc.is_active());
+            if active {
+                let acc = self.score_accumulator.as_ref().unwrap();
+                let scores = acc.importance_scores().to_vec();
+                let attn = acc.last_step_head_attn().map(|s| s.to_vec());
+                self.cache_manager
+                    .force_evict_with_scores(caches, ratio, &scores, attn.as_deref())
+            } else {
+                self.cache_manager.force_evict(caches, ratio)
+            }
+        } else {
+            self.cache_manager.force_evict(caches, ratio)
+        };
+
+        if let Ok(evict_result) = result
+            && evict_result.evicted
+        {
+            self.eviction_count += 1;
+            self.evicted_total += evict_result.tokens_removed;
+            let cache_pos_after = max_cache_pos(caches);
+
+            if self.dump_evict_importance {
+                // Maps the keep-set back to original indices, compacts `resident_orig`,
+                // and (when the per-layer-head buffer is available) builds the record.
+                if let Some(snap) = self.assemble_streaming_dump(
+                    cache_pos_before,
+                    cache_pos_after,
+                    n_layers,
+                    prefill_pos,
+                ) {
+                    self.streaming_dumps.push(snap);
+                }
+            }
+
+            // Reset the accumulator so the next event ranks on a fresh, slot-aligned
+            // window of importance over the compacted cache (mirrors the single-shot
+            // hook's post-evict reset; avoids stale pre-compaction slot importance).
+            if let Some(acc) = self.score_accumulator.as_mut() {
+                acc.reset();
+            }
+        } else if self.dump_evict_importance {
+            // No eviction fired — drop the armed capture so it can't leak forward.
+            crate::kv::eviction::keepset_dump::disarm_capture();
+        }
+    }
+
+    /// Map the just-captured keep-set back to original token indices, compact the
+    /// `resident_orig` map for subsequent events, and assemble the streaming dump
+    /// snapshot. Must run AFTER `force_evict` (keep-set captured) and BEFORE
+    /// `acc.reset()`. Returns `None` (and still compacts `resident_orig`) when the
+    /// importance / per-(layer,head) buffer is unavailable.
+    fn assemble_streaming_dump(
+        &mut self,
+        cache_pos_before: usize,
+        cache_pos_after: usize,
+        n_layers: usize,
+        prefill_pos: usize,
+    ) -> Option<crate::session::eval::dump::EvictImportanceSnapshot> {
+        use crate::session::eval::dump;
+
+        let captured = crate::kv::eviction::keepset_dump::drain_capture();
+        // LayerWide eval eviction → take layer 0 / head 0's keep-set as the canonical
+        // resident set (uniform across layers/heads), mirroring the single-shot path.
+        let kept_slots: Vec<usize> = captured
+            .first()
+            .and_then(|c| c.keep.first())
+            .cloned()
+            .unwrap_or_default();
+
+        // Pre-compaction slot→original map (length cache_pos_before).
+        let resident_positions = std::mem::take(&mut self.resident_orig);
+
+        // Map the keep-set (slot space) back to original token indices.
+        let (kept_positions, evicted_positions, compacted) =
+            map_keepset_to_original(&resident_positions, &kept_slots);
+
+        // Compact the live map for subsequent events (new resident slots hold the kept
+        // tokens in ascending slot order = ascending original indices).
+        self.resident_orig = compacted;
+
+        // Importance payload (slot-indexed). Absent per-(layer,head) buffer → no record
+        // (matches the single-shot path); the map above is still compacted so later
+        // events stay consistent.
+        let acc = self.score_accumulator.as_ref()?;
+        let layer_head = acc.layer_head_importance()?;
+        let max_seq_len = acc.importance_scores().len();
+        let n_kv_heads = acc.n_kv_heads();
+        let prompt_len = cache_pos_before.min(max_seq_len);
+        let importance_flat = acc.importance_scores()[..prompt_len].to_vec();
+        let importance_by_layer_head =
+            dump::reshape_layer_head(layer_head, n_layers, n_kv_heads, max_seq_len, prompt_len);
+
+        Some(dump::EvictImportanceSnapshot {
+            prompt_len,
+            budget: self.effective_budget,
+            keep_ratio: self.h2o_keep_ratio,
+            technique: self.cache_manager.policy_id(),
+            kept_positions,
+            evicted_positions,
+            importance_flat,
+            importance_by_layer_head,
+            event: Some(dump::EvictEventMeta {
+                eviction_event: self.eviction_count,
+                prefill_pos,
+                cache_pos_before,
+                cache_pos_after,
+                resident_positions,
+            }),
         })
     }
 }
@@ -306,19 +534,7 @@ impl StepHook<KVCache> for EvictionHook {
         // (2) head importance as proxy for last_layer_head_attn (the GPU path
         // doesn't have raw per-step attention weights, but cumulative head
         // importance is proportional and sufficient for QCF computation).
-        #[cfg(feature = "opencl")]
-        if let Some(ref mut acc) = self.score_accumulator
-            && acc.is_active()
-            && let Some(ocl_be) = self
-                .backend
-                .as_any()
-                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            && let Some(gpu_acc) = ocl_be.gpu_score_acc()
-            && gpu_acc.is_active()
-            && let Ok((flat, head)) = gpu_acc.sync_to_cpu(ocl_be.queue.as_core())
-        {
-            acc.import_gpu_scores(&flat, &head);
-        }
+        self.sync_gpu_scores_to_cpu();
 
         // can_compute_qcf: true when V data is CPU-accessible (CPU backend) or
         // successfully read back (GPU backend). Supports F32, F16, and Q4_0 dtypes.
@@ -582,6 +798,34 @@ impl StepHook<KVCache> for EvictionHook {
         self.eviction_qcf = None;
         self.experimental_qcf = None;
         self.last_evict_dump = None;
+        self.resident_orig.clear();
+        self.streaming_dumps.clear();
+    }
+
+    fn on_prefill_step(&mut self, caches: &mut [KVCache], orig_token_idx: usize) {
+        // Variant b only. The other timings (and the quant-window hook) leave this a
+        // no-op, so token-by-token prefill stays byte-identical for them (`INV-147`).
+        if !self.streaming_overflow || self.effective_budget == 0 {
+            return;
+        }
+        let cache_pos = max_cache_pos(caches);
+        // Track the original prompt index of this just-ingested token at its new slot.
+        // Maintained only when the dump needs the original-index map; the eviction
+        // decision itself never reads it.
+        if self.dump_evict_importance {
+            self.resident_orig.push(orig_token_idx);
+            debug_assert_eq!(
+                self.resident_orig.len(),
+                cache_pos,
+                "resident_orig must track cache occupancy slot-for-slot"
+            );
+        }
+        if cache_pos <= self.effective_budget {
+            return; // within budget — no overflow this step.
+        }
+        // Overflow: evict down to the low-water mark. `cache_pos` is bounded by
+        // `effective_budget + 1` (we check after every single-token ingest).
+        self.streaming_evict(caches, cache_pos, orig_token_idx + 1);
     }
 
     fn snapshot(&self, caches: &[KVCache]) -> Box<dyn CacheSnapshot<KVCache>> {
@@ -692,6 +936,12 @@ impl StepHook<KVCache> for EvictionHook {
     ) -> Option<crate::session::eval::dump::EvictImportanceSnapshot> {
         self.last_evict_dump.take()
     }
+
+    fn take_streaming_evict_dumps(
+        &mut self,
+    ) -> Vec<crate::session::eval::dump::EvictImportanceSnapshot> {
+        std::mem::take(&mut self.streaming_dumps)
+    }
 }
 
 #[cfg(test)]
@@ -744,6 +994,7 @@ mod tests {
             false,
             vec![], // qcf_sample_layers: empty → internal fallback to [0]
             false,  // dump_evict_importance
+            false,  // streaming_overflow
         )
     }
 
@@ -877,7 +1128,101 @@ mod tests {
             false,
             vec![0, 4, 8, 12, 15],
             false, // dump_evict_importance
+            false, // streaming_overflow
         );
         assert_eq!(hook.qcf_sample_layers, vec![0, 4, 8, 12, 15]);
+    }
+
+    // ── variant b: streaming overflow eviction (mechanism, model-free) ──
+
+    #[test]
+    fn low_water_target_is_below_budget_and_respects_floors() {
+        // floor(budget * 0.9), so each event drops a block instead of re-triggering.
+        assert_eq!(streaming_low_water_target(16, 0), 14); // floor(14.4)
+        assert_eq!(streaming_low_water_target(256, 0), 230); // floor(230.4)
+        assert_eq!(streaming_low_water_target(2, 0), 1); // floor(1.8)
+        // protected prefix raises the floor…
+        assert_eq!(streaming_low_water_target(16, 15), 15);
+        // …but the target never exceeds the budget.
+        assert!(streaming_low_water_target(16, 100) <= 16);
+        // …and is always at least one resident token.
+        assert_eq!(streaming_low_water_target(1, 0), 1);
+    }
+
+    /// Acceptance #2 (bounded residency): simulate the token-by-token streaming loop —
+    /// ingest one token (cache_pos += 1), and on `cache_pos > B` evict to the low-water
+    /// mark exactly as `streaming_evict` does (force_evict keeps `floor(before*ratio)`).
+    /// Occupancy must never exceed `B + 1` and a long prompt must overflow more than once.
+    #[test]
+    fn streaming_residency_is_bounded_by_budget_plus_one_slack() {
+        for &budget in &[8usize, 16, 31, 256] {
+            let protected = 0;
+            let mut cache_pos = 0usize;
+            let mut max_seen = 0usize;
+            let mut events = 0usize;
+            for _ in 0..(budget * 8 + 5) {
+                cache_pos += 1; // ingest one token
+                max_seen = max_seen.max(cache_pos);
+                if cache_pos > budget {
+                    let before = cache_pos;
+                    let target = streaming_low_water_target(budget, protected);
+                    let ratio = target as f32 / before as f32;
+                    cache_pos = ((before as f32) * ratio).floor() as usize;
+                    events += 1;
+                    assert!(
+                        cache_pos <= budget,
+                        "budget={budget}: post-evict occupancy {cache_pos} must be <= budget"
+                    );
+                }
+            }
+            assert_eq!(
+                max_seen,
+                budget + 1,
+                "budget={budget}: resident peaks at exactly one step's slack over budget"
+            );
+            assert!(
+                events >= 2,
+                "budget={budget}: a prompt many times the budget overflows repeatedly"
+            );
+        }
+    }
+
+    /// Acceptance #3 (positions in original index space): after a prior compaction the
+    /// cache's slot space is reindexed; the keep-set (slot space) must map back to the
+    /// original prompt indices, with kept/evicted disjoint and unioning to the resident
+    /// set, and the compacted map carried to the next event.
+    #[test]
+    fn keepset_maps_back_to_original_index_space() {
+        // Slots {0,1,2,3} currently hold original tokens {3,7,9,11} (post-compaction).
+        let resident = [3usize, 7, 9, 11];
+        // Policy keeps slots {0,2,3} (drops slot 1).
+        let (kept, evicted, compacted) = map_keepset_to_original(&resident, &[0, 2, 3]);
+        assert_eq!(kept, vec![3, 9, 11], "kept slots → original indices");
+        assert_eq!(evicted, vec![7], "evicted slot → original index");
+        assert_eq!(compacted, vec![3, 9, 11], "next-event map = kept originals");
+        // Disjoint, and their union is exactly the resident set.
+        assert!(kept.iter().all(|k| !evicted.contains(k)));
+        let mut all: Vec<usize> = kept.iter().chain(&evicted).copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![3, 7, 9, 11]);
+        // Original indices stay ascending across the carry-over (join-friendly).
+        assert!(compacted.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// Two compaction rounds: the map composes, so event 2's `kept_positions` are still
+    /// in the original prompt space even though it ranks over a twice-reindexed cache.
+    #[test]
+    fn original_map_composes_across_events() {
+        // Event 1 over original [0..6): keep slots {0,2,4,5} → originals {0,2,4,5}.
+        let resident0: Vec<usize> = (0..6).collect();
+        let (_k1, _e1, after1) = map_keepset_to_original(&resident0, &[0, 2, 4, 5]);
+        assert_eq!(after1, vec![0, 2, 4, 5]);
+        // Two more original tokens (6, 7) ingested → resident = [0,2,4,5,6,7].
+        let mut resident1 = after1;
+        resident1.extend([6, 7]);
+        // Event 2: keep slots {0,3,4,5} → originals {0,5,6,7}.
+        let (k2, e2, _after2) = map_keepset_to_original(&resident1, &[0, 3, 4, 5]);
+        assert_eq!(k2, vec![0, 5, 6, 7], "still original prompt indices");
+        assert_eq!(e2, vec![2, 4], "evicted-at-event-2 originals");
     }
 }

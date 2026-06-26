@@ -67,6 +67,25 @@ pub trait StepHook<C> {
         false
     }
 
+    /// Called once per token during token-by-token prefill, **after** that token's
+    /// forward (so the cache reflects the just-ingested token and per-step importance
+    /// is accumulated). `orig_token_idx` is the token's original prompt index.
+    ///
+    /// `--evict-timing prefill_streaming` (variant b) uses this to cap the resident
+    /// cache at the budget: on overflow it evicts down to a low-water mark, keeping
+    /// occupancy bounded by `budget` (+ one step's slack). Default no-op — the other
+    /// timings and the quant-window hook evict only at `post_prefill`, so their
+    /// token-by-token prefill stays byte-identical (`INV-147`).
+    fn on_prefill_step(&mut self, _caches: &mut [C], _orig_token_idx: usize) {}
+
+    /// Drain the `prefill_streaming` per-event `evict_importance` (IMP-1) snapshots
+    /// captured during prefill (one per eviction event, `schema_version: 2`). The eval
+    /// loop writes them after prefill, adding the per-question metadata. Default empty
+    /// (only `EvictionHook` in streaming mode produces any).
+    fn take_streaming_evict_dumps(&mut self) -> Vec<super::dump::EvictImportanceSnapshot> {
+        Vec::new()
+    }
+
     /// Cache-specific per-question JSON fields (e.g., quant_q2_tokens).
     fn extra_question_fields(&self, caches: &[C]) -> serde_json::Value;
 

@@ -374,8 +374,8 @@ mod tests {
         assert_eq!(a.sink_size(), 4);
     }
 
-    /// `--evict-timing` defaults to today's behavior, parses `prefill_end`, and
-    /// rejects unknown / not-yet-implemented modes (no silent fallback).
+    /// `--evict-timing` defaults to today's behavior, parses the query-agnostic
+    /// modes, and rejects unknown modes (no silent fallback).
     #[test]
     fn evict_timing_flag_parses_and_defaults() {
         use crate::session::eval::EvictTiming;
@@ -389,15 +389,22 @@ mod tests {
         let p = Args::try_parse_from(["test", "--evict-timing", "post_prefill_probe"]).unwrap();
         assert_eq!(p.evict_timing(), EvictTiming::PostPrefillProbe);
 
-        // Query-agnostic mode parses and flips both behavior bits.
+        // Query-agnostic end-of-prefill mode parses and flips both behavior bits.
         let e = Args::try_parse_from(["test", "--evict-timing", "prefill_end"]).unwrap();
         assert_eq!(e.evict_timing(), EvictTiming::PrefillEnd);
         assert!(!e.evict_timing().runs_query_probe());
         assert!(e.evict_timing().accumulates_context_scores());
+        assert!(!e.evict_timing().evicts_on_overflow());
 
-        // An unimplemented / unknown mode is rejected at parse time, not silently
-        // coerced to the default.
-        assert!(Args::try_parse_from(["test", "--evict-timing", "prefill_streaming"]).is_err());
+        // Variant b (evict-on-overflow streaming) now parses too: same query-agnostic
+        // accumulation, plus the overflow-eviction axis.
+        let s = Args::try_parse_from(["test", "--evict-timing", "prefill_streaming"]).unwrap();
+        assert_eq!(s.evict_timing(), EvictTiming::PrefillStreaming);
+        assert!(!s.evict_timing().runs_query_probe());
+        assert!(s.evict_timing().accumulates_context_scores());
+        assert!(s.evict_timing().evicts_on_overflow());
+
+        // An unknown mode is rejected at parse time, not silently coerced to default.
         assert!(Args::try_parse_from(["test", "--evict-timing", "bogus"]).is_err());
     }
 
