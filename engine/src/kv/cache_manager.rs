@@ -417,8 +417,21 @@ impl CacheManager {
     }
 
     /// Returns the name of the active policy or pipeline.
+    ///
+    /// This is the **logging** descriptor — each stage is decorated with the
+    /// pressure level that arms it (`h2o@Warning`). For a stable identity to
+    /// group diagnostic records by, use [`policy_id`](Self::policy_id).
     pub fn policy_name(&self) -> String {
         self.pipeline.name()
+    }
+
+    /// Returns the stable policy identity (no pressure-level decoration).
+    ///
+    /// Where [`policy_name`](Self::policy_name) yields the log descriptor
+    /// `h2o@Warning`, this yields the bare `h2o` — what diagnostic dumps record
+    /// in their `technique` field so the lab can join/group by technique.
+    pub fn policy_id(&self) -> String {
+        self.pipeline.policy_id()
     }
 
     /// Shared eviction core: guard on `target_len`, dispatch to policy methods,

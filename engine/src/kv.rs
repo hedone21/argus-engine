@@ -183,6 +183,24 @@ impl CachePressurePipeline {
             .join(" → ")
     }
 
+    /// Stable policy identity for grouping/joining diagnostic records.
+    ///
+    /// Unlike [`name`](Self::name) — a logging descriptor that decorates each
+    /// stage with the pressure level that arms it (`h2o@Warning`) — this returns
+    /// just the handler identities (`h2o`), so a consumer can group records by
+    /// technique without parsing out the `@<level>` tag. Multi-stage pipelines
+    /// join the bare names with ` → `.
+    pub fn policy_id(&self) -> String {
+        if self.stages.is_empty() {
+            return "empty_pipeline".to_string();
+        }
+        self.stages
+            .iter()
+            .map(|s| s.handler.name())
+            .collect::<Vec<_>>()
+            .join(" → ")
+    }
+
     /// Number of stages in the pipeline.
     pub fn len(&self) -> usize {
         self.stages.len()
@@ -362,6 +380,29 @@ mod tests {
         assert_eq!(c1.load(Ordering::SeqCst), 0);
         assert_eq!(c2.load(Ordering::SeqCst), 0);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn policy_id_drops_pressure_level_decoration() {
+        // The logging `name()` decorates each stage with the level that arms it;
+        // `policy_id()` keeps only the bare handler identity so diagnostic records
+        // can be grouped by technique (R1: dump `technique` was "h2o@Warning").
+        let (h_warn, _c) = CountingHandler::new("h2o");
+        let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
+            min_level: PressureLevel::Warning,
+            handler: Box::new(h_warn),
+        }]);
+        assert_eq!(pipeline.name(), "h2o@Warning");
+        assert_eq!(pipeline.policy_id(), "h2o");
+        assert!(
+            !pipeline.policy_id().contains('@'),
+            "policy_id must not carry a status/level tag"
+        );
+        // Empty pipeline keeps a stable sentinel id.
+        assert_eq!(
+            CachePressurePipeline::new(vec![]).policy_id(),
+            "empty_pipeline"
+        );
     }
 
     #[test]

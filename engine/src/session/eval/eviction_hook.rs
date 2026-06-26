@@ -253,7 +253,10 @@ impl EvictionHook {
             prompt_len,
             budget: self.effective_budget,
             keep_ratio: self.h2o_keep_ratio,
-            technique: self.cache_manager.policy_name(),
+            // R1: the dump groups by technique, so record the stable policy
+            // identity ("h2o"), not the pressure-level-decorated log descriptor
+            // (`policy_name()` → "h2o@Warning").
+            technique: self.cache_manager.policy_id(),
             kept_positions,
             evicted_positions,
             importance_flat,
@@ -735,6 +738,31 @@ mod tests {
             vec![], // qcf_sample_layers: empty → internal fallback to [0]
             false,  // dump_evict_importance
         )
+    }
+
+    #[test]
+    fn dump_technique_is_clean_policy_id_not_log_name() {
+        // R1: assemble_evict_importance records `cache_manager.policy_id()` in the
+        // dump's `technique`, which must be the bare policy name — NOT the
+        // logging descriptor `policy_name()` that folds in the pressure level
+        // ("none@Warning"). A real (force-linked "none") policy is fed here, so
+        // this exercises the actual plugin-backed name, unlike the hard-coded
+        // "h2o" in the dump.rs record test.
+        let hook = make_hook(8, true);
+        let log_name = hook.cache_manager.policy_name();
+        let technique = hook.cache_manager.policy_id();
+        assert!(
+            log_name.contains('@'),
+            "log descriptor keeps the level tag: {log_name}"
+        );
+        assert_eq!(
+            technique, "none",
+            "dump technique is the clean id: {technique}"
+        );
+        assert!(
+            !technique.contains('@') && !technique.contains('→'),
+            "dump technique must carry no status/level/stage-join decoration"
+        );
     }
 
     #[test]
