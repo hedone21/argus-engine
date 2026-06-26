@@ -34,6 +34,10 @@ enum Compaction {
     Keep(Vec<usize>),
     /// Per-head keep — `[n_kv_heads][keep]`, each ascending, all equal length (HeadMajor only).
     KeepPerHead(Vec<Vec<usize>>),
+    /// Offload the LRU prefix of `n` tokens through the swap handler (residency axis).
+    Offload(usize),
+    /// Recall this layer's outstanding offloaded prefix through the swap handler.
+    Recall,
 }
 
 /// Engine-side [`CacheHandle`] over **one layer's** `&mut KVCache`. Stages position-mutating intents
@@ -43,6 +47,9 @@ pub struct EngineCacheHandle<'a> {
     cache: &'a mut KVCache,
     layer_idx: usize,
     n_layers: usize,
+    /// The swap handler backing `offload` / `recall` (residency axis). `None` ⇒ those ops are
+    /// unconfigured and reject (the common keep/merge/reencode path needs no swap).
+    swap: Option<&'a crate::kv::swap_handler::SwapHandler>,
     /// Entry-frame token count (T-3): the frame every read + every keep validation observes.
     entry_pos: usize,
     /// Staged weighted merges (applied in the pre-compaction frame at commit).
@@ -56,19 +63,33 @@ pub struct EngineCacheHandle<'a> {
 }
 
 impl<'a> EngineCacheHandle<'a> {
-    /// Build a handle over one layer's cache for a mutation callback.
+    /// Build a handle over one layer's cache for a mutation callback (no swap backend — `offload` /
+    /// `recall` reject until built via [`with_swap`](Self::with_swap)).
     pub fn new(cache: &'a mut KVCache, layer_idx: usize, n_layers: usize) -> Self {
         let entry_pos = cache.current_pos();
         Self {
             cache,
             layer_idx,
             n_layers,
+            swap: None,
             entry_pos,
             merges: None,
             compaction: None,
             reencode: None,
             mutated: false,
         }
+    }
+
+    /// Build a handle with a swap backend so `offload` / `recall` are live (residency axis).
+    pub fn with_swap(
+        cache: &'a mut KVCache,
+        layer_idx: usize,
+        n_layers: usize,
+        swap: &'a crate::kv::swap_handler::SwapHandler,
+    ) -> Self {
+        let mut h = Self::new(cache, layer_idx, n_layers);
+        h.swap = Some(swap);
+        h
     }
 
     /// Validate a keep-list against the entry frame: ascending, unique (strictly increasing), and
@@ -137,6 +158,20 @@ impl<'a> EngineCacheHandle<'a> {
                 }
                 self.cache.set_current_pos(new_pos);
                 self.mutated = true;
+            }
+            Some(Compaction::Offload(prefix)) => {
+                let swap = self
+                    .swap
+                    .ok_or_else(|| anyhow::anyhow!("offload requires a swap handler"))?;
+                let n = swap.offload_prefix(self.layer_idx, self.cache, prefix)?;
+                self.mutated |= n > 0;
+            }
+            Some(Compaction::Recall) => {
+                let swap = self
+                    .swap
+                    .ok_or_else(|| anyhow::anyhow!("recall requires a swap handler"))?;
+                let n = swap.recall_layer(self.layer_idx, self.cache)?;
+                self.mutated |= n > 0;
             }
             None => {}
         }
@@ -224,12 +259,12 @@ impl CacheHandle for EngineCacheHandle<'_> {
         Err(CacheOpError::WrongContainer)
     }
 
-    fn offload(&mut self, _prefix_len: usize) -> Result<(), CacheOpError> {
-        // Residency ops are wired through swap_handler in the next commit (s1 c4).
-        Err(CacheOpError::WrongContainer)
+    fn offload(&mut self, prefix_len: usize) -> Result<(), CacheOpError> {
+        // Residency compaction-slot op (T-2): stage it; commit routes to swap_handler::offload_prefix.
+        self.set_compaction(Compaction::Offload(prefix_len))
     }
     fn recall(&mut self) -> Result<(), CacheOpError> {
-        Err(CacheOpError::WrongContainer)
+        self.set_compaction(Compaction::Recall)
     }
 }
 
@@ -318,6 +353,101 @@ mod tests {
         assert_eq!(h.project_rank(2), Err(CacheOpError::GeometryImmutable));
         drop(h);
         assert_eq!(c.k_buffer.as_slice::<f32>(), &before[..]);
+    }
+
+    /// c4: a HeadMajor F32 cache with a deterministic pattern, for the offload/recall round-trip.
+    fn cache_hm_f32(resident: usize, heads: usize, dim: usize) -> KVCache {
+        use crate::kv_cache_ops::KVLayout;
+        let backend = Arc::new(CpuBackend::new());
+        let cap = 32;
+        let bytes = cap * heads * dim * std::mem::size_of::<f32>();
+        let shape = Shape::new(vec![1, cap, heads, dim]);
+        let mut c = KVCache::new(
+            Tensor::new(
+                shape.clone(),
+                Arc::new(SharedBuffer::new(bytes, DType::F32)),
+                backend.clone(),
+            ),
+            Tensor::new(shape, Arc::new(SharedBuffer::new(bytes, DType::F32)), backend),
+            cap,
+        )
+        .with_layout(KVLayout::HeadMajor);
+        c.set_current_pos(resident);
+        for (i, x) in c.k_buffer.as_mut_slice::<f32>().iter_mut().enumerate() {
+            *x = i as f32;
+        }
+        for (i, x) in c.v_buffer.as_mut_slice::<f32>().iter_mut().enumerate() {
+            *x = -(i as f32);
+        }
+        c
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "argus_cache_handle_test_{}_{}_{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// c4: `offload` then `recall` through the handle route to swap_handler::offload_prefix /
+    /// recall_layer. Offload shrinks current_pos by the prefix; recall restores it AND the original
+    /// prefix bytes. Mutation-proof: a broken offload/recall wiring leaves current_pos or the
+    /// restored bytes wrong. Offload/recall are compaction-slot ops (a 2nd in one callback would be
+    /// MultipleCompactions — covered by test_t2).
+    #[test]
+    fn test_offload_recall_round_trip_via_handle() {
+        use crate::kv::swap_handler::SwapHandler;
+        let (heads, dim, resident, prefix) = (2usize, 4usize, 10usize, 5usize);
+        let dir = tmp_dir("offload_recall");
+        let swap = SwapHandler::with_disk(0.5, dir.clone());
+
+        let mut c = cache_hm_f32(resident, heads, dim);
+        let cap = c.capacity();
+        // Snapshot the original per-head prefix (first `prefix` positions of each head).
+        let mut orig = Vec::<f32>::new();
+        {
+            let k = c.k_buffer.as_slice::<f32>();
+            for h in 0..heads {
+                let base = h * cap * dim;
+                for pos in 0..prefix {
+                    let off = base + pos * dim;
+                    orig.extend_from_slice(&k[off..off + dim]);
+                }
+            }
+        }
+
+        // offload the prefix through the handle.
+        let mut h = EngineCacheHandle::with_swap(&mut c, 0, 1, &swap);
+        assert_eq!(h.offload(prefix), Ok(()));
+        assert_eq!(h.commit().unwrap(), true);
+        assert_eq!(c.current_pos(), resident - prefix, "offload pruned the prefix");
+        assert_eq!(swap.state.lock().unwrap().records.len(), 1);
+
+        // recall it back through the handle.
+        let mut h = EngineCacheHandle::with_swap(&mut c, 0, 1, &swap);
+        assert_eq!(h.recall(), Ok(()));
+        assert_eq!(h.commit().unwrap(), true);
+        assert_eq!(c.current_pos(), resident, "recall restored the prefix length");
+        // restored prefix bytes match the original.
+        let k = c.k_buffer.as_slice::<f32>();
+        let mut got = Vec::<f32>::new();
+        for head in 0..heads {
+            let base = head * cap * dim;
+            for pos in 0..prefix {
+                let off = base + pos * dim;
+                got.extend_from_slice(&k[off..off + dim]);
+            }
+        }
+        assert_eq!(got, orig, "recalled prefix bytes match the offloaded original");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A staged keep, when committed, applies via `compact_keep_positions` + `set_current_pos` — the
