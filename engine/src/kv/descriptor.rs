@@ -102,6 +102,25 @@ pub static KV_TECHNIQUE_DESCRIPTORS: &[KvTechniqueDescriptor] = &[
         reads: &[TensorKind::Scores, TensorKind::Key],
         produces: &[],
     },
+    // ── observer/score + read producer axes ──
+    // attn_score accumulates the forward-internal attention into the per-token Scores signal that the
+    // score-based stage techniques (h2o / h2o_plus / d2o) read — the producer that closes their reads.
+    KvTechniqueDescriptor {
+        name: "attn_score",
+        axis: KvAxis::Score,
+        phase: MutationPhase::KvMutate,
+        reads: &[],
+        produces: &[TensorKind::Scores],
+    },
+    // quest produces a sparse read plan from query criticality; it reads the raw K plus the current /
+    // running query (all engine-intrinsic signals).
+    KvTechniqueDescriptor {
+        name: "quest",
+        axis: KvAxis::Read,
+        phase: MutationPhase::KvMutate,
+        reads: &[TensorKind::Key, TensorKind::Query, TensorKind::QueryStats],
+        produces: &[],
+    },
 ];
 
 /// All descriptor names (for the matrix-invariance self-test / diagnostics).
