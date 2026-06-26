@@ -452,6 +452,201 @@ pub fn stage_caps(name: &str) -> Option<StageCaps> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// HYBRID v3 — imperative CacheHandle mutation surface (M4 callback class)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The plan-returning [`KVCacheStage`] above expresses one declarative shape per call (a keep-set +
+// merges). HYBRID v3 adds an imperative sibling for the composite / stateful / escape-hatch class: a
+// [`KVMutationStage`] callback that drives a transactional [`CacheHandle`]. The two coexist (this is
+// purely additive); a technique picks whichever surface fits.
+//
+// The whole surface is rule-respecting and transactional — every guarantee below is enforced by the
+// engine's `CacheHandle` impl, never by the plugin author:
+//   T-1  position-mutating ops are STAGED, then committed once at callback end (single renumber).
+//   T-2  at most ONE position-mutating compaction per callback; the 2nd is `MultipleCompactions`.
+//   T-3  reads observe the pre-callback coordinate frame (no read-after-mutate).
+//   T-5  position-PRESERVING ops (reencode/transition) are exempt from T-2 (free composition).
+//   T-8  an `Err` leaves the cache bytes untouched (all-or-nothing).
+//   T-9  a raw device buffer (cl_mem) is NEVER exposed through this surface.
+//  T-10  keep-lists are validated ascending + unique + in-range before any mutation.
+
+/// The lifecycle phase at which a [`KVMutationStage`] fires. A minimal, additive enum: `PrefillEnd`
+/// (after prefill batch, before the decode loop) and `KvMutate` (mid-decode, the eviction / format
+/// re-encode slot). A `PreAttention` phase is intentionally omitted — it has no engine lifecycle
+/// mapping today. `#[repr(u32)]` so a future `.so` C-ABI passes the discriminant directly.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MutationPhase {
+    /// After the prefill batch is materialized, before the first decode step.
+    PrefillEnd,
+    /// Mid-decode, the per-step KV mutation slot (eviction / merge / re-encode / offload).
+    KvMutate,
+}
+
+/// Why a [`CacheHandle`] mutation op was rejected. Every variant is a clean logical error, not a
+/// panic, and (transaction invariant T-8) leaves the cache bytes untouched — an `Err` is an
+/// all-or-nothing abort, never a partial mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheOpError {
+    /// More than one position-mutating compaction was requested in a single callback (T-2). At most
+    /// one compaction (keep / evict / keep_per_head / offload / recall) may run per transaction so
+    /// the single `current_pos` renumber stays unambiguous; the second op is rejected rather than
+    /// composed with an implicit ordering.
+    MultipleCompactions,
+    /// A keep / evict list was not ascending + unique + in-range (T-10). This closes the historical
+    /// leaky-keep hole where an unsorted/out-of-range keep silently corrupted the compaction.
+    InvalidKeep,
+    /// A geometry-narrowing op (`prune_channels` / `set_head_dim` / `project_rank`) was requested.
+    /// head_dim and rank are a single per-cache scalar woven through every offset / alloc / kernel
+    /// call, so no current container can store a narrowed or ragged geometry. Faithful channel /
+    /// rank pruning needs an engine-core base-split (common to the declarative model too).
+    GeometryImmutable,
+    /// The op requires a container kind the current cache is not (e.g. `transition_quant_bits` on a
+    /// `StandardFormat` cache, whose bit-width is not a runtime-transitionable property).
+    WrongContainer,
+    /// A host-only op was requested on a device-resident (GPU) cache that has no CPU pointer.
+    NotOnHost,
+    /// The op names a storage format the current backend / host path cannot materialize (e.g. an
+    /// opaque `.so` codec on the typed-floor host re-encode path).
+    UnsupportedFormat(String),
+    /// The requested mutation would produce heterogeneous-within-layer state (per-head or per-token
+    /// precision) that no current single-precision-per-layer container can hold.
+    HeterogeneousUnsupported,
+}
+
+impl core::fmt::Display for CacheOpError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CacheOpError::MultipleCompactions => write!(
+                f,
+                "more than one position-mutating compaction in a single callback (T-2): at most one \
+                 keep/evict/keep_per_head/offload/recall may run per transaction"
+            ),
+            CacheOpError::InvalidKeep => write!(
+                f,
+                "keep/evict list is not ascending + unique + in-range (T-10)"
+            ),
+            CacheOpError::GeometryImmutable => write!(
+                f,
+                "head_dim / rank geometry is immutable: no current container can store a narrowed or \
+                 ragged geometry (needs an engine-core base-split)"
+            ),
+            CacheOpError::WrongContainer => {
+                write!(f, "op requires a different KV container kind than the current cache")
+            }
+            CacheOpError::NotOnHost => {
+                write!(f, "host-only op requested on a device-resident (GPU) cache")
+            }
+            CacheOpError::UnsupportedFormat(name) => {
+                write!(f, "op names a storage format this path cannot materialize: {name}")
+            }
+            CacheOpError::HeterogeneousUnsupported => write!(
+                f,
+                "mutation would produce heterogeneous-within-layer precision no container can hold"
+            ),
+        }
+    }
+}
+
+/// A rule-respecting, transactional mutation surface over **one layer's** KV cache, handed to a
+/// [`KVMutationStage`] callback as `&mut dyn CacheHandle`.
+///
+/// **dyn-safe is mandatory** (the callback takes a `&mut dyn CacheHandle`): every method is free of
+/// generic parameters / `Self` by value / associated types / `impl Trait` arguments. Like
+/// [`StageCtx`], dtype-branching reads are exposed via the [`TensorHandle`] out-param convention.
+///
+/// Transaction model: reads observe the pre-callback frame (T-3); position-mutating ops are staged
+/// and committed once by the engine at callback end (T-1/T-2); position-preserving ops are exempt
+/// from the at-most-one rule (T-5); any `Err` leaves the bytes untouched (T-8); a raw device buffer
+/// is never exposed (T-9). The dormant geometry walls (`prune_channels` / `set_head_dim` /
+/// `project_rank`) return [`CacheOpError::GeometryImmutable`] via default methods — a future
+/// narrowed-geometry container would override them.
+pub trait CacheHandle {
+    // ── reads (pre-callback frame, T-3) ──
+
+    /// Current number of valid tokens (the compaction starting point). Pre-callback frame.
+    fn current_pos(&self) -> usize;
+    /// Number of KV heads.
+    fn n_kv_heads(&self) -> usize;
+    /// Dimension per head.
+    fn head_dim(&self) -> usize;
+    /// Whether the KV buffers live device-only (no CPU pointer). Host-only ops bail with
+    /// [`CacheOpError::NotOnHost`] when this is `true`.
+    fn kv_on_device(&self) -> bool;
+    /// The single tensor-access mechanism (mirror of [`StageCtx::tensor`]). Reads observe the
+    /// pre-callback frame. Returns `None` when the kind is unavailable for this call.
+    fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle>;
+
+    // ── token axis (S / L / N) — at most one position-mutating compaction per callback (T-2) ──
+
+    /// Stage a keep-set of token positions (ascending + unique + in-range, validated eagerly per
+    /// T-10). LayerWide (all heads keep the same positions). The engine compacts once at commit.
+    fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError>;
+
+    /// Stage an evict-set; sugar for `keep(complement)`. The complement is taken over
+    /// `[0, current_pos)` so the resulting keep-set is ascending + unique + in-range by construction.
+    fn evict(&mut self, drop: &[usize]) -> Result<(), CacheOpError> {
+        let n = self.current_pos();
+        let keep: Vec<usize> = (0..n).filter(|p| !drop.contains(p)).collect();
+        self.keep(&keep)
+    }
+
+    /// Stage a per-head keep-set (`[n_kv_heads][keep]`, each ascending + unique + in-range, all heads
+    /// equal length — the engine's single shared `current_pos` invariant). Requires HeadMajor layout.
+    fn keep_per_head(&mut self, keep: &[&[usize]]) -> Result<(), CacheOpError>;
+
+    /// Stage weighted merges (summed in the pre-compaction frame, then compacted by a paired
+    /// `keep`). Position-preserving in itself; composes with one compaction in the same callback.
+    fn merge(&mut self, merges: &[WeightedMerge]) -> Result<(), CacheOpError>;
+
+    // ── format / precision axis (position-preserving, T-5: exempt from the at-most-one rule) ──
+
+    /// Re-encode the resident tokens to `target` (typed floor f32/f16/q4_0). An opaque codec or a
+    /// device-resident buffer bails with [`CacheOpError::UnsupportedFormat`] / `NotOnHost`.
+    fn reencode(&mut self, target: FormatId) -> Result<(), CacheOpError>;
+
+    /// Transition the per-layer quantization bit-width (quant-window container only). On a
+    /// `StandardFormat` cache this is [`CacheOpError::WrongContainer`].
+    fn transition_quant_bits(&mut self, bits: u8) -> Result<(), CacheOpError>;
+
+    // ── residency (hardware) axis — compaction-slot ops (T-2) ──
+
+    /// Offload the LRU prefix (`prefix_len` tokens) to the backing store.
+    fn offload(&mut self, prefix_len: usize) -> Result<(), CacheOpError>;
+    /// Recall previously offloaded tokens for this layer.
+    fn recall(&mut self) -> Result<(), CacheOpError>;
+
+    // ── dormant geometry walls (always Err today; common to the declarative model) ──
+
+    /// Prune KEY head_dim channels (ThinK). Dormant: [`CacheOpError::GeometryImmutable`].
+    fn prune_channels(&mut self, _keep: &[usize]) -> Result<(), CacheOpError> {
+        Err(CacheOpError::GeometryImmutable)
+    }
+    /// Narrow head_dim. Dormant: [`CacheOpError::GeometryImmutable`].
+    fn set_head_dim(&mut self, _head_dim: usize) -> Result<(), CacheOpError> {
+        Err(CacheOpError::GeometryImmutable)
+    }
+    /// Project K/V to a lower rank (ShadowKV). Dormant: [`CacheOpError::GeometryImmutable`].
+    fn project_rank(&mut self, _rank: usize) -> Result<(), CacheOpError> {
+        Err(CacheOpError::GeometryImmutable)
+    }
+}
+
+/// The imperative sibling of [`KVCacheStage`] — a callback that drives a transactional
+/// [`CacheHandle`] at a [`MutationPhase`]. Additive: a technique implements EITHER this or the
+/// plan-returning [`KVCacheStage`], whichever its mutation shape fits.
+pub trait KVMutationStage: Send + Sync {
+    /// The technique name (unique within the mutation-stage slice; CLI selector / logging).
+    fn name(&self) -> &str;
+    /// The lifecycle phase this stage fires at.
+    fn phase(&self) -> MutationPhase;
+    /// Drive the cache through the transactional handle. Reads observe the pre-callback frame; staged
+    /// position-mutating ops are committed once when this returns `Ok`. An `Err` aborts the whole
+    /// transaction (T-8: bytes untouched).
+    fn on_phase(&self, ctx: &dyn StageCtx, cache: &mut dyn CacheHandle) -> Result<(), CacheOpError>;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // GATE-C — Stage-axis `.so` cdylib dlopen plugin C-ABI
 // ════════════════════════════════════════════════════════════════════════════
 //
