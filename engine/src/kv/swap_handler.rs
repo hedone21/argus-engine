@@ -703,7 +703,10 @@ mod tests {
             let g = handler.state.lock().unwrap();
             (g.records[0].k_path.clone(), g.records[0].v_path.clone())
         };
-        assert!(kp.exists() && vp.exists(), "offload wrote the backing files");
+        assert!(
+            kp.exists() && vp.exists(),
+            "offload wrote the backing files"
+        );
 
         // Recall into a cache with a DIFFERENT head_dim (8 != recorded 4) → recall_one bails on the
         // layout mismatch, but recall_layer must still drop the popped record's files.

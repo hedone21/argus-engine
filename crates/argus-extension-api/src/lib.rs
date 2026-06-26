@@ -605,7 +605,10 @@ impl core::fmt::Display for CacheOpError {
                 "weighted merge names an into/from position outside [0, current_pos)"
             ),
             CacheOpError::MergeAlreadyStaged => {
-                write!(f, "a second weighted-merge batch was staged in one callback")
+                write!(
+                    f,
+                    "a second weighted-merge batch was staged in one callback"
+                )
             }
             CacheOpError::NoResidencyBackend => write!(
                 f,
