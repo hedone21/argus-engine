@@ -690,6 +690,31 @@ pub fn compile_keep_top_k(spec: KeepTopK, score: impl Fn(usize) -> f32) -> Vec<u
     keep
 }
 
+/// Intersect keep-sets into a single ascending, deduplicated keep-set (positions kept by ALL inputs).
+/// Explicit composition for meta-intersection policies (CAOTE): the combination is visible at the
+/// call site instead of riding an implicit op ordering. Empty input ⇒ empty.
+pub fn keep_intersect(sets: &[&[usize]]) -> Vec<usize> {
+    match sets.split_first() {
+        None => Vec::new(),
+        Some((first, rest)) => {
+            let mut out: Vec<usize> = first.to_vec();
+            out.sort_unstable();
+            out.dedup();
+            out.retain(|p| rest.iter().all(|s| s.contains(p)));
+            out
+        }
+    }
+}
+
+/// Union keep-sets into a single ascending, deduplicated keep-set (positions kept by ANY input).
+/// Explicit composition for union policies (NaCl). Empty input ⇒ empty.
+pub fn keep_union(sets: &[&[usize]]) -> Vec<usize> {
+    let mut out: Vec<usize> = sets.iter().flat_map(|s| s.iter().copied()).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // GATE-C — Stage-axis `.so` cdylib dlopen plugin C-ABI
 // ════════════════════════════════════════════════════════════════════════════
@@ -3096,6 +3121,18 @@ mod tests {
             |_| 0.0,
         );
         assert_eq!(keep, vec![0, 1, 2, 3, 14, 15, 16, 17, 18, 19]);
+    }
+
+    /// keep_intersect / keep_union compose keep-sets into ascending, deduped results.
+    #[test]
+    fn keep_combinators_intersect_and_union() {
+        let a = [0usize, 1, 3, 5, 7];
+        let b = [1usize, 2, 3, 5, 9];
+        let c = [3usize, 5, 7, 9];
+        assert_eq!(keep_intersect(&[&a, &b, &c]), vec![3, 5]);
+        assert_eq!(keep_union(&[&a, &b, &c]), vec![0, 1, 2, 3, 5, 7, 9]);
+        assert_eq!(keep_intersect(&[]), Vec::<usize>::new());
+        assert_eq!(keep_union(&[]), Vec::<usize>::new());
     }
 
     /// (D3 proof) `KVFormatPlan` values are constructible and `format_of` resolves last-wins over
