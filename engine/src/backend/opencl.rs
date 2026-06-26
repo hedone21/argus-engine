@@ -571,6 +571,19 @@ impl OpenCLBackend {
         Self::new_with_profile_events(false)
     }
 
+    /// Hand out a KV-cache allocator ([`OpenCLMemory`](crate::backend::opencl::memory::OpenCLMemory))
+    /// bound to this backend's context/queue and `use_zero_copy` policy — the same allocator the engine
+    /// uses for production KV caches. Lets a caller build a device-resident KV cache via
+    /// [`KVCache::new_dynamic`](crate::kv::kv_cache::KVCache::new_dynamic) exactly as the engine does
+    /// (used by the on-device `test_kv_reencode_device` byte-equality verifier).
+    pub fn make_kv_memory(&self) -> std::sync::Arc<dyn crate::memory::Memory> {
+        std::sync::Arc::new(crate::backend::opencl::memory::OpenCLMemory::new(
+            self.context.clone(),
+            self.queue.clone(),
+            self.use_zero_copy,
+        ))
+    }
+
     /// Sprint 2a Phase 2 (ENG-RPCMEM-020 ~ 024): construct with both profile-
     /// events and `--opencl-rpcmem` toggles. When `opencl_rpcmem` is true the
     /// constructor eagerly attempts `RpcmemAllocator::new()`; on failure the
