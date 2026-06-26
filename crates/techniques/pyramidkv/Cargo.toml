@@ -1,0 +1,20 @@
+[package]
+name = "pyramidkv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# PyramidKV (Cai et al., 2024 — https://arxiv.org/abs/2406.02069) technique crate — pyramidal
+# per-layer KV budget allocation on top of SnapKV per-head attention scoring. Stage-axis extension
+# depending only on `argus-extension-api` + `linkme` (no engine/other-axis reference = proof of
+# additive extension cost). Matched byte-for-byte against NVIDIA kvpress `PyramidKVPress`: the
+# per-layer `get_layer_budget` arithmetic + the SnapKV score→topk selection. Reads the engine's
+# `TensorKind::PrefillAttention` (trailing-window attention to all prefix keys) and emits a per-head
+# [`KeepSpec::PerHead`] plan. Force-linked via one `use pyramidkv as _;` (the d2o/h2o precedent);
+# private knobs (compression_ratio/window_size/kernel_size/beta) ride the StageArgs blob, which only
+# the static force-link path carries (the dynamic `.so` C-ABI passes StageParams only).
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

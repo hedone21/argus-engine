@@ -122,6 +122,11 @@ impl PipelineStage for PrefillKeepSetStage {
 mod tests {
     use super::*;
 
+    // Force-link the out-of-tree `pyramidkv` stage into the TEST binary only (dev-dependency), so
+    // `make_stage_with_args("pyramidkv", ...)` resolves it from the linkme slice. Not linked into
+    // the production engine — no default-behavior change.
+    use pyramidkv as _;
+
     use argus_extension_api::{KVCachePlan, KeepSpec, StageCtx, TensorKind};
 
     use crate::backend::Backend;
@@ -422,6 +427,114 @@ mod tests {
                     (kv * 1000 + orig + 1) as f32,
                     "kv-head {kv} compacted pos {i} should hold original pos {orig}"
                 );
+            }
+        }
+    }
+
+    /// Byte-identical engine verification of the REAL `pyramidkv` stage driven through the full
+    /// PrefillEnd path: PFA → `pyramidkv::plan()` → `execute_kv_plan` (PerHead) → HeadMajor
+    /// per-head compaction. The expected per-layer/per-kv-head keep-sets + pyramid budgets are the
+    /// kvpress oracle from `crates/techniques/pyramidkv/reference/gen_engine_fixture.py`
+    /// (4 layers, GQA 2:1, k_len=32, window=4, kernel=1, beta=2, compression_ratio=0.5). This is
+    /// the engine-execution half of the byte-by-byte chain: pyramidkv's decision == kvpress (crate
+    /// unit suite) AND the engine compacts the buffers to exactly that decision (here).
+    #[test]
+    fn prefill_end_real_pyramidkv_byte_identical_vs_kvpress() {
+        use crate::kv_cache_ops::KVLayout;
+        const N_LAYERS: usize = 4;
+        const N_KV: usize = 2;
+        const N_Q: usize = 4; // GQA 2:1
+        const K_LEN: usize = 32; // == MAX_SEQ
+
+        // Same LCG as reference/pyramidkv_select_ref.py (head outer, pos inner, continuous state).
+        fn synth_attn(n_q: usize, k_len: usize, seed: i64) -> Vec<f32> {
+            let mut data = Vec::with_capacity(n_q * k_len);
+            let mut s = seed;
+            for _ in 0..n_q {
+                for _ in 0..k_len {
+                    s = (1_103_515_245_i64 * s + 12_345) & 0x7FFF_FFFF;
+                    data.push((s % 1000) as f32);
+                }
+            }
+            data
+        }
+
+        // kvpress-reference oracle (reference/gen_engine_fixture.py). Pyramid budgets per layer:
+        let budgets: [usize; N_LAYERS] = [24, 19, 13, 8];
+        #[rustfmt::skip]
+        let expected: [[&[usize]; N_KV]; N_LAYERS] = [
+            [&[0,1,3,5,7,8,9,11,12,13,15,16,17,18,19,20,22,25,26,27,28,29,30,31],
+             &[0,1,2,4,5,7,8,10,11,14,15,16,18,19,21,23,24,25,26,27,28,29,30,31]],
+            [&[1,3,4,5,7,8,9,10,11,18,19,21,22,24,25,28,29,30,31],
+             &[2,5,6,7,9,10,11,12,14,16,19,21,23,24,26,28,29,30,31]],
+            [&[0,5,7,8,11,17,19,21,25,28,29,30,31],
+             &[0,4,10,12,14,16,19,20,27,28,29,30,31]],
+            [&[3,5,16,20,28,29,30,31],
+             &[0,1,9,20,28,29,30,31]],
+        ];
+
+        let handles: Vec<Arc<StandardFormat>> = (0..N_LAYERS)
+            .map(|l| Arc::new(StandardFormat::new(l, make_head_major_cache(N_KV, K_LEN))))
+            .collect();
+        let pfa: Vec<Vec<f32>> = (0..N_LAYERS)
+            .map(|l| synth_attn(N_Q, K_LEN, 1000 + l as i64))
+            .collect();
+        let cell = Arc::new(Mutex::new(Some(pfa)));
+
+        // pyramidkv with explicit knobs via the StageArgs blob (compression_ratio drives the budget,
+        // so PrefillKeepSetStage's target_ratio is irrelevant here — set to 1.0).
+        let blob = [
+            argus_extension_api::PluginArg {
+                key: "compression_ratio",
+                val: "0.5",
+            },
+            argus_extension_api::PluginArg {
+                key: "window_size",
+                val: "4",
+            },
+            argus_extension_api::PluginArg {
+                key: "kernel_size",
+                val: "1",
+            },
+            argus_extension_api::PluginArg {
+                key: "beta",
+                val: "2",
+            },
+        ];
+        let plugin = crate::kv::eviction::stage_registry::make_stage_with_args(
+            "pyramidkv",
+            &argus_extension_api::StageParams::default(),
+            &blob,
+        )
+        .expect("pyramidkv stage registered (engine dev-dep force-link)");
+
+        let stage = PrefillKeepSetStage::new(handles.clone(), plugin, cell, N_Q, 1.0);
+        let mut profiler = OpProfiler::new();
+        let mut ctx = make_ctx(&mut profiler);
+        let outcome = stage
+            .on_phase(&LifecyclePhase::PrefillEnd, &mut ctx)
+            .unwrap();
+        assert!(matches!(outcome, StageOutcome::Consumed));
+
+        for (layer, handle) in handles.iter().enumerate() {
+            assert_eq!(handle.current_pos(), budgets[layer], "layer {layer} budget");
+            let inner = handle.take_inner();
+            assert_eq!(inner.layout(), KVLayout::HeadMajor);
+            let k = inner.k_buffer.as_slice::<f32>();
+            for (kv, kept) in expected[layer].iter().enumerate() {
+                assert_eq!(
+                    kept.len(),
+                    budgets[layer],
+                    "layer {layer} head {kv} keep len"
+                );
+                for (i, &orig) in kept.iter().enumerate() {
+                    let off = (kv * MAX_SEQ + i) * HEAD_DIM; // HeadMajor offset.
+                    assert_eq!(
+                        k[off],
+                        (kv * 1000 + orig + 1) as f32,
+                        "layer {layer} kv-head {kv} compacted pos {i} != kvpress original pos {orig}"
+                    );
+                }
             }
         }
     }
