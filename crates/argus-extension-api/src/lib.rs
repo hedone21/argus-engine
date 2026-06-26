@@ -230,6 +230,38 @@ pub trait StageCtx {
     fn kv_on_device(&self) -> bool {
         false
     }
+
+    // ── constraint advertisement (default methods; the engine overrides, StageCtxAbi unchanged) ──
+    //
+    // A technique reads these BEFORE producing a plan to avoid emitting one the current container
+    // cannot execute (the "expressible != executable" honesty boundary, surfaced up-front instead of
+    // as a runtime executor reject). All are default methods so the ~13 existing `StageCtx` impls and
+    // the C-ABI `StageCtxAbi` (a fixed fn-ptr table) compile unchanged.
+
+    /// The stored KV dtype of this layer's cache (for diagnostics / granularity reasoning).
+    /// Default [`TensorDtype::F32`].
+    fn cache_dtype(&self) -> TensorDtype {
+        TensorDtype::F32
+    }
+
+    /// Whether per-head compaction ([`KeepSpec::PerHead`]) is supported — `true` only on a HeadMajor
+    /// cache (where a head's tokens are contiguous and shiftable in isolation). A per-head policy
+    /// degrades to [`KeepSpec::LayerWide`] when this is `false`. Default `false`.
+    fn supports_per_head(&self) -> bool {
+        false
+    }
+
+    /// Whether a weighted merge ([`WeightedMerge`]) can be applied — the merge executor is CPU-only,
+    /// so `false` on device-only KV. Default `= !kv_on_device()`.
+    fn supports_merge(&self) -> bool {
+        !self.kv_on_device()
+    }
+
+    /// The keep/merge position granularity: `1` for typed-float caches; the quant block length for
+    /// block-quantized caches (a keep-set off this granularity forces a re-encode). Default `1`.
+    fn keep_granularity(&self) -> usize {
+        1
+    }
 }
 
 /// A weighted merge instruction. Sums the evicted tokens (`from`) with weights into a single retained token's slot (`into`).
