@@ -100,10 +100,10 @@ impl<'a> EngineCacheHandle<'a> {
             if k >= self.entry_pos {
                 return Err(CacheOpError::InvalidKeep);
             }
-            if let Some(p) = prev {
-                if k <= p {
-                    return Err(CacheOpError::InvalidKeep);
-                }
+            if let Some(p) = prev
+                && k <= p
+            {
+                return Err(CacheOpError::InvalidKeep);
             }
             prev = Some(k);
         }
@@ -139,11 +139,11 @@ impl<'a> EngineCacheHandle<'a> {
             .map_err(|e| anyhow::anyhow!("re-encode commit failed: {e}"))?;
             self.mutated = true;
         }
-        if let Some(merges) = self.merges.take() {
-            if !merges.is_empty() {
-                crate::kv::standard_format::apply_weighted_merges(self.cache, &merges);
-                self.mutated = true;
-            }
+        if let Some(merges) = self.merges.take()
+            && !merges.is_empty()
+        {
+            crate::kv::standard_format::apply_weighted_merges(self.cache, &merges);
+            self.mutated = true;
         }
         match self.compaction.take() {
             Some(Compaction::Keep(keep)) => {
@@ -154,7 +154,8 @@ impl<'a> EngineCacheHandle<'a> {
             Some(Compaction::KeepPerHead(heads)) => {
                 let new_pos = heads.first().map_or(0, |h| h.len());
                 for (kv_head, keep) in heads.iter().enumerate() {
-                    self.cache.compact_keep_positions_for_head(kv_head, keep, 0)?;
+                    self.cache
+                        .compact_keep_positions_for_head(kv_head, keep, 0)?;
                 }
                 self.cache.set_current_pos(new_pos);
                 self.mutated = true;
@@ -348,7 +349,10 @@ mod tests {
         let mut c = cache_f32(8);
         let before = c.k_buffer.as_slice::<f32>().to_vec();
         let mut h = EngineCacheHandle::new(&mut c, 0, 1);
-        assert_eq!(h.prune_channels(&[0, 1]), Err(CacheOpError::GeometryImmutable));
+        assert_eq!(
+            h.prune_channels(&[0, 1]),
+            Err(CacheOpError::GeometryImmutable)
+        );
         assert_eq!(h.set_head_dim(2), Err(CacheOpError::GeometryImmutable));
         assert_eq!(h.project_rank(2), Err(CacheOpError::GeometryImmutable));
         drop(h);
@@ -368,7 +372,11 @@ mod tests {
                 Arc::new(SharedBuffer::new(bytes, DType::F32)),
                 backend.clone(),
             ),
-            Tensor::new(shape, Arc::new(SharedBuffer::new(bytes, DType::F32)), backend),
+            Tensor::new(
+                shape,
+                Arc::new(SharedBuffer::new(bytes, DType::F32)),
+                backend,
+            ),
             cap,
         )
         .with_layout(KVLayout::HeadMajor);
@@ -428,14 +436,22 @@ mod tests {
         let mut h = EngineCacheHandle::with_swap(&mut c, 0, 1, &swap);
         assert_eq!(h.offload(prefix), Ok(()));
         assert_eq!(h.commit().unwrap(), true);
-        assert_eq!(c.current_pos(), resident - prefix, "offload pruned the prefix");
+        assert_eq!(
+            c.current_pos(),
+            resident - prefix,
+            "offload pruned the prefix"
+        );
         assert_eq!(swap.state.lock().unwrap().records.len(), 1);
 
         // recall it back through the handle.
         let mut h = EngineCacheHandle::with_swap(&mut c, 0, 1, &swap);
         assert_eq!(h.recall(), Ok(()));
         assert_eq!(h.commit().unwrap(), true);
-        assert_eq!(c.current_pos(), resident, "recall restored the prefix length");
+        assert_eq!(
+            c.current_pos(),
+            resident,
+            "recall restored the prefix length"
+        );
         // restored prefix bytes match the original.
         let k = c.k_buffer.as_slice::<f32>();
         let mut got = Vec::<f32>::new();
@@ -446,7 +462,10 @@ mod tests {
                 got.extend_from_slice(&k[off..off + dim]);
             }
         }
-        assert_eq!(got, orig, "recalled prefix bytes match the offloaded original");
+        assert_eq!(
+            got, orig,
+            "recalled prefix bytes match the offloaded original"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -515,7 +534,10 @@ mod tests {
         let mut c = cache_f32(8);
         let mut h = EngineCacheHandle::new(&mut c, 0, 1);
         // intersect([0,1,2,3,5], [1,3,5,7]) = [1,3,5]
-        assert_eq!(h.keep_intersect_of(&[&[0, 1, 2, 3, 5], &[1, 3, 5, 7]]), Ok(()));
+        assert_eq!(
+            h.keep_intersect_of(&[&[0, 1, 2, 3, 5], &[1, 3, 5, 7]]),
+            Ok(())
+        );
         assert_eq!(h.commit().unwrap(), true);
         assert_eq!(c.current_pos(), 3);
 

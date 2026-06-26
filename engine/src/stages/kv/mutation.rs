@@ -56,7 +56,12 @@ pub struct ScalarStageCtx {
 
 impl ScalarStageCtx {
     /// Snapshot the entry-frame scalars of `cache` (copies, no borrow held).
-    pub fn from_cache(cache: &KVCache, target_len: usize, layer_idx: usize, n_layers: usize) -> Self {
+    pub fn from_cache(
+        cache: &KVCache,
+        target_len: usize,
+        layer_idx: usize,
+        n_layers: usize,
+    ) -> Self {
         Self {
             current_pos: cache.current_pos(),
             target_len,
@@ -121,7 +126,11 @@ impl KVMutationStage for PlanStageAdapter {
     fn phase(&self) -> MutationPhase {
         self.phase
     }
-    fn on_phase(&self, ctx: &dyn StageCtx, cache: &mut dyn CacheHandle) -> Result<(), CacheOpError> {
+    fn on_phase(
+        &self,
+        ctx: &dyn StageCtx,
+        cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
         let Some(plan) = self.inner.plan(ctx) else {
             return Ok(()); // no-op plan
         };
@@ -192,9 +201,9 @@ impl PipelineStage for KVMutationDriverStage {
                 // target_len = 0 in s1 (the eviction budget plumbing is production/follow-up).
                 let sctx = ScalarStageCtx::from_cache(cache, 0, layer_idx, n_layers);
                 let mut handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
-                self.stage
-                    .on_phase(&sctx, &mut handle)
-                    .map_err(|e| anyhow::anyhow!("mutation stage '{}' failed: {e}", self.stage.name()))?;
+                self.stage.on_phase(&sctx, &mut handle).map_err(|e| {
+                    anyhow::anyhow!("mutation stage '{}' failed: {e}", self.stage.name())
+                })?;
                 handle.commit()?;
             }
             Ok(())
@@ -246,7 +255,11 @@ mod tests {
             _ => unreachable!(),
         };
         let mut c = KVCache::new(
-            Tensor::new(sh.clone(), Arc::new(SharedBuffer::new(bytes, dtype)), be.clone()),
+            Tensor::new(
+                sh.clone(),
+                Arc::new(SharedBuffer::new(bytes, dtype)),
+                be.clone(),
+            ),
             Tensor::new(sh, Arc::new(SharedBuffer::new(bytes, dtype)), be),
             MAX_SEQ,
         );
@@ -273,11 +286,19 @@ mod tests {
     fn write_row(c: &mut KVCache, off: usize, dtype: DType, row: &[f32], is_k: bool) {
         match dtype {
             DType::F32 => {
-                let buf = if is_k { c.k_buffer.as_mut_slice::<f32>() } else { c.v_buffer.as_mut_slice::<f32>() };
+                let buf = if is_k {
+                    c.k_buffer.as_mut_slice::<f32>()
+                } else {
+                    c.v_buffer.as_mut_slice::<f32>()
+                };
                 buf[off..off + HD].copy_from_slice(row);
             }
             DType::F16 => {
-                let buf = if is_k { c.k_buffer.as_mut_slice::<f16>() } else { c.v_buffer.as_mut_slice::<f16>() };
+                let buf = if is_k {
+                    c.k_buffer.as_mut_slice::<f16>()
+                } else {
+                    c.v_buffer.as_mut_slice::<f16>()
+                };
                 for d in 0..HD {
                     buf[off + d] = f16::from_f32(row[d]);
                 }
@@ -285,7 +306,11 @@ mod tests {
             DType::Q4_0 => {
                 let bpp = HD / QK4_0;
                 let bo = off / QK4_0;
-                let buf = if is_k { c.k_buffer.as_mut_slice::<BlockQ4_0>() } else { c.v_buffer.as_mut_slice::<BlockQ4_0>() };
+                let buf = if is_k {
+                    c.k_buffer.as_mut_slice::<BlockQ4_0>()
+                } else {
+                    c.v_buffer.as_mut_slice::<BlockQ4_0>()
+                };
                 for bi in 0..bpp {
                     let mut blk = [0.0f32; QK4_0];
                     blk.copy_from_slice(&row[bi * QK4_0..(bi + 1) * QK4_0]);
@@ -336,11 +361,16 @@ mod tests {
         let handle = Arc::new(StandardFormat::new(0, cache_h));
         let driver = KVMutationDriverStage::new(
             vec![handle.clone()],
-            Box::new(PlanStageAdapter::new((reg.make)(params), MutationPhase::KvMutate)),
+            Box::new(PlanStageAdapter::new(
+                (reg.make)(params),
+                MutationPhase::KvMutate,
+            )),
         );
         let mut profiler = OpProfiler::new();
         let mut pctx = make_ctx(&mut profiler);
-        let outcome = driver.on_phase(&LifecyclePhase::KvMutate, &mut pctx).unwrap();
+        let outcome = driver
+            .on_phase(&LifecyclePhase::KvMutate, &mut pctx)
+            .unwrap();
         assert!(matches!(outcome, StageOutcome::Consumed));
         let cache_h = handle.take_inner();
 
@@ -356,18 +386,34 @@ mod tests {
                     DType::F32 => {
                         let a = cache_v2.k_buffer.as_slice::<f32>();
                         let b = cache_h.k_buffer.as_slice::<f32>();
-                        assert_eq!(a[off..off + HD], b[off..off + HD], "K pos {pos} head {head}");
+                        assert_eq!(
+                            a[off..off + HD],
+                            b[off..off + HD],
+                            "K pos {pos} head {head}"
+                        );
                         let a = cache_v2.v_buffer.as_slice::<f32>();
                         let b = cache_h.v_buffer.as_slice::<f32>();
-                        assert_eq!(a[off..off + HD], b[off..off + HD], "V pos {pos} head {head}");
+                        assert_eq!(
+                            a[off..off + HD],
+                            b[off..off + HD],
+                            "V pos {pos} head {head}"
+                        );
                     }
                     DType::F16 => {
                         let a = cache_v2.k_buffer.as_slice::<f16>();
                         let b = cache_h.k_buffer.as_slice::<f16>();
-                        assert_eq!(a[off..off + HD], b[off..off + HD], "K pos {pos} head {head}");
+                        assert_eq!(
+                            a[off..off + HD],
+                            b[off..off + HD],
+                            "K pos {pos} head {head}"
+                        );
                         let a = cache_v2.v_buffer.as_slice::<f16>();
                         let b = cache_h.v_buffer.as_slice::<f16>();
-                        assert_eq!(a[off..off + HD], b[off..off + HD], "V pos {pos} head {head}");
+                        assert_eq!(
+                            a[off..off + HD],
+                            b[off..off + HD],
+                            "V pos {pos} head {head}"
+                        );
                     }
                     DType::Q4_0 => {
                         let bpp = HD / QK4_0;
@@ -375,14 +421,30 @@ mod tests {
                         let a = cache_v2.k_buffer.as_slice::<BlockQ4_0>();
                         let b = cache_h.k_buffer.as_slice::<BlockQ4_0>();
                         for bi in 0..bpp {
-                            assert_eq!(a[bo + bi].d, b[bo + bi].d, "K q4 d pos {pos} head {head} blk {bi}");
-                            assert_eq!(a[bo + bi].qs, b[bo + bi].qs, "K q4 qs pos {pos} head {head} blk {bi}");
+                            assert_eq!(
+                                a[bo + bi].d,
+                                b[bo + bi].d,
+                                "K q4 d pos {pos} head {head} blk {bi}"
+                            );
+                            assert_eq!(
+                                a[bo + bi].qs,
+                                b[bo + bi].qs,
+                                "K q4 qs pos {pos} head {head} blk {bi}"
+                            );
                         }
                         let a = cache_v2.v_buffer.as_slice::<BlockQ4_0>();
                         let b = cache_h.v_buffer.as_slice::<BlockQ4_0>();
                         for bi in 0..bpp {
-                            assert_eq!(a[bo + bi].d, b[bo + bi].d, "V q4 d pos {pos} head {head} blk {bi}");
-                            assert_eq!(a[bo + bi].qs, b[bo + bi].qs, "V q4 qs pos {pos} head {head} blk {bi}");
+                            assert_eq!(
+                                a[bo + bi].d,
+                                b[bo + bi].d,
+                                "V q4 d pos {pos} head {head} blk {bi}"
+                            );
+                            assert_eq!(
+                                a[bo + bi].qs,
+                                b[bo + bi].qs,
+                                "V q4 qs pos {pos} head {head} blk {bi}"
+                            );
                         }
                     }
                     _ => unreachable!(),

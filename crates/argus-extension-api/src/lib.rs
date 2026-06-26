@@ -564,13 +564,19 @@ impl core::fmt::Display for CacheOpError {
                  ragged geometry (needs an engine-core base-split)"
             ),
             CacheOpError::WrongContainer => {
-                write!(f, "op requires a different KV container kind than the current cache")
+                write!(
+                    f,
+                    "op requires a different KV container kind than the current cache"
+                )
             }
             CacheOpError::NotOnHost => {
                 write!(f, "host-only op requested on a device-resident (GPU) cache")
             }
             CacheOpError::UnsupportedFormat(name) => {
-                write!(f, "op names a storage format this path cannot materialize: {name}")
+                write!(
+                    f,
+                    "op names a storage format this path cannot materialize: {name}"
+                )
             }
             CacheOpError::HeterogeneousUnsupported => write!(
                 f,
@@ -645,7 +651,7 @@ pub trait CacheHandle {
         spec: KeepTopK,
         score: &dyn Fn(usize) -> f32,
     ) -> Result<(), CacheOpError> {
-        let keep = compile_keep_top_k(spec, |pos| score(pos));
+        let keep = compile_keep_top_k(spec, score);
         self.keep(&keep)
     }
 
@@ -703,7 +709,8 @@ pub trait KVMutationStage: Send + Sync {
     /// Drive the cache through the transactional handle. Reads observe the pre-callback frame; staged
     /// position-mutating ops are committed once when this returns `Ok`. An `Err` aborts the whole
     /// transaction (T-8: bytes untouched).
-    fn on_phase(&self, ctx: &dyn StageCtx, cache: &mut dyn CacheHandle) -> Result<(), CacheOpError>;
+    fn on_phase(&self, ctx: &dyn StageCtx, cache: &mut dyn CacheHandle)
+    -> Result<(), CacheOpError>;
 }
 
 /// The canonical 3-partition keep-set shape (T1): `[0..prefix)` (protected) + the top-`heavy`

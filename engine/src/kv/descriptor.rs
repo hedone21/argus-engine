@@ -170,3 +170,78 @@ pub fn descriptor_self_test() {
         panic!("KV technique coordinate-map OCCUPANCY violation: {e}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The coordinate map is exactly the 7-technique matrix, regardless of feature-gated crates.
+    /// Mutation-proof: adding/removing a descriptor changes this set (and breaks the CARDINALITY
+    /// const-assert).
+    #[test]
+    fn descriptor_names_match_the_seven_technique_matrix() {
+        let mut got = descriptor_names();
+        got.sort_unstable();
+        let mut want = vec![
+            "attn_score",
+            "d2o",
+            "h2o",
+            "h2o_plus",
+            "quest",
+            "sliding",
+            "streaming",
+        ];
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    /// The live map satisfies OCCUPANCY (every read produced or engine-intrinsic) and the boot
+    /// self-test does not panic.
+    #[test]
+    fn live_map_satisfies_occupancy() {
+        assert_eq!(
+            validate_occupancy(KV_TECHNIQUE_DESCRIPTORS, ENGINE_INTRINSIC),
+            Ok(())
+        );
+        descriptor_self_test();
+    }
+
+    /// OCCUPANCY rejects an orphan read (a signal neither produced nor intrinsic), and accepts it once
+    /// a producer is present. Mutation-proof / non-tautological: a validator that skipped the read
+    /// check would make the first assert `Ok` (failing it), and one that ignored `produces` would make
+    /// the second `Err` (failing that).
+    #[test]
+    fn orphan_read_is_rejected_then_satisfied_by_a_producer() {
+        // `ghost` reads Scores; the intrinsic set here is {Key} only and nothing produces Scores.
+        let orphaned = [KvTechniqueDescriptor {
+            name: "ghost",
+            axis: KvAxis::Stage,
+            phase: MutationPhase::KvMutate,
+            reads: &[TensorKind::Scores],
+            produces: &[],
+        }];
+        assert!(validate_occupancy(&orphaned, &[TensorKind::Key]).is_err());
+
+        // Add a producer of Scores → the same read is now satisfied.
+        let with_producer = [
+            KvTechniqueDescriptor {
+                name: "ghost",
+                axis: KvAxis::Stage,
+                phase: MutationPhase::KvMutate,
+                reads: &[TensorKind::Scores],
+                produces: &[],
+            },
+            KvTechniqueDescriptor {
+                name: "source",
+                axis: KvAxis::Score,
+                phase: MutationPhase::KvMutate,
+                reads: &[],
+                produces: &[TensorKind::Scores],
+            },
+        ];
+        assert_eq!(
+            validate_occupancy(&with_producer, &[TensorKind::Key]),
+            Ok(())
+        );
+    }
+}
