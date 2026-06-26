@@ -173,6 +173,52 @@ pub(crate) fn execute_kv_plan(
     }
 }
 
+/// (dormant) Pre-make compatibility check: reject a stage whose declared capabilities the current
+/// container cannot execute, BEFORE instantiation — surfacing the expressible-vs-executable boundary
+/// at make time instead of as a runtime executor reject (the channel-axis honest-reject precedent).
+/// Today it checks the one pre-make-knowable constraint: a merge-producing stage
+/// ([`StageCaps::produces_merge_plan`]) needs CPU-resident KV (the merge executor is host-only).
+///
+/// DORMANT: not yet wired into the production make path (zero behavior change); the CacheHandle /
+/// mutation driver consult it as the constraint surface matures. Exercised by its unit test; the
+/// `allow(dead_code)` marks the deliberate dormancy (mirroring the ChannelKeep dormant-surface
+/// precedent) rather than hiding an oversight.
+#[allow(dead_code)]
+pub(crate) fn validate_stage_constraints(
+    caps: &argus_extension_api::StageCaps,
+    supports_merge: bool,
+) -> Result<(), String> {
+    if caps.produces_merge_plan && !supports_merge {
+        return Err(
+            "stage produces weighted merges but the cache is device-resident (the merge executor is \
+             CPU-only); degrade to a keep-only plan or place KV on host"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod constraint_validator_tests {
+    use super::validate_stage_constraints;
+    use argus_extension_api::{StageCaps, TensorKind};
+
+    /// A merge-producing stage is rejected on device-only KV, accepted on host KV; a drop-only stage
+    /// is always accepted. Mutation-proof: dropping the `produces_merge_plan && !supports_merge` guard
+    /// makes the device-merge case return Ok, failing the first assert.
+    #[test]
+    fn merge_stage_requires_host_residency() {
+        let merge_caps = StageCaps {
+            reads: &[TensorKind::Scores],
+            default_protected_prefix: 4,
+            produces_merge_plan: true,
+        };
+        assert!(validate_stage_constraints(&merge_caps, false).is_err()); // device → reject
+        assert!(validate_stage_constraints(&merge_caps, true).is_ok()); // host → ok
+        assert!(validate_stage_constraints(&StageCaps::SCORE_FREE, false).is_ok()); // drop-only → ok
+    }
+}
+
 /// 엔진 `DType` → argus-extension-api `TensorDtype` 매핑(핸들 진단용; 읽기 산출은 항상 f32).
 fn map_dtype(dt: DType) -> TensorDtype {
     match dt {
@@ -509,6 +555,21 @@ impl StageCtx for KVStageCtx<'_> {
             // (D2) raw current-Q accessor — `Some` when the forward-time capture fed it via
             // `with_query` (faithful read-plan path); else `None` (production/offload/device-degraded).
             TensorKind::Query => self.query_handle.as_ref().map(|h| h as &dyn TensorHandle),
+        }
+    }
+
+    // ── constraint advertisement (override the argus-extension-api defaults with real cache state) ──
+    fn cache_dtype(&self) -> TensorDtype {
+        map_dtype(self.cache.kv_dtype())
+    }
+    fn supports_per_head(&self) -> bool {
+        self.cache.layout() == crate::kv_cache_ops::KVLayout::HeadMajor
+    }
+    fn keep_granularity(&self) -> usize {
+        // A block-quantized cache compacts in whole quant blocks; typed-float caches are per-token.
+        match self.cache.kv_dtype() {
+            DType::Q4_0 => crate::quant::QK4_0,
+            _ => 1,
         }
     }
 }
