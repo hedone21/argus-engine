@@ -467,4 +467,146 @@ mod tests {
     fn streaming_via_handle_byte_identical_q4_0() {
         streaming_handle_byte_identical(DType::Q4_0);
     }
+
+    /// Assert K and V byte-identical over the resident region of two caches.
+    fn assert_kv_byte_identical(a: &KVCache, b: &KVCache) {
+        assert_eq!(a.current_pos(), b.current_pos());
+        let n = a.current_pos();
+        for pos in 0..n {
+            for head in 0..KV_HEADS {
+                let off = a.offset(pos, head);
+                assert_eq!(off, b.offset(pos, head));
+                assert_eq!(
+                    &a.k_buffer.as_slice::<f32>()[off..off + HD],
+                    &b.k_buffer.as_slice::<f32>()[off..off + HD],
+                    "K pos {pos} head {head}"
+                );
+                assert_eq!(
+                    &a.v_buffer.as_slice::<f32>()[off..off + HD],
+                    &b.v_buffer.as_slice::<f32>()[off..off + HD],
+                    "V pos {pos} head {head}"
+                );
+            }
+        }
+    }
+
+    /// F4: a LayerWide keep + WeightedMerge plan (d2o shape) through the handle (merge + keep,
+    /// committed) is byte-identical to the same plan through execute_kv_plan — covering the
+    /// merge-commit arm the streaming gate (empty merges) never reached.
+    #[test]
+    fn merge_plan_via_handle_byte_identical() {
+        use argus_extension_api::{KVCachePlan, KeepSpec, MergeAxis, WeightedMerge};
+        let merges = vec![WeightedMerge {
+            into: 0,
+            into_weight: 0.5,
+            from: vec![(5, 0.5)],
+            apply_to: MergeAxis::Both,
+        }];
+        let keep: Vec<usize> = (0..RESIDENT).filter(|&p| p != 5).collect();
+
+        let mut cv2 = make_cache(DType::F32);
+        let plan = KVCachePlan {
+            keep: KeepSpec::LayerWide(keep.clone()),
+            merges: merges.clone(),
+            channels: None,
+        };
+        execute_kv_plan(&mut cv2, &plan, 0, 1).unwrap();
+
+        let mut ch = make_cache(DType::F32);
+        {
+            let mut h = EngineCacheHandle::new(&mut ch, 0, 1);
+            h.merge(&merges).unwrap();
+            h.keep(&keep).unwrap();
+            assert_eq!(h.commit().unwrap(), true);
+        }
+        assert_kv_byte_identical(&cv2, &ch);
+    }
+
+    /// F4: a PerHead keep plan on a HeadMajor cache through keep_per_head is byte-identical to the same
+    /// plan through execute_kv_plan — covering the per-head compaction arm.
+    #[test]
+    fn per_head_plan_via_handle_byte_identical() {
+        use crate::kv_cache_ops::KVLayout;
+        use argus_extension_api::{KVCachePlan, KeepSpec};
+        let build = || {
+            let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+            let sh = Shape::new(vec![1, MAX_SEQ, KV_HEADS, HD]);
+            let total = MAX_SEQ * KV_HEADS * HD;
+            let mut c = KVCache::new(
+                Tensor::new(
+                    sh.clone(),
+                    Arc::new(SharedBuffer::new(total * 4, DType::F32)),
+                    be.clone(),
+                ),
+                Tensor::new(sh, Arc::new(SharedBuffer::new(total * 4, DType::F32)), be),
+                MAX_SEQ,
+            )
+            .with_layout(KVLayout::HeadMajor);
+            c.set_current_pos(RESIDENT);
+            for pos in 0..RESIDENT {
+                for head in 0..KV_HEADS {
+                    let off = c.offset(pos, head);
+                    let kb = c.k_buffer.as_mut_slice::<f32>();
+                    for d in 0..HD {
+                        kb[off + d] = (pos * 100 + head * 10 + d) as f32;
+                    }
+                    let vb = c.v_buffer.as_mut_slice::<f32>();
+                    for d in 0..HD {
+                        vb[off + d] = (pos * 100 + head * 10 + d) as f32 - 0.25;
+                    }
+                }
+            }
+            c
+        };
+        // equal-length per-head keeps (the single shared current_pos invariant): 6 each.
+        let keep0: Vec<usize> = (0..RESIDENT).step_by(2).take(6).collect();
+        let keep1: Vec<usize> = (0..RESIDENT).skip(1).step_by(2).take(6).collect();
+        let heads = vec![keep0, keep1];
+
+        let mut cv2 = build();
+        let plan = KVCachePlan {
+            keep: KeepSpec::PerHead(heads.clone()),
+            merges: vec![],
+            channels: None,
+        };
+        execute_kv_plan(&mut cv2, &plan, 0, 1).unwrap();
+
+        let mut ch = build();
+        {
+            let mut h = EngineCacheHandle::new(&mut ch, 0, 1);
+            let refs: Vec<&[usize]> = heads.iter().map(|x| x.as_slice()).collect();
+            h.keep_per_head(&refs).unwrap();
+            assert_eq!(h.commit().unwrap(), true);
+        }
+        assert_kv_byte_identical(&cv2, &ch);
+    }
+
+    /// F4: a re-encode (f16 -> f32) through the handle commit is byte-identical to a direct
+    /// apply_format_plan — covering the reencode-commit arm (zero handle reencode call-sites before).
+    #[test]
+    fn reencode_via_handle_byte_identical() {
+        use crate::kv::format_apply::apply_format_plan;
+        use argus_extension_api::{FormatId, KVFormatPlan};
+        let mut cv2 = make_cache(DType::F16);
+        apply_format_plan(
+            &mut cv2,
+            &KVFormatPlan {
+                base: FormatId("f32".into()),
+                overrides: vec![],
+            },
+            0,
+            1,
+        )
+        .unwrap();
+
+        let mut ch = make_cache(DType::F16);
+        {
+            let mut h = EngineCacheHandle::new(&mut ch, 0, 1);
+            h.reencode(FormatId("f32".into())).unwrap();
+            assert_eq!(h.commit().unwrap(), true);
+        }
+        assert_eq!(cv2.kv_dtype(), DType::F32);
+        assert_eq!(ch.kv_dtype(), DType::F32);
+        assert_kv_byte_identical(&cv2, &ch);
+    }
 }

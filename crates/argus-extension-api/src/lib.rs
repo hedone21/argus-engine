@@ -3213,6 +3213,23 @@ mod tests {
         assert_eq!(keep, vec![0, 1, 2, 3, 14, 15, 16, 17, 18, 19]);
     }
 
+    /// The STABLE descending sort is load-bearing for the byte-identical-to-old-plugins refactor: on a
+    /// score tie at the heavy-budget cut, the lower input/position index must win. positions 3 and 4
+    /// tie (heavy=1) → keep 3, not 4. A switch to sort_unstable_by would flip this and is caught here.
+    #[test]
+    fn compile_keep_top_k_stable_tie_breaks_by_position() {
+        let keep = compile_keep_top_k(
+            KeepTopK {
+                current: 8,
+                prefix: 2,
+                recent: 2,
+                heavy: 1,
+            },
+            |p| if p == 3 || p == 4 { 5.0 } else { 0.0 },
+        );
+        assert_eq!(keep, vec![0, 1, 3, 6, 7]);
+    }
+
     /// keep_intersect / keep_union compose keep-sets into ascending, deduped results.
     #[test]
     fn keep_combinators_intersect_and_union() {
