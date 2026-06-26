@@ -471,4 +471,59 @@ mod tests {
             }
         }
     }
+
+    /// c10: the high-level `keep_top_k` op compiles the 3-partition set (T1) and stages it through the
+    /// validated low-level `keep`, then commits to the expected surviving positions (h2o shape).
+    /// Mutation-proof: a wrong compile or a skipped commit leaves current_pos / the survivor rows off.
+    #[test]
+    fn test_keep_top_k_high_level_op() {
+        use argus_extension_api::KeepTopK;
+        // current=8, prefix=2, recent=2 (recent_start=6), heavy=2 over [2..6); scores pick 3 and 5.
+        let mut c = cache_f32(8);
+        let scores = [0.0f32, 0.0, 1.0, 9.0, 2.0, 8.0, 0.0, 0.0];
+        let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+        assert_eq!(
+            h.keep_top_k(
+                KeepTopK {
+                    current: 8,
+                    prefix: 2,
+                    recent: 2,
+                    heavy: 2,
+                },
+                &|p| scores[p],
+            ),
+            Ok(())
+        );
+        assert_eq!(h.commit().unwrap(), true);
+        // keep = [0,1] ++ {3,5} ++ [6,7]
+        assert_eq!(c.current_pos(), 6);
+        for (new_pos, &src) in [0usize, 1, 3, 5, 6, 7].iter().enumerate() {
+            for head in 0..N_KV {
+                let off = c.offset(new_pos, head);
+                let k = c.k_buffer.as_slice::<f32>();
+                for d in 0..HD {
+                    assert_eq!(k[off + d], (src * 100 + head * 10 + d) as f32);
+                }
+            }
+        }
+    }
+
+    /// c10: the high-level `keep_intersect_of` / `keep_union_of` combinators compose component
+    /// keep-sets and commit to the intersection / union token count.
+    #[test]
+    fn test_keep_combinator_high_level_ops() {
+        let mut c = cache_f32(8);
+        let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+        // intersect([0,1,2,3,5], [1,3,5,7]) = [1,3,5]
+        assert_eq!(h.keep_intersect_of(&[&[0, 1, 2, 3, 5], &[1, 3, 5, 7]]), Ok(()));
+        assert_eq!(h.commit().unwrap(), true);
+        assert_eq!(c.current_pos(), 3);
+
+        let mut c = cache_f32(8);
+        let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+        // union([0,2], [2,5,7]) = [0,2,5,7]
+        assert_eq!(h.keep_union_of(&[&[0, 2], &[2, 5, 7]]), Ok(()));
+        assert_eq!(h.commit().unwrap(), true);
+        assert_eq!(c.current_pos(), 4);
+    }
 }

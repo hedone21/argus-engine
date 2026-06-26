@@ -631,6 +631,34 @@ pub trait CacheHandle {
     /// `keep`). Position-preserving in itself; composes with one compaction in the same callback.
     fn merge(&mut self, merges: &[WeightedMerge]) -> Result<(), CacheOpError>;
 
+    // ── high-level rule-respecting ops (T1 compiler + combinators, worn as imperative methods) ──
+    //
+    // The dominant score-based eviction class becomes a single op call: the author supplies budgets +
+    // a score fn (or component keep-sets), and the engine owns the top-k / recency / ascending re-sort
+    // / composition — then stages the result through the validated low-level `keep` (T-10 + T-2). These
+    // are default methods (`&dyn Fn` keeps the trait dyn-safe); a custom container needs only `keep`.
+
+    /// Keep the canonical 3-partition top-k set (T1): compiles via [`compile_keep_top_k`] and stages
+    /// it. `score(pos)` is the per-position ranking key over the heavy-hitter middle.
+    fn keep_top_k(
+        &mut self,
+        spec: KeepTopK,
+        score: &dyn Fn(usize) -> f32,
+    ) -> Result<(), CacheOpError> {
+        let keep = compile_keep_top_k(spec, |pos| score(pos));
+        self.keep(&keep)
+    }
+
+    /// Keep the intersection of `sets` (CAOTE meta-intersection) — stages [`keep_intersect`].
+    fn keep_intersect_of(&mut self, sets: &[&[usize]]) -> Result<(), CacheOpError> {
+        self.keep(&keep_intersect(sets))
+    }
+
+    /// Keep the union of `sets` (NaCl) — stages [`keep_union`].
+    fn keep_union_of(&mut self, sets: &[&[usize]]) -> Result<(), CacheOpError> {
+        self.keep(&keep_union(sets))
+    }
+
     // ── format / precision axis (position-preserving, T-5: exempt from the at-most-one rule) ──
 
     /// Re-encode the resident tokens to `target` (typed floor f32/f16/q4_0). An opaque codec or a
