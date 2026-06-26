@@ -64,10 +64,19 @@ struct AttnScoreProducer {
     /// Whether the non-collapsed per-(layer, KV-head, token) importance dump is active (IMP-1).
     /// Off by default → no extra buffer, production path byte-identical (`INV-147`).
     dump_layer_head: bool,
-    /// Non-collapsed per-(layer, KV-head, token) importance from the most recent step:
+    /// Non-collapsed per-(layer, KV-head, token) **step-local** scratch:
     /// `[total_layers * n_kv_heads * max_seq_len]`, row-major
-    /// `(layer * n_kv_heads + kv_head) * max_seq_len + pos`. Empty unless `dump_layer_head`.
+    /// `(layer * n_kv_heads + kv_head) * max_seq_len + pos`. Cleared each `begin_step`,
+    /// written during `accumulate_layer_gqa`, flushed into `layer_head_cum` by
+    /// `end_step`. Empty unless `dump_layer_head`.
     layer_head: Vec<f32>,
+    /// Cumulative per-(layer, KV-head, token) importance summed across steps — the
+    /// layer-resolved twin of `head_importance`, and what `layer_head_importance()`
+    /// reports. Over a single decode step (the post-prefill probe) it equals the
+    /// step value, so the probe-path IMP-1 dump is byte-identical; over a
+    /// token-by-token prefill it is the query-agnostic context importance the
+    /// policy actually ranked on. Empty unless `dump_layer_head`.
+    layer_head_cum: Vec<f32>,
 }
 
 impl AttnScoreProducer {
@@ -110,6 +119,7 @@ impl AttnScoreProducer {
             current_layer: 0,
             dump_layer_head: false,
             layer_head: Vec::new(),
+            layer_head_cum: Vec::new(),
         }
     }
 }
@@ -149,6 +159,12 @@ impl ScoreProducer for AttnScoreProducer {
                 *v *= factor;
             }
             for v in self.head_importance.iter_mut() {
+                *v *= factor;
+            }
+            // Decay the layer-resolved cumulative in lockstep with head_importance so
+            // the IMP-1 dump stays consistent with the score the policy ranks on.
+            // No-op when the dump is off (buffer empty).
+            for v in self.layer_head_cum.iter_mut() {
                 *v *= factor;
             }
         }
@@ -272,6 +288,14 @@ impl ScoreProducer for AttnScoreProducer {
         {
             *cum += step;
         }
+        // Sum this step's per-(layer, KV-head) values into the cumulative dump buffer
+        // (same flush as head_importance, with the layer axis kept). Guarded so the
+        // production path (dump off → both buffers empty) does no work — INV-147.
+        if self.dump_layer_head {
+            for (cum, &step) in self.layer_head_cum.iter_mut().zip(self.layer_head.iter()) {
+                *cum += step;
+            }
+        }
     }
 
     fn import_gpu_scores(&mut self, flat: &[f32], head: &[f32]) {
@@ -309,6 +333,7 @@ impl ScoreProducer for AttnScoreProducer {
         self.step_count.fill(0);
         self.normalized.fill(0.0);
         self.layer_head.fill(0.0);
+        self.layer_head_cum.fill(0.0);
     }
 
     fn importance_scores(&self) -> &[f32] {
@@ -356,12 +381,18 @@ impl ScoreProducer for AttnScoreProducer {
         if self.layer_head.len() != size {
             self.layer_head = vec![0.0; size];
         }
+        if self.layer_head_cum.len() != size {
+            self.layer_head_cum = vec![0.0; size];
+        }
         self.dump_layer_head = true;
     }
 
     fn layer_head_importance(&self) -> Option<&[f32]> {
         if self.dump_layer_head && self.n_kv_heads > 0 {
-            Some(&self.layer_head)
+            // The cumulative (across-step) buffer, not the step-local scratch — over a
+            // single probe step they coincide, over a token-by-token prefill the
+            // cumulative is the query-agnostic context importance.
+            Some(&self.layer_head_cum)
         } else {
             None
         }
@@ -891,6 +922,11 @@ mod tests {
         acc.set_current_layer(1);
         acc.accumulate_layer_gqa(&l1, 4, 4, 4, 2, 0);
 
+        // The dump reports the cumulative buffer, flushed by end_step — the same point
+        // the real flow reads it (post_prefill, after forward_into's end_step). Over a
+        // single step the cumulative equals the step values (probe-path invariant).
+        acc.end_step();
+
         let buf = acc.layer_head_importance().expect("dump enabled");
         assert_eq!(
             buf.len(),
@@ -985,5 +1021,58 @@ mod tests {
         assert_eq!(off.0, on.0, "dump must not perturb flat importance");
         assert_eq!(off.1, on.1, "dump must not perturb per-head importance");
         assert_eq!(off.2, on.2, "dump must not perturb CAOTE last-step attn");
+    }
+
+    /// The per-(layer, KV-head) dump accumulates ACROSS steps (the `prefill_end`
+    /// query-agnostic semantics), and over a SINGLE step it equals the step value
+    /// (the post-prefill-probe path stays byte-identical). One KV-head, one layer,
+    /// max_seq=2 so the two token positions are the two ranked slots.
+    #[test]
+    fn layer_head_dump_is_cumulative_across_steps() {
+        let mk = || {
+            let mut acc = AttnScoreProducer::new(ScoreProducerParams {
+                max_seq_len: 2,
+                n_heads: 2,
+                n_kv_heads: 1,
+                total_layers: 1,
+                last_n_layers: 0,
+                decay: 0.0,
+            });
+            acc.set_active(true);
+            acc.enable_layer_head_dump();
+            acc
+        };
+        // One layer-0 step that puts mass 1.0 (avg over 2 Q-heads of [1,1]) on tok0.
+        // group_score(tok0) = (1+1)/2 = 1.0; tok1 = 0.
+        let step_scores = vec![
+            1.0, 0.0, // Q0 → KV0
+            1.0, 0.0, // Q1 → KV0
+        ];
+        let run_n = |steps: usize| {
+            let mut acc = mk();
+            for _ in 0..steps {
+                acc.begin_step();
+                acc.set_current_layer(0);
+                acc.accumulate_layer_gqa(&step_scores, 2, 2, 2, 1, 0);
+                acc.end_step();
+            }
+            acc.layer_head_importance().unwrap().to_vec()
+        };
+
+        // Single step (probe path): cumulative == the one step's value (1.0 on tok0).
+        let one = run_n(1);
+        assert!((one[0] - 1.0).abs() < 1e-6, "tok0 single-step = 1.0");
+        assert_eq!(one[1], 0.0, "tok1 untouched");
+
+        // Three steps (token-by-token prefill): the SAME slot sums to 3.0 — cumulative.
+        let three = run_n(3);
+        assert!(
+            (three[0] - 3.0).abs() < 1e-6,
+            "tok0 must accumulate across 3 steps (got {})",
+            three[0]
+        );
+        assert_eq!(three[1], 0.0, "tok1 still 0 across steps");
+        // It is genuinely cumulative, not a most-recent-step snapshot.
+        assert!(three[0] > one[0], "more steps ⇒ strictly larger cumulative");
     }
 }
