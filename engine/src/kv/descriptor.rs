@@ -284,4 +284,45 @@ mod tests {
             Ok(())
         );
     }
+
+    /// Pass2-TR1/DM1: each descriptor's reads/produces actually MATCHES the live registry it claims to
+    /// mirror (the SSOT prose at the top of this module), so a future registry caps edit cannot silently
+    /// desync the coordinate map while every other descriptor test stays green. Stage axis ->
+    /// `KVCacheStageReg.caps.reads`; Score axis -> `ScoreProducerReg.produces`; the Read axis (quest,
+    /// whose `KVReadStageReg` carries no reads field) is pinned directly to `[Key, Query]` — guarding
+    /// the F3 accuracy fix (quest reads `Query`, NOT the never-armed `QueryStats`). Mutation-proof:
+    /// reverting any descriptor read/produce edge — or a registry `caps.reads` — fails this assert.
+    #[test]
+    fn descriptor_reads_produces_match_live_registry() {
+        use argus_extension_api::{find_score_producer, find_stage};
+        for d in KV_TECHNIQUE_DESCRIPTORS {
+            match d.axis {
+                KvAxis::Stage => {
+                    let reg = find_stage(d.name).expect("stage registered");
+                    assert_eq!(
+                        reg.caps.reads, d.reads,
+                        "descriptor '{}' reads drifted from registry caps.reads",
+                        d.name
+                    );
+                }
+                KvAxis::Score => {
+                    let reg = find_score_producer(d.name).expect("score producer registered");
+                    assert_eq!(
+                        reg.produces, d.produces,
+                        "descriptor '{}' produces drifted from registry produces",
+                        d.name
+                    );
+                }
+                KvAxis::Read => {
+                    assert_eq!(
+                        d.reads,
+                        [TensorKind::Key, TensorKind::Query].as_slice(),
+                        "quest descriptor reads drifted (F3: must be [Key, Query], not QueryStats)"
+                    );
+                }
+                // No name-keyed registry for the format/hardware axes (no built-in occupies them).
+                KvAxis::Format | KvAxis::Hardware => {}
+            }
+        }
+    }
 }

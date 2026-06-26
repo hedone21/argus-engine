@@ -712,7 +712,10 @@ pub trait CacheHandle {
     /// Offload the LRU prefix (`prefix_len` tokens) to the backing store. Requires a residency
     /// backend (else [`CacheOpError::NoResidencyBackend`], eager). NOTE: only F32/F16 host-resident KV
     /// is persisted to the store; a Q4_0 / non-persistable cache (or an unset store) degrades to a
-    /// **lossy prune** of the prefix — those tokens are dropped, not recoverable by `recall`.
+    /// **lossy prune** of the prefix — those tokens are dropped, not recoverable by `recall`. An
+    /// out-of-range `prefix_len` (0, or `>= current_pos` — "offload nothing / everything") is a silent
+    /// no-op at commit but still CONSUMES the single per-callback compaction slot (T-2), so a later
+    /// keep / recall / offload in the same callback would be rejected with `MultipleCompactions`.
     fn offload(&mut self, prefix_len: usize) -> Result<(), CacheOpError>;
     /// Recall this layer's most-recent outstanding offloaded prefix. Requires a residency backend
     /// (else [`CacheOpError::NoResidencyBackend`], eager). Recalls ONE record per call (the engine
@@ -777,9 +780,14 @@ pub struct KeepTopK {
 /// matching the verbatim heavy-hitter selection the built-in eviction plugins ship — so routing a
 /// plugin's keep-list assembly through this is byte-identical.
 pub fn compile_keep_top_k(spec: KeepTopK, score: impl Fn(usize) -> f32) -> Vec<usize> {
-    let recent_start = spec.current.saturating_sub(spec.recent).max(spec.prefix);
+    // Clamp the protected prefix to the resident count. When current < prefix (few tokens resident —
+    // e.g. early in decode, or a prefix configured above the current occupancy) the correct keep-set is
+    // the whole resident range, NOT a list containing indices >= current that the T-10 keep validator
+    // would later reject as InvalidKeep. With prefix <= current this clamp is a no-op (byte-identical).
+    let prefix = spec.prefix.min(spec.current);
+    let recent_start = spec.current.saturating_sub(spec.recent).max(prefix);
     // (pos, score) over the evictable middle, STABLE sort desc, take top-`heavy`, re-sort ascending.
-    let mut token_scores: Vec<(usize, f32)> = (spec.prefix..recent_start)
+    let mut token_scores: Vec<(usize, f32)> = (prefix..recent_start)
         .map(|pos| (pos, score(pos)))
         .collect();
     token_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
@@ -789,7 +797,7 @@ pub fn compile_keep_top_k(spec: KeepTopK, score: impl Fn(usize) -> f32) -> Vec<u
         .map(|(pos, _)| *pos)
         .collect();
     heavy.sort_unstable();
-    let mut keep: Vec<usize> = (0..spec.prefix).collect();
+    let mut keep: Vec<usize> = (0..prefix).collect();
     keep.extend_from_slice(&heavy);
     keep.extend(recent_start..spec.current);
     keep
@@ -3243,6 +3251,39 @@ mod tests {
             |p| if p == 3 || p == 4 { 5.0 } else { 0.0 },
         );
         assert_eq!(keep, vec![0, 1, 3, 6, 7]);
+    }
+
+    /// Pass2-ABI1: when current < prefix (cache smaller than the protected prefix), the compiler clamps
+    /// the prefix to current and yields the whole resident range — ascending + in-range — NOT a list
+    /// with indices >= current that the T-10 keep validator would reject as InvalidKeep. Mutation-proof:
+    /// without the `spec.prefix.min(spec.current)` clamp, current=2/prefix=4 emits [0,1,2,3] (2,3 out of
+    /// range).
+    #[test]
+    fn compile_keep_top_k_clamps_prefix_to_current() {
+        // current=2, prefix=4 (> current): keep everything in range, no index >= current.
+        let keep = compile_keep_top_k(
+            KeepTopK {
+                current: 2,
+                prefix: 4,
+                recent: 2,
+                heavy: 0,
+            },
+            |_| 0.0,
+        );
+        assert_eq!(keep, vec![0, 1]);
+        assert!(keep.iter().all(|&p| p < 2), "no out-of-range index");
+
+        // current=0, prefix=4: empty resident -> empty keep (no panic, no out-of-range).
+        let keep = compile_keep_top_k(
+            KeepTopK {
+                current: 0,
+                prefix: 4,
+                recent: 2,
+                heavy: 0,
+            },
+            |_| 0.0,
+        );
+        assert!(keep.is_empty());
     }
 
     /// keep_intersect / keep_union compose keep-sets into ascending, deduped results.
