@@ -8,9 +8,15 @@
 //!
 //! It is a CENTRAL engine table (not a per-crate `linkme` slice) so the built-in set is exactly the
 //! same regardless of which feature-gated crates (caote / rkv) are force-linked — the coordinate map
-//! is a fixed matrix, not a build-dependent one. The OCCUPANCY invariant ([`validate_occupancy`])
-//! checks that no technique reads a signal nothing produces (no orphan read), where the engine forward
-//! pass produces the [`ENGINE_INTRINSIC`] signals.
+//! is a fixed matrix, not a build-dependent one.
+//!
+//! What is VALIDATED today: CARDINALITY (exactly 7, const-assert), OCCUPANCY ([`validate_occupancy`] —
+//! no technique reads a signal nothing produces, where the engine supplies [`ENGINE_INTRINSIC`]), and
+//! name↔registry resolution (the tests). `axis` and `phase` are DESCRIPTIVE coordinates beyond the
+//! name-resolution cross-check — not otherwise validated. Only the stage / score / read cells are
+//! populated; no built-in occupies the format / hardware axes (those producers live in their own
+//! registries — `KV_FORMAT_POLICIES`, the offload store — and folding them into this map is a
+//! follow-up).
 
 use argus_extension_api::{MutationPhase, TensorKind};
 
@@ -18,14 +24,16 @@ use argus_extension_api::{MutationPhase, TensorKind};
 pub type SignalSet = &'static [TensorKind];
 
 /// Which orthogonal axis a technique occupies (the coordinate-map cell). Mirrors CONTEXT.md's
-/// stage ⊥ format ⊥ hardware, plus the observer score / read producer axes.
+/// stage ⊥ format ⊥ hardware, plus the observer score / read producer axes. The full taxonomy is
+/// listed for completeness; only `Stage` / `Score` / `Read` are occupied by a built-in descriptor
+/// today (`Format` / `Hardware` have no built-in entry — their producers live in separate registries).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvAxis {
     /// Resident-token adjustment (eviction / merge): sliding / streaming / h2o / h2o_plus / d2o.
     Stage,
-    /// Storage precision / layout (the format axis).
+    /// Storage precision / layout (the format axis). No built-in descriptor yet (see `KV_FORMAT_POLICIES`).
     Format,
-    /// Compute / residency location (the hardware axis).
+    /// Compute / residency location (the hardware axis). No built-in descriptor yet (see the offload store).
     Hardware,
     /// Forward-time attention-score producer (observer/score axis): attn_score.
     Score,
@@ -50,9 +58,12 @@ pub struct KvTechniqueDescriptor {
     pub produces: SignalSet,
 }
 
-/// Signals the engine forward pass produces intrinsically (not by any technique): raw K/V, the
-/// previous-step attention weights, the Q running statistics, the prefill attention slice, and the
-/// raw current-Q. The OCCUPANCY invariant treats these as always-available producers.
+/// Signals the engine MAY supply directly (not via a technique). `Key`/`Value` are always resident;
+/// `AttnWeights` / `QueryStats` / `PrefillAttention` / `Query` are armed on demand by the forward pass
+/// (a score-active step, a faithful-read step, prefill-end, …). The OCCUPANCY invariant treats these
+/// as available producers, so a built-in must list one in `reads` only when a built-in actually arms
+/// it — otherwise the invariant would pass vacuously (see `quest`, which omits the never-armed
+/// `QueryStats`).
 pub const ENGINE_INTRINSIC: &[TensorKind] = &[
     TensorKind::Key,
     TensorKind::Value,
@@ -63,8 +74,11 @@ pub const ENGINE_INTRINSIC: &[TensorKind] = &[
 ];
 
 /// The central coordinate map — the built-in KV techniques. `phase` is the consumption phase
-/// (`KvMutate`, the per-step KV-mutation slot). `reads` mirror each technique's `StageCaps.reads`
-/// (the SSOT); `produces` is empty for stage techniques (they mutate, they do not feed a signal).
+/// (`KvMutate`, the per-step KV-mutation slot). The `reads`/`produces` SSOT differs by axis: the 5
+/// Stage techniques mirror their `KVCacheStageReg.caps.reads`; `attn_score` mirrors
+/// `ScoreProducerReg.produces`; `quest` mirrors `KVReadStageReg` (its runtime-consumed query signals,
+/// not `StageCaps` — a read stage has none). `produces` is empty for the stage techniques (they
+/// mutate, they do not feed a signal).
 pub static KV_TECHNIQUE_DESCRIPTORS: &[KvTechniqueDescriptor] = &[
     // ── stage axis (resident-token adjustment) ──
     KvTechniqueDescriptor {
@@ -112,13 +126,15 @@ pub static KV_TECHNIQUE_DESCRIPTORS: &[KvTechniqueDescriptor] = &[
         reads: &[],
         produces: &[TensorKind::Scores],
     },
-    // quest produces a sparse read plan from query criticality; it reads the raw K plus the current /
-    // running query (all engine-intrinsic signals).
+    // quest produces a sparse read plan from query criticality; it reads the raw K plus the current
+    // query (both engine-intrinsic). QueryStats is NOT listed: quest registers wants_query_stats=false,
+    // so no built-in arms the QueryStats accumulator — listing it would let OCCUPANCY pass vacuously on
+    // a signal nothing produces. (quest falls back to a K-magnitude proxy when Query is absent.)
     KvTechniqueDescriptor {
         name: "quest",
         axis: KvAxis::Read,
         phase: MutationPhase::KvMutate,
-        reads: &[TensorKind::Key, TensorKind::Query, TensorKind::QueryStats],
+        reads: &[TensorKind::Key, TensorKind::Query],
         produces: &[],
     },
 ];
@@ -193,6 +209,30 @@ mod tests {
         ];
         want.sort_unstable();
         assert_eq!(got, want);
+    }
+
+    /// Every descriptor name resolves to a LIVE registration in the registry for its axis (Stage →
+    /// find_stage, Score → find_score_producer, Read → find_read_stage). This closes the
+    /// descriptor↔registry loop: a registry rename or a descriptor typo (e.g. "h2o-plus" vs the
+    /// registered "h2o_plus") fails here instead of silently passing the hardcoded-name test above.
+    /// Mutation-proof: misspelling any descriptor name flips the matching assert to None.
+    #[test]
+    fn descriptor_names_resolve_to_live_registrations() {
+        use argus_extension_api::{find_read_stage, find_score_producer, find_stage};
+        for d in KV_TECHNIQUE_DESCRIPTORS {
+            let resolved = match d.axis {
+                KvAxis::Stage => find_stage(d.name).is_some(),
+                KvAxis::Score => find_score_producer(d.name).is_some(),
+                KvAxis::Read => find_read_stage(d.name).is_some(),
+                // No name-keyed registry for the format/hardware axes (no built-in occupies them).
+                KvAxis::Format | KvAxis::Hardware => true,
+            };
+            assert!(
+                resolved,
+                "descriptor '{}' (axis {:?}) does not resolve to a registered technique",
+                d.name, d.axis
+            );
+        }
     }
 
     /// The live map satisfies OCCUPANCY (every read produced or engine-intrinsic) and the boot

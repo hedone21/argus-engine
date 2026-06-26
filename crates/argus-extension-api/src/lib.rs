@@ -237,6 +237,12 @@ pub trait StageCtx {
     // cannot execute (the "expressible != executable" honesty boundary, surfaced up-front instead of
     // as a runtime executor reject). All are default methods so the ~13 existing `StageCtx` impls and
     // the C-ABI `StageCtxAbi` (a fixed fn-ptr table) compile unchanged.
+    //
+    // C-ABI CAVEAT: these are NOT flattened into `StageCtxAbi`, so a `.so` plugin reaching the host
+    // through `AbiStageCtx` sees the DEFAULTS here (cache_dtype=F32, supports_per_head=false,
+    // keep_granularity=1), not the real cache state — e.g. a Q4_0 cache reports keep_granularity=1 over
+    // the C-ABI. There is no in-tree consumer yet; a future `.so` consumer must append a `cache_dtype`
+    // fn-ptr (bumping `KV_STAGE_ABI_VERSION`) and override these on `AbiStageCtx`.
 
     /// The stored KV dtype of this layer's cache (for diagnostics / granularity reasoning).
     /// Default [`TensorDtype::F32`].
@@ -544,6 +550,18 @@ pub enum CacheOpError {
     /// The requested mutation would produce heterogeneous-within-layer state (per-head or per-token
     /// precision) that no current single-precision-per-layer container can hold.
     HeterogeneousUnsupported,
+    /// A weighted merge named an `into` or `from` position outside `[0, current_pos)` (eager-rejected
+    /// before any mutation — the merge twin of [`InvalidKeep`](Self::InvalidKeep)). Closes the
+    /// out-of-range merge that would otherwise panic / silently corrupt in the CPU merge executor.
+    InvalidMerge,
+    /// A second weighted-merge batch was staged in one callback. Merge is position-preserving but the
+    /// engine accepts at most one merge batch per transaction (distinct from
+    /// [`MultipleCompactions`](Self::MultipleCompactions), which is about position-renumbering ops).
+    MergeAlreadyStaged,
+    /// `offload` / `recall` was requested on a handle with no residency (swap) backend configured.
+    /// Rejected eagerly so the op never stages alongside a byte-mutating op that would then be
+    /// orphaned by a commit-time failure.
+    NoResidencyBackend,
 }
 
 impl core::fmt::Display for CacheOpError {
@@ -581,6 +599,20 @@ impl core::fmt::Display for CacheOpError {
             CacheOpError::HeterogeneousUnsupported => write!(
                 f,
                 "mutation would produce heterogeneous-within-layer precision no container can hold"
+            ),
+            CacheOpError::InvalidMerge => write!(
+                f,
+                "weighted merge names an into/from position outside [0, current_pos)"
+            ),
+            CacheOpError::MergeAlreadyStaged => {
+                write!(
+                    f,
+                    "a second weighted-merge batch was staged in one callback"
+                )
+            }
+            CacheOpError::NoResidencyBackend => write!(
+                f,
+                "offload/recall requested but this handle has no residency (swap) backend"
             ),
         }
     }
@@ -677,9 +709,15 @@ pub trait CacheHandle {
 
     // ── residency (hardware) axis — compaction-slot ops (T-2) ──
 
-    /// Offload the LRU prefix (`prefix_len` tokens) to the backing store.
+    /// Offload the LRU prefix (`prefix_len` tokens) to the backing store. Requires a residency
+    /// backend (else [`CacheOpError::NoResidencyBackend`], eager). NOTE: only F32/F16 host-resident KV
+    /// is persisted to the store; a Q4_0 / non-persistable cache (or an unset store) degrades to a
+    /// **lossy prune** of the prefix — those tokens are dropped, not recoverable by `recall`.
     fn offload(&mut self, prefix_len: usize) -> Result<(), CacheOpError>;
-    /// Recall previously offloaded tokens for this layer.
+    /// Recall this layer's most-recent outstanding offloaded prefix. Requires a residency backend
+    /// (else [`CacheOpError::NoResidencyBackend`], eager). Recalls ONE record per call (the engine
+    /// stages at most one residency op per callback, T-2); a layer with multiple outstanding offloads
+    /// needs one `recall` per offload.
     fn recall(&mut self) -> Result<(), CacheOpError>;
 
     // ── dormant geometry walls (always Err today; common to the declarative model) ──
@@ -3188,6 +3226,23 @@ mod tests {
             |_| 0.0,
         );
         assert_eq!(keep, vec![0, 1, 2, 3, 14, 15, 16, 17, 18, 19]);
+    }
+
+    /// The STABLE descending sort is load-bearing for the byte-identical-to-old-plugins refactor: on a
+    /// score tie at the heavy-budget cut, the lower input/position index must win. positions 3 and 4
+    /// tie (heavy=1) → keep 3, not 4. A switch to sort_unstable_by would flip this and is caught here.
+    #[test]
+    fn compile_keep_top_k_stable_tie_breaks_by_position() {
+        let keep = compile_keep_top_k(
+            KeepTopK {
+                current: 8,
+                prefix: 2,
+                recent: 2,
+                heavy: 1,
+            },
+            |p| if p == 3 || p == 4 { 5.0 } else { 0.0 },
+        );
+        assert_eq!(keep, vec![0, 1, 3, 6, 7]);
     }
 
     /// keep_intersect / keep_union compose keep-sets into ascending, deduped results.

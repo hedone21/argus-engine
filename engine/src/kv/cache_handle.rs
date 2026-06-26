@@ -28,6 +28,17 @@ use argus_extension_api::{
     CacheHandle, CacheOpError, FormatId, KVFormatPlan, TensorHandle, TensorKind, WeightedMerge,
 };
 
+/// The cache's current stored-format name, mirroring `format_apply::current_format_name` (the
+/// `register_kv_format!` floor names). Used to skip a re-encode to the already-current format.
+fn current_format_name(cache: &KVCache) -> &'static str {
+    match cache.kv_dtype() {
+        crate::buffer::DType::F32 => "f32",
+        crate::buffer::DType::F16 => "f16",
+        crate::buffer::DType::Q4_0 => "q4_0",
+        _ => "unknown",
+    }
+}
+
 /// The single staged position-mutating compaction slot (T-2: at most one per callback).
 enum Compaction {
     /// LayerWide keep — all heads keep the same ascending positions.
@@ -122,8 +133,18 @@ impl<'a> EngineCacheHandle<'a> {
     /// Apply the staged transaction in canonical order and return whether any bytes changed.
     ///
     /// Order: re-encode (position-preserving, commutes with row permutation) → merges (pre-compaction
-    /// frame) → compaction (the single renumber, T-1). Every staged op was validated eagerly, so this
-    /// does not reject; a defensive executor `Err` is surfaced as `anyhow`.
+    /// frame) → compaction (the single renumber, T-1).
+    ///
+    /// Atomicity contract (T-8, precise): every op is validated *eagerly* at call time, so a rejected
+    /// op (`CacheOpError`) never stages and never mutates — that path is fully all-or-nothing. At
+    /// commit, the staged ops apply sequentially with no buffer snapshot; the only residual failure
+    /// modes are an executor I/O / backend error (e.g. `offload` disk write, `compact` GPU
+    /// `buffer_shift`) AFTER an earlier byte-mutating step has run. In that case commit returns `Err`
+    /// with the earlier step applied — multi-op commits are NOT rolled back. Single-op commits, and
+    /// any eager rejection, remain strictly all-or-nothing. (Eager validation — merge positions,
+    /// reencode floor/head_dim, offload/recall backend presence — removes every *reachable*
+    /// commit-time failure for the in-tree executors; buffer-snapshot rollback for the I/O residual is
+    /// a deliberate non-goal until a production multi-op caller needs it.)
     pub fn commit(mut self) -> Result<bool> {
         if let Some(target) = self.reencode.take() {
             let plan = KVFormatPlan {
@@ -235,7 +256,16 @@ impl CacheHandle for EngineCacheHandle<'_> {
             return Err(CacheOpError::NotOnHost);
         }
         if self.merges.is_some() {
-            return Err(CacheOpError::MultipleCompactions);
+            return Err(CacheOpError::MergeAlreadyStaged);
+        }
+        // Eager position validation (the merge twin of T-10): every into/from must be in the entry
+        // frame. The CPU executor indexes `offset(pos, head)` with no bounds guard, so an out-of-range
+        // position would panic (>= capacity) or silently sum non-resident tail (>= current_pos);
+        // reject before staging so a malformed merge never mutates (T-8).
+        for m in merges {
+            if m.into >= self.entry_pos || m.from.iter().any(|&(p, _)| p >= self.entry_pos) {
+                return Err(CacheOpError::InvalidMerge);
+            }
         }
         self.merges = Some(merges.to_vec());
         Ok(())
@@ -250,6 +280,16 @@ impl CacheHandle for EngineCacheHandle<'_> {
         if !matches!(target.0.as_str(), "f32" | "f16" | "q4_0") {
             return Err(CacheOpError::UnsupportedFormat(target.0));
         }
+        // A re-encode to the cache's CURRENT stored format is a byte-identical no-op (apply_format_plan
+        // Gate-0); don't stage it, so commit's `mutated` flag does not falsely report a mutation.
+        if target.0 == current_format_name(self.cache) {
+            return Ok(());
+        }
+        // q4_0 tiles a head's `head_dim` values into QK4_0-sized blocks; a non-multiple head_dim
+        // cannot be re-encoded — check eagerly so commit's apply_format_plan never fails on it.
+        if target.0 == "q4_0" && !self.cache.head_dim().is_multiple_of(crate::quant::QK4_0) {
+            return Err(CacheOpError::UnsupportedFormat(target.0));
+        }
         self.reencode = Some(target);
         Ok(())
     }
@@ -261,10 +301,18 @@ impl CacheHandle for EngineCacheHandle<'_> {
     }
 
     fn offload(&mut self, prefix_len: usize) -> Result<(), CacheOpError> {
-        // Residency compaction-slot op (T-2): stage it; commit routes to swap_handler::offload_prefix.
+        // Residency compaction-slot op (T-2). Reject eagerly when no swap backend is configured, so it
+        // never stages alongside a byte-mutating reencode/merge that a commit-time failure would orphan
+        // (T-8). With a backend, stage it; commit routes to swap_handler::offload_prefix.
+        if self.swap.is_none() {
+            return Err(CacheOpError::NoResidencyBackend);
+        }
         self.set_compaction(Compaction::Offload(prefix_len))
     }
     fn recall(&mut self) -> Result<(), CacheOpError> {
+        if self.swap.is_none() {
+            return Err(CacheOpError::NoResidencyBackend);
+        }
         self.set_compaction(Compaction::Recall)
     }
 }
@@ -547,5 +595,117 @@ mod tests {
         assert_eq!(h.keep_union_of(&[&[0, 2], &[2, 5, 7]]), Ok(()));
         assert_eq!(h.commit().unwrap(), true);
         assert_eq!(c.current_pos(), 4);
+    }
+
+    /// F1: merge() eager-validates positions (the merge twin of T-10). An into/from outside
+    /// [0, current_pos) is InvalidMerge BEFORE staging — closing the OOB panic / silent-corruption the
+    /// CPU executor would otherwise hit. Mutation-proof: bytes + pos untouched after the reject.
+    #[test]
+    fn test_merge_out_of_range_rejected() {
+        use argus_extension_api::{MergeAxis, WeightedMerge};
+        let mut c = cache_f32(8);
+        let before = c.k_buffer.as_slice::<f32>().to_vec();
+        let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+        // into == entry_pos (8) is out of range.
+        let bad_into = [WeightedMerge {
+            into: 8,
+            into_weight: 0.5,
+            from: vec![(1, 0.5)],
+            apply_to: MergeAxis::Both,
+        }];
+        assert_eq!(h.merge(&bad_into), Err(CacheOpError::InvalidMerge));
+        // from position out of range.
+        let bad_from = [WeightedMerge {
+            into: 0,
+            into_weight: 0.5,
+            from: vec![(40, 0.5)],
+            apply_to: MergeAxis::Both,
+        }];
+        assert_eq!(h.merge(&bad_from), Err(CacheOpError::InvalidMerge));
+        drop(h);
+        assert_eq!(c.k_buffer.as_slice::<f32>(), &before[..]);
+        assert_eq!(c.current_pos(), 8);
+    }
+
+    /// F1: offload()/recall() on a handle with NO swap backend reject eagerly (NoResidencyBackend)
+    /// rather than staging and failing at commit — so a residency op never orphans an earlier
+    /// byte-mutating op. Bytes + pos untouched.
+    #[test]
+    fn test_residency_without_backend_rejected() {
+        let mut c = cache_f32(8);
+        let before = c.k_buffer.as_slice::<f32>().to_vec();
+        let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+        assert_eq!(h.offload(2), Err(CacheOpError::NoResidencyBackend));
+        assert_eq!(h.recall(), Err(CacheOpError::NoResidencyBackend));
+        drop(h);
+        assert_eq!(c.k_buffer.as_slice::<f32>(), &before[..]);
+        assert_eq!(c.current_pos(), 8);
+    }
+
+    /// F1: a multi-op callback (merge + keep) commits BOTH in canonical order (merge in the
+    /// pre-compaction frame, then compaction). Exercises the merge-commit arm + composition.
+    #[test]
+    fn test_merge_then_keep_commits_both() {
+        use argus_extension_api::{MergeAxis, WeightedMerge};
+        let mut c = cache_f32(8);
+        let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+        // row 0 = 0.5*row0 + 0.5*row1 (both K and V); then drop position 1.
+        assert_eq!(
+            h.merge(&[WeightedMerge {
+                into: 0,
+                into_weight: 0.5,
+                from: vec![(1, 0.5)],
+                apply_to: MergeAxis::Both,
+            }]),
+            Ok(())
+        );
+        assert_eq!(h.keep(&[0, 2, 3, 4, 5, 6, 7]), Ok(()));
+        assert_eq!(h.commit().unwrap(), true);
+        assert_eq!(c.current_pos(), 7);
+        // new pos 0 (the merged target): K = 0.5*(head*10+d) + 0.5*(100+head*10+d) = head*10+d+50.
+        for head in 0..N_KV {
+            let off = c.offset(0, head);
+            let k = c.k_buffer.as_slice::<f32>();
+            for d in 0..HD {
+                assert_eq!(k[off + d], (head * 10 + d) as f32 + 50.0);
+            }
+        }
+        // new pos 1 == original position 2 (unmerged, shifted down by the dropped pos 1).
+        for head in 0..N_KV {
+            let off = c.offset(1, head);
+            let k = c.k_buffer.as_slice::<f32>();
+            for d in 0..HD {
+                assert_eq!(k[off + d], (2 * 100 + head * 10 + d) as f32);
+            }
+        }
+    }
+
+    /// F1: a re-encode to the cache's CURRENT format is a no-op that does not stage (commit reports
+    /// no mutation); a real re-encode commits and flips the dtype; an infeasible q4_0 target (head_dim
+    /// not a QK4_0 multiple) is eager-rejected.
+    #[test]
+    fn test_reencode_noop_and_feasibility() {
+        use crate::buffer::DType;
+        // no-op: f32 cache reencoded to "f32" → does not stage → commit returns mutated=false.
+        let mut c = cache_f32(8);
+        let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+        assert_eq!(h.reencode(FormatId("f32".into())), Ok(()));
+        assert_eq!(h.commit().unwrap(), false);
+        assert_eq!(c.kv_dtype(), DType::F32);
+
+        // infeasible: HD=4 is not a multiple of QK4_0 (32) → q4_0 reencode eager-rejected.
+        let mut c = cache_f32(8);
+        let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+        assert!(matches!(
+            h.reencode(FormatId("q4_0".into())),
+            Err(CacheOpError::UnsupportedFormat(_))
+        ));
+
+        // real: f32 → f16 commits and flips the stored dtype.
+        let mut c = cache_f32(8);
+        let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+        assert_eq!(h.reencode(FormatId("f16".into())), Ok(()));
+        assert_eq!(h.commit().unwrap(), true);
+        assert_eq!(c.kv_dtype(), DType::F16);
     }
 }
