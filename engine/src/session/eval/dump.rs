@@ -125,6 +125,33 @@ impl JsonlDumpWriter {
 
 // ── IMP-1: evict_importance (technique-side per-(layer, KV-head) importance) ──
 
+/// Per-eviction-event metadata for the `prefill_streaming` (variant b) multi-event
+/// dump. Present (`Some`) only for streaming records (`schema_version: 2`); `None` for
+/// the single-shot `post_prefill_probe` / `prefill_end` records (`schema_version: 1`,
+/// byte-identical to before).
+///
+/// Because streaming compacts the live cache on each eviction, the cache's slot space
+/// is reindexed; these fields keep the dump in the **original** prompt token-index
+/// space so it joins against `answer_attention` (which is in original positions).
+#[derive(Debug, Clone)]
+pub struct EvictEventMeta {
+    /// 1-based eviction event index within the question (strictly increasing).
+    pub eviction_event: usize,
+    /// Tokens ingested so far (original prompt position reached) when this eviction
+    /// fired. `>= cache_pos_before` once a prior event has compacted the cache.
+    pub prefill_pos: usize,
+    /// Resident cache length immediately *before* this eviction (`= prompt_len`).
+    pub cache_pos_before: usize,
+    /// Resident cache length immediately *after* this eviction (`<= budget`).
+    pub cache_pos_after: usize,
+    /// Original token index of each resident slot *before* this eviction, in slot
+    /// order (`len == cache_pos_before`). `importance_flat[i]` and the per-(layer,head)
+    /// rows are indexed by slot `i`, so `resident_positions[i]` is that slot's original
+    /// prompt position — the join key from slot-space importance to original-space
+    /// `kept_positions` / `evicted_positions` / `answer_attention`.
+    pub resident_positions: Vec<usize>,
+}
+
 /// Everything the eviction hook can produce for one `evict_importance` record.
 /// The eval loop adds the per-question metadata (`question_id`, gold/needle token
 /// positions) and writes the record — the hook has no question context or writer.
@@ -139,13 +166,20 @@ pub struct EvictImportanceSnapshot {
     /// Eviction policy name (the actual registered policy, e.g. `"h2o"`).
     pub technique: String,
     /// Kept context positions (ascending, technique-agnostic — from the policy's plan).
+    /// **Original** token-index space (mapped back through the resident map for
+    /// streaming; identity for the single-shot modes that never reindex).
     pub kept_positions: Vec<usize>,
-    /// Evicted context positions = `[0, prompt_len)` minus `kept_positions`.
+    /// Evicted context positions = resident positions minus `kept_positions`, in
+    /// **original** token-index space.
     pub evicted_positions: Vec<usize>,
-    /// The flat per-token importance the policy actually ranked on `[prompt_len]`.
+    /// The flat per-token importance the policy actually ranked on `[prompt_len]`
+    /// (slot-indexed; see [`EvictEventMeta::resident_positions`] for the streaming map).
     pub importance_flat: Vec<f32>,
     /// Non-collapsed per-(layer, KV-head, token) importance `[L][Hkv][prompt_len]`.
     pub importance_by_layer_head: Vec<Vec<Vec<f32>>>,
+    /// `Some` for `prefill_streaming` per-event records (`schema_version: 2`); `None`
+    /// for the single-shot modes (`schema_version: 1`, unchanged).
+    pub event: Option<EvictEventMeta>,
 }
 
 /// Evicted positions = `[0, seq_len)` minus the kept set (ascending).
@@ -189,7 +223,40 @@ pub fn reshape_layer_head(
 
 /// Write one `evict_importance` JSONL record, joining the hook snapshot with the
 /// per-question metadata (`question_id`, gold/needle token positions).
+///
+/// A snapshot with no [`event`](EvictImportanceSnapshot::event) is a single-shot record
+/// (`post_prefill_probe` / `prefill_end`) and is serialized **byte-identically** to
+/// before (`schema_version: 1`, `INV-147`). A snapshot with an event is a
+/// `prefill_streaming` per-event record (`schema_version: 2`) carrying the extra
+/// eviction-event fields.
 pub fn write_evict_importance_record(
+    writer: &mut JsonlDumpWriter,
+    snapshot: &EvictImportanceSnapshot,
+    question_id: &str,
+    gold_token_positions: Option<&[usize]>,
+    needle_token_positions: Option<&[usize]>,
+) -> Result<()> {
+    match &snapshot.event {
+        None => write_evict_importance_record_v1(
+            writer,
+            snapshot,
+            question_id,
+            gold_token_positions,
+            needle_token_positions,
+        ),
+        Some(event) => write_evict_importance_record_v2(
+            writer,
+            snapshot,
+            event,
+            question_id,
+            gold_token_positions,
+            needle_token_positions,
+        ),
+    }
+}
+
+/// Single-shot record (`schema_version: 1`) — unchanged on-disk format.
+fn write_evict_importance_record_v1(
     writer: &mut JsonlDumpWriter,
     snapshot: &EvictImportanceSnapshot,
     question_id: &str,
@@ -229,8 +296,65 @@ pub fn write_evict_importance_record(
     })
 }
 
-/// Schema version of the `evict_importance` record.
+/// Streaming per-event record (`schema_version: 2`). One per (question, eviction
+/// event); positions are in original token-index space and `keep_ratio` is `null`
+/// (the absolute budget `B`, not a ratio, is the trigger).
+fn write_evict_importance_record_v2(
+    writer: &mut JsonlDumpWriter,
+    snapshot: &EvictImportanceSnapshot,
+    event: &EvictEventMeta,
+    question_id: &str,
+    gold_token_positions: Option<&[usize]>,
+    needle_token_positions: Option<&[usize]>,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct Record<'a> {
+        kind: &'static str,
+        schema_version: u32,
+        question_id: &'a str,
+        eviction_event: usize,
+        prefill_pos: usize,
+        cache_pos_before: usize,
+        cache_pos_after: usize,
+        budget: usize,
+        /// Always `null`: streaming evicts on an absolute budget, not a keep-ratio.
+        keep_ratio: Option<f32>,
+        technique: &'a str,
+        evicted_positions: &'a [usize],
+        kept_positions: &'a [usize],
+        resident_positions: &'a [usize],
+        gold_token_positions: Option<&'a [usize]>,
+        needle_token_positions: Option<&'a [usize]>,
+        importance_flat: &'a [f32],
+        importance_by_layer_head: &'a [Vec<Vec<f32>>],
+    }
+    writer.write_record(&Record {
+        kind: DUMP_EVICT_IMPORTANCE,
+        schema_version: EVICT_IMPORTANCE_SCHEMA_VERSION_STREAMING,
+        question_id,
+        eviction_event: event.eviction_event,
+        prefill_pos: event.prefill_pos,
+        cache_pos_before: event.cache_pos_before,
+        cache_pos_after: event.cache_pos_after,
+        budget: snapshot.budget,
+        keep_ratio: None,
+        technique: &snapshot.technique,
+        evicted_positions: &snapshot.evicted_positions,
+        kept_positions: &snapshot.kept_positions,
+        resident_positions: &event.resident_positions,
+        gold_token_positions,
+        needle_token_positions,
+        importance_flat: &snapshot.importance_flat,
+        importance_by_layer_head: &snapshot.importance_by_layer_head,
+    })
+}
+
+/// Schema version of the single-shot `evict_importance` record
+/// (`post_prefill_probe` / `prefill_end`).
 pub const EVICT_IMPORTANCE_SCHEMA_VERSION: u32 = 1;
+
+/// Schema version of the `prefill_streaming` multi-event `evict_importance` record.
+pub const EVICT_IMPORTANCE_SCHEMA_VERSION_STREAMING: u32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -363,6 +487,7 @@ mod tests {
             evicted_positions: vec![1],
             importance_flat: vec![0.9, 0.1, 0.7],
             importance_by_layer_head: vec![vec![vec![0.9, 0.1, 0.7], vec![0.8, 0.2, 0.6]]],
+            event: None,
         };
         write_evict_importance_record(&mut w, &snap, "q1", Some(&[2]), None).unwrap();
         w.finish().unwrap();
@@ -392,7 +517,67 @@ mod tests {
                 .len(),
             3
         );
+        // v1 record carries NO streaming-only fields.
+        assert!(r.get("eviction_event").is_none());
+        assert!(r.get("cache_pos_before").is_none());
+        assert!(r.get("resident_positions").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn streaming_record_is_schema_v2_with_event_fields_in_original_space() {
+        let dir = std::env::temp_dir().join(format!("argus-evict-v2-test-{}", std::process::id()));
+        let path = dir.join("evict_importance.jsonl");
+        let mut w = JsonlDumpWriter::create(&path).unwrap();
+        // Second eviction event: the cache already compacted once, so slot space is
+        // reindexed. `resident_positions` maps slot i → original prompt position.
+        // Slots {0,1,2} hold original tokens {3,7,9}; the policy keeps slots {0,2}.
+        let snap = EvictImportanceSnapshot {
+            prompt_len: 3, // == cache_pos_before
+            budget: 2,
+            keep_ratio: 0.9, // ignored by v2 writer (emits null)
+            technique: "h2o".into(),
+            kept_positions: vec![3, 9], // ORIGINAL indices of kept slots {0,2}
+            evicted_positions: vec![7], // ORIGINAL index of evicted slot {1}
+            importance_flat: vec![0.9, 0.1, 0.7],
+            importance_by_layer_head: vec![vec![vec![0.9, 0.1, 0.7]]],
+            event: Some(EvictEventMeta {
+                eviction_event: 2,
+                prefill_pos: 12,
+                cache_pos_before: 3,
+                cache_pos_after: 2,
+                resident_positions: vec![3, 7, 9],
+            }),
+        };
+        write_evict_importance_record(&mut w, &snap, "q1", Some(&[9]), Some(&[3])).unwrap();
+        w.finish().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let r: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(r["kind"], "evict_importance");
+        assert_eq!(r["schema_version"], 2);
+        assert_eq!(r["question_id"], "q1");
+        assert_eq!(r["eviction_event"], 2);
+        assert_eq!(r["prefill_pos"], 12);
+        assert_eq!(r["cache_pos_before"], 3);
+        assert_eq!(r["cache_pos_after"], 2);
+        assert_eq!(r["budget"], 2);
+        assert!(r["keep_ratio"].is_null(), "v2 keep_ratio is null");
+        // Positions are ORIGINAL token indices, kept/evicted disjoint, both ⊆ resident.
+        assert_eq!(r["kept_positions"], serde_json::json!([3, 9]));
+        assert_eq!(r["evicted_positions"], serde_json::json!([7]));
+        assert_eq!(r["resident_positions"], serde_json::json!([3, 7, 9]));
+        assert_eq!(r["gold_token_positions"], serde_json::json!([9]));
+        assert_eq!(r["needle_token_positions"], serde_json::json!([3]));
+        // importance dims [L][Hkv][cache_pos_before].
+        assert_eq!(r["importance_flat"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            r["importance_by_layer_head"][0][0]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 }

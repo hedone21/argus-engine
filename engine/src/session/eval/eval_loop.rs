@@ -245,7 +245,14 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
         // ignoring start_pos (which only affects RoPE). The probe adds an extra entry
         // at position prompt_len with RoPE for position prompt_len-1. We must restore
         // current_pos afterwards so eviction sees the correct token count.
-        if hook.needs_score_probe(kv_caches) {
+        //
+        // The probe re-feeds the *post-question* last token, so the importance it
+        // produces is query-informed. `--evict-timing prefill_end` suppresses it
+        // (`runs_query_probe()` = false) and instead ranks on the context importance
+        // accumulated by the token-by-token prefill above — a query-agnostic decision.
+        if effective_eval_config.evict_timing.runs_query_probe()
+            && hook.needs_score_probe(kv_caches)
+        {
             // Save current_pos before probe (will be prompt_len)
             let saved_positions: Vec<usize> = kv_caches.iter().map(|c| c.cur_pos()).collect();
 
@@ -297,19 +304,32 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
         // ── post_prefill hook (eviction if cache exceeds budget) ──
         hook.post_prefill(kv_caches);
 
-        // ── IMP-1: drain + write the evict_importance dump record ──
-        // Read-only diagnostic; the hook captured it during post_prefill (above)
-        // without perturbing eviction (INV-147). No record when eviction did not fire.
-        if let Some(writer) = evict_dump.as_deref_mut()
-            && let Some(snap) = hook.take_evict_importance_dump()
-        {
-            super::dump::write_evict_importance_record(
-                writer,
-                &snap,
-                &question.id,
-                question.gold_token_positions.as_deref(),
-                question.needle_token_positions.as_deref(),
-            )?;
+        // ── IMP-1: drain + write the evict_importance dump record(s) ──
+        // Read-only diagnostic (INV-147). Two shapes share one writer:
+        //   • single-shot (post_prefill_probe / prefill_end): one schema_version:1
+        //     record captured at post_prefill (above);
+        //   • streaming (prefill_streaming, variant b): one schema_version:2 record per
+        //     overflow eviction event, captured during the token-by-token prefill.
+        // At most one of the two is non-empty for a given question.
+        if let Some(writer) = evict_dump.as_deref_mut() {
+            if let Some(snap) = hook.take_evict_importance_dump() {
+                super::dump::write_evict_importance_record(
+                    writer,
+                    &snap,
+                    &question.id,
+                    question.gold_token_positions.as_deref(),
+                    question.needle_token_positions.as_deref(),
+                )?;
+            }
+            for snap in hook.take_streaming_evict_dumps() {
+                super::dump::write_evict_importance_record(
+                    writer,
+                    &snap,
+                    &question.id,
+                    question.gold_token_positions.as_deref(),
+                    question.needle_token_positions.as_deref(),
+                )?;
+            }
         }
 
         // IMPORTANT: Do NOT update start_pos_after_prompt to current_pos after eviction.
@@ -639,6 +659,47 @@ fn run_importance_pass<C: EvalCacheKind>(
     Ok((Some(table), Some(qcf), Some(opr_skip), skip_set_len))
 }
 
+/// Decide whether prefill runs token-by-token (per-step score accumulation / per-step
+/// overflow eviction) instead of a single batched pass. Pure so the timing policy — and
+/// the `INV-147` guarantee that the default leaves prefill batched — is provable without
+/// a model.
+///
+/// Reasons to go token-by-token:
+/// 1. `needs_cache_scores`: the cache itself consumes per-step attention scores
+///    (quant-window AWQE/AW-VOPR) — unchanged, timing-independent.
+/// 2. `--evict-timing prefill_end`: accumulate query-agnostic context importance, but
+///    only when a *score-ranking* eviction will actually fire — `hook_ranks_on_scores`
+///    with a positive budget the prompt exceeds. Positional policies and the
+///    no-eviction case keep the fast batched path.
+/// 3. `--evict-timing prefill_streaming`: cap the resident cache at the budget by
+///    evicting per overflow, so the pass is required for **any** policy (positional or
+///    score-based) once the prompt exceeds the budget — the per-step eviction *is* the
+///    mechanism, independent of whether the eviction ranks on scores.
+fn prefill_runs_token_by_token(
+    needs_cache_scores: bool,
+    evict_timing: super::evict_timing::EvictTiming,
+    hook_ranks_on_scores: bool,
+    effective_budget: usize,
+    prompt_len: usize,
+) -> bool {
+    if prompt_len <= 1 {
+        return false;
+    }
+    if needs_cache_scores {
+        return true;
+    }
+    if !evict_timing.accumulates_context_scores() {
+        return false; // post_prefill_probe (default) stays batched (INV-147).
+    }
+    let over_budget = effective_budget > 0 && prompt_len > effective_budget;
+    if !over_budget {
+        return false; // no eviction will fire → no need for the slow per-token pass.
+    }
+    // Streaming evicts on overflow regardless of how the policy ranks; prefill_end only
+    // benefits when the eviction actually ranks on the accumulated scores.
+    evict_timing.evicts_on_overflow() || hook_ranks_on_scores
+}
+
 /// Run prompt processing (prefill or chunked prefill + decode) for one question.
 ///
 /// Returns `(prompt_logits_cpu, start_pos_after_prompt)`.
@@ -665,7 +726,14 @@ fn run_prefill<C: EvalCacheKind>(
     // When KV caches need attention scores (quant-window+AWQE/AW-VOPR), use token-by-token
     // prefill so each quant-window flush has scores from the previous step.
     let needs_scores = !kv_caches.is_empty() && kv_caches[0].needs_scores();
-    if needs_scores && prompt_ids.len() > 1 {
+
+    if prefill_runs_token_by_token(
+        needs_scores,
+        eval_config.evict_timing,
+        hook.ranks_on_scores(),
+        eval_config.effective_budget,
+        prompt_ids.len(),
+    ) {
         return run_token_by_token_prefill(
             model,
             backend,
@@ -735,6 +803,14 @@ fn run_token_by_token_prefill<C: EvalCacheKind>(
             std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
         })?;
 
+        // Reset the per-step accumulator buffers before each token's forward so
+        // importance sums correctly across the prompt (the eviction accumulator under
+        // `--evict-timing prefill_end`). No-op for the quant-window hook, whose
+        // `score_accumulator()` is None — so this stays byte-identical there.
+        if let Some(acc) = hook.score_accumulator() {
+            acc.begin_step();
+        }
+
         let tbt_need = kv_caches.first().is_some_and(|c| c.needs_scores());
         C::forward_fmt_roundtrip(kv_caches, |fmts| {
             model.forward_into(TransformerModelForwardArgs {
@@ -757,6 +833,14 @@ fn run_token_by_token_prefill<C: EvalCacheKind>(
                 prefill_attn: None,
             })
         })?;
+
+        // `--evict-timing prefill_streaming` (variant b): after ingesting this token,
+        // cap the resident cache at the budget — evict on overflow. No-op for every
+        // other timing and for the quant-window hook (`INV-147`). RoPE `start_pos = i`
+        // (original position) is unaffected by the compaction: the cache writes at the
+        // compacted physical slot but RoPE keeps the original index, exactly as the
+        // production decode path does.
+        hook.on_prefill_step(kv_caches, i);
     }
 
     let mut prompt_logits_cpu = vec![0.0f32; vocab_size];
@@ -997,7 +1081,93 @@ fn run_chunked_prefill<C: EvalCacheKind>(
 
 #[cfg(test)]
 mod tests {
+    use super::prefill_runs_token_by_token;
+    use crate::session::eval::evict_timing::EvictTiming;
     use crate::session::eval::output::{EvalConfig, EvalQuestion};
+
+    // ── prefill-driver selection (mutation-provable INV-147 + prefill_end gating) ──
+
+    /// `INV-147`: with the default timing, the eviction path NEVER switches to
+    /// token-by-token — it stays on today's batched full prefill (+ probe), no matter
+    /// the budget or prompt length. A regression that made the default accumulate
+    /// would flip these and fail the test.
+    #[test]
+    fn default_timing_keeps_batched_prefill() {
+        // Over budget, score-based, long prompt — the prefill_end trigger conditions —
+        // yet the default must stay batched.
+        assert!(!prefill_runs_token_by_token(
+            false,
+            EvictTiming::PostPrefillProbe,
+            true,
+            8,
+            100
+        ));
+        // And without a budget.
+        assert!(!prefill_runs_token_by_token(
+            false,
+            EvictTiming::PostPrefillProbe,
+            true,
+            0,
+            100
+        ));
+    }
+
+    /// `prefill_end` goes token-by-token exactly when a score-ranking eviction will
+    /// fire: a positive budget the prompt exceeds, on a score-based policy.
+    #[test]
+    fn prefill_end_token_by_token_only_when_eviction_fires() {
+        let pe = EvictTiming::PrefillEnd;
+        // score-based, over budget → token-by-token (accumulate context importance).
+        assert!(prefill_runs_token_by_token(false, pe, true, 8, 100));
+        // positional policy (ranks_on_scores=false) → batched (scores would be unused).
+        assert!(!prefill_runs_token_by_token(false, pe, false, 8, 100));
+        // no budget → no eviction → batched.
+        assert!(!prefill_runs_token_by_token(false, pe, true, 0, 100));
+        // prompt within budget → no eviction → batched.
+        assert!(!prefill_runs_token_by_token(false, pe, true, 100, 100));
+        // single-token prompt is never chunked.
+        assert!(!prefill_runs_token_by_token(false, pe, true, 1, 1));
+    }
+
+    /// `prefill_streaming` goes token-by-token whenever the prompt exceeds the budget —
+    /// for **any** policy, because the per-step overflow eviction *is* the mechanism
+    /// (unlike `prefill_end`, it does not require a score-ranking policy).
+    #[test]
+    fn prefill_streaming_token_by_token_for_any_over_budget_policy() {
+        let ps = EvictTiming::PrefillStreaming;
+        // score-based, over budget → token-by-token.
+        assert!(prefill_runs_token_by_token(false, ps, true, 8, 100));
+        // positional policy (ranks_on_scores=false), over budget → STILL token-by-token
+        // (this is the key difference from prefill_end).
+        assert!(prefill_runs_token_by_token(false, ps, false, 8, 100));
+        // no budget → no cap → batched.
+        assert!(!prefill_runs_token_by_token(false, ps, true, 0, 100));
+        // prompt within budget → never overflows → batched.
+        assert!(!prefill_runs_token_by_token(false, ps, true, 100, 100));
+        // single-token prompt is never chunked.
+        assert!(!prefill_runs_token_by_token(false, ps, true, 1, 1));
+    }
+
+    /// Cache-driven score need (quant-window) forces token-by-token regardless of the
+    /// eviction timing — that path is unchanged by this feature.
+    #[test]
+    fn cache_score_need_forces_token_by_token_for_any_timing() {
+        for timing in [
+            EvictTiming::PostPrefillProbe,
+            EvictTiming::PrefillEnd,
+            EvictTiming::PrefillStreaming,
+        ] {
+            assert!(prefill_runs_token_by_token(true, timing, false, 0, 10));
+        }
+        // ...but still not for a trivial 1-token prompt.
+        assert!(!prefill_runs_token_by_token(
+            true,
+            EvictTiming::PostPrefillProbe,
+            false,
+            0,
+            1
+        ));
+    }
 
     fn make_config() -> EvalConfig {
         EvalConfig {
@@ -1009,6 +1179,7 @@ mod tests {
             qcf_mode: "attn".to_string(),
             vocab_size: 32000,
             hidden_size: 2048,
+            evict_timing: crate::session::eval::EvictTiming::default(),
         }
     }
 
