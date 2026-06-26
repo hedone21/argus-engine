@@ -62,9 +62,47 @@ pub const ENGINE_INTRINSIC: &[TensorKind] = &[
     TensorKind::Query,
 ];
 
-/// The central coordinate map — the built-in KV techniques. Populated in c12 (stage) + c13
-/// (producers).
-pub static KV_TECHNIQUE_DESCRIPTORS: &[KvTechniqueDescriptor] = &[];
+/// The central coordinate map — the built-in KV techniques. `phase` is the consumption phase
+/// (`KvMutate`, the per-step KV-mutation slot). `reads` mirror each technique's `StageCaps.reads`
+/// (the SSOT); `produces` is empty for stage techniques (they mutate, they do not feed a signal).
+pub static KV_TECHNIQUE_DESCRIPTORS: &[KvTechniqueDescriptor] = &[
+    // ── stage axis (resident-token adjustment) ──
+    KvTechniqueDescriptor {
+        name: "sliding",
+        axis: KvAxis::Stage,
+        phase: MutationPhase::KvMutate,
+        reads: &[],
+        produces: &[],
+    },
+    KvTechniqueDescriptor {
+        name: "streaming",
+        axis: KvAxis::Stage,
+        phase: MutationPhase::KvMutate,
+        reads: &[],
+        produces: &[],
+    },
+    KvTechniqueDescriptor {
+        name: "h2o",
+        axis: KvAxis::Stage,
+        phase: MutationPhase::KvMutate,
+        reads: &[TensorKind::Scores],
+        produces: &[],
+    },
+    KvTechniqueDescriptor {
+        name: "h2o_plus",
+        axis: KvAxis::Stage,
+        phase: MutationPhase::KvMutate,
+        reads: &[TensorKind::Scores],
+        produces: &[],
+    },
+    KvTechniqueDescriptor {
+        name: "d2o",
+        axis: KvAxis::Stage,
+        phase: MutationPhase::KvMutate,
+        reads: &[TensorKind::Scores, TensorKind::Key],
+        produces: &[],
+    },
+];
 
 /// All descriptor names (for the matrix-invariance self-test / diagnostics).
 pub fn descriptor_names() -> Vec<&'static str> {
