@@ -386,10 +386,14 @@ impl SwapHandler {
         };
         match rec {
             Some(rec) => {
-                let n = Self::recall_one(cache, &rec)?;
+                // Clean up the backing files UNCONDITIONALLY (mirroring `recall_caches`), even when
+                // recall_one fails (e.g. a dtype mismatch after an intervening re-encode): the record
+                // was already popped, so leaving the files would leak them. Run the restore, drop the
+                // files regardless, then surface the restore result to the transactional caller.
+                let result = Self::recall_one(cache, &rec);
                 let _ = fs::remove_file(&rec.k_path);
                 let _ = fs::remove_file(&rec.v_path);
-                Ok(n)
+                result
             }
             None => Ok(0),
         }
@@ -683,6 +687,37 @@ mod tests {
         assert_eq!(n, 0);
         assert_eq!(caches[0].current_pos, before);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// recall_layer cleans up the popped record's backing files even when recall_one FAILS (a layout /
+    /// dtype mismatch, e.g. after an intervening re-encode). Mutation-proof: reverting recall_layer to
+    /// `?`-propagate-before-cleanup leaves the two .bin files on disk, failing the final assertions.
+    #[test]
+    fn test_recall_layer_cleans_files_on_error() {
+        let dir = unique_tmp_dir("recall_layer_err");
+        let handler = SwapHandler::with_disk(0.5, dir.clone());
+        let mut caches = vec![make_hm_cache_with_data(10, 2, 4)];
+        handler.offload_caches(&mut caches).unwrap();
+        let (kp, vp) = {
+            let g = handler.state.lock().unwrap();
+            (g.records[0].k_path.clone(), g.records[0].v_path.clone())
+        };
+        assert!(kp.exists() && vp.exists(), "offload wrote the backing files");
+
+        // Recall into a cache with a DIFFERENT head_dim (8 != recorded 4) → recall_one bails on the
+        // layout mismatch, but recall_layer must still drop the popped record's files.
+        let mut other = make_hm_cache_with_data(0, 2, 8);
+        let res = handler.recall_layer(0, &mut other);
+        assert!(res.is_err(), "recall_one must fail on the layout mismatch");
+        assert!(
+            handler.state.lock().unwrap().records.is_empty(),
+            "the record was popped"
+        );
+        assert!(
+            !kp.exists() && !vp.exists(),
+            "backing files cleaned up on the recall error path (no leak)"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
