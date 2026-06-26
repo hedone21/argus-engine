@@ -35,6 +35,15 @@ pub fn load_eval_questions(
         let gold_index = task["gold_index"].as_u64().map(|v| v as usize);
         let gold_token_positions = parse_usize_array(task, "gold_token_positions");
         let needle_token_positions = parse_usize_array(task, "needle_token_positions");
+        // Model-agnostic alternative to the raw token-index arrays: a string the
+        // engine later locates in its own canonical tokenization (see
+        // `resolve_token_spans_from_text`). `needle` is the NIAH generator's key;
+        // `needle_text` / `gold_text` are the explicit forms.
+        let gold_text = task["gold_text"].as_str().map(str::to_string);
+        let needle_text = task["needle_text"]
+            .as_str()
+            .or_else(|| task["needle"].as_str())
+            .map(str::to_string);
 
         if let Some(choices) = task["choices"].as_array() {
             questions.push(crate::session::eval::EvalQuestion {
@@ -50,6 +59,8 @@ pub fn load_eval_questions(
                 gold_index,
                 gold_token_positions,
                 needle_token_positions,
+                gold_text,
+                needle_text,
             });
         } else if let Some(cont) = task["continuation"].as_str() {
             questions.push(crate::session::eval::EvalQuestion {
@@ -62,6 +73,8 @@ pub fn load_eval_questions(
                 gold_index,
                 gold_token_positions,
                 needle_token_positions,
+                gold_text,
+                needle_text,
             });
         }
     }
@@ -76,6 +89,79 @@ fn parse_usize_array(task: &serde_json::Value, key: &str) -> Option<Vec<usize>> 
             .filter_map(|v| v.as_u64().map(|n| n as usize))
             .collect()
     })
+}
+
+/// Token indices whose byte span overlaps `[byte_start, byte_end)`.
+///
+/// `offsets[i] = (s, e)` is the byte range token `i` covers in the source string
+/// (from the tokenizer's own offset mapping). A token is included when its range
+/// overlaps the target span and is non-empty — so special tokens (BOS etc., which
+/// carry the empty `(0, 0)` range) are skipped while every content token that
+/// touches the span, including one straddling a boundary, is kept. Pure: no
+/// tokenizer needed, so the boundary logic is unit-tested directly.
+fn token_positions_overlapping(
+    offsets: &[(usize, usize)],
+    byte_start: usize,
+    byte_end: usize,
+) -> Vec<usize> {
+    offsets
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(s, e))| e > s && s < byte_end && e > byte_start)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Locate `text` inside `prompt`'s canonical tokenization and return the token
+/// indices it spans, or `None` if it can't be located.
+///
+/// The string is found as a byte substring of `prompt` (first occurrence), then
+/// that byte range is mapped to token indices via the tokenizer's offset mapping
+/// — we never re-encode `text` on its own, which would risk BOS / prefix-space /
+/// merge mismatches at the span boundaries. `prompt` is tokenized with special
+/// tokens (`encode(prompt, true)`), matching the scorer's own prompt tokenization
+/// so the indices line up with the importance buffer's positions.
+fn resolve_span_from_text(
+    tokenizer: &tokenizers::Tokenizer,
+    prompt: &str,
+    text: &str,
+) -> Option<Vec<usize>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let byte_start = prompt.find(text)?;
+    let byte_end = byte_start + text.len();
+    let enc = tokenizer.encode(prompt, true).ok()?;
+    let positions = token_positions_overlapping(enc.get_offsets(), byte_start, byte_end);
+    (!positions.is_empty()).then_some(positions)
+}
+
+/// Fill `gold_token_positions` / `needle_token_positions` from the string forms
+/// (`gold_text` / `needle_text`) when the host supplied a span as text instead of
+/// raw token indices.
+///
+/// Resolving against each question's own canonical tokenization keeps fixtures
+/// model-agnostic: token indices depend on the tokenizer, but a string does not,
+/// so one NIAH JSON can drive any model. Raw token positions, when present, are
+/// an explicit override and are left untouched. A string that can't be located is
+/// left as `None` (no positions) rather than guessed.
+pub fn resolve_token_spans_from_text(
+    questions: &mut [crate::session::eval::EvalQuestion],
+    tokenizer: &tokenizers::Tokenizer,
+) {
+    for q in questions.iter_mut() {
+        if q.gold_token_positions.is_none()
+            && let Some(text) = q.gold_text.clone()
+        {
+            q.gold_token_positions = resolve_span_from_text(tokenizer, &q.prompt, &text);
+        }
+        if q.needle_token_positions.is_none()
+            && let Some(text) = q.needle_text.clone()
+        {
+            q.needle_token_positions = resolve_span_from_text(tokenizer, &q.prompt, &text);
+        }
+    }
 }
 
 /// Build a warmup token sequence from the eval-ll question set.
@@ -170,5 +256,52 @@ mod tests {
         assert_eq!(qs[1].needle_token_positions, None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loader_reads_needle_and_gold_text_keys() {
+        let dir =
+            std::env::temp_dir().join(format!("argus-loader-text-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("batch.json");
+        // `needle` is the NIAH generator's key; `gold_text` the explicit form.
+        std::fs::write(
+            &path,
+            r#"[
+                {"id":"q1","prompt":"P","choices":[" A"],"needle":"the code is 42",
+                 "gold_text":"42"}
+            ]"#,
+        )
+        .unwrap();
+        let args = Args::try_parse_from([
+            "argus-eval",
+            "--model-path",
+            "/tmp/m.gguf",
+            "--eval-ll",
+            "--eval-batch",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let qs = load_eval_questions(&args, "default").unwrap();
+        assert_eq!(qs[0].needle_text.as_deref(), Some("the code is 42"));
+        assert_eq!(qs[0].gold_text.as_deref(), Some("42"));
+        // Strings alone do not populate raw positions (that needs a tokenizer pass).
+        assert_eq!(qs[0].needle_token_positions, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlap_keeps_content_tokens_and_skips_specials() {
+        // Tokenization of "ab XX cd" as: BOS | "ab" | " XX" | " cd", with BOS
+        // carrying the empty (0,0) range that special tokens use.
+        let offsets = [(0usize, 0usize), (0, 2), (2, 5), (5, 8)];
+        // Needle "XX" spans bytes [3, 5) → only token 2 (" XX") overlaps.
+        assert_eq!(token_positions_overlapping(&offsets, 3, 5), vec![2]);
+        // A span touching two tokens keeps both (boundary-straddle is included).
+        assert_eq!(token_positions_overlapping(&offsets, 1, 6), vec![1, 2, 3]);
+        // The empty-range BOS is never selected, even for a whole-string span.
+        assert!(!token_positions_overlapping(&offsets, 0, 8).contains(&0));
     }
 }

@@ -99,10 +99,27 @@ fn build_answer_attn_by_layer_head(
         .collect()
 }
 
+/// The gold-choice index to forward for a question's answer-attention record.
+///
+/// Uses the host-supplied `gold_index` when present. When it is absent but the
+/// question has exactly one choice, the gold is unambiguous, so default to `0`
+/// rather than skip — this keeps single-choice (e.g. continuation) batches from
+/// silently producing zero records. Multi-choice questions with no `gold_index`
+/// are genuinely ambiguous and return `None` (the caller skips them, loudly).
+fn effective_gold_index(gold_index: Option<usize>, n_choices: usize) -> Option<usize> {
+    match gold_index {
+        Some(g) => Some(g),
+        None if n_choices == 1 => Some(0),
+        None => None,
+    }
+}
+
 /// Run the `answer_attention` (IMP-2) dump over `questions`, writing one JSONL
-/// record per question that has a `gold_index`. Questions without a gold index,
-/// with an empty gold continuation, or longer than `max_seq_len` are skipped
-/// (with a warning) so a partially-annotated batch still produces a usable dump.
+/// record per question whose gold choice is known. The gold is the supplied
+/// `gold_index`, or `0` for a single-choice question (unambiguous). Questions
+/// that remain ambiguous (no `gold_index` and >1 choice), or have an empty gold
+/// continuation, or are longer than `max_seq_len`, are skipped (with a named
+/// warning) so a partially-annotated batch still produces a usable dump.
 ///
 /// `out_path` is created (with parent dirs); `vocab_size` sizes the throwaway
 /// logits buffer (logits are not used — only the PFA side channel is read).
@@ -151,7 +168,17 @@ pub fn run_answer_attention_dump(
     let mut skipped = 0usize;
 
     for question in questions {
-        let Some(gold_index) = question.gold_index else {
+        // Single-choice questions need no `gold_index` (the gold is unambiguous);
+        // a multi-choice question without one is genuinely ambiguous → skip with a
+        // named warning rather than silently inflating the "skipped" count (R3).
+        let Some(gold_index) = effective_gold_index(question.gold_index, question.choices.len())
+        else {
+            eprintln!(
+                "[dump:answer_attention] {}: no `gold_index` and {} choices (gold ambiguous), \
+                 skipping",
+                question.id,
+                question.choices.len()
+            );
             skipped += 1;
             continue;
         };
@@ -284,6 +311,18 @@ pub fn run_answer_attention_dump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_gold_index_defaults_only_for_single_choice() {
+        // Explicit gold is always honored.
+        assert_eq!(effective_gold_index(Some(1), 3), Some(1));
+        // Single choice → gold unambiguous, default to 0 instead of skipping.
+        assert_eq!(effective_gold_index(None, 1), Some(0));
+        // Multi-choice with no gold → ambiguous → skip (None).
+        assert_eq!(effective_gold_index(None, 3), None);
+        // Degenerate zero-choice question is not single-choice → still skip.
+        assert_eq!(effective_gold_index(None, 0), None);
+    }
 
     #[test]
     fn record_builder_shape_and_context_slice() {

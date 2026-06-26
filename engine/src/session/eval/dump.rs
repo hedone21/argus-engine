@@ -38,6 +38,24 @@ pub fn is_known_dump_kind(kind: &str) -> bool {
     KNOWN_DUMP_KINDS.contains(&kind)
 }
 
+/// Startup warning for the `evict_importance` + no-KV-budget footgun.
+///
+/// `evict_importance` only emits on a real eviction event, which in eval-ll fires
+/// only when a global KV budget (`--kv-budget` / `--kv-budget-ratio`) is set — the
+/// policy's own `keep_ratio` does **not** set a budget. With no budget the run is
+/// full-prefill, nothing is evicted, and the dump is silently empty. Returns the
+/// warning to print when that combination is requested, else `None`.
+pub fn evict_importance_empty_dump_warning(
+    evict_dump_enabled: bool,
+    has_kv_budget: bool,
+) -> Option<&'static str> {
+    (evict_dump_enabled && !has_kv_budget).then_some(
+        "[dump:evict_importance] WARNING: no KV budget set \
+         (--kv-budget / --kv-budget-ratio) → eviction will not fire → \
+         the evict_importance dump will be empty",
+    )
+}
+
 /// Validate a set of requested `--dump` kinds, erroring on the first unknown one.
 pub fn validate_dump_kinds(kinds: &[String]) -> Result<()> {
     for k in kinds {
@@ -243,6 +261,17 @@ mod tests {
     #[test]
     fn empty_kinds_validate_ok() {
         assert!(validate_dump_kinds(&[]).is_ok());
+    }
+
+    #[test]
+    fn evict_importance_warns_only_without_budget() {
+        // Requested + no budget → warn (the dump would be silently empty).
+        assert!(evict_importance_empty_dump_warning(true, false).is_some());
+        // Requested + a budget set → fine, no warning.
+        assert!(evict_importance_empty_dump_warning(true, true).is_none());
+        // Not requested → never warn, budget or not.
+        assert!(evict_importance_empty_dump_warning(false, false).is_none());
+        assert!(evict_importance_empty_dump_warning(false, true).is_none());
     }
 
     #[test]
