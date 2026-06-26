@@ -17,6 +17,8 @@
 
 pub mod eviction;
 pub mod format_reencode;
+// HYBRID v3 — driver for imperative KVMutationStage callbacks (mutation twin of format_reencode).
+pub mod mutation;
 pub mod offload;
 pub mod prefill_keepset;
 pub mod quant_window_stage;
