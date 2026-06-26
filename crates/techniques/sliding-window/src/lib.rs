@@ -20,9 +20,9 @@
 //! unchanged.
 
 use argus_extension_api::{
-    EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec,
+    EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, KeepTopK,
     QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
-    redistribute_value,
+    compile_keep_top_k, redistribute_value,
 };
 use linkme::distributed_slice;
 
@@ -67,10 +67,16 @@ impl KVCacheStage for SlidingWindow {
             if tokens_to_keep_after_prefix >= removable_count {
                 (0..current).collect()
             } else {
-                let prune_count = removable_count - tokens_to_keep_after_prefix;
-                let mut k: Vec<usize> = (0..self.protected_prefix).collect();
-                k.extend((self.protected_prefix + prune_count)..current);
-                k
+                // prefix + recent window, score-free (heavy 0) — routed through the T1 compiler.
+                compile_keep_top_k(
+                    KeepTopK {
+                        current,
+                        prefix: self.protected_prefix,
+                        recent: tokens_to_keep_after_prefix,
+                        heavy: 0,
+                    },
+                    |_| 0.0,
+                )
             }
         };
         Some(KVCachePlan {
