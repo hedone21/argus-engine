@@ -127,3 +127,46 @@ pub static KV_TECHNIQUE_DESCRIPTORS: &[KvTechniqueDescriptor] = &[
 pub fn descriptor_names() -> Vec<&'static str> {
     KV_TECHNIQUE_DESCRIPTORS.iter().map(|d| d.name).collect()
 }
+
+/// OCCUPANCY invariant: every descriptor's `reads` ⊆ (∪ all `produces`) ∪ `intrinsic` — no technique
+/// reads a signal that nothing produces and that the engine does not supply intrinsically (no orphan
+/// read). Returns the first orphan as an `Err` (the technique + the unsatisfied signal).
+pub fn validate_occupancy(
+    descriptors: &[KvTechniqueDescriptor],
+    intrinsic: &[TensorKind],
+) -> Result<(), String> {
+    let mut available: Vec<TensorKind> = intrinsic.to_vec();
+    for d in descriptors {
+        for &p in d.produces {
+            if !available.contains(&p) {
+                available.push(p);
+            }
+        }
+    }
+    for d in descriptors {
+        for &r in d.reads {
+            if !available.contains(&r) {
+                return Err(format!(
+                    "technique '{}' reads {r:?} which no descriptor produces and is not \
+                     engine-intrinsic (orphan read)",
+                    d.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// CARDINALITY invariant: the built-in coordinate map is exactly 7 techniques, regardless of which
+/// feature-gated crates are linked (a fixed matrix). A compile-time assert — adding/removing a
+/// descriptor without updating this fails the build.
+const _: () = assert!(KV_TECHNIQUE_DESCRIPTORS.len() == 7);
+
+/// Boot self-test: the live coordinate map satisfies OCCUPANCY over the engine-intrinsic producer
+/// set. Panics with the offending orphan on violation. Callable at engine startup; exercised by the
+/// invariant tests.
+pub fn descriptor_self_test() {
+    if let Err(e) = validate_occupancy(KV_TECHNIQUE_DESCRIPTORS, ENGINE_INTRINSIC) {
+        panic!("KV technique coordinate-map OCCUPANCY violation: {e}");
+    }
+}
