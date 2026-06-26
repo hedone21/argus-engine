@@ -544,6 +544,18 @@ pub enum CacheOpError {
     /// The requested mutation would produce heterogeneous-within-layer state (per-head or per-token
     /// precision) that no current single-precision-per-layer container can hold.
     HeterogeneousUnsupported,
+    /// A weighted merge named an `into` or `from` position outside `[0, current_pos)` (eager-rejected
+    /// before any mutation — the merge twin of [`InvalidKeep`](Self::InvalidKeep)). Closes the
+    /// out-of-range merge that would otherwise panic / silently corrupt in the CPU merge executor.
+    InvalidMerge,
+    /// A second weighted-merge batch was staged in one callback. Merge is position-preserving but the
+    /// engine accepts at most one merge batch per transaction (distinct from
+    /// [`MultipleCompactions`](Self::MultipleCompactions), which is about position-renumbering ops).
+    MergeAlreadyStaged,
+    /// `offload` / `recall` was requested on a handle with no residency (swap) backend configured.
+    /// Rejected eagerly so the op never stages alongside a byte-mutating op that would then be
+    /// orphaned by a commit-time failure.
+    NoResidencyBackend,
 }
 
 impl core::fmt::Display for CacheOpError {
@@ -581,6 +593,17 @@ impl core::fmt::Display for CacheOpError {
             CacheOpError::HeterogeneousUnsupported => write!(
                 f,
                 "mutation would produce heterogeneous-within-layer precision no container can hold"
+            ),
+            CacheOpError::InvalidMerge => write!(
+                f,
+                "weighted merge names an into/from position outside [0, current_pos)"
+            ),
+            CacheOpError::MergeAlreadyStaged => {
+                write!(f, "a second weighted-merge batch was staged in one callback")
+            }
+            CacheOpError::NoResidencyBackend => write!(
+                f,
+                "offload/recall requested but this handle has no residency (swap) backend"
             ),
         }
     }
