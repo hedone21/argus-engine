@@ -8,7 +8,9 @@ use anyhow::Result;
 
 use crate::session::cli::parse_qcf_sample_layers;
 use crate::session::eval::args::EvalLlRunCtx;
-use crate::session::eval::helpers::{build_eval_ll_warmup_text, load_eval_questions};
+use crate::session::eval::helpers::{
+    build_eval_ll_warmup_text, load_eval_questions, resolve_token_spans_from_text,
+};
 use crate::session::qcf_runtime::{
     QcfWarmupConfig, QcfWarmupCtx, run_layer_swap, run_qcf_warmup_workflow,
 };
@@ -40,7 +42,16 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         swap_only_layers,
     } = ctx;
 
-    let questions = load_eval_questions(&args, &prompt)?;
+    let mut questions = load_eval_questions(&args, &prompt)?;
+
+    // R2: a fixture may ship needle/gold spans as *text* (model-agnostic) rather
+    // than raw token indices; resolve those against each question's own canonical
+    // tokenization so positions stay consistent with scoring. Gated on a dump
+    // being requested so the no-dump path does zero extra tokenization (INV-147).
+    // Raw token positions, when present, are an explicit override (left as-is).
+    if !args.dump_kinds().is_empty() {
+        resolve_token_spans_from_text(&mut questions, &tokenizer);
+    }
 
     // ── IMP-2: answer_attention diagnostic dump (read-only; INV-147) ──────
     // Standalone pass over a fresh uncompressed reference cache — decoupled from
@@ -150,6 +161,17 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
             "full-prefill"
         }
     );
+
+    // R4: warn early if `--dump evict_importance` was requested without a KV
+    // budget — eviction never fires (full-prefill), so the dump would be silently
+    // empty. (The policy's keep_ratio does not set a budget; only --kv-budget /
+    // --kv-budget-ratio do.)
+    if let Some(w) = crate::session::eval::dump::evict_importance_empty_dump_warning(
+        args.dump_enabled(crate::session::eval::dump::DUMP_EVICT_IMPORTANCE),
+        budget_mode,
+    ) {
+        eprintln!("{w}");
+    }
 
     // "caote" folds to Attn: the value-aware QcfMode variant was name-only residue and `mode` is
     // dead-stored in QcfConfig (never branched on). --qcf-mode caote still flips needs_caote in

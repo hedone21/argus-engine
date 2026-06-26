@@ -37,6 +37,14 @@ pub struct EvalQuestion {
     /// Context token positions of an inserted "needle" (host-supplied). Carried
     /// through to dumps for needle-recall analysis.
     pub needle_token_positions: Option<Vec<usize>>,
+    /// Gold-answer span as a *string*, located in the prompt's own canonical
+    /// tokenization when raw `gold_token_positions` are absent. Lets a fixture
+    /// stay model-agnostic (token indices depend on the tokenizer). Resolved by
+    /// `helpers::resolve_token_spans_from_text`; raw positions, if present, win.
+    pub gold_text: Option<String>,
+    /// Needle span as a *string*, resolved into `needle_token_positions` the same
+    /// way as [`gold_text`](Self::gold_text) when raw positions are absent.
+    pub needle_text: Option<String>,
 }
 
 /// Unified output from the generic eval loop.
