@@ -183,6 +183,13 @@ pub(crate) fn execute_kv_plan(
 /// mutation driver consult it as the constraint surface matures. Exercised by its unit test; the
 /// `allow(dead_code)` marks the deliberate dormancy (mirroring the ChannelKeep dormant-surface
 /// precedent) rather than hiding an oversight.
+///
+/// ⚠ Wiring it as a HARD make-time reject is NOT behavior-neutral: a self-degrading stage (e.g. d2o,
+/// which sets `produces_merge_plan: true` statically but at runtime emits a keep-only plan on
+/// device-resident KV via `merge_enabled = !kv_on_device()`) currently WORKS on device. Feeding its
+/// caps here with `supports_merge=false` returns `Err`, regressing it from works→fail. Before wiring,
+/// treat this as advisory (degrade-to-keep-only), or drive it off an effective/runtime capability
+/// rather than the static `produces_merge_plan`.
 #[allow(dead_code)]
 pub(crate) fn validate_stage_constraints(
     caps: &argus_extension_api::StageCaps,

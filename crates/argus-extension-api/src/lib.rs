@@ -237,6 +237,12 @@ pub trait StageCtx {
     // cannot execute (the "expressible != executable" honesty boundary, surfaced up-front instead of
     // as a runtime executor reject). All are default methods so the ~13 existing `StageCtx` impls and
     // the C-ABI `StageCtxAbi` (a fixed fn-ptr table) compile unchanged.
+    //
+    // C-ABI CAVEAT: these are NOT flattened into `StageCtxAbi`, so a `.so` plugin reaching the host
+    // through `AbiStageCtx` sees the DEFAULTS here (cache_dtype=F32, supports_per_head=false,
+    // keep_granularity=1), not the real cache state — e.g. a Q4_0 cache reports keep_granularity=1 over
+    // the C-ABI. There is no in-tree consumer yet; a future `.so` consumer must append a `cache_dtype`
+    // fn-ptr (bumping `KV_STAGE_ABI_VERSION`) and override these on `AbiStageCtx`.
 
     /// The stored KV dtype of this layer's cache (for diagnostics / granularity reasoning).
     /// Default [`TensorDtype::F32`].
@@ -700,9 +706,15 @@ pub trait CacheHandle {
 
     // ── residency (hardware) axis — compaction-slot ops (T-2) ──
 
-    /// Offload the LRU prefix (`prefix_len` tokens) to the backing store.
+    /// Offload the LRU prefix (`prefix_len` tokens) to the backing store. Requires a residency
+    /// backend (else [`CacheOpError::NoResidencyBackend`], eager). NOTE: only F32/F16 host-resident KV
+    /// is persisted to the store; a Q4_0 / non-persistable cache (or an unset store) degrades to a
+    /// **lossy prune** of the prefix — those tokens are dropped, not recoverable by `recall`.
     fn offload(&mut self, prefix_len: usize) -> Result<(), CacheOpError>;
-    /// Recall previously offloaded tokens for this layer.
+    /// Recall this layer's most-recent outstanding offloaded prefix. Requires a residency backend
+    /// (else [`CacheOpError::NoResidencyBackend`], eager). Recalls ONE record per call (the engine
+    /// stages at most one residency op per callback, T-2); a layer with multiple outstanding offloads
+    /// needs one `recall` per offload.
     fn recall(&mut self) -> Result<(), CacheOpError>;
 
     // ── dormant geometry walls (always Err today; common to the declarative model) ──

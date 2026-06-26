@@ -8,9 +8,15 @@
 //!
 //! It is a CENTRAL engine table (not a per-crate `linkme` slice) so the built-in set is exactly the
 //! same regardless of which feature-gated crates (caote / rkv) are force-linked — the coordinate map
-//! is a fixed matrix, not a build-dependent one. The OCCUPANCY invariant ([`validate_occupancy`])
-//! checks that no technique reads a signal nothing produces (no orphan read), where the engine forward
-//! pass produces the [`ENGINE_INTRINSIC`] signals.
+//! is a fixed matrix, not a build-dependent one.
+//!
+//! What is VALIDATED today: CARDINALITY (exactly 7, const-assert), OCCUPANCY ([`validate_occupancy`] —
+//! no technique reads a signal nothing produces, where the engine supplies [`ENGINE_INTRINSIC`]), and
+//! name↔registry resolution (the tests). `axis` and `phase` are DESCRIPTIVE coordinates beyond the
+//! name-resolution cross-check — not otherwise validated. Only the stage / score / read cells are
+//! populated; no built-in occupies the format / hardware axes (those producers live in their own
+//! registries — `KV_FORMAT_POLICIES`, the offload store — and folding them into this map is a
+//! follow-up).
 
 use argus_extension_api::{MutationPhase, TensorKind};
 
@@ -18,14 +24,16 @@ use argus_extension_api::{MutationPhase, TensorKind};
 pub type SignalSet = &'static [TensorKind];
 
 /// Which orthogonal axis a technique occupies (the coordinate-map cell). Mirrors CONTEXT.md's
-/// stage ⊥ format ⊥ hardware, plus the observer score / read producer axes.
+/// stage ⊥ format ⊥ hardware, plus the observer score / read producer axes. The full taxonomy is
+/// listed for completeness; only `Stage` / `Score` / `Read` are occupied by a built-in descriptor
+/// today (`Format` / `Hardware` have no built-in entry — their producers live in separate registries).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvAxis {
     /// Resident-token adjustment (eviction / merge): sliding / streaming / h2o / h2o_plus / d2o.
     Stage,
-    /// Storage precision / layout (the format axis).
+    /// Storage precision / layout (the format axis). No built-in descriptor yet (see `KV_FORMAT_POLICIES`).
     Format,
-    /// Compute / residency location (the hardware axis).
+    /// Compute / residency location (the hardware axis). No built-in descriptor yet (see the offload store).
     Hardware,
     /// Forward-time attention-score producer (observer/score axis): attn_score.
     Score,
