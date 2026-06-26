@@ -28,6 +28,14 @@ pub mod format_apply;
 // read 축(KVReadStage) 빌트인 등록 + force-link self-test (Quest).
 pub mod read;
 pub mod standard_format;
+// HYBRID v3 — engine-side transaction engine implementing the imperative `CacheHandle` ABI
+// (the M4 callback class). Stages position-mutating ops and commits them once per callback
+// (single renumber), routing every op to an existing executor (execute_kv_plan / apply_weighted_merges
+// / apply_format_plan / swap_handler). The format twin of the plan executor in eviction/stage_registry.
+pub mod cache_handle;
+// HYBRID v3 — the declarative coordinate map for KV techniques (axis cell + phase + signal edges).
+// A static, CI-validatable matrix of "what technique sits where, consuming/feeding which signals".
+pub mod descriptor;
 
 // Shared KV dequantization + similarity helpers (formerly in d2o_handler; weighted-merge was extracted to
 // the out-of-tree `d2o` plugin crate). Consumed by the StageCtx Key/Value handles + R-KV stage.

@@ -18,8 +18,8 @@
 //! 3-partition model (per head): `[Protected Prefix] [Heavy Hitters] [Recent Window]`.
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCaps, StageCtx,
-    StageParams,
+    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, KeepTopK, StageCaps,
+    StageCtx, StageParams, compile_keep_top_k,
 };
 use linkme::distributed_slice;
 
@@ -42,11 +42,10 @@ impl H2OPlus {
 /// The shared 3-partition budget split (prefix / heavy-hitters / recent), computed once per plan.
 struct Partition {
     prefix: usize,
-    /// Total evictable budget `keep - prefix` (= hh_budget + recent_budget).
+    /// Total evictable budget `keep - prefix` (= hh_budget + recent_budget). The recent-window count
+    /// passed to the T1 compiler is `available - hh_budget`.
     available: usize,
     hh_budget: usize,
-    /// Start of the recent window in the **score-based** split (`current - recent_budget`).
-    recent_start: usize,
     current: usize,
 }
 
@@ -61,13 +60,10 @@ impl H2OPlus {
         }
         let available = keep.saturating_sub(prefix);
         let hh_budget = (available as f32 * self.keep_ratio) as usize;
-        let recent_budget = available - hh_budget;
-        let recent_start = current.saturating_sub(recent_budget).max(prefix);
         Some(Partition {
             prefix,
             available,
             hh_budget,
-            recent_start,
             current,
         })
     }
@@ -77,21 +73,17 @@ impl H2OPlus {
 /// score reader over the evictable range `[prefix, recent_start)`: keep the prefix, the top
 /// `hh_budget` scorers (re-sorted by position), and the recent window `[recent_start, current)`.
 fn keep_list_from_scores(p: &Partition, score: impl Fn(usize) -> f32) -> Vec<usize> {
-    let mut token_scores: Vec<(usize, f32)> = (p.prefix..p.recent_start)
-        .map(|pos| (pos, score(pos)))
-        .collect();
-    token_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut hh: Vec<usize> = token_scores
-        .iter()
-        .take(p.hh_budget)
-        .map(|(pos, _)| *pos)
-        .collect();
-    hh.sort_unstable();
-
-    let mut keep: Vec<usize> = (0..p.prefix).collect();
-    keep.extend_from_slice(&hh);
-    keep.extend(p.recent_start..p.current);
-    keep
+    // The recent window count is `available - hh_budget` (so `recent_start` matches `p.recent_start`).
+    // Routed through the engine's T1 compiler — byte-identical to the verbatim selection it replaced.
+    compile_keep_top_k(
+        KeepTopK {
+            current: p.current,
+            prefix: p.prefix,
+            recent: p.available - p.hh_budget,
+            heavy: p.hh_budget,
+        },
+        score,
+    )
 }
 
 impl KVCacheStage for H2OPlus {
@@ -124,12 +116,15 @@ impl KVCacheStage for H2OPlus {
         //     retained `keep` tokens (NOT `keep - hh_budget`).
         let keep = match ctx.importance() {
             Some(imp) => keep_list_from_scores(&p, |pos| imp.get(pos).copied().unwrap_or(0.0)),
-            None => {
-                let recent_start = p.current.saturating_sub(p.available).max(p.prefix);
-                let mut keep: Vec<usize> = (0..p.prefix).collect();
-                keep.extend(recent_start..p.current);
-                keep
-            }
+            None => compile_keep_top_k(
+                KeepTopK {
+                    current: p.current,
+                    prefix: p.prefix,
+                    recent: p.available,
+                    heavy: 0,
+                },
+                |_| 0.0,
+            ),
         };
         Some(KVCachePlan {
             keep: KeepSpec::LayerWide(keep),

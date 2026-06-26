@@ -15,9 +15,9 @@
 //! keep-list; the engine executes the compaction (plan-returning, D1).
 
 use argus_extension_api::{
-    EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec,
+    EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, KeepTopK,
     QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
-    redistribute_value,
+    compile_keep_top_k, redistribute_value,
 };
 use linkme::distributed_slice;
 
@@ -54,19 +54,27 @@ impl KVCacheStage for H2o {
             return None;
         }
 
+        // The keep-set assembly is the canonical 3-partition T1 shape — routed through the engine's
+        // `compile_keep_top_k` (the policy supplies only budgets + a score fn; the compiler owns the
+        // recency window, the STABLE top-k, and the ascending re-sort). Byte-identical to the verbatim
+        // engine `evict_with_scores` selection this replaced.
         let keep_list: Vec<usize> = match ctx.importance() {
-            // score-free fallback: prefix + most-recent.
+            // score-free fallback: prefix + most-recent (heavy 0).
             None => {
                 let available = keep.saturating_sub(prefix);
-                let recent_budget = available;
-                let actual_recent = recent_budget.min(current - prefix);
-                let prune_count = current - prefix - actual_recent;
-                if prune_count == 0 {
-                    return None;
+                let actual_recent = available.min(current - prefix);
+                if current - prefix - actual_recent == 0 {
+                    return None; // nothing to prune — equivalent to the engine's full-keep plan.
                 }
-                let mut k: Vec<usize> = (0..prefix).collect();
-                k.extend((prefix + prune_count)..current);
-                k
+                compile_keep_top_k(
+                    KeepTopK {
+                        current,
+                        prefix,
+                        recent: actual_recent,
+                        heavy: 0,
+                    },
+                    |_| 0.0,
+                )
             }
             // score-based: prefix + heavy hitters (top score) + recent window.
             Some(imp) => {
@@ -74,27 +82,15 @@ impl KVCacheStage for H2o {
                 let hh_budget = (available as f32 * self.keep_ratio) as usize;
                 let recent_budget = available - hh_budget;
                 let actual_recent = recent_budget.min(current - prefix);
-                let recent_start = current.saturating_sub(actual_recent).max(prefix);
-                let evictable_start = prefix;
-
-                // (pos, score) over evictable range, stable sort desc, take top-hh_budget, re-sort
-                // by position — identical token set + order to the engine's evict_with_scores.
-                let mut token_scores: Vec<(usize, f32)> = (evictable_start..recent_start)
-                    .map(|pos| (pos, imp.get(pos).copied().unwrap_or(0.0)))
-                    .collect();
-                token_scores
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let mut hh_positions: Vec<usize> = token_scores
-                    .iter()
-                    .take(hh_budget)
-                    .map(|(pos, _)| *pos)
-                    .collect();
-                hh_positions.sort();
-
-                let mut k: Vec<usize> = (0..prefix).collect();
-                k.extend_from_slice(&hh_positions);
-                k.extend(recent_start..current);
-                k
+                compile_keep_top_k(
+                    KeepTopK {
+                        current,
+                        prefix,
+                        recent: actual_recent,
+                        heavy: hh_budget,
+                    },
+                    |pos| imp.get(pos).copied().unwrap_or(0.0),
+                )
             }
         };
         Some(KVCachePlan {

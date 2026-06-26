@@ -17,9 +17,9 @@
 //! (plan-returning, D1). It never references engine types (`KVCache`/`Backend`).
 
 use argus_extension_api::{
-    EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec,
+    EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, KeepTopK,
     QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
-    redistribute_value,
+    compile_keep_top_k, redistribute_value,
 };
 use linkme::distributed_slice;
 
@@ -63,9 +63,16 @@ impl KVCacheStage for StreamingLlm {
             return None; // within budget — no-op
         }
 
-        let recent_start = current - effective_window;
-        let mut keep_list: Vec<usize> = (0..self.sink_size).collect();
-        keep_list.extend(recent_start..current);
+        // prefix(sink) + recent window, score-free (heavy 0) — routed through the T1 compiler.
+        let keep_list = compile_keep_top_k(
+            KeepTopK {
+                current,
+                prefix: self.sink_size,
+                recent: effective_window,
+                heavy: 0,
+            },
+            |_| 0.0,
+        );
         Some(KVCachePlan {
             keep: KeepSpec::LayerWide(keep_list),
             merges: Vec::new(),

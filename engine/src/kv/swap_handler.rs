@@ -146,10 +146,23 @@ impl SwapHandler {
         if total == 0 {
             return Ok(0);
         }
-
         let offload_count = ((total as f32 * self.offload_ratio) as usize).max(1);
-        if offload_count >= total {
-            return Ok(0); // Don't offload everything
+        self.offload_prefix(layer_idx, cache, offload_count)
+    }
+
+    /// Offload an explicit `offload_count`-token LRU prefix of one layer, decoupled from
+    /// `offload_ratio`. The `CacheHandle::offload` residency op routes here; `offload_one` computes a
+    /// ratio-driven count then delegates. Guards `current_pos == 0` and `offload_count >= current_pos`
+    /// (never offload everything / nothing). Same disk/lossy body as the ratio-driven path.
+    pub(crate) fn offload_prefix(
+        &self,
+        layer_idx: usize,
+        cache: &mut KVCache,
+        offload_count: usize,
+    ) -> Result<usize> {
+        let total = cache.current_pos;
+        if total == 0 || offload_count == 0 || offload_count >= total {
+            return Ok(0); // Don't offload everything / nothing.
         }
 
         let dtype = cache.k_buffer.dtype();
@@ -356,6 +369,30 @@ impl SwapHandler {
             cache.high_water_pos = cache.current_pos;
         }
         Ok(count)
+    }
+
+    /// Recall the first outstanding record for `layer_idx` back into `cache` (the `CacheHandle::recall`
+    /// residency op routes here). Pops that layer's record from the ledger, restores its prefix, and
+    /// cleans up the backing files. `Ok(0)` when this layer has no outstanding record. The all-layers
+    /// `recall_caches` is the ratio/pressure-driven twin.
+    pub(crate) fn recall_layer(&self, layer_idx: usize, cache: &mut KVCache) -> Result<usize> {
+        let rec = {
+            let mut guard = self.state.lock().unwrap();
+            guard
+                .records
+                .iter()
+                .position(|r| r.layer_idx == layer_idx)
+                .map(|i| guard.records.remove(i))
+        };
+        match rec {
+            Some(rec) => {
+                let n = Self::recall_one(cache, &rec)?;
+                let _ = fs::remove_file(&rec.k_path);
+                let _ = fs::remove_file(&rec.v_path);
+                Ok(n)
+            }
+            None => Ok(0),
+        }
     }
 }
 
