@@ -14,28 +14,71 @@
 //! GATE-C: `cargo build -p example-keep-recent --features plugin-cdylib` produces the `.so` →
 //! `argus-bench --load-plugin <.so> eviction plugin --name example_keep_recent` loads it zero-compile.
 
-use argus_extension_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, StageParams};
+use argus_extension_api::{
+    CacheHandle, CacheOpError, KVCachePlan, KVCacheStage, KVMutationStage, KeepSpec, MutationPhase,
+    StageCtx, StageParams,
+};
 
 /// Stage that keeps only the most recent `target_len` tokens.
 struct KeepRecent;
+
+impl KeepRecent {
+    /// The keep-list (`None` = no shrink needed), shared by the v3 `on_phase` and the v2 `plan` so
+    /// they decide identically: the most-recent `target_len` tokens (ascending).
+    fn keep_list(&self, current: usize, target: usize) -> Option<Vec<usize>> {
+        if current <= target {
+            return None; // no shrink needed — no-op
+        }
+        Some((current - target..current).collect()) // ascending
+    }
+}
+
+// ── v3 native (imperative) surface — the canonical contributor TEMPLATE ──
+//
+// A native v3 technique implements `KVMutationStage` (imperative: stage ops on the transactional
+// `CacheHandle`, the engine owns the commit) and registers via `register_kv_mutation_stage!`
+// (static-linkme only). `on_phase` reads the pre-callback frame through `&dyn StageCtx` and stages
+// its keep through `&mut dyn CacheHandle` — the two views never alias.
+impl KVMutationStage for KeepRecent {
+    fn name(&self) -> &str {
+        "example_keep_recent"
+    }
+
+    fn on_phase(
+        &self,
+        ctx: &dyn StageCtx,
+        cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        match self.keep_list(ctx.current_pos(), ctx.target_len()) {
+            Some(keep) => cache.keep(&keep),
+            None => Ok(()),
+        }
+    }
+}
+
+// v3 registration: score-free, fires at the mid-decode KvMutate slot. The engine resolves it via
+// `find_mutation_stage("example_keep_recent")`.
+argus_extension_api::register_kv_mutation_stage!(
+    "example_keep_recent",
+    |_p| Box::new(KeepRecent),
+    MutationPhase::KvMutate
+);
+
+// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
 
 impl KVCacheStage for KeepRecent {
     fn name(&self) -> &str {
         "example_keep_recent"
     }
 
+    /// Decides via the shared `keep_list`, so it is byte-identical to the v3 `on_phase`.
     fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-        let current = ctx.current_pos();
-        let target = ctx.target_len();
-        if current <= target {
-            return None; // no shrink needed — no-op
-        }
-        let keep: Vec<usize> = (current - target..current).collect(); // ascending
-        Some(KVCachePlan {
-            keep: KeepSpec::LayerWide(keep),
-            merges: Vec::new(),
-            channels: None,
-        })
+        self.keep_list(ctx.current_pos(), ctx.target_len())
+            .map(|keep| KVCachePlan {
+                keep: KeepSpec::LayerWide(keep),
+                merges: Vec::new(),
+                channels: None,
+            })
     }
 }
 
@@ -101,6 +144,76 @@ mod tests {
         let reg = find_stage("example_keep_recent")
             .expect("example stage must be registered in the slice");
         assert_eq!(reg.name, "example_keep_recent");
+    }
+
+    /// A mock [`CacheHandle`] capturing the keep staged by `keep`.
+    struct CaptureHandle {
+        kept: Option<Vec<usize>>,
+    }
+    impl CacheHandle for CaptureHandle {
+        fn current_pos(&self) -> usize {
+            100
+        }
+        fn n_kv_heads(&self) -> usize {
+            1
+        }
+        fn head_dim(&self) -> usize {
+            1
+        }
+        fn kv_on_device(&self) -> bool {
+            false
+        }
+        fn tensor(
+            &self,
+            _kind: argus_extension_api::TensorKind,
+        ) -> Option<&dyn argus_extension_api::TensorHandle> {
+            None
+        }
+        fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
+            self.kept = Some(keep.to_vec());
+            Ok(())
+        }
+        fn keep_per_head(&mut self, _keep: &[&[usize]]) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn merge(
+            &mut self,
+            _merges: &[argus_extension_api::WeightedMerge],
+        ) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn reencode(&mut self, _target: argus_extension_api::FormatId) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn transition_quant_bits(&mut self, _bits: u8) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn offload(&mut self, _prefix_len: usize) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn recall(&mut self) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+    }
+
+    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages exactly the keep the v2
+    /// `plan` returns (both via the shared `keep_list`). The contributor-template gate.
+    #[test]
+    fn v3_native_matches_v2_decision() {
+        use argus_extension_api::find_mutation_stage;
+        let reg =
+            find_mutation_stage("example_keep_recent").expect("registered in KV_MUTATION_STAGES");
+        assert_eq!(reg.name, "example_keep_recent");
+        assert_eq!(reg.phase, MutationPhase::KvMutate);
+        assert_eq!(
+            (reg.make)(StageParams::default(), &[]).name(),
+            "example_keep_recent"
+        );
+
+        let mut h = CaptureHandle { kept: None };
+        <KeepRecent as KVMutationStage>::on_phase(&KeepRecent, &Ctx { cur: 100, tgt: 30 }, &mut h)
+            .unwrap();
+        assert_eq!(h.kept, Some((70..100).collect::<Vec<_>>()));
     }
 
     #[test]
