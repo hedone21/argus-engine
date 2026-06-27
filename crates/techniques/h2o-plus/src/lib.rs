@@ -18,10 +18,19 @@
 //! 3-partition model (per head): `[Protected Prefix] [Heavy Hitters] [Recent Window]`.
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, KeepTopK, StageCaps,
-    StageCtx, StageParams, compile_keep_top_k,
+    CacheHandle, CacheOpError, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg,
+    KVMutationStage, KeepSpec, KeepTopK, MutationPhase, StageCaps, StageCtx, StageParams,
+    TensorKind, compile_keep_top_k, register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
+
+/// The score-based caps shared by the v2 [`KVCacheStageReg`] and the v3 registration: H2O+ ranks
+/// per-head heavy hitters by accumulated importance (Scores), protecting 4 sinks by default.
+const H2OPLUS_CAPS: StageCaps = StageCaps {
+    reads: &[TensorKind::Scores],
+    default_protected_prefix: 4,
+    produces_merge_plan: false,
+};
 
 /// H2O+ eviction stage. `keep_ratio` is clamped to `[0,1]` and `protected_prefix` to ≥4 (attention
 /// sink), matching the original engine `H2OPlusPolicy::new`.
@@ -86,12 +95,12 @@ fn keep_list_from_scores(p: &Partition, score: impl Fn(usize) -> f32) -> Vec<usi
     )
 }
 
-impl KVCacheStage for H2OPlus {
-    fn name(&self) -> &str {
-        "h2o_plus"
-    }
-
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+impl H2OPlus {
+    /// The keep-set shape (`None` = no-op within budget), shared by the v3 `on_phase` and the v2
+    /// `plan` so they decide byte-identically. Per-head when head scores are present (each KV head
+    /// ranks its own heavy hitters, all heads keep the same count); otherwise a layer-wide keep from
+    /// the flat importance (score-based) or recency (score-free).
+    fn keep_spec(&self, ctx: &dyn StageCtx) -> Option<KeepSpec> {
         let current = ctx.current_pos();
         let p = self.partition(current, ctx.target_len())?;
 
@@ -103,11 +112,7 @@ impl KVCacheStage for H2OPlus {
             let heads: Vec<Vec<usize>> = (0..n_kv_heads)
                 .map(|kv_h| keep_list_from_scores(&p, |pos| ctx.head_score(kv_h, pos)))
                 .collect();
-            return Some(KVCachePlan {
-                keep: KeepSpec::PerHead(heads),
-                merges: Vec::new(),
-                channels: None,
-            });
+            return Some(KeepSpec::PerHead(heads));
         }
 
         // (2) Flat fallback: heavy hitters from the layer-wide importance score (score-based H2O).
@@ -126,8 +131,54 @@ impl KVCacheStage for H2OPlus {
                 |_| 0.0,
             ),
         };
-        Some(KVCachePlan {
-            keep: KeepSpec::LayerWide(keep),
+        Some(KeepSpec::LayerWide(keep))
+    }
+}
+
+// ── v3 native (imperative) surface — the production path ──
+
+impl KVMutationStage for H2OPlus {
+    fn name(&self) -> &str {
+        "h2o_plus"
+    }
+
+    /// Stage the per-head (or layer-wide fallback) heavy-hitter keep-set, or no-op within budget.
+    /// Byte-identical to the v2 plan via the shared `keep_spec`. The per-head path needs HeadMajor
+    /// layout (the engine supplies head scores only there); `keep_per_head` enforces it.
+    fn on_phase(
+        &self,
+        ctx: &dyn StageCtx,
+        cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        match self.keep_spec(ctx) {
+            None => Ok(()),
+            Some(KeepSpec::LayerWide(keep)) => cache.keep(&keep),
+            Some(KeepSpec::PerHead(heads)) => {
+                let refs: Vec<&[usize]> = heads.iter().map(|h| h.as_slice()).collect();
+                cache.keep_per_head(&refs)
+            }
+        }
+    }
+}
+
+register_kv_mutation_stage!(
+    "h2o_plus",
+    |p, _args| Box::new(H2OPlus::new(p.keep_ratio, p.protected_prefix)),
+    H2OPLUS_CAPS,
+    MutationPhase::KvMutate
+);
+
+// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
+
+impl KVCacheStage for H2OPlus {
+    fn name(&self) -> &str {
+        "h2o_plus"
+    }
+
+    /// Decides via the shared `keep_spec`, so it is byte-identical to the v3 `on_phase`.
+    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+        self.keep_spec(ctx).map(|keep| KVCachePlan {
+            keep,
             merges: Vec::new(),
             channels: None,
         })
@@ -145,11 +196,7 @@ static H2O_PLUS: KVCacheStageReg = KVCacheStageReg {
         Box::new(H2OPlus::new(p.keep_ratio, p.protected_prefix))
     },
     // H2O+ ranks per-head heavy hitters by accumulated importance (score-based); protect 4 sinks.
-    caps: StageCaps {
-        reads: &[argus_extension_api::TensorKind::Scores],
-        default_protected_prefix: 4,
-        produces_merge_plan: false,
-    },
+    caps: H2OPLUS_CAPS,
 };
 
 #[cfg(test)]
@@ -230,6 +277,124 @@ mod tests {
         assert_eq!(reg.name, "h2o_plus");
         assert!(!reg.caps.reads.is_empty());
         assert_eq!(reg.caps.default_protected_prefix, 4);
+    }
+
+    /// A mock [`CacheHandle`] capturing keep / keep_per_head.
+    #[derive(Default)]
+    struct CaptureHandle {
+        cur: usize,
+        n_kv: usize,
+        kept: Option<Vec<usize>>,
+        kept_per_head: Option<Vec<Vec<usize>>>,
+    }
+    impl CacheHandle for CaptureHandle {
+        fn current_pos(&self) -> usize {
+            self.cur
+        }
+        fn n_kv_heads(&self) -> usize {
+            self.n_kv
+        }
+        fn head_dim(&self) -> usize {
+            4
+        }
+        fn kv_on_device(&self) -> bool {
+            false
+        }
+        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+            None
+        }
+        fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
+            self.kept = Some(keep.to_vec());
+            Ok(())
+        }
+        fn keep_per_head(&mut self, keep: &[&[usize]]) -> Result<(), CacheOpError> {
+            self.kept_per_head = Some(keep.iter().map(|h| h.to_vec()).collect());
+            Ok(())
+        }
+        fn merge(
+            &mut self,
+            _merges: &[argus_extension_api::WeightedMerge],
+        ) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn reencode(&mut self, _target: argus_extension_api::FormatId) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn transition_quant_bits(&mut self, _bits: u8) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn offload(&mut self, _prefix_len: usize) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn recall(&mut self) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+    }
+
+    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages the same shape the v2
+    /// `plan` returns — `keep_per_head` for the per-head path, `keep` for the layer-wide fallback.
+    #[test]
+    fn v3_native_matches_v2_decision() {
+        use argus_extension_api::find_mutation_stage;
+        let reg = find_mutation_stage("h2o_plus").expect("h2o_plus in KV_MUTATION_STAGES");
+        assert_eq!(reg.name, "h2o_plus");
+        assert_eq!(reg.caps, H2OPLUS_CAPS);
+        assert_eq!((reg.make)(StageParams::default(), &[]).name(), "h2o_plus");
+
+        let s = H2OPlus::new(0.5, 4);
+
+        // per-head path: head 0 prefers 5,6,7; head 1 prefers 10,11,12.
+        let (n_kv_heads, stride) = (2usize, 100usize);
+        let mut hs = vec![0.0f32; n_kv_heads * stride];
+        for (i, &pos) in [5usize, 6, 7].iter().enumerate() {
+            hs[pos] = 10.0 - i as f32;
+        }
+        for (i, &pos) in [10usize, 11, 12].iter().enumerate() {
+            hs[stride + pos] = 10.0 - i as f32;
+        }
+        let ctx = Ctx {
+            current: 20,
+            target: 10,
+            n_kv_heads,
+            stride,
+            head_scores: Some(hs),
+            importance: None,
+        };
+        let expected_per_head = match s.plan(&ctx).unwrap().keep {
+            KeepSpec::PerHead(h) => h,
+            KeepSpec::LayerWide(_) => panic!("expected PerHead"),
+        };
+        let mut h = CaptureHandle {
+            cur: 20,
+            n_kv: n_kv_heads,
+            ..Default::default()
+        };
+        <H2OPlus as KVMutationStage>::on_phase(&s, &ctx, &mut h).unwrap();
+        assert_eq!(h.kept_per_head, Some(expected_per_head));
+        assert_eq!(h.kept, None, "per-head path must NOT use layer-wide keep");
+
+        // layer-wide fallback (no head scores, flat importance).
+        let imp: Vec<f32> = (0..20).map(|i| (i % 5) as f32).collect();
+        let ctx2 = Ctx {
+            current: 20,
+            target: 10,
+            n_kv_heads: 1,
+            stride: 0,
+            head_scores: None,
+            importance: Some(imp),
+        };
+        let expected_lw = match s.plan(&ctx2).unwrap().keep {
+            KeepSpec::LayerWide(k) => k,
+            KeepSpec::PerHead(_) => panic!("expected LayerWide"),
+        };
+        let mut h2 = CaptureHandle {
+            cur: 20,
+            n_kv: 1,
+            ..Default::default()
+        };
+        <H2OPlus as KVMutationStage>::on_phase(&s, &ctx2, &mut h2).unwrap();
+        assert_eq!(h2.kept, Some(expected_lw));
+        assert_eq!(h2.kept_per_head, None);
     }
 
     #[test]
