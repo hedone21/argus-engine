@@ -10,10 +10,24 @@
 //! per-head 는 단계 ⑤ executor 대기). feature `caote` 설치 시 `eviction caote` 서브커맨드로 선택.
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageCaps, StageCtx,
-    StageParams, TensorKind,
+    CacheHandle, CacheOpError, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg,
+    KVMutationStage, KeepSpec, MutationPhase, StageCaps, StageCtx, StageParams, TensorKind,
+    register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
+
+/// The score-based caps shared by the v2 [`KVCacheStageReg`] and the v3 registration: CAOTE weights
+/// criticality by the attention weight `a_i` (AttnWeights) and reads cached V (Value), falling back to
+/// flat importance (Scores); protects 4 sinks by default.
+const CAOTE_CAPS: StageCaps = StageCaps {
+    reads: &[
+        TensorKind::Scores,
+        TensorKind::Value,
+        TensorKind::AttnWeights,
+    ],
+    default_protected_prefix: 4,
+    produces_merge_plan: false,
+};
 
 /// CAOTE eviction stage — value-aware criticality.
 struct Caote;
@@ -28,12 +42,11 @@ fn weight(ctx: &dyn StageCtx, use_aw: bool, kv_head: usize, pos: usize) -> f32 {
     }
 }
 
-impl KVCacheStage for Caote {
-    fn name(&self) -> &str {
-        "caote"
-    }
-
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+impl Caote {
+    /// The value-aware criticality keep-list (`None` = no-op within budget), shared by the v3
+    /// `on_phase` and the v2 `plan` so they decide byte-identically. CAOTE uses its OWN unstable sort
+    /// (NOT `keep_top_k` — the tie-break differs): top-`tgt` criticality, then ascending.
+    fn compute_keep(&self, ctx: &dyn StageCtx) -> Option<Vec<usize>> {
         let cur = ctx.current_pos();
         let tgt = ctx.target_len();
         if cur <= tgt {
@@ -91,8 +104,51 @@ impl KVCacheStage for Caote {
         });
         idx.truncate(tgt);
         idx.sort_unstable();
-        Some(KVCachePlan {
-            keep: KeepSpec::LayerWide(idx),
+        Some(idx)
+    }
+}
+
+// ── v3 native (imperative) surface — the production path ──
+
+impl KVMutationStage for Caote {
+    fn name(&self) -> &str {
+        "caote"
+    }
+
+    /// Stage the value-aware criticality keep-set (or no-op within budget). The driver supplies V via
+    /// `ctx.tensor(Value)` (P0-3c V snapshot, armed by `CAOTE_CAPS.reads ∋ Value`) and the attention
+    /// weight / importance via `ctx.attn_weight` / `ctx.importance`. Byte-identical to the v2 plan via
+    /// the shared `compute_keep`.
+    fn on_phase(
+        &self,
+        ctx: &dyn StageCtx,
+        cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        match self.compute_keep(ctx) {
+            Some(keep) => cache.keep(&keep),
+            None => Ok(()),
+        }
+    }
+}
+
+register_kv_mutation_stage!(
+    "caote",
+    |_p, _args| Box::new(Caote),
+    CAOTE_CAPS,
+    MutationPhase::KvMutate
+);
+
+// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
+
+impl KVCacheStage for Caote {
+    fn name(&self) -> &str {
+        "caote"
+    }
+
+    /// Decides via the shared `compute_keep`, so it is byte-identical to the v3 `on_phase`.
+    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+        self.compute_keep(ctx).map(|keep| KVCachePlan {
+            keep: KeepSpec::LayerWide(keep),
             merges: Vec::new(),
             channels: None,
         })
@@ -108,18 +164,9 @@ static CAOTE: KVCacheStageReg = KVCacheStageReg {
     make_with_args: |_params: StageParams, _args| Box::new(Caote),
     // CAOTE weights criticality by the attention weight a_i when available
     // (ctx.attn_weight / has_attn_weights => AttnWeights) and reads cached V
-    // (ctx.dequant_v => Value), falling back to flat importance (Scores). Declare
-    // all three so the buffer-allocation handshake can wire each; it is score-based
-    // (non-empty reads). Protect 4 attention sinks by default.
-    caps: StageCaps {
-        reads: &[
-            argus_extension_api::TensorKind::Scores,
-            argus_extension_api::TensorKind::Value,
-            argus_extension_api::TensorKind::AttnWeights,
-        ],
-        default_protected_prefix: 4,
-        produces_merge_plan: false,
-    },
+    // (ctx.dequant_v => Value), falling back to flat importance (Scores). It is
+    // score-based (non-empty reads). Protect 4 attention sinks by default.
+    caps: CAOTE_CAPS,
 };
 
 #[cfg(test)]
@@ -301,5 +348,83 @@ mod tests {
             KeepSpec::PerHead(_) => panic!("v1 은 LayerWide"),
         }
         assert!(plan.merges.is_empty());
+    }
+
+    /// A mock [`CacheHandle`] capturing the keep staged by `keep`.
+    struct CaptureHandle {
+        kept: Option<Vec<usize>>,
+    }
+    impl CacheHandle for CaptureHandle {
+        fn current_pos(&self) -> usize {
+            4
+        }
+        fn n_kv_heads(&self) -> usize {
+            1
+        }
+        fn head_dim(&self) -> usize {
+            2
+        }
+        fn kv_on_device(&self) -> bool {
+            false
+        }
+        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+            None
+        }
+        fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
+            self.kept = Some(keep.to_vec());
+            Ok(())
+        }
+        fn keep_per_head(&mut self, _keep: &[&[usize]]) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn merge(
+            &mut self,
+            _merges: &[argus_extension_api::WeightedMerge],
+        ) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn reencode(&mut self, _target: argus_extension_api::FormatId) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn transition_quant_bits(&mut self, _bits: u8) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn offload(&mut self, _prefix_len: usize) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn recall(&mut self) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+    }
+
+    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages exactly the
+    /// value-aware criticality keep the v2 `plan` returns (both via the shared `compute_keep`, which
+    /// uses CAOTE's own unstable sort, NOT keep_top_k).
+    #[test]
+    fn v3_native_matches_v2_decision() {
+        use argus_extension_api::find_mutation_stage;
+        let reg = find_mutation_stage("caote").expect("caote in KV_MUTATION_STAGES");
+        assert_eq!(reg.name, "caote");
+        assert_eq!(reg.caps, CAOTE_CAPS);
+        assert_eq!((reg.make)(StageParams::default(), &[]).name(), "caote");
+
+        let ctx = ValueAwareCtx {
+            cur: 4,
+            tgt: 2,
+            v: VHandle {
+                rows: vec![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 2.0]],
+            },
+            a: AHandle {
+                a: vec![0.1, 0.2, 0.3, 0.4],
+            },
+        };
+        let v2_keep = match Caote.plan(&ctx).unwrap().keep {
+            KeepSpec::LayerWide(k) => k,
+            KeepSpec::PerHead(_) => panic!("caote is layer-wide"),
+        };
+        let mut h = CaptureHandle { kept: None };
+        <Caote as KVMutationStage>::on_phase(&Caote, &ctx, &mut h).unwrap();
+        assert_eq!(h.kept, Some(v2_keep));
+        assert_eq!(h.kept, Some(vec![1, 3]), "value-aware keep");
     }
 }
