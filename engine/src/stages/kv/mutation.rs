@@ -9,30 +9,30 @@
 //! Because every handle op routes to the SAME executor `execute_kv_plan` uses
 //! (`compact_keep_positions` / `apply_weighted_merges` / `apply_format_plan`), a keep applied through
 //! this driver is **byte-identical** to the same keep applied through the plan executor (the s1 gate).
-//! (Byte-identical refers to the cache BUFFERS: the handle path does NOT emit the `keepset_dump`
-//! observability side-channel that `execute_kv_plan` records under `ARGUS_DUMP_KEEPSET`. The
-//! production-wiring follow-up must re-add that record if a handle-driven eviction needs to appear in
-//! keepset dumps.)
+//! The handle commit path also emits the `keepset_dump` observability side-channel (P0-2), so a
+//! handle-driven eviction appears in `ARGUS_DUMP_KEEPSET` / the in-memory capture identically to the
+//! v2 `execute_kv_plan` path.
 //!
-//! Read/mutate aliasing: a mutation stage reads its cache state through an owned-scalar
-//! [`SnapshotStageCtx`] (current_pos / target_len / geometry + score snapshots, captured before the
-//! handle is built) and
-//! mutates through the `&mut` handle. The ctx owns copies rather than borrowing the cache, so the
-//! `&dyn StageCtx` read view and the `&mut dyn CacheHandle` write view never alias — and both observe
-//! the entry frame (the cache is untouched until `commit`).
+//! Read/mutate aliasing: a mutation stage reads its cache state through a [`SnapshotStageCtx`] backed
+//! by OWNED snapshots captured in the entry frame BEFORE the handle is built — scalars + budget
+//! (`target_len`, P0-3a), flat importance / per-head scores (P0-3b), and raw K/V dequant snapshots
+//! (P0-3c) — and mutates through the `&mut` handle. The ctx borrows those loop-local snapshots rather
+//! than the cache, so the `&dyn StageCtx` read view and the `&mut dyn CacheHandle` write view never
+//! alias — and both observe the entry frame (the cache is untouched until `commit`).
 //!
-//! The driver is NOT registered into the pipeline in s1 (the `KV_MUTATION_STAGES` slice / production
-//! wiring is a follow-up); it is constructed directly and exercised by the byte-identical gate.
+//! The driver is NOT registered into the pipeline yet (the `KV_MUTATION_STAGES` slice / production
+//! wiring is P0-5/P0-6); it is constructed directly and exercised by the gates below.
 
 use std::sync::{Arc, Mutex};
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, KVCacheStage, KVMutationStage, KeepSpec, MutationPhase, StageCtx,
-    TensorDtype, TensorHandle, TensorKind, TensorShape,
+    CacheHandle, CacheOpError, KVCacheStage, KVMutationStage, KeepSpec, MutationPhase, StageCaps,
+    StageCtx, TensorDtype, TensorHandle, TensorKind, TensorShape,
 };
 
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::kv::cache_handle::EngineCacheHandle;
+use crate::kv::dequant::{dequantize_k, dequantize_v};
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
 use crate::pipeline::{LifecyclePhase, PipelineStage, StageContext, StageLifecycle, StageOutcome};
@@ -74,12 +74,71 @@ impl TensorHandle for ScalarSnapHandle<'_> {
     }
 }
 
+/// A per-(kv_head, pos) dequantized K/V snapshot handle (`tensor(Key)` / `tensor(Value)`), reading
+/// from a driver-owned `[n_kv_heads * rows * head_dim]` f32 snapshot (idx `(kv_head*rows + row)*hd`).
+/// The mirror of `stage_registry::{KeyHandle,ValueHandle}`, but over an owned dequant snapshot
+/// captured BEFORE the handle is built (entry frame, T-3) — so a value-aware stage (caote) or a
+/// merge-similarity stage (d2o) can read raw K/V while the `&mut` [`CacheHandle`] holds the cache.
+struct KvSnapHandle<'a> {
+    data: &'a [f32],
+    rows: usize,
+    head_dim: usize,
+}
+impl TensorHandle for KvSnapHandle<'_> {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: self.rows,
+            cols: self.head_dim,
+            per_head: true,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        TensorDtype::F32
+    }
+    fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
+        let base = (kv_head * self.rows + row) * self.head_dim;
+        let n = self.head_dim.min(out.len());
+        if base + n <= self.data.len() {
+            out[..n].copy_from_slice(&self.data[base..base + n]);
+        } else {
+            out[..n].fill(0.0);
+        }
+    }
+}
+
+/// Dequantize the resident region of `cache`'s K (or V) into an owned `[n_kv_heads * rows * head_dim]`
+/// f32 snapshot (layout matching [`KvSnapHandle`]). Host-only — the caller must gate on
+/// `!kv_on_device()` (a device buffer has no host pointer to dequantize from).
+fn dequant_snapshot(
+    cache: &KVCache,
+    rows: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    is_k: bool,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; n_kv_heads * rows * head_dim];
+    let mut tmp = vec![0.0f32; head_dim];
+    for kv_head in 0..n_kv_heads {
+        for row in 0..rows {
+            if is_k {
+                dequantize_k(cache, row, kv_head, head_dim, &mut tmp);
+            } else {
+                dequantize_v(cache, row, kv_head, head_dim, &mut tmp);
+            }
+            let base = (kv_head * rows + row) * head_dim;
+            out[base..base + head_dim].copy_from_slice(&tmp);
+        }
+    }
+    out
+}
+
 /// A read [`StageCtx`] backed by OWNED/borrowed snapshots — never the live cache — so it coexists with
 /// a `&mut` [`CacheHandle`] over the same cache (a v3 callback holds both at once). The scalars are
 /// copied from the entry frame; the signal slices are borrowed from driver-loop locals captured in
 /// that same pre-callback frame (T-3): `importance` (flat per-token) and the per-head `Scores` /
-/// `AttnWeights` from the score accumulator. A score-free stage gets all-`None` signals and reads only
-/// the scalars + budget. (Raw `Key`/`Value` dequant snapshots are P0-3c.)
+/// `AttnWeights` from the score accumulator, plus raw `Key`/`Value` dequant snapshots for value-aware
+/// (caote) / merge (d2o) stages. A score-free stage gets all-`None` signals and reads only the
+/// scalars + budget.
 pub struct SnapshotStageCtx<'a> {
     current_pos: usize,
     target_len: usize,
@@ -91,6 +150,8 @@ pub struct SnapshotStageCtx<'a> {
     importance: Option<&'a [f32]>,
     score_handle: Option<ScalarSnapHandle<'a>>,
     attn_handle: Option<ScalarSnapHandle<'a>>,
+    key_handle: Option<KvSnapHandle<'a>>,
+    value_handle: Option<KvSnapHandle<'a>>,
 }
 
 impl SnapshotStageCtx<'_> {
@@ -113,6 +174,8 @@ impl SnapshotStageCtx<'_> {
             importance: None,
             score_handle: None,
             attn_handle: None,
+            key_handle: None,
+            value_handle: None,
         }
     }
 }
@@ -146,6 +209,8 @@ impl StageCtx for SnapshotStageCtx<'_> {
         match kind {
             TensorKind::Scores => self.score_handle.as_ref().map(|h| h as &dyn TensorHandle),
             TensorKind::AttnWeights => self.attn_handle.as_ref().map(|h| h as &dyn TensorHandle),
+            TensorKind::Key => self.key_handle.as_ref().map(|h| h as &dyn TensorHandle),
+            TensorKind::Value => self.value_handle.as_ref().map(|h| h as &dyn TensorHandle),
             _ => None,
         }
     }
@@ -222,6 +287,11 @@ pub struct KVMutationDriverStage {
     /// accumulator after a successful commit (stale-score guard: the KV geometry just changed). `None`
     /// = score-free (sliding/streaming/no-eviction): the ctx exposes no signals.
     score_cell: Option<Arc<Mutex<Option<AttentionScoreAccumulator>>>>,
+    /// The stage's declared capabilities — used to gate the per-layer raw K/V dequant snapshot: a
+    /// snapshot is built only when `caps.reads` contains the kind (and the cache is host-resident), so
+    /// a score-free / importance-only stage pays nothing. Defaults to [`StageCaps::SCORE_FREE`] (no
+    /// K/V reads); set via [`with_caps`](Self::with_caps) for value-aware (caote) / merge (d2o) stages.
+    caps: StageCaps,
 }
 
 impl KVMutationDriverStage {
@@ -240,6 +310,7 @@ impl KVMutationDriverStage {
             phase,
             target_ratio,
             score_cell: None,
+            caps: StageCaps::SCORE_FREE,
         }
     }
 
@@ -250,6 +321,14 @@ impl KVMutationDriverStage {
         score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
     ) -> Self {
         self.score_cell = Some(score_cell);
+        self
+    }
+
+    /// Declare the stage's capabilities so the driver builds the per-layer raw K/V dequant snapshot
+    /// only for the kinds the stage actually reads (`caps.reads` ∋ Key/Value). Without this the driver
+    /// assumes [`StageCaps::SCORE_FREE`] (no K/V snapshot).
+    pub fn with_caps(mut self, caps: StageCaps) -> Self {
+        self.caps = caps;
         self
     }
 
@@ -331,16 +410,30 @@ impl PipelineStage for KVMutationDriverStage {
                 // (the `.max(1)` floor in budget_for is the wipe guard).
                 let target_len = self.budget_for(current_pos);
                 let max_seq = cache.max_seq_len;
+                let n_kv_heads = cache.kv_heads();
+                let head_dim = cache.head_dim();
+                let on_device = cache.k_buffer.buffer().is_gpu_buffer();
+                // Per-layer raw K/V dequant snapshots (P0-3c) — built ONLY when the stage declares the
+                // read AND the cache is host-resident (a device buffer has no host pointer). Captured
+                // BEFORE the handle (entry frame, T-3); owned, so they never alias the &mut handle. A
+                // device-resident cache yields None → tensor(Key/Value)==None, and the stage degrades.
+                let want_key = !on_device && self.caps.reads.contains(&TensorKind::Key);
+                let want_value = !on_device && self.caps.reads.contains(&TensorKind::Value);
+                let key_snap: Option<Vec<f32>> = want_key
+                    .then(|| dequant_snapshot(cache, current_pos, n_kv_heads, head_dim, true));
+                let value_snap: Option<Vec<f32>> = want_value
+                    .then(|| dequant_snapshot(cache, current_pos, n_kv_heads, head_dim, false));
                 // Read ctx backed by owned snapshots (NOT the cache) — coexists with the &mut handle:
-                // it borrows the score snapshots captured above (entry frame, T-3), never the cache.
+                // it borrows the score + K/V snapshots captured above (entry frame, T-3), never the
+                // cache.
                 let sctx = SnapshotStageCtx {
                     current_pos,
                     target_len,
                     layer_idx,
                     n_layers,
-                    n_kv_heads: cache.kv_heads(),
-                    head_dim: cache.head_dim(),
-                    on_device: cache.k_buffer.buffer().is_gpu_buffer(),
+                    n_kv_heads,
+                    head_dim,
+                    on_device,
                     importance: importance.as_deref(),
                     score_handle: head_scores.as_deref().map(|data| ScalarSnapHandle {
                         data,
@@ -351,6 +444,16 @@ impl PipelineStage for KVMutationDriverStage {
                         data,
                         rows: current_pos,
                         max_seq,
+                    }),
+                    key_handle: key_snap.as_deref().map(|data| KvSnapHandle {
+                        data,
+                        rows: current_pos,
+                        head_dim,
+                    }),
+                    value_handle: value_snap.as_deref().map(|data| KvSnapHandle {
+                        data,
+                        rows: current_pos,
+                        head_dim,
                     }),
                 };
                 let mut handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
@@ -775,6 +878,112 @@ mod tests {
                 .iter()
                 .all(|&x| x == 0.0),
             "scores reset after eviction (stale-score guard)"
+        );
+    }
+
+    /// A value-aware stage (caote shape): reads raw V via `tensor(Value)` and keeps positions whose
+    /// V value is even. With V[p]=p this keeps {0,2,4,6}. Asserts internally that tensor(Value) is
+    /// present (the snapshot was built) — so a missing snapshot fails loudly instead of silently
+    /// keeping nothing.
+    struct ValueReadStage;
+    impl KVMutationStage for ValueReadStage {
+        fn name(&self) -> &str {
+            "test.value_read"
+        }
+        fn on_phase(
+            &self,
+            ctx: &dyn StageCtx,
+            cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            assert!(
+                ctx.tensor(TensorKind::Value).is_some(),
+                "value snapshot must be present when caps declare Value"
+            );
+            let pos = ctx.current_pos();
+            let hd = ctx.head_dim();
+            let mut row = vec![0.0f32; hd];
+            let mut keep = Vec::new();
+            for p in 0..pos {
+                ctx.dequant_v(p, 0, &mut row); // reads tensor(Value)
+                if (row[0] as usize).is_multiple_of(2) {
+                    keep.push(p);
+                }
+            }
+            cache.keep(&keep)
+        }
+    }
+
+    /// P0-3c: a value-aware stage reads raw V through the driver's per-layer dequant snapshot (caote's
+    /// `v_i`), and a stage that does NOT declare the read sees `tensor(Value)==None` (no snapshot
+    /// built — the score-free fast path). Mutation-proof: removing the caps gate would build a snapshot
+    /// even for the no-caps stage; removing the dequant_snapshot wiring makes the value read all-zero
+    /// → every position "even" → keeps all 8 (failing the ==4 assert).
+    #[test]
+    fn value_snapshot_reaches_value_aware_stage() {
+        // caps declare Value → snapshot built → stage keeps evens {0,2,4,6}.
+        let handle = Arc::new(StandardFormat::new(0, make_int_cache(8)));
+        let caps = StageCaps {
+            reads: &[TensorKind::Value],
+            default_protected_prefix: 0,
+            produces_merge_plan: false,
+        };
+        let driver = KVMutationDriverStage::new(
+            vec![handle.clone()],
+            Box::new(ValueReadStage),
+            MutationPhase::KvMutate,
+            1.0, // budget irrelevant — the stage keeps by value, not target_len.
+        )
+        .with_caps(caps);
+        let mut profiler = OpProfiler::new();
+        let mut pctx = make_ctx(&mut profiler);
+        driver
+            .on_phase(&LifecyclePhase::KvMutate, &mut pctx)
+            .unwrap();
+        let inner = handle.take_inner();
+        assert_eq!(inner.current_pos(), 4, "kept the 4 even-valued positions");
+        let k = inner.k_buffer.as_slice::<f32>();
+        for (i, &orig) in [0usize, 2, 4, 6].iter().enumerate() {
+            assert_eq!(
+                k[inner.offset(i, 0)],
+                orig as f32,
+                "survivor {i} == orig {orig}"
+            );
+        }
+
+        // No caps (SCORE_FREE default) → no snapshot → tensor(Value) is None.
+        struct ProbeNoValue;
+        impl KVMutationStage for ProbeNoValue {
+            fn name(&self) -> &str {
+                "test.probe_no_value"
+            }
+            fn on_phase(
+                &self,
+                ctx: &dyn StageCtx,
+                _cache: &mut dyn CacheHandle,
+            ) -> Result<(), CacheOpError> {
+                assert!(
+                    ctx.tensor(TensorKind::Value).is_none(),
+                    "no Value snapshot without caps"
+                );
+                Ok(())
+            }
+        }
+        let handle2 = Arc::new(StandardFormat::new(0, make_int_cache(8)));
+        let driver2 = KVMutationDriverStage::new(
+            vec![handle2.clone()],
+            Box::new(ProbeNoValue),
+            MutationPhase::KvMutate,
+            1.0,
+        );
+        let mut profiler2 = OpProfiler::new();
+        let mut pctx2 = make_ctx(&mut profiler2);
+        driver2
+            .on_phase(&LifecyclePhase::KvMutate, &mut pctx2)
+            .unwrap();
+        assert_eq!(
+            handle2.take_inner().current_pos(),
+            8,
+            "probe kept all (no-op)"
         );
     }
 
