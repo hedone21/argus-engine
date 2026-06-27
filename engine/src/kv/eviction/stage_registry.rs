@@ -465,8 +465,12 @@ impl<'a> KVStageCtx<'a> {
             importance,
             layer_idx: 0,
             n_layers: 1,
-            // Device-only KV (discrete GPU) returns a null host pointer → CPU read/merge unsafe.
-            on_device: cache.k_buffer.as_ptr().is_null(),
+            // P0-4: unify the kv_on_device predicate on `is_gpu_buffer()` (the v3 CacheHandle /
+            // SnapshotStageCtx predicate). The old `as_ptr().is_null()` disagrees on Adreno UMA, where
+            // a GPU buffer is ALSO host-mapped (non-null ptr) → it read "not on device" and let d2o run
+            // a host merge over a GPU buffer (the UMA coherence hazard). `is_gpu_buffer()` reports true
+            // on UMA, so a value-aware/merge stage correctly degrades to keep-only.
+            on_device: cache.k_buffer.buffer().is_gpu_buffer(),
             key_handle: KeyHandle { cache },
             value_handle: ValueHandle { cache },
             scores_handle: head_scores.map(|data| ScalarHandle {
@@ -2194,6 +2198,108 @@ mod tests {
         assert!(
             checked > 0,
             "no score-based stages registered — force-link / feature regression?"
+        );
+    }
+}
+
+#[cfg(test)]
+mod kv_on_device_unification_tests {
+    use super::KVStageCtx;
+    use crate::backend::Backend;
+    use crate::backend::cpu::CpuBackend;
+    use crate::buffer::{Buffer, DType};
+    use crate::kv::cache_handle::EngineCacheHandle;
+    use crate::kv::kv_cache::KVCache;
+    use crate::shape::Shape;
+    use crate::stages::kv::mutation::SnapshotStageCtx;
+    use crate::tensor::Tensor;
+    use argus_extension_api::{CacheHandle, StageCtx};
+    use std::any::Any;
+    use std::sync::Arc;
+
+    /// A UMA-shaped mock buffer: a GPU buffer (`is_gpu_buffer()==true`) that is ALSO host-mapped
+    /// (`as_ptr()` non-null) — exactly the Adreno `UnifiedBuffer` case where the old
+    /// `as_ptr().is_null()` predicate and `is_gpu_buffer()` disagree. Backed by a real `Vec` so the
+    /// pointer is valid + non-null.
+    struct UmaMockBuffer {
+        data: Vec<u8>,
+    }
+    impl Buffer for UmaMockBuffer {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn dtype(&self) -> DType {
+            DType::F32
+        }
+        fn size(&self) -> usize {
+            self.data.len()
+        }
+        fn as_ptr(&self) -> *const u8 {
+            self.data.as_ptr() // non-null: host-mapped, like a mapped UMA buffer
+        }
+        fn as_mut_ptr(&self) -> *mut u8 {
+            self.data.as_ptr() as *mut u8
+        }
+        #[cfg(feature = "opencl")]
+        fn cl_mem(&self) -> Option<&ocl::core::Mem> {
+            None
+        }
+        #[cfg(not(feature = "opencl"))]
+        fn cl_mem(&self) -> Option<()> {
+            None
+        }
+        fn sync_device(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn is_gpu_buffer(&self) -> bool {
+            true // UMA buffers ARE GPU buffers (the discriminator vs. as_ptr().is_null())
+        }
+    }
+
+    fn uma_cache() -> KVCache {
+        let (kv_heads, head_dim, max_seq) = (2usize, 4usize, 8usize);
+        let bytes = max_seq * kv_heads * head_dim * 4;
+        let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let sh = Shape::new(vec![1, max_seq, kv_heads, head_dim]);
+        let mk = || {
+            Tensor::new(
+                sh.clone(),
+                Arc::new(UmaMockBuffer {
+                    data: vec![0u8; bytes],
+                }) as Arc<dyn Buffer>,
+                be.clone(),
+            )
+        };
+        let mut c = KVCache::new(mk(), mk(), max_seq);
+        c.set_current_pos(4);
+        c
+    }
+
+    /// P0-4: a UMA-shaped buffer (`is_gpu_buffer()==true`, `as_ptr()` non-null) reports
+    /// `kv_on_device()==true` on ALL THREE surfaces — the v2 `KVStageCtx` and the v3
+    /// `EngineCacheHandle` / `SnapshotStageCtx` — so a value-aware / merge stage degrades to keep-only
+    /// on Adreno UMA instead of running an unsafe host merge over a GPU buffer. Mutation-proof:
+    /// reverting `KVStageCtx` to `as_ptr().is_null()` makes the v2 assert fail (non-null ptr → false).
+    #[test]
+    fn uma_buffer_is_on_device_across_v2_and_v3_surfaces() {
+        let mut cache = uma_cache();
+        // v2 plan-path ctx.
+        let v2 = KVStageCtx::new(&cache, 0, None, None, None, None);
+        assert!(
+            v2.kv_on_device(),
+            "v2 KVStageCtx: UMA must read as on-device"
+        );
+        // v3 read ctx (the mutation driver's read view).
+        let snap = SnapshotStageCtx::from_cache(&cache, 0, 0, 1);
+        assert!(
+            snap.kv_on_device(),
+            "v3 SnapshotStageCtx: UMA must read as on-device"
+        );
+        // v3 transactional handle.
+        let h = EngineCacheHandle::new(&mut cache, 0, 1);
+        assert!(
+            CacheHandle::kv_on_device(&h),
+            "v3 EngineCacheHandle: UMA must read as on-device"
         );
     }
 }
