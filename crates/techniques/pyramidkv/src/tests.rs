@@ -296,6 +296,107 @@ fn plan_wires_budget_to_per_head_selection() {
     assert!(plan.merges.is_empty());
 }
 
+// ── v3 native (imperative) decision equivalence ──────────────────────────────
+
+/// A mock [`CacheHandle`] capturing keep / keep_per_head.
+#[derive(Default)]
+struct CaptureHandle {
+    cur: usize,
+    n_kv: usize,
+    kept: Option<Vec<usize>>,
+    kept_per_head: Option<Vec<Vec<usize>>>,
+}
+impl CacheHandle for CaptureHandle {
+    fn current_pos(&self) -> usize {
+        self.cur
+    }
+    fn n_kv_heads(&self) -> usize {
+        self.n_kv
+    }
+    fn head_dim(&self) -> usize {
+        4
+    }
+    fn kv_on_device(&self) -> bool {
+        false
+    }
+    fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+        None
+    }
+    fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
+        self.kept = Some(keep.to_vec());
+        Ok(())
+    }
+    fn keep_per_head(&mut self, keep: &[&[usize]]) -> Result<(), CacheOpError> {
+        self.kept_per_head = Some(keep.iter().map(|h| h.to_vec()).collect());
+        Ok(())
+    }
+    fn merge(
+        &mut self,
+        _merges: &[argus_extension_api::WeightedMerge],
+    ) -> Result<(), CacheOpError> {
+        Ok(())
+    }
+    fn reencode(&mut self, _target: argus_extension_api::FormatId) -> Result<(), CacheOpError> {
+        Ok(())
+    }
+    fn transition_quant_bits(&mut self, _bits: u8) -> Result<(), CacheOpError> {
+        Ok(())
+    }
+    fn offload(&mut self, _prefix_len: usize) -> Result<(), CacheOpError> {
+        Ok(())
+    }
+    fn recall(&mut self) -> Result<(), CacheOpError> {
+        Ok(())
+    }
+}
+
+/// v3 native registration (PrefillEnd phase) + DECISION equivalence: the v3 `on_phase` stages the
+/// per-head SnapKV keep the v2 `plan` returns (both via the shared `keep_spec`).
+#[test]
+fn v3_native_matches_v2_decision() {
+    let reg = argus_extension_api::find_mutation_stage("pyramidkv")
+        .expect("pyramidkv in KV_MUTATION_STAGES");
+    assert_eq!(reg.name, "pyramidkv");
+    assert_eq!(reg.phase, MutationPhase::PrefillEnd);
+    assert!(reg.caps.reads.contains(&TensorKind::PrefillAttention));
+
+    let (current, n_kv, n_q) = (512usize, 4usize, 4usize);
+    let attn = synth_attn(n_q, current, 123);
+    let args = cr_args("0.5", 8, 5, 20);
+    let ctx = Ctx {
+        current,
+        target: 0,
+        layer_idx: 3,
+        n_layers: 16,
+        n_kv_heads: n_kv,
+        pfa: Some(PfaHandle {
+            data: attn.clone(),
+            rows: n_q,
+            cols: current,
+        }),
+        ..Default::default()
+    };
+    // v2 decision via the registered (boxed) stage.
+    let v2_heads = match make_pyramidkv(&args).plan(&ctx).unwrap().keep {
+        KeepSpec::PerHead(h) => h,
+        KeepSpec::LayerWide(_) => panic!("expected PerHead"),
+    };
+    // v3 decision via a concrete PyramidKv built from the same config.
+    let blob: Vec<argus_extension_api::PluginArg> = args
+        .iter()
+        .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
+        .collect();
+    let v3 = PyramidKv::new(PyramidKvConfig::from_args(StageParams::default(), &blob));
+    let mut h = CaptureHandle {
+        cur: current,
+        n_kv,
+        ..Default::default()
+    };
+    <PyramidKv as KVMutationStage>::on_phase(&v3, &ctx, &mut h).unwrap();
+    assert_eq!(h.kept_per_head, Some(v2_heads));
+    assert_eq!(h.kept, None, "per-head path uses keep_per_head, not keep");
+}
+
 // ── 5. edge cases / fallbacks ────────────────────────────────────────────────
 
 #[test]

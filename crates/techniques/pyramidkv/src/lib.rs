@@ -37,10 +37,19 @@
 //! all to recency — so it is always safe to run.
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, KeepTopK, StageArgs,
-    StageCaps, StageCtx, StageParams, TensorKind, compile_keep_top_k,
+    CacheHandle, CacheOpError, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg,
+    KVMutationStage, KeepSpec, KeepTopK, MutationPhase, StageArgs, StageCaps, StageCtx,
+    StageParams, TensorKind, compile_keep_top_k, register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
+
+/// The caps shared by the v2 [`KVCacheStageReg`] and the v3 registration: PyramidKV reads the
+/// prefill attention (SnapKV score source); protects no prefix; drop-only.
+const PYRAMIDKV_CAPS: StageCaps = StageCaps {
+    reads: &[TensorKind::PrefillAttention],
+    default_protected_prefix: 0,
+    produces_merge_plan: false,
+};
 
 // ── KVPress-parity arithmetic ────────────────────────────────────────────────
 
@@ -255,12 +264,11 @@ impl PyramidKv {
     }
 }
 
-impl KVCacheStage for PyramidKv {
-    fn name(&self) -> &str {
-        "pyramidkv"
-    }
-
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+impl PyramidKv {
+    /// The keep-set shape (`None` = no-op), shared by the v3 `on_phase` and the v2 `plan` so they
+    /// decide byte-identically. Faithful per-head SnapKV ([`KeepSpec::PerHead`]) when PrefillAttention
+    /// is usable; otherwise a layer-wide pyramid budget (window-only or score-ranked fallback).
+    fn keep_spec(&self, ctx: &dyn StageCtx) -> Option<KeepSpec> {
         let current = ctx.current_pos();
         let cr = self.cfg.effective_cr(current, ctx.target_len());
         if cr <= 0.0 {
@@ -293,11 +301,7 @@ impl KVCacheStage for PyramidKv {
             // the budget equals the window). Layer-wide (identical across heads) — valid on any
             // cache layout, no HeadMajor requirement.
             let keep: Vec<usize> = (current - window..current).collect();
-            return Some(KVCachePlan {
-                keep: KeepSpec::LayerWide(keep),
-                merges: Vec::new(),
-                channels: None,
-            });
+            return Some(KeepSpec::LayerWide(keep));
         }
         let heavy = n_kept - window;
 
@@ -319,11 +323,7 @@ impl KVCacheStage for PyramidKv {
                     self.cfg.kernel_size,
                     heavy,
                 );
-                return Some(KVCachePlan {
-                    keep: KeepSpec::PerHead(heads),
-                    merges: Vec::new(),
-                    channels: None,
-                });
+                return Some(KeepSpec::PerHead(heads));
             }
         }
 
@@ -352,8 +352,54 @@ impl KVCacheStage for PyramidKv {
                 |_| 0.0,
             ),
         };
-        Some(KVCachePlan {
-            keep: KeepSpec::LayerWide(keep),
+        Some(KeepSpec::LayerWide(keep))
+    }
+}
+
+// ── v3 native (imperative) surface — the production path (PrefillEnd phase) ──
+
+impl KVMutationStage for PyramidKv {
+    fn name(&self) -> &str {
+        "pyramidkv"
+    }
+
+    /// Stage the SnapKV per-head (or layer-wide fallback) keep-set at prefill end, or no-op. The
+    /// driver supplies PrefillAttention via `ctx.tensor(PrefillAttention)`. Byte-identical to the v2
+    /// plan via the shared `keep_spec`.
+    fn on_phase(
+        &self,
+        ctx: &dyn StageCtx,
+        cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        match self.keep_spec(ctx) {
+            None => Ok(()),
+            Some(KeepSpec::LayerWide(keep)) => cache.keep(&keep),
+            Some(KeepSpec::PerHead(heads)) => {
+                let refs: Vec<&[usize]> = heads.iter().map(|h| h.as_slice()).collect();
+                cache.keep_per_head(&refs)
+            }
+        }
+    }
+}
+
+register_kv_mutation_stage!(
+    "pyramidkv",
+    |p, args| Box::new(PyramidKv::new(PyramidKvConfig::from_args(p, args))),
+    PYRAMIDKV_CAPS,
+    MutationPhase::PrefillEnd
+);
+
+// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
+
+impl KVCacheStage for PyramidKv {
+    fn name(&self) -> &str {
+        "pyramidkv"
+    }
+
+    /// Decides via the shared `keep_spec`, so it is byte-identical to the v3 `on_phase`.
+    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+        self.keep_spec(ctx).map(|keep| KVCachePlan {
+            keep,
             merges: Vec::new(),
             channels: None,
         })
@@ -373,11 +419,7 @@ static PYRAMIDKV: KVCacheStageReg = KVCacheStageReg {
     make_with_args: |p: StageParams, args| {
         Box::new(PyramidKv::new(PyramidKvConfig::from_args(p, args)))
     },
-    caps: StageCaps {
-        reads: &[TensorKind::PrefillAttention],
-        default_protected_prefix: 0,
-        produces_merge_plan: false,
-    },
+    caps: PYRAMIDKV_CAPS,
 };
 
 #[cfg(test)]
