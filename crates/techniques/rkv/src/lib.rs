@@ -29,10 +29,19 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, StageArgs, StageCaps,
-    StageCtx, StageParams, TensorKind,
+    CacheHandle, CacheOpError, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg,
+    KVMutationStage, KeepSpec, MutationPhase, StageArgs, StageCaps, StageCtx, StageParams,
+    TensorKind, register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
+
+/// The score-based caps shared by the v2 [`KVCacheStageReg`] and the v3 registration: R-KV reads
+/// cached K (redundancy matrix R) + importance (the fusion term I), protecting 4 sinks by default.
+const RKV_CAPS: StageCaps = StageCaps {
+    reads: &[TensorKind::Key, TensorKind::Scores],
+    default_protected_prefix: 4,
+    produces_merge_plan: false,
+};
 
 /// 1단 측정 덤프 게이트 env var. set 시 plan() 마다 per-kv_head `[RkvStats]` 마커 라인을 stderr 로
 /// 출력한다(파싱 가능 포맷). 측정 전용 — 미설정 시 덤프 경로 미진입(production 무영향).
@@ -146,12 +155,11 @@ fn dump_redundancy_stats(layer: usize, stats: &[RedundancyStats]) {
     }
 }
 
-impl KVCacheStage for RkvStage {
-    fn name(&self) -> &str {
-        "rkv"
-    }
-
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+impl RkvStage {
+    /// The redundancy + importance fusion keep-list (`None` = no-op within budget / no K tensor),
+    /// including the measurement side-effects (plan_calls / dump / last_stats via interior
+    /// mutability). Shared by the v3 `on_phase` and the v2 `plan` so they decide byte-identically.
+    fn compute_keep(&self, ctx: &dyn StageCtx) -> Option<Vec<usize>> {
         let n = ctx.current_pos();
         let target = ctx.target_len();
         // budget 이 현 토큰 수 이상이면 evict 불요(no-op). 0 토큰도 no-op.
@@ -193,8 +201,49 @@ impl KVCacheStage for RkvStage {
         dump_redundancy_stats(layer, &stats);
         *self.last_stats.lock().expect("rkv stats poisoned") = stats;
 
-        let keep = select_keep(&z_sum, n, target, self.config.recent_alpha);
-        Some(KVCachePlan {
+        Some(select_keep(&z_sum, n, target, self.config.recent_alpha))
+    }
+}
+
+// ── v3 native (imperative) surface — the production path ──
+
+impl KVMutationStage for RkvStage {
+    fn name(&self) -> &str {
+        "rkv"
+    }
+
+    /// Stage the fusion keep-list (or no-op). The driver supplies K via `ctx.tensor(Key)` (P0-3c K
+    /// snapshot, armed by `RKV_CAPS.reads ∋ Key`) and importance via `ctx.importance()`.
+    /// Byte-identical to the v2 plan via the shared `compute_keep`.
+    fn on_phase(
+        &self,
+        ctx: &dyn StageCtx,
+        cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        match self.compute_keep(ctx) {
+            Some(keep) => cache.keep(&keep),
+            None => Ok(()),
+        }
+    }
+}
+
+register_kv_mutation_stage!(
+    "rkv",
+    |_p, args| Box::new(RkvStage::new(RkvConfig::from_args(args))),
+    RKV_CAPS,
+    MutationPhase::KvMutate
+);
+
+// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
+
+impl KVCacheStage for RkvStage {
+    fn name(&self) -> &str {
+        "rkv"
+    }
+
+    /// Decides via the shared `compute_keep`, so it is byte-identical to the v3 `on_phase`.
+    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+        self.compute_keep(ctx).map(|keep| KVCachePlan {
             keep: KeepSpec::LayerWide(keep),
             merges: Vec::new(),
             channels: None,
@@ -322,14 +371,7 @@ static RKV: KVCacheStageReg = KVCacheStageReg {
     // R-KV reads cached K for the redundancy matrix R (ctx.tensor(Key)/dequant_k => Key)
     // and the importance term I for the fusion Z = λ·I − (1−λ)·R (Scores), so it is
     // score-based; protect 4 attention sinks by default (same as the other score-based stages).
-    caps: StageCaps {
-        reads: &[
-            argus_extension_api::TensorKind::Key,
-            argus_extension_api::TensorKind::Scores,
-        ],
-        default_protected_prefix: 4,
-        produces_merge_plan: false,
-    },
+    caps: RKV_CAPS,
 };
 
 #[cfg(test)]
@@ -555,5 +597,95 @@ mod tests {
         assert_eq!(stats.len(), 1, "kv_heads=1 → stats 1개");
         assert!(stats[0].mpc.is_finite());
         assert!((0.0..=1.0).contains(&stats[0].redundant_fraction));
+    }
+
+    /// A mock [`CacheHandle`] capturing the keep staged by `keep`.
+    struct CaptureHandle {
+        kept: Option<Vec<usize>>,
+    }
+    impl CacheHandle for CaptureHandle {
+        fn current_pos(&self) -> usize {
+            8
+        }
+        fn n_kv_heads(&self) -> usize {
+            1
+        }
+        fn head_dim(&self) -> usize {
+            3
+        }
+        fn kv_on_device(&self) -> bool {
+            false
+        }
+        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+            None
+        }
+        fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
+            self.kept = Some(keep.to_vec());
+            Ok(())
+        }
+        fn keep_per_head(&mut self, _keep: &[&[usize]]) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn merge(
+            &mut self,
+            _merges: &[argus_extension_api::WeightedMerge],
+        ) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn reencode(&mut self, _target: argus_extension_api::FormatId) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn transition_quant_bits(&mut self, _bits: u8) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn offload(&mut self, _prefix_len: usize) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn recall(&mut self) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+    }
+
+    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages the fusion keep the v2
+    /// `plan` returns (both via the shared `compute_keep`). Uses fresh stage instances so the
+    /// interior-mutable measurement counters don't cross-contaminate.
+    #[test]
+    fn v3_native_matches_v2_decision() {
+        use argus_extension_api::find_mutation_stage;
+        let reg = find_mutation_stage("rkv").expect("rkv in KV_MUTATION_STAGES");
+        assert_eq!(reg.name, "rkv");
+        assert_eq!(reg.caps, RKV_CAPS);
+        assert_eq!((reg.make)(StageParams::default(), &[]).name(), "rkv");
+
+        let build_ctx = || {
+            let (head_dim, n) = (3usize, 8usize);
+            let mut k = vec![0.0f32; n * head_dim];
+            for t in 0..n {
+                k[t * head_dim] = t as f32;
+            }
+            KCtx {
+                n,
+                head_dim,
+                k,
+                target: 4,
+                importance: vec![1.0; n],
+            }
+        };
+        let v2_keep = match RkvStage::new(RkvConfig::default())
+            .plan(&build_ctx())
+            .unwrap()
+            .keep
+        {
+            KeepSpec::LayerWide(k) => k,
+            KeepSpec::PerHead(_) => panic!("rkv is layer-wide"),
+        };
+        let mut h = CaptureHandle { kept: None };
+        <RkvStage as KVMutationStage>::on_phase(
+            &RkvStage::new(RkvConfig::default()),
+            &build_ctx(),
+            &mut h,
+        )
+        .unwrap();
+        assert_eq!(h.kept, Some(v2_keep));
     }
 }
