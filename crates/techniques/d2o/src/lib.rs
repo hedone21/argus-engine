@@ -26,12 +26,22 @@
 //! [`StageCtx::layer_idx`]/[`StageCtx::n_layers`].
 
 use argus_extension_api::{
-    EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, MergeAxis,
-    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
-    WeightedMerge,
+    CacheHandle, CacheOpError, EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage,
+    KVCacheStageReg, KVMutationStage, KeepSpec, MergeAxis, MutationPhase, QCF_ESTIMATORS,
+    QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams, TensorKind,
+    WeightedMerge, register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
 use std::sync::Mutex;
+
+/// The merge-producing caps shared by the v2 [`KVCacheStageReg`] and the v3 registration: D2O ranks
+/// by importance (Scores) and, on the off-device merge path, reads cached K (Key) for the Eq.8
+/// matching; protects 4 sinks by default.
+const D2O_CAPS: StageCaps = StageCaps {
+    reads: &[TensorKind::Scores, TensorKind::Key],
+    default_protected_prefix: 4,
+    produces_merge_plan: true,
+};
 
 // ── Configuration ────────────────────────────────────────────────
 
@@ -419,12 +429,12 @@ impl D2OStage {
     }
 }
 
-impl KVCacheStage for D2OStage {
-    fn name(&self) -> &str {
-        "d2o"
-    }
-
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+impl D2OStage {
+    /// The (keep, merges) decision (`None` = protected layer / no-op), shared by the v3 `on_phase` and
+    /// the v2 `plan` so they decide byte-identically. Merges are emitted only off-device
+    /// (`!kv_on_device()`); a device-resident cache degrades to keep-only (empty merges).
+    #[allow(clippy::type_complexity)]
+    fn compute_plan(&self, ctx: &dyn StageCtx) -> Option<(Vec<usize>, Vec<WeightedMerge>)> {
         // Per-layer protection (formerly the handler's per-layer loop skip).
         if self.is_protected(ctx.layer_idx(), ctx.n_layers()) {
             return None;
@@ -473,11 +483,59 @@ impl KVCacheStage for D2OStage {
                 .collect()
         };
 
-        Some(KVCachePlan {
-            keep: KeepSpec::LayerWide(retain_all),
-            merges,
-            channels: None,
-        })
+        Some((retain_all, merges))
+    }
+}
+
+// ── v3 native (imperative) surface — the production path ──
+
+impl KVMutationStage for D2OStage {
+    fn name(&self) -> &str {
+        "d2o"
+    }
+
+    /// Stage the Eq.11 weighted merges (off-device only) then the retain-all keep, or no-op on a
+    /// protected layer. On a device-resident cache `compute_plan` yields no merges, so this stages
+    /// keep-only WITHOUT aborting (T-8). Byte-identical to the v2 plan via the shared `compute_plan`.
+    fn on_phase(
+        &self,
+        ctx: &dyn StageCtx,
+        cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        match self.compute_plan(ctx) {
+            None => Ok(()),
+            Some((keep, merges)) => {
+                if !merges.is_empty() {
+                    cache.merge(&merges)?;
+                }
+                cache.keep(&keep)
+            }
+        }
+    }
+}
+
+register_kv_mutation_stage!(
+    "d2o",
+    |p, args| Box::new(D2OStage::new(D2OConfig::from_args(p, args))),
+    D2O_CAPS,
+    MutationPhase::KvMutate
+);
+
+// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
+
+impl KVCacheStage for D2OStage {
+    fn name(&self) -> &str {
+        "d2o"
+    }
+
+    /// Decides via the shared `compute_plan`, so it is byte-identical to the v3 `on_phase`.
+    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+        self.compute_plan(ctx)
+            .map(|(retain_all, merges)| KVCachePlan {
+                keep: KeepSpec::LayerWide(retain_all),
+                merges,
+                channels: None,
+            })
     }
 }
 
@@ -494,14 +552,7 @@ static D2O: KVCacheStageReg = KVCacheStageReg {
     // D2O ranks tokens by accumulated importance (Scores) and, on the off-device merge
     // path, dequantizes cached K for the Eq.8 nearest-neighbour matching
     // (ctx.dequant_k => Key); protect 4 attention sinks by default.
-    caps: StageCaps {
-        reads: &[
-            argus_extension_api::TensorKind::Scores,
-            argus_extension_api::TensorKind::Key,
-        ],
-        default_protected_prefix: 4,
-        produces_merge_plan: true,
-    },
+    caps: D2O_CAPS,
 };
 
 // ── QCF estimator (observer/score axis) ──────────────────────────
@@ -1088,6 +1139,98 @@ mod tests {
             KeepSpec::LayerWide(k) => assert_eq!(k.len(), 12, "keep target_len tokens"),
             KeepSpec::PerHead(_) => panic!("d2o is layer-wide"),
         }
+    }
+
+    /// A mock [`CacheHandle`] capturing the staged merges + keep.
+    #[derive(Default)]
+    struct CaptureHandle {
+        merged: Option<Vec<WeightedMerge>>,
+        kept: Option<Vec<usize>>,
+    }
+    impl CacheHandle for CaptureHandle {
+        fn current_pos(&self) -> usize {
+            20
+        }
+        fn n_kv_heads(&self) -> usize {
+            1
+        }
+        fn head_dim(&self) -> usize {
+            2
+        }
+        fn kv_on_device(&self) -> bool {
+            false
+        }
+        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+            None
+        }
+        fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
+            self.kept = Some(keep.to_vec());
+            Ok(())
+        }
+        fn keep_per_head(&mut self, _keep: &[&[usize]]) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn merge(&mut self, merges: &[WeightedMerge]) -> Result<(), CacheOpError> {
+            self.merged = Some(merges.to_vec());
+            Ok(())
+        }
+        fn reencode(&mut self, _target: argus_extension_api::FormatId) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn transition_quant_bits(&mut self, _bits: u8) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn offload(&mut self, _prefix_len: usize) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn recall(&mut self) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+    }
+
+    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages the same merges + keep
+    /// the v2 `plan` produces (both via the shared `compute_plan`), and on a device-resident cache it
+    /// stages keep-only without a merge (T-8). Fresh stage instances so the EMA state doesn't carry.
+    #[test]
+    fn v3_native_matches_v2_decision() {
+        use argus_extension_api::find_mutation_stage;
+        let reg = find_mutation_stage("d2o").expect("d2o in KV_MUTATION_STAGES");
+        assert_eq!(reg.name, "d2o");
+        assert_eq!(reg.caps, D2O_CAPS);
+        assert!(reg.caps.produces_merge_plan);
+        assert_eq!((reg.make)(StageParams::default(), &[]).name(), "d2o");
+
+        // host path: merges + keep.
+        let plan = D2OStage::new(D2OConfig::default())
+            .plan(&base_ctx())
+            .expect("plan Some");
+        let (v2_keep, v2_merges) = match plan.keep {
+            KeepSpec::LayerWide(k) => (k, plan.merges),
+            KeepSpec::PerHead(_) => panic!("d2o is layer-wide"),
+        };
+        assert!(!v2_merges.is_empty(), "host base_ctx must produce merges");
+        let mut h = CaptureHandle::default();
+        <D2OStage as KVMutationStage>::on_phase(
+            &D2OStage::new(D2OConfig::default()),
+            &base_ctx(),
+            &mut h,
+        )
+        .unwrap();
+        assert_eq!(h.merged, Some(v2_merges));
+        assert_eq!(h.kept, Some(v2_keep));
+
+        // device path: keep-only, no merge call.
+        let mut dctx = base_ctx();
+        dctx.on_device = true;
+        let mut h2 = CaptureHandle::default();
+        <D2OStage as KVMutationStage>::on_phase(
+            &D2OStage::new(D2OConfig::default()),
+            &dctx,
+            &mut h2,
+        )
+        .unwrap();
+        assert_eq!(h2.merged, None, "device → no merge staged (T-8 degrade)");
+        assert!(h2.kept.is_some(), "device still stages the keep");
     }
 
     #[test]
