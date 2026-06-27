@@ -166,21 +166,38 @@ pub struct KVMutationDriverStage {
     /// (`MutationStageReg.phase`, the single source of truth). The trait has no `phase()` method, so
     /// the registered placement phase and the runtime firing phase are the same value by construction.
     phase: MutationPhase,
+    /// Per-layer eviction budget ratio. The read ctx exposes `target_len = (current_pos *
+    /// target_ratio).max(1)` (mirror of [`EvictionHandler`](crate::kv::EvictionHandler)), so a
+    /// score-based stage receives a real keep budget instead of the s1 stub's `0` (which made a
+    /// budget-driven stage stage an empty keep = a full-cache wipe). `1.0` ⇒ keep all (no eviction by
+    /// budget); a score-free positional stage that ignores `target_len` is unaffected.
+    target_ratio: f32,
 }
 
 impl KVMutationDriverStage {
     /// `handles` enumerate order must equal layer idx. `stage` is the mutation callback; `phase` is its
-    /// registered firing phase (`MutationStageReg.phase`).
+    /// registered firing phase (`MutationStageReg.phase`); `target_ratio` sets the per-layer keep
+    /// budget the read ctx exposes as `target_len`.
     pub fn new(
         handles: Vec<Arc<StandardFormat>>,
         stage: Box<dyn KVMutationStage>,
         phase: MutationPhase,
+        target_ratio: f32,
     ) -> Self {
         Self {
             handles,
             stage,
             phase,
+            target_ratio,
         }
+    }
+
+    /// The per-layer keep budget for a cache at `current_pos`, mirroring
+    /// [`EvictionHandler`](crate::kv::EvictionHandler): `(current_pos * target_ratio).max(1)`. The
+    /// `.max(1)` floor is the wipe guard — a budget can never round down to `0` and make a
+    /// budget-driven stage retain nothing.
+    fn budget_for(&self, current_pos: usize) -> usize {
+        (((current_pos as f32) * self.target_ratio) as usize).max(1)
     }
 }
 
@@ -212,8 +229,10 @@ impl PipelineStage for KVMutationDriverStage {
                     continue;
                 }
                 // Owned-scalar read ctx (no cache borrow) — coexists with the &mut handle below.
-                // target_len = 0 in s1 (the eviction budget plumbing is production/follow-up).
-                let sctx = ScalarStageCtx::from_cache(cache, 0, layer_idx, n_layers);
+                // Real per-layer keep budget (P0-3): a budget-driven stage gets a non-zero target_len
+                // (the `.max(1)` floor in budget_for is the wipe guard).
+                let target_len = self.budget_for(cache.current_pos());
+                let sctx = ScalarStageCtx::from_cache(cache, target_len, layer_idx, n_layers);
                 let mut handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
                 self.stage.on_phase(&sctx, &mut handle).map_err(|e| {
                     anyhow::anyhow!("mutation stage '{}' failed: {e}", self.stage.name())
@@ -377,10 +396,14 @@ mod tests {
         // Handle cache: same streaming plugin driven through KVMutationDriverStage.
         let cache_h = make_cache(dtype);
         let handle = Arc::new(StandardFormat::new(0, cache_h));
+        // target_ratio=1.0 → budget = current_pos (no budget-driven shrink), so streaming keeps exactly
+        // sink+window just like the v2 reference (target_len=0) above — the application path is what's
+        // under test, and both sides produce the identical streaming plan.
         let driver = KVMutationDriverStage::new(
             vec![handle.clone()],
             Box::new(PlanStageAdapter::new((reg.make)(params))),
             MutationPhase::KvMutate,
+            1.0,
         );
         let mut profiler = OpProfiler::new();
         let mut pctx = make_ctx(&mut profiler);
@@ -482,6 +505,67 @@ mod tests {
     #[test]
     fn streaming_via_handle_byte_identical_q4_0() {
         streaming_handle_byte_identical(DType::Q4_0);
+    }
+
+    /// A budget-driven mutation stage: keeps `[0..target_len)`. Stands in for the score-based class
+    /// (caote/h2o) whose keep size is the engine-supplied budget — used to prove the P0-3 budget +
+    /// wipe guard (the s1 stub's `target_len=0` would make this keep nothing = a full-cache wipe).
+    struct BudgetKeepStage;
+    impl KVMutationStage for BudgetKeepStage {
+        fn name(&self) -> &str {
+            "test.budget_keep"
+        }
+        fn on_phase(
+            &self,
+            ctx: &dyn StageCtx,
+            cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            let keep: Vec<usize> = (0..ctx.target_len().min(ctx.current_pos())).collect();
+            cache.keep(&keep)
+        }
+    }
+
+    fn drive_budget_keep(resident: usize, target_ratio: f32) -> usize {
+        let handle = Arc::new(StandardFormat::new(0, make_cache_f32_resident(resident)));
+        let driver = KVMutationDriverStage::new(
+            vec![handle.clone()],
+            Box::new(BudgetKeepStage),
+            MutationPhase::KvMutate,
+            target_ratio,
+        );
+        let mut profiler = OpProfiler::new();
+        let mut pctx = make_ctx(&mut profiler);
+        driver
+            .on_phase(&LifecyclePhase::KvMutate, &mut pctx)
+            .unwrap();
+        handle.take_inner().current_pos()
+    }
+
+    /// A minimal F32 SeqMajor cache with `resident` tokens (the byte pattern is irrelevant here — only
+    /// `current_pos` drives the budget). Reuses the `make_cache` geometry constants.
+    fn make_cache_f32_resident(resident: usize) -> KVCache {
+        let mut c = make_cache(DType::F32);
+        c.set_current_pos(resident);
+        c
+    }
+
+    /// P0-3 wipe guard: a budget-driven stage keeps `target_len = (pos * ratio).max(1)` tokens, NOT 0.
+    /// With the s1 stub (`target_len=0`) this stage would `keep(&[])` and wipe the whole cache; the real
+    /// budget makes it retain the budgeted count. The `.max(1)` floor guarantees a tiny ratio still
+    /// keeps ≥1 token (never a wipe). Mutation-proof: reverting budget_for to `0` makes both asserts
+    /// fail (current_pos would be 0).
+    #[test]
+    fn budget_drives_keep_and_never_wipes() {
+        // ratio 0.5 on 8 resident → target_len 4 → keeps [0,1,2,3].
+        assert_eq!(drive_budget_keep(8, 0.5), 4, "budget = (8*0.5).max(1) = 4");
+        // tiny ratio: (8 * 0.01) rounds to 0 → .max(1) floor → keep [0] → current_pos 1, NOT a wipe.
+        assert_eq!(
+            drive_budget_keep(8, 0.01),
+            1,
+            "wipe guard: budget floored to 1, never 0"
+        );
+        // ratio 1.0 → keep all 8 (no budget-driven eviction).
+        assert_eq!(drive_budget_keep(8, 1.0), 8, "ratio 1.0 keeps all");
     }
 
     /// Assert K and V byte-identical over the resident region of two caches.
