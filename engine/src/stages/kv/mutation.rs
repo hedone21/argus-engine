@@ -23,6 +23,7 @@
 //! The driver is NOT registered into the pipeline yet (the `KV_MUTATION_STAGES` slice / production
 //! wiring is P0-5/P0-6); it is constructed directly and exercised by the gates below.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use argus_extension_api::{
@@ -287,6 +288,10 @@ pub struct KVMutationDriverStage {
     /// accumulator after a successful commit (stale-score guard: the KV geometry just changed). `None`
     /// = score-free (sliding/streaming/no-eviction): the ctx exposes no signals.
     score_cell: Option<Arc<Mutex<Option<AttentionScoreAccumulator>>>>,
+    /// Shared plan-invalidation cell (T-6). Set `true` when a commit mutated any layer so the decode
+    /// loop invalidates the fused decode plan. `None` until wired (P0-5c) — the test-driven driver and
+    /// score-free positional stages that only shrink keeps are already covered by the pos-shrink reflux.
+    mutation_fired: Option<Arc<AtomicBool>>,
     /// The stage's declared capabilities — used to gate the per-layer raw K/V dequant snapshot: a
     /// snapshot is built only when `caps.reads` contains the kind (and the cache is host-resident), so
     /// a score-free / importance-only stage pays nothing. Defaults to [`StageCaps::SCORE_FREE`] (no
@@ -310,6 +315,7 @@ impl KVMutationDriverStage {
             phase,
             target_ratio,
             score_cell: None,
+            mutation_fired: None,
             caps: StageCaps::SCORE_FREE,
         }
     }
@@ -329,6 +335,16 @@ impl KVMutationDriverStage {
     /// assumes [`StageCaps::SCORE_FREE`] (no K/V snapshot).
     pub fn with_caps(mut self, caps: StageCaps) -> Self {
         self.caps = caps;
+        self
+    }
+
+    /// Attach the shared plan-invalidation cell (T-6, mirror of `FormatReencodeStage::reencode_fired`
+    /// / `CommandDispatcher::reencode_fired_cell`). The driver sets it `true` when a commit mutated any
+    /// layer, so the decode loop swap-checks it after the KvMutate dispatch and invalidates the fused
+    /// decode plan (`on_kv_reencode`). A position-shrinking keep is ALSO covered by the loop's
+    /// pos-shrink reflux, but a position-PRESERVING mutation (reencode) needs this cell.
+    pub fn with_mutation_fired(mut self, cell: Arc<AtomicBool>) -> Self {
+        self.mutation_fired = Some(cell);
         self
     }
 
@@ -400,6 +416,8 @@ impl PipelineStage for KVMutationDriverStage {
         // UER (mirroring FormatReencodeStage): take_inner -> per-layer drive+commit -> put_inner.
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
         let n_layers = temp.len();
+        // T-6 (P0-5b): tracks whether any layer's commit mutated bytes, to fire plan invalidation.
+        let mut any_mutated = false;
         let result = (|| -> anyhow::Result<()> {
             for (layer_idx, cache) in temp.iter_mut().enumerate() {
                 let current_pos = cache.current_pos();
@@ -474,7 +492,7 @@ impl PipelineStage for KVMutationDriverStage {
                     },
                 ));
                 match driven {
-                    Ok(Ok(_mutated)) => {}
+                    Ok(Ok(mutated)) => any_mutated |= mutated,
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
                         return Err(anyhow::anyhow!(
@@ -492,6 +510,12 @@ impl PipelineStage for KVMutationDriverStage {
         result?;
         // Reset scores after a successful eviction (KV geometry changed → prior scores stale).
         self.reset_scores();
+        // T-6: a committed mutation invalidates the fused decode plan. Fire the shared cell so the
+        // decode loop rebuilds it (covers position-PRESERVING reencode; a shrinking keep is also
+        // covered by the loop's pos-shrink reflux).
+        if any_mutated && let Some(cell) = self.mutation_fired.as_ref() {
+            cell.store(true, Ordering::Relaxed);
+        }
         Ok(StageOutcome::Consumed)
     }
 }
@@ -1054,6 +1078,84 @@ mod tests {
             handle.take_inner().current_pos(),
             8,
             "cache untouched + handle restored after a caught panic"
+        );
+    }
+
+    /// A position-PRESERVING mutation stage: re-encodes f32 -> f16 (no compaction). Exercises the T-6
+    /// path that the pos-shrink reflux does NOT cover.
+    struct ReencodeStage;
+    impl KVMutationStage for ReencodeStage {
+        fn name(&self) -> &str {
+            "test.reencode"
+        }
+        fn on_phase(
+            &self,
+            _ctx: &dyn StageCtx,
+            cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            cache.reencode(argus_extension_api::FormatId("f16".into()))
+        }
+    }
+
+    /// A no-op stage (stages nothing) — commit reports no mutation.
+    struct NoopMutStage;
+    impl KVMutationStage for NoopMutStage {
+        fn name(&self) -> &str {
+            "test.noop_mut"
+        }
+        fn on_phase(
+            &self,
+            _ctx: &dyn StageCtx,
+            _cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+    }
+
+    /// P0-5b T-6: a committed mutation fires the shared plan-invalidation cell (so the decode loop
+    /// rebuilds the fused plan), and a no-op commit leaves it unset. Mutation-proof: dropping the
+    /// `cell.store(true)` leaves the cell false after a real reencode → the fused plan would not be
+    /// invalidated and decode would read stale geometry.
+    #[test]
+    fn mutation_fires_plan_invalidation_cell() {
+        // A real reencode (f32 -> f16) sets the cell.
+        let handle = Arc::new(StandardFormat::new(0, make_int_cache(8)));
+        let cell = Arc::new(AtomicBool::new(false));
+        let driver = KVMutationDriverStage::new(
+            vec![handle.clone()],
+            Box::new(ReencodeStage),
+            MutationPhase::KvMutate,
+            1.0,
+        )
+        .with_mutation_fired(cell.clone());
+        let mut profiler = OpProfiler::new();
+        let mut pctx = make_ctx(&mut profiler);
+        driver
+            .on_phase(&LifecyclePhase::KvMutate, &mut pctx)
+            .unwrap();
+        assert!(
+            cell.load(Ordering::Relaxed),
+            "a committed reencode must fire plan invalidation (T-6)"
+        );
+
+        // A no-op stage leaves the cell unset.
+        let handle2 = Arc::new(StandardFormat::new(0, make_int_cache(8)));
+        let cell2 = Arc::new(AtomicBool::new(false));
+        let driver2 = KVMutationDriverStage::new(
+            vec![handle2.clone()],
+            Box::new(NoopMutStage),
+            MutationPhase::KvMutate,
+            1.0,
+        )
+        .with_mutation_fired(cell2.clone());
+        let mut profiler2 = OpProfiler::new();
+        let mut pctx2 = make_ctx(&mut profiler2);
+        driver2
+            .on_phase(&LifecyclePhase::KvMutate, &mut pctx2)
+            .unwrap();
+        assert!(
+            !cell2.load(Ordering::Relaxed),
+            "a no-op commit must NOT fire plan invalidation"
         );
     }
 
