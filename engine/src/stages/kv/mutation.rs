@@ -456,15 +456,33 @@ impl PipelineStage for KVMutationDriverStage {
                         head_dim,
                     }),
                 };
-                let mut handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
-                self.stage.on_phase(&sctx, &mut handle).map_err(|e| {
-                    anyhow::anyhow!("mutation stage '{}' failed: {e}", self.stage.name())
-                })?;
-                // commit() returns `mutated` (whether bytes changed). The s1 driver discards it; the
-                // production-wiring follow-up must route it into coalesced plan invalidation (T-6,
-                // mirroring `FormatReencodeStage::reencode_fired`) — which is also why this driver is
-                // not yet pipeline-registered.
-                handle.commit()?;
+                let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
+                // catch_unwind (P0-5a, correctness hazard): an (untrusted, native) plugin's on_phase
+                // could panic. Without this, the panic would unwind PAST the `put_inner` rewrap loop
+                // below — leaving the StandardFormat handles empty (take_inner'd, never returned),
+                // corrupting the engine's KV bookkeeping. Convert a panic into an anyhow::Err so the
+                // for-loop after still runs put_inner. (commit()'s `mutated` flag is captured here for
+                // the T-6 plan-invalidation wiring in P0-5b.)
+                let stage = self.stage.as_ref();
+                let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    move || -> anyhow::Result<bool> {
+                        let mut handle = handle;
+                        stage.on_phase(&sctx, &mut handle).map_err(|e| {
+                            anyhow::anyhow!("mutation stage '{}' failed: {e}", stage.name())
+                        })?;
+                        handle.commit()
+                    },
+                ));
+                match driven {
+                    Ok(Ok(_mutated)) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(anyhow::anyhow!(
+                            "mutation stage '{}' panicked during on_phase/commit",
+                            self.stage.name()
+                        ));
+                    }
+                }
             }
             Ok(())
         })();
@@ -984,6 +1002,58 @@ mod tests {
             handle2.take_inner().current_pos(),
             8,
             "probe kept all (no-op)"
+        );
+    }
+
+    /// A stage that panics in on_phase — stands in for an untrusted native plugin that faults.
+    struct PanicStage;
+    impl KVMutationStage for PanicStage {
+        fn name(&self) -> &str {
+            "test.panic"
+        }
+        fn on_phase(
+            &self,
+            _ctx: &dyn StageCtx,
+            _cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            panic!("intentional plugin panic");
+        }
+    }
+
+    /// P0-5a catch_unwind: a panic in a plugin's on_phase is caught and converted to an Err — it does
+    /// NOT unwind past the driver's put_inner rewrap, so the StandardFormat handle is restored intact
+    /// (take_inner succeeds afterward, cache untouched). Mutation-proof: removing the catch_unwind
+    /// makes on_phase panic-unwind, the handle is left empty, and the post-run take_inner would observe
+    /// a placeholder (current_pos 0) instead of the original 8.
+    #[test]
+    fn panic_in_stage_is_caught_and_handles_restored() {
+        let handle = Arc::new(StandardFormat::new(0, make_int_cache(8)));
+        let driver = KVMutationDriverStage::new(
+            vec![handle.clone()],
+            Box::new(PanicStage),
+            MutationPhase::KvMutate,
+            1.0,
+        );
+        let mut profiler = OpProfiler::new();
+        let mut pctx = make_ctx(&mut profiler);
+        // Suppress the default panic hook's stderr noise for this intentional panic.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            driver.on_phase(&LifecyclePhase::KvMutate, &mut pctx)
+        }));
+        std::panic::set_hook(prev);
+        // The driver converted the plugin panic into an Err (it did NOT propagate a panic).
+        match r {
+            Ok(Ok(_)) => panic!("driver should have returned Err on a plugin panic"),
+            Ok(Err(_)) => {} // expected: caught panic -> Err
+            Err(_) => panic!("panic escaped the driver (catch_unwind missing)"),
+        }
+        // The handle was restored by put_inner: take_inner works and the cache is intact.
+        assert_eq!(
+            handle.take_inner().current_pos(),
+            8,
+            "cache untouched + handle restored after a caught panic"
         );
     }
 
