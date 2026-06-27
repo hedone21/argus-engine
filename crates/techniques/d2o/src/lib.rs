@@ -1216,7 +1216,18 @@ mod tests {
             &mut h,
         )
         .unwrap();
-        assert_eq!(h.merged, Some(v2_merges));
+        // The merge GROUPING is HashMap-backed, so the emitted Vec order is not deterministic across
+        // two calls (group_by_retain). Compare order-independently by sorting on the `into` target —
+        // both calls produce the SAME set of weighted merges, just possibly in a different order.
+        let sort_by_into = |mut m: Vec<WeightedMerge>| {
+            m.sort_by_key(|w| w.into);
+            m
+        };
+        assert_eq!(
+            h.merged.map(sort_by_into),
+            Some(sort_by_into(v2_merges)),
+            "v3 stages the same set of merges as v2"
+        );
         assert_eq!(h.kept, Some(v2_keep));
 
         // device path: keep-only, no merge call.
