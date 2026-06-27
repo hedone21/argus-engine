@@ -7,50 +7,93 @@
 //! 가 불필요함을 실증하는 vehicle(번들 양축 등록).
 
 use argus_extension_api::{
-    KVCachePlan, KVCacheStage, KVFormat, KVLayoutDesc, KeepSpec, Packing, ScaleLayout, StageCtx,
-    StageParams,
+    CacheHandle, CacheOpError, KVCachePlan, KVCacheStage, KVFormat, KVLayoutDesc, KVMutationStage,
+    KeepSpec, MutationPhase, Packing, ScaleLayout, StageCtx, StageParams,
 };
 
 /// 번들 stage — 최근 `target_len` 토큰 유지(example_keep_recent 와 동형, 다른 이름).
 struct BundleKeep;
+impl BundleKeep {
+    fn keep_list(&self, current: usize, target: usize) -> Option<Vec<usize>> {
+        (current > target).then(|| (current - target..current).collect())
+    }
+}
+// v3 native (the production path) + v2 plan-returning (migration window). Both via `keep_list`.
+impl KVMutationStage for BundleKeep {
+    fn name(&self) -> &str {
+        "bundle_keep"
+    }
+    fn on_phase(
+        &self,
+        ctx: &dyn StageCtx,
+        cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        match self.keep_list(ctx.current_pos(), ctx.target_len()) {
+            Some(keep) => cache.keep(&keep),
+            None => Ok(()),
+        }
+    }
+}
 impl KVCacheStage for BundleKeep {
     fn name(&self) -> &str {
         "bundle_keep"
     }
     fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-        let (current, target) = (ctx.current_pos(), ctx.target_len());
-        if current <= target {
-            return None;
-        }
-        Some(KVCachePlan {
-            keep: KeepSpec::LayerWide((current - target..current).collect()),
-            merges: Vec::new(),
-            channels: None,
-        })
+        self.keep_list(ctx.current_pos(), ctx.target_len())
+            .map(|keep| KVCachePlan {
+                keep: KeepSpec::LayerWide(keep),
+                merges: Vec::new(),
+                channels: None,
+            })
     }
 }
 
-/// per-head keep 을 산출하는 stage — host(DynStage)가 PerHead(keep_kind==1)에 대해 명시 bail 하는
-/// 경로(landmine, planabi_to_plan)를 구동하는 vehicle. 한 `.so` 에 stage 2종(bundle_keep
-/// LayerWide + bundle_perhead PerHead) = 멀티-stage 인덱스 바인딩 검증.
+/// per-head keep 을 산출하는 stage — 한 `.so` 에 stage 2종(bundle_keep LayerWide + bundle_perhead
+/// PerHead) = 멀티-stage 인덱스 바인딩 검증. v3 routes the per-head keep through `keep_per_head`.
 struct BundlePerHead;
+impl BundlePerHead {
+    fn per_head_keep(
+        &self,
+        current: usize,
+        target: usize,
+        n_kv_heads: usize,
+    ) -> Option<Vec<Vec<usize>>> {
+        if current <= target {
+            return None;
+        }
+        let keep: Vec<usize> = (current - target..current).collect();
+        Some(vec![keep; n_kv_heads.max(1)]) // all heads keep the same (equal-length invariant)
+    }
+}
+impl KVMutationStage for BundlePerHead {
+    fn name(&self) -> &str {
+        "bundle_perhead"
+    }
+    fn on_phase(
+        &self,
+        ctx: &dyn StageCtx,
+        cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        match self.per_head_keep(ctx.current_pos(), ctx.target_len(), ctx.n_kv_heads()) {
+            None => Ok(()),
+            Some(heads) => {
+                let refs: Vec<&[usize]> = heads.iter().map(|h| h.as_slice()).collect();
+                cache.keep_per_head(&refs)
+            }
+        }
+    }
+}
 impl KVCacheStage for BundlePerHead {
     fn name(&self) -> &str {
         "bundle_perhead"
     }
     fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-        let (current, target) = (ctx.current_pos(), ctx.target_len());
-        if current <= target {
-            return None;
-        }
-        let keep: Vec<usize> = (current - target..current).collect();
-        // 전 head 동일 keep — host 는 PerHead 미지원이라 마샬링 단계에서 bail(None) 한다.
-        let per_head = vec![keep; ctx.n_kv_heads().max(1)];
-        Some(KVCachePlan {
-            keep: KeepSpec::PerHead(per_head),
-            merges: Vec::new(),
-            channels: None,
-        })
+        self.per_head_keep(ctx.current_pos(), ctx.target_len(), ctx.n_kv_heads())
+            .map(|per_head| KVCachePlan {
+                keep: KeepSpec::PerHead(per_head),
+                merges: Vec::new(),
+                channels: None,
+            })
     }
 }
 
@@ -78,6 +121,18 @@ argus_extension_api::register_kv_stage!("bundle_perhead", |_p: StageParams| Box:
 argus_extension_api::register_kv_format!("bundle_fmt", || Box::new(BundleFmt));
 argus_extension_api::export_plugin!();
 
+// v3 native registrations (static-linkme only) for both KV stages — the format half is unchanged.
+argus_extension_api::register_kv_mutation_stage!(
+    "bundle_keep",
+    |_p| Box::new(BundleKeep),
+    MutationPhase::KvMutate
+);
+argus_extension_api::register_kv_mutation_stage!(
+    "bundle_perhead",
+    |_p| Box::new(BundlePerHead),
+    MutationPhase::KvMutate
+);
+
 #[cfg(test)]
 mod tests {
     use argus_extension_api::{find_kv_format, find_stage};
@@ -98,5 +153,25 @@ mod tests {
             find_kv_format("bundle_fmt").expect("format 등록").name,
             "bundle_fmt"
         );
+    }
+
+    /// v3 native: both KV stages register in KV_MUTATION_STAGES (the format half is unchanged). The
+    /// keep decision is shared with the v2 plan via `keep_list` / `per_head_keep`, so they are
+    /// byte-identical by construction.
+    #[test]
+    fn bundle_stages_register_in_mutation_slice() {
+        use argus_extension_api::{MutationPhase, find_mutation_stage};
+        for name in ["bundle_keep", "bundle_perhead"] {
+            let reg =
+                find_mutation_stage(name).unwrap_or_else(|| panic!("{name} in mutation slice"));
+            assert_eq!(reg.name, name);
+            assert_eq!(reg.phase, MutationPhase::KvMutate);
+            assert_eq!(
+                (reg.make)(argus_extension_api::StageParams::default(), &[]).name(),
+                name
+            );
+        }
+        // the format axis is untouched by the v3 migration.
+        assert!(find_kv_format("bundle_fmt").is_some());
     }
 }
