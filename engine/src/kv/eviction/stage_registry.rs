@@ -116,8 +116,10 @@ pub(crate) fn execute_kv_plan(
     }
     // R-P0-2: optional keep-set dump (no-op unless `ARGUS_DUMP_KEEPSET` is set).
     // Recorded before any compaction so the kept positions are absolute indices
-    // into the pre-eviction `[0, current_pos)` range.
-    super::keepset_dump::record(cache, plan, layer_idx, n_layers);
+    // into the pre-eviction `[0, current_pos)` range. The dump consumes only the
+    // keep-set (`KeepSpec`), so it is independent of the v2 `KVCachePlan` envelope
+    // (it survives the v2 removal — the v3 handle commit records the same way).
+    super::keepset_dump::record(cache, &plan.keep, layer_idx, n_layers);
     match &plan.keep {
         KeepSpec::LayerWide(keep) => {
             if !plan.merges.is_empty() {

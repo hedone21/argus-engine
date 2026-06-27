@@ -25,7 +25,8 @@ use crate::kv::kv_cache::KVCache;
 use crate::kv_cache_ops::KVLayout;
 use anyhow::Result;
 use argus_extension_api::{
-    CacheHandle, CacheOpError, FormatId, KVFormatPlan, TensorHandle, TensorKind, WeightedMerge,
+    CacheHandle, CacheOpError, FormatId, KVFormatPlan, KeepSpec, TensorHandle, TensorKind,
+    WeightedMerge,
 };
 
 /// The cache's current stored-format name, mirroring `format_apply::current_format_name` (the
@@ -172,11 +173,29 @@ impl<'a> EngineCacheHandle<'a> {
         }
         match self.compaction.take() {
             Some(Compaction::Keep(keep)) => {
+                // P0-2: record the FINAL committed keep-set BEFORE compaction, so the dump's
+                // positions are absolute indices into the pre-eviction `[0, current_pos)` frame
+                // (reencode/merges above are position-preserving, so current_pos == entry_pos here).
+                // No-op unless ARGUS_DUMP_KEEPSET is set / in-memory capture is armed — keeps the
+                // commit path byte-identical otherwise. The v2 `execute_kv_plan` records the same way,
+                // so a handle-driven eviction appears in keepset dumps identically.
+                crate::kv::eviction::keepset_dump::record(
+                    self.cache,
+                    &KeepSpec::LayerWide(keep.clone()),
+                    self.layer_idx,
+                    self.n_layers,
+                );
                 self.cache.compact_keep_positions(&keep, 0)?;
                 self.cache.set_current_pos(keep.len());
                 self.mutated = true;
             }
             Some(Compaction::KeepPerHead(heads)) => {
+                crate::kv::eviction::keepset_dump::record(
+                    self.cache,
+                    &KeepSpec::PerHead(heads.clone()),
+                    self.layer_idx,
+                    self.n_layers,
+                );
                 let new_pos = heads.first().map_or(0, |h| h.len());
                 for (kv_head, keep) in heads.iter().enumerate() {
                     self.cache
@@ -557,6 +576,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// P0-2: a keep committed through the handle records the FINAL keep-set into the keepset dump
+    /// (in-memory capture), so a handle-driven eviction appears in dumps exactly as the v2
+    /// `execute_kv_plan` path does. Mutation-proof: removing the `keepset_dump::record` call from
+    /// `commit`'s Keep arm captures nothing for our fingerprint, failing the assert. Uses a unique
+    /// `seq_len` (13) fingerprint + the capture serialization lock for determinism.
+    #[test]
+    fn test_keep_commit_records_keepset_dump() {
+        use crate::kv::eviction::keepset_dump::{arm_capture, capture_test_lock, drain_capture};
+        let _guard = capture_test_lock();
+
+        let mut c = cache_f32(13); // unique pre-eviction seq_len fingerprint
+        let keep = [1usize, 4, 9];
+        // LayerWide capture replicates the one keep-list across all kv heads.
+        let mine = |x: &crate::kv::eviction::keepset_dump::CapturedKeepSet| {
+            x.seq_len == 13 && x.keep == vec![keep.to_vec(); N_KV]
+        };
+
+        arm_capture();
+        {
+            let mut h = EngineCacheHandle::new(&mut c, 0, 1);
+            assert_eq!(h.keep(&keep), Ok(()));
+            assert_eq!(h.commit().unwrap(), true);
+        }
+        let captured = drain_capture();
+        assert_eq!(
+            captured.iter().filter(|x| mine(x)).count(),
+            1,
+            "handle commit must record the keep-set into the dump capture"
+        );
+        // current_pos shrank to the keep count (the keep actually committed).
+        assert_eq!(c.current_pos(), 3);
     }
 
     /// c10: the high-level `keep_top_k` op compiles the 3-partition set (T1) and stages it through the

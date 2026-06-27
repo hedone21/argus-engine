@@ -7,7 +7,10 @@
 //!
 //! ## Hot-path cost
 //!
-//! [`record`] is called from [`execute_kv_plan`](super::stage_registry::execute_kv_plan).
+//! [`record`] is called from the eviction commit path: the v2 `execute_kv_plan`
+//! (`super::stage_registry`) and the v3 `EngineCacheHandle::commit`
+//! (`crate::kv::cache_handle`). Both pass the FINAL committed keep-set (the same
+//! position-set the engine compacts to), so the dump is path-independent.
 //! When the env var is unset (the default), it does a single cached `OnceLock` read
 //! and returns — no allocation, no lock, no I/O — so the eviction path stays
 //! byte-identical (acceptance #1). When set, eviction is a warm path (fires at
@@ -34,7 +37,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use argus_extension_api::{KVCachePlan, KeepSpec};
+use argus_extension_api::KeepSpec;
 
 use crate::kv::kv_cache::KVCache;
 
@@ -117,15 +120,25 @@ pub(crate) fn drain_capture() -> Vec<CapturedKeepSet> {
     std::mem::take(&mut *capture_buf().lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// Serializes tests that use the global arm/record/drain capture buffer, so a concurrent test's
+/// `drain_capture` (which takes ALL events) cannot steal another's captured keep-sets. Test-only.
+#[cfg(test)]
+pub(crate) fn capture_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Push one layer's keep-set into the capture buffer when armed. Called before any
 /// compaction, so positions are absolute indices into `[0, seq_len)`.
-fn capture_if_armed(cache: &KVCache, plan: &KVCachePlan, layer_idx: usize) {
+fn capture_if_armed(cache: &KVCache, keep_spec: &KeepSpec, layer_idx: usize) {
     if !CAPTURE_ARMED.load(Ordering::Relaxed) {
         return; // disarmed (default): single atomic load, no behaviour change.
     }
     let n_kv_heads = cache.kv_heads();
     let seq_len = cache.current_pos();
-    let keep: Vec<Vec<usize>> = match &plan.keep {
+    let keep: Vec<Vec<usize>> = match keep_spec {
         KeepSpec::LayerWide(k) => vec![k.clone(); n_kv_heads.max(1)],
         KeepSpec::PerHead(heads) => heads.clone(),
     };
@@ -140,11 +153,13 @@ fn capture_if_armed(cache: &KVCache, plan: &KVCachePlan, layer_idx: usize) {
         });
 }
 
-/// Record one layer's keep-set, then rewrite the dump file. No-op (cached env read)
-/// when `ARGUS_DUMP_KEEPSET` is unset.
-pub(crate) fn record(cache: &KVCache, plan: &KVCachePlan, layer_idx: usize, n_layers: usize) {
+/// Record one layer's FINAL committed keep-set, then rewrite the dump file. No-op
+/// (cached env read) when `ARGUS_DUMP_KEEPSET` is unset. Call BEFORE compaction so
+/// `cache.current_pos()` is still the pre-eviction `seq_len` and the positions are
+/// absolute indices into `[0, seq_len)`.
+pub(crate) fn record(cache: &KVCache, keep_spec: &KeepSpec, layer_idx: usize, n_layers: usize) {
     // In-memory capture (IMP-1) is independent of the env-gated file dump below.
-    capture_if_armed(cache, plan, layer_idx);
+    capture_if_armed(cache, keep_spec, layer_idx);
 
     let Some(path) = dump_path() else {
         return; // disabled: byte-identical eviction path.
@@ -154,7 +169,7 @@ pub(crate) fn record(cache: &KVCache, plan: &KVCachePlan, layer_idx: usize, n_la
     let seq_len = cache.current_pos();
 
     let mut per_head: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    match &plan.keep {
+    match keep_spec {
         KeepSpec::LayerWide(keep) => {
             for h in 0..n_kv_heads.max(1) {
                 per_head.insert(h, keep.clone());
@@ -250,6 +265,8 @@ mod tests {
     /// other tests writing to the shared capture buffer.
     #[test]
     fn in_memory_capture_is_arm_gated() {
+        // Serialize with other capture-using tests so a concurrent drain can't steal our events.
+        let _guard = capture_test_lock();
         use crate::backend::cpu::CpuBackend;
         use crate::buffer::DType;
         use crate::memory::host::shared::SharedBuffer;
@@ -264,23 +281,19 @@ mod tests {
         };
         let mut cache = KVCache::new(mk(vec![1, 8, 2, 4]), mk(vec![1, 8, 2, 4]), 8);
         cache.current_pos = 7; // unique fingerprint seq_len
-        let plan = KVCachePlan {
-            keep: KeepSpec::LayerWide(vec![0, 1, 6]),
-            merges: vec![],
-            channels: None,
-        };
+        let keep = KeepSpec::LayerWide(vec![0, 1, 6]);
         let mine =
             |c: &CapturedKeepSet| c.seq_len == 7 && c.keep == vec![vec![0, 1, 6], vec![0, 1, 6]];
 
         // Disarmed: record captures nothing of ours.
         disarm_capture();
-        record(&cache, &plan, 0, 2);
+        record(&cache, &keep, 0, 2);
         assert_eq!(drain_capture().iter().filter(|c| mine(c)).count(), 0);
 
         // Armed: record captures the (replicated) keep-set per layer.
         arm_capture();
-        record(&cache, &plan, 0, 2);
-        record(&cache, &plan, 1, 2);
+        record(&cache, &keep, 0, 2);
+        record(&cache, &keep, 1, 2);
         let captured = drain_capture();
         let ours: Vec<_> = captured.into_iter().filter(mine).collect();
         assert_eq!(ours.len(), 2, "one capture per layer while armed");
@@ -288,7 +301,7 @@ mod tests {
         assert_eq!(ours[0].keep, vec![vec![0, 1, 6], vec![0, 1, 6]]);
 
         // drain disarmed: a further record is not captured.
-        record(&cache, &plan, 0, 2);
+        record(&cache, &keep, 0, 2);
         assert_eq!(drain_capture().iter().filter(|c| mine(c)).count(), 0);
     }
 }
