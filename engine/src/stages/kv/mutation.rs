@@ -15,7 +15,8 @@
 //! keepset dumps.)
 //!
 //! Read/mutate aliasing: a mutation stage reads its cache state through an owned-scalar
-//! [`ScalarStageCtx`] (current_pos / target_len / geometry, copied before the handle is built) and
+//! [`SnapshotStageCtx`] (current_pos / target_len / geometry + score snapshots, captured before the
+//! handle is built) and
 //! mutates through the `&mut` handle. The ctx owns copies rather than borrowing the cache, so the
 //! `&dyn StageCtx` read view and the `&mut dyn CacheHandle` write view never alias — and both observe
 //! the entry frame (the cache is untouched until `commit`).
@@ -23,13 +24,14 @@
 //! The driver is NOT registered into the pipeline in s1 (the `KV_MUTATION_STAGES` slice / production
 //! wiring is a follow-up); it is constructed directly and exercised by the byte-identical gate.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use argus_extension_api::{
     CacheHandle, CacheOpError, KVCacheStage, KVMutationStage, KeepSpec, MutationPhase, StageCtx,
-    TensorHandle, TensorKind,
+    TensorDtype, TensorHandle, TensorKind, TensorShape,
 };
 
+use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::kv::cache_handle::EngineCacheHandle;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
@@ -43,12 +45,42 @@ fn lifecycle_of(phase: MutationPhase) -> LifecyclePhase {
     }
 }
 
-/// An owned-scalar [`StageCtx`] that does NOT borrow the cache — so it can coexist with a `&mut`
-/// [`CacheHandle`] over the same cache. Carries the entry-frame scalars a score-free stage needs
-/// (current_pos / target_len / geometry); external signals (importance / scores) are `None`
-/// (production signal plumbing is a follow-up — score-based stages route through the s2 keep_top_k
-/// compiler, not this driver).
-pub struct ScalarStageCtx {
+/// A per-(kv_head, pos) scalar snapshot handle (`tensor(Scores)` / `tensor(AttnWeights)`), reading
+/// from a driver-owned slice in the `[n_kv_heads * max_seq]` row-major layout the score accumulator
+/// produces (stride `max_seq`). The mirror of `stage_registry::ScalarHandle`, but over an owned
+/// snapshot instead of the live cache, so it never aliases the `&mut` handle.
+struct ScalarSnapHandle<'a> {
+    data: &'a [f32],
+    rows: usize,
+    max_seq: usize,
+}
+impl TensorHandle for ScalarSnapHandle<'_> {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: self.rows,
+            cols: 1,
+            per_head: true,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        TensorDtype::F32
+    }
+    fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
+        out[0] = self
+            .data
+            .get(kv_head * self.max_seq + row)
+            .copied()
+            .unwrap_or(0.0);
+    }
+}
+
+/// A read [`StageCtx`] backed by OWNED/borrowed snapshots — never the live cache — so it coexists with
+/// a `&mut` [`CacheHandle`] over the same cache (a v3 callback holds both at once). The scalars are
+/// copied from the entry frame; the signal slices are borrowed from driver-loop locals captured in
+/// that same pre-callback frame (T-3): `importance` (flat per-token) and the per-head `Scores` /
+/// `AttnWeights` from the score accumulator. A score-free stage gets all-`None` signals and reads only
+/// the scalars + budget. (Raw `Key`/`Value` dequant snapshots are P0-3c.)
+pub struct SnapshotStageCtx<'a> {
     current_pos: usize,
     target_len: usize,
     layer_idx: usize,
@@ -56,10 +88,14 @@ pub struct ScalarStageCtx {
     n_kv_heads: usize,
     head_dim: usize,
     on_device: bool,
+    importance: Option<&'a [f32]>,
+    score_handle: Option<ScalarSnapHandle<'a>>,
+    attn_handle: Option<ScalarSnapHandle<'a>>,
 }
 
-impl ScalarStageCtx {
-    /// Snapshot the entry-frame scalars of `cache` (copies, no borrow held).
+impl SnapshotStageCtx<'_> {
+    /// A scalars-only ctx (no signals) over `cache`'s entry frame — copies, no borrow of `cache` held.
+    /// Used by score-free stages and as the no-signal reference in tests.
     pub fn from_cache(
         cache: &KVCache,
         target_len: usize,
@@ -74,11 +110,14 @@ impl ScalarStageCtx {
             n_kv_heads: cache.kv_heads(),
             head_dim: cache.head_dim(),
             on_device: cache.k_buffer.buffer().is_gpu_buffer(),
+            importance: None,
+            score_handle: None,
+            attn_handle: None,
         }
     }
 }
 
-impl StageCtx for ScalarStageCtx {
+impl StageCtx for SnapshotStageCtx<'_> {
     fn current_pos(&self) -> usize {
         self.current_pos
     }
@@ -101,10 +140,14 @@ impl StageCtx for ScalarStageCtx {
         self.on_device
     }
     fn importance(&self) -> Option<&[f32]> {
-        None
+        self.importance
     }
-    fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
-        None
+    fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
+        match kind {
+            TensorKind::Scores => self.score_handle.as_ref().map(|h| h as &dyn TensorHandle),
+            TensorKind::AttnWeights => self.attn_handle.as_ref().map(|h| h as &dyn TensorHandle),
+            _ => None,
+        }
     }
 }
 
@@ -172,6 +215,13 @@ pub struct KVMutationDriverStage {
     /// budget-driven stage stage an empty keep = a full-cache wipe). `1.0` ⇒ keep all (no eviction by
     /// budget); a score-free positional stage that ignores `target_len` is unaffected.
     target_ratio: f32,
+    /// Optional attention-score source for score-based stages (mirror of
+    /// [`EvictionStage`](super::eviction::EvictionStage)'s `score_cell`). When `Some` and the
+    /// accumulator is active, the driver extracts (flat importance, per-head importance, last-step
+    /// head attn) ONCE per fire into owned snapshots fed to the read ctx, then `reset()`s the
+    /// accumulator after a successful commit (stale-score guard: the KV geometry just changed). `None`
+    /// = score-free (sliding/streaming/no-eviction): the ctx exposes no signals.
+    score_cell: Option<Arc<Mutex<Option<AttentionScoreAccumulator>>>>,
 }
 
 impl KVMutationDriverStage {
@@ -189,6 +239,50 @@ impl KVMutationDriverStage {
             stage,
             phase,
             target_ratio,
+            score_cell: None,
+        }
+    }
+
+    /// Attach a score accumulator cell so score-based stages receive importance / per-head scores /
+    /// last-step attention through the read ctx (mirror of `EvictionStage::one_shot_scored`).
+    pub fn with_score_cell(
+        mut self,
+        score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
+    ) -> Self {
+        self.score_cell = Some(score_cell);
+        self
+    }
+
+    /// Extract owned snapshots of (flat importance, per-head importance, last-step head attn) from the
+    /// score cell ONCE per fire (mirror of `EvictionStage::run_eviction`). Empty when there is no cell
+    /// or the accumulator is inactive. The slices are cloned so the read ctx can borrow them without
+    /// holding the cell lock across the per-layer callbacks.
+    #[allow(clippy::type_complexity)]
+    fn extract_scores(&self) -> (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>) {
+        match self.score_cell.as_ref() {
+            Some(cell) => {
+                let guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+                match guard.as_ref().filter(|acc| acc.is_active()) {
+                    Some(acc) => (
+                        Some(acc.importance_scores().to_vec()),
+                        acc.head_importance_scores().map(|s| s.to_vec()),
+                        acc.last_step_head_attn().map(|s| s.to_vec()),
+                    ),
+                    None => (None, None, None),
+                }
+            }
+            None => (None, None, None),
+        }
+    }
+
+    /// Reset the score accumulator after a successful eviction (KV geometry changed → prior scores are
+    /// stale). Mirror of `EvictionStage::run_eviction`'s post-eviction reset.
+    fn reset_scores(&self) {
+        if let Some(cell) = self.score_cell.as_ref() {
+            let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(acc) = guard.as_mut() {
+                acc.reset();
+            }
         }
     }
 
@@ -220,19 +314,45 @@ impl PipelineStage for KVMutationDriverStage {
             return Ok(StageOutcome::Continue);
         }
 
+        // Extract score snapshots ONCE per fire (owned, so the per-layer read ctx borrows them without
+        // holding the cell lock across callbacks). All `None` for a score-free stage.
+        let (importance, head_scores, last_attn) = self.extract_scores();
+
         // UER (mirroring FormatReencodeStage): take_inner -> per-layer drive+commit -> put_inner.
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
         let n_layers = temp.len();
         let result = (|| -> anyhow::Result<()> {
             for (layer_idx, cache) in temp.iter_mut().enumerate() {
-                if cache.current_pos() == 0 {
+                let current_pos = cache.current_pos();
+                if current_pos == 0 {
                     continue;
                 }
-                // Owned-scalar read ctx (no cache borrow) — coexists with the &mut handle below.
-                // Real per-layer keep budget (P0-3): a budget-driven stage gets a non-zero target_len
+                // Real per-layer keep budget (P0-3a): a budget-driven stage gets a non-zero target_len
                 // (the `.max(1)` floor in budget_for is the wipe guard).
-                let target_len = self.budget_for(cache.current_pos());
-                let sctx = ScalarStageCtx::from_cache(cache, target_len, layer_idx, n_layers);
+                let target_len = self.budget_for(current_pos);
+                let max_seq = cache.max_seq_len;
+                // Read ctx backed by owned snapshots (NOT the cache) — coexists with the &mut handle:
+                // it borrows the score snapshots captured above (entry frame, T-3), never the cache.
+                let sctx = SnapshotStageCtx {
+                    current_pos,
+                    target_len,
+                    layer_idx,
+                    n_layers,
+                    n_kv_heads: cache.kv_heads(),
+                    head_dim: cache.head_dim(),
+                    on_device: cache.k_buffer.buffer().is_gpu_buffer(),
+                    importance: importance.as_deref(),
+                    score_handle: head_scores.as_deref().map(|data| ScalarSnapHandle {
+                        data,
+                        rows: current_pos,
+                        max_seq,
+                    }),
+                    attn_handle: last_attn.as_deref().map(|data| ScalarSnapHandle {
+                        data,
+                        rows: current_pos,
+                        max_seq,
+                    }),
+                };
                 let mut handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
                 self.stage.on_phase(&sctx, &mut handle).map_err(|e| {
                     anyhow::anyhow!("mutation stage '{}' failed: {e}", self.stage.name())
@@ -249,6 +369,8 @@ impl PipelineStage for KVMutationDriverStage {
             f.put_inner(c);
         }
         result?;
+        // Reset scores after a successful eviction (KV geometry changed → prior scores stale).
+        self.reset_scores();
         Ok(StageOutcome::Consumed)
     }
 }
@@ -387,7 +509,7 @@ mod tests {
 
         // Reference cache: streaming plan -> execute_kv_plan (v2).
         let mut cache_v2 = make_cache(dtype);
-        let sctx = ScalarStageCtx::from_cache(&cache_v2, 0, 0, 1);
+        let sctx = SnapshotStageCtx::from_cache(&cache_v2, 0, 0, 1);
         let plan: KVCachePlan = (reg.make)(params)
             .plan(&sctx)
             .expect("streaming evicts at resident > sink+window");
@@ -547,6 +669,113 @@ mod tests {
         let mut c = make_cache(DType::F32);
         c.set_current_pos(resident);
         c
+    }
+
+    /// An F32 SeqMajor cache with `resident` tokens where every element of position `p` is `p`
+    /// (so a survivor's original position is read directly off `k_buffer` after compaction).
+    fn make_int_cache(resident: usize) -> KVCache {
+        let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let sh = Shape::new(vec![1, MAX_SEQ, KV_HEADS, HD]);
+        let total = MAX_SEQ * KV_HEADS * HD;
+        let mut c = KVCache::new(
+            Tensor::new(
+                sh.clone(),
+                Arc::new(SharedBuffer::new(total * 4, DType::F32)),
+                be.clone(),
+            ),
+            Tensor::new(sh, Arc::new(SharedBuffer::new(total * 4, DType::F32)), be),
+            MAX_SEQ,
+        );
+        c.set_current_pos(resident);
+        for pos in 0..resident {
+            for head in 0..KV_HEADS {
+                let off = c.offset(pos, head);
+                let kb = c.k_buffer.as_mut_slice::<f32>();
+                for d in 0..HD {
+                    kb[off + d] = pos as f32;
+                }
+                let vb = c.v_buffer.as_mut_slice::<f32>();
+                for d in 0..HD {
+                    vb[off + d] = pos as f32;
+                }
+            }
+        }
+        c
+    }
+
+    /// A score-based stage that keeps the top-`target_len` positions by `importance()` (h2o shape).
+    /// Reads scores through the ctx — the score-free fallback (no importance) would keep `[0..target)`.
+    struct ImportanceTopKStage;
+    impl KVMutationStage for ImportanceTopKStage {
+        fn name(&self) -> &str {
+            "test.importance_topk"
+        }
+        fn on_phase(
+            &self,
+            ctx: &dyn StageCtx,
+            cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            let pos = ctx.current_pos();
+            let target = ctx.target_len().min(pos);
+            let imp = ctx.importance().unwrap_or(&[]);
+            let mut idx: Vec<usize> = (0..pos).collect();
+            idx.sort_by(|&a, &b| {
+                imp.get(b)
+                    .unwrap_or(&0.0)
+                    .partial_cmp(imp.get(a).unwrap_or(&0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut keep: Vec<usize> = idx.into_iter().take(target).collect();
+            keep.sort_unstable();
+            cache.keep(&keep)
+        }
+    }
+
+    /// P0-3b: a score-based stage receives flat `importance()` through the driver's score_cell, and the
+    /// accumulator is reset after eviction. Scores favor positions {2,5}; budget 0.25*8=2 → exactly
+    /// those survive (the score-free fallback would keep {0,1}), proving importance reached the plugin.
+    /// Mutation-proof: dropping the score_cell wiring leaves importance None → survivors become {0,1}.
+    #[test]
+    fn importance_reaches_stage_and_resets() {
+        let handle = Arc::new(StandardFormat::new(0, make_int_cache(8)));
+        let mut acc = AttentionScoreAccumulator::new(MAX_SEQ, 1, 1, 1, 1.0);
+        acc.set_active(true);
+        let mut flat = vec![0.0f32; MAX_SEQ];
+        flat[2] = 10.0;
+        flat[5] = 9.0;
+        acc.import_gpu_scores(&flat, &[]);
+        let cell = Arc::new(Mutex::new(Some(acc)));
+
+        let driver = KVMutationDriverStage::new(
+            vec![handle.clone()],
+            Box::new(ImportanceTopKStage),
+            MutationPhase::KvMutate,
+            0.25,
+        )
+        .with_score_cell(cell.clone());
+        let mut profiler = OpProfiler::new();
+        let mut pctx = make_ctx(&mut profiler);
+        driver
+            .on_phase(&LifecyclePhase::KvMutate, &mut pctx)
+            .unwrap();
+
+        let inner = handle.take_inner();
+        assert_eq!(inner.current_pos(), 2, "budget 0.25 * 8 = 2");
+        let k = inner.k_buffer.as_slice::<f32>();
+        // Survivors compacted to the front: new pos 0 == original 2, new pos 1 == original 5.
+        assert_eq!(k[inner.offset(0, 0)], 2.0, "highest-importance pos 2 kept");
+        assert_eq!(k[inner.offset(1, 0)], 5.0, "second-importance pos 5 kept");
+
+        // reset-on-eviction: the accumulator's importance is cleared after a successful eviction.
+        let g = cell.lock().unwrap();
+        assert!(
+            g.as_ref()
+                .unwrap()
+                .importance_scores()
+                .iter()
+                .all(|&x| x == 0.0),
+            "scores reset after eviction (stale-score guard)"
+        );
     }
 
     /// P0-3 wipe guard: a budget-driven stage keeps `target_len = (pos * ratio).max(1)` tokens, NOT 0.
