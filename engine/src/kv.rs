@@ -40,6 +40,11 @@ pub mod descriptor;
 // Shared KV dequantization + similarity helpers (formerly in d2o_handler; weighted-merge was extracted to
 // the out-of-tree `d2o` plugin crate). Consumed by the StageCtx Key/Value handles + R-KV stage.
 pub(crate) mod dequant;
+// Oracle (R-1/R-2): a handle-INDEPENDENT naive reference for KV mutations, used by the byte/value
+// identity gates (it shares no code with compact_keep_positions / apply_weighted_merges /
+// EngineCacheHandle, so it is a non-tautological reference once `execute_kv_plan` is deleted).
+#[cfg(test)]
+pub(crate) mod naive_reference;
 // Pressure pipeline handlers (구 core/pressure/ 내용 flat 병합)
 pub mod eviction_handler;
 pub mod quantize_handler;
