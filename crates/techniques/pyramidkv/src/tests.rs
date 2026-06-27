@@ -397,6 +397,65 @@ fn v3_native_matches_v2_decision() {
     assert_eq!(h.kept, None, "per-head path uses keep_per_head, not keep");
 }
 
+/// v3 DECISION equivalence on the OTHER on_phase arms: the layer-wide degraded fallback (no PFA,
+/// flat importance) stages `cache.keep` matching the v2 plan; and the no-op (cr==0) stages nothing.
+#[test]
+fn v3_native_layerwide_and_noop_arms() {
+    let blob_args = cr_args("0.5", 8, 5, 20);
+    let blob: Vec<argus_extension_api::PluginArg> = blob_args
+        .iter()
+        .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
+        .collect();
+    let v3 = PyramidKv::new(PyramidKvConfig::from_args(StageParams::default(), &blob));
+
+    // (1) layer-wide fallback: no PFA but flat importance present → LayerWide keep.
+    let lw_ctx = Ctx {
+        current: 64,
+        target: 0,
+        layer_idx: 3,
+        n_layers: 16,
+        n_kv_heads: 4,
+        pfa: None,
+        importance: Some((0..64).map(|i| (i % 11) as f32).collect()),
+    };
+    let v2_lw = match make_pyramidkv(&blob_args).plan(&lw_ctx).unwrap().keep {
+        KeepSpec::LayerWide(k) => k,
+        KeepSpec::PerHead(_) => panic!("no-PFA fallback is layer-wide"),
+    };
+    let mut h = CaptureHandle {
+        cur: 64,
+        n_kv: 4,
+        ..Default::default()
+    };
+    <PyramidKv as KVMutationStage>::on_phase(&v3, &lw_ctx, &mut h).unwrap();
+    assert_eq!(h.kept, Some(v2_lw));
+    assert_eq!(h.kept_per_head, None, "fallback uses layer-wide keep");
+
+    // (2) no-op: compression_ratio == 0 (no explicit cr, no target) → plan None, on_phase stages nothing.
+    let noop_v3 = PyramidKv::new(PyramidKvConfig::from_args(StageParams::default(), &[]));
+    let noop_ctx = Ctx {
+        current: 64,
+        target: 0,
+        layer_idx: 0,
+        n_layers: 16,
+        n_kv_heads: 4,
+        pfa: None,
+        importance: None,
+    };
+    assert!(
+        make_pyramidkv(&[]).plan(&noop_ctx).is_none(),
+        "cr==0 → no-op plan"
+    );
+    let mut h2 = CaptureHandle {
+        cur: 64,
+        n_kv: 4,
+        ..Default::default()
+    };
+    <PyramidKv as KVMutationStage>::on_phase(&noop_v3, &noop_ctx, &mut h2).unwrap();
+    assert_eq!(h2.kept, None);
+    assert_eq!(h2.kept_per_head, None);
+}
+
 // ── 5. edge cases / fallbacks ────────────────────────────────────────────────
 
 #[test]

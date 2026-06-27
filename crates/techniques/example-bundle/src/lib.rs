@@ -135,7 +135,125 @@ argus_extension_api::register_kv_mutation_stage!(
 
 #[cfg(test)]
 mod tests {
-    use argus_extension_api::{find_kv_format, find_stage};
+    use super::*;
+    use argus_extension_api::{TensorHandle, TensorKind, find_kv_format, find_stage};
+
+    /// Minimal ctx — both bundle stages read only current_pos / target_len / n_kv_heads.
+    struct Ctx {
+        cur: usize,
+        tgt: usize,
+        n_kv: usize,
+    }
+    impl StageCtx for Ctx {
+        fn current_pos(&self) -> usize {
+            self.cur
+        }
+        fn target_len(&self) -> usize {
+            self.tgt
+        }
+        fn layer_idx(&self) -> usize {
+            0
+        }
+        fn importance(&self) -> Option<&[f32]> {
+            None
+        }
+        fn n_kv_heads(&self) -> usize {
+            self.n_kv
+        }
+        fn head_dim(&self) -> usize {
+            1
+        }
+        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+            None
+        }
+    }
+
+    /// A mock [`CacheHandle`] capturing keep / keep_per_head.
+    #[derive(Default)]
+    struct CaptureHandle {
+        kept: Option<Vec<usize>>,
+        kept_per_head: Option<Vec<Vec<usize>>>,
+    }
+    impl CacheHandle for CaptureHandle {
+        fn current_pos(&self) -> usize {
+            100
+        }
+        fn n_kv_heads(&self) -> usize {
+            2
+        }
+        fn head_dim(&self) -> usize {
+            1
+        }
+        fn kv_on_device(&self) -> bool {
+            false
+        }
+        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+            None
+        }
+        fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
+            self.kept = Some(keep.to_vec());
+            Ok(())
+        }
+        fn keep_per_head(&mut self, keep: &[&[usize]]) -> Result<(), CacheOpError> {
+            self.kept_per_head = Some(keep.iter().map(|h| h.to_vec()).collect());
+            Ok(())
+        }
+        fn merge(
+            &mut self,
+            _merges: &[argus_extension_api::WeightedMerge],
+        ) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn reencode(&mut self, _target: argus_extension_api::FormatId) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn transition_quant_bits(&mut self, _bits: u8) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn offload(&mut self, _prefix_len: usize) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn recall(&mut self) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+    }
+
+    /// DECISION equivalence: each bundle stage's v3 on_phase stages exactly what its v2 plan returns
+    /// (BundleKeep -> LayerWide keep; BundlePerHead -> per-head keep), including the no-op case.
+    #[test]
+    fn bundle_v3_matches_v2_decision() {
+        // BundleKeep: LayerWide.
+        let ctx = Ctx {
+            cur: 100,
+            tgt: 30,
+            n_kv: 2,
+        };
+        let v2_keep = match BundleKeep.plan(&ctx).unwrap().keep {
+            KeepSpec::LayerWide(k) => k,
+            KeepSpec::PerHead(_) => panic!("bundle_keep is layer-wide"),
+        };
+        let mut h = CaptureHandle::default();
+        <BundleKeep as KVMutationStage>::on_phase(&BundleKeep, &ctx, &mut h).unwrap();
+        assert_eq!(h.kept, Some(v2_keep));
+        // BundlePerHead: PerHead.
+        let v2_heads = match BundlePerHead.plan(&ctx).unwrap().keep {
+            KeepSpec::PerHead(h) => h,
+            KeepSpec::LayerWide(_) => panic!("bundle_perhead is per-head"),
+        };
+        let mut h2 = CaptureHandle::default();
+        <BundlePerHead as KVMutationStage>::on_phase(&BundlePerHead, &ctx, &mut h2).unwrap();
+        assert_eq!(h2.kept_per_head, Some(v2_heads));
+        // no-op (within budget) stages nothing for either.
+        let noop = Ctx {
+            cur: 20,
+            tgt: 30,
+            n_kv: 2,
+        };
+        let mut h3 = CaptureHandle::default();
+        <BundleKeep as KVMutationStage>::on_phase(&BundleKeep, &noop, &mut h3).unwrap();
+        assert_eq!(h3.kept, None);
+        assert!(BundleKeep.plan(&noop).is_none());
+    }
 
     #[test]
     fn bundle_registers_both_axes() {
