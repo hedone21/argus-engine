@@ -17,9 +17,10 @@
 //! (plan-returning, D1). It never references engine types (`KVCache`/`Backend`).
 
 use argus_extension_api::{
-    EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, KeepTopK,
-    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
-    compile_keep_top_k, redistribute_value,
+    CacheHandle, CacheOpError, EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage,
+    KVCacheStageReg, KVMutationStage, KeepSpec, KeepTopK, MutationPhase, QCF_ESTIMATORS,
+    QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams, compile_keep_top_k,
+    redistribute_value, register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
 
@@ -37,42 +38,70 @@ impl StreamingLlm {
             window_size: window_size.max(1),
         }
     }
+
+    /// The 3-partition shape (sink prefix + recent window, score-free) to keep, or `None` when already
+    /// within budget (a no-op). Shared by the v3 `on_phase` and the v2 `plan` so they decide
+    /// identically — when `target_len` is specified and smaller than `sink + window`, the recent
+    /// window shrinks to fit (minimum 1).
+    fn keep_spec(&self, current: usize, target: usize) -> Option<KeepTopK> {
+        let keep = self.sink_size + self.window_size;
+        let effective_window = if target > 0 && target < keep {
+            target.saturating_sub(self.sink_size).max(1)
+        } else {
+            self.window_size
+        };
+        if current <= self.sink_size + effective_window {
+            return None; // within budget — no-op
+        }
+        Some(KeepTopK {
+            current,
+            prefix: self.sink_size,
+            recent: effective_window,
+            heavy: 0,
+        })
+    }
 }
+
+// ── v3 native (imperative) surface — the production path ──
+
+impl KVMutationStage for StreamingLlm {
+    fn name(&self) -> &str {
+        "streaming"
+    }
+
+    /// Keep `[0..sink) ∪ [recent_start..current)` via the T1 compiler (score-free), or no-op when
+    /// within budget. Byte-identical to the v2 plan (both route through the same `keep_spec`).
+    fn on_phase(
+        &self,
+        ctx: &dyn StageCtx,
+        cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        match self.keep_spec(ctx.current_pos(), ctx.target_len()) {
+            Some(spec) => cache.keep_top_k(spec, &|_| 0.0),
+            None => Ok(()),
+        }
+    }
+}
+
+register_kv_mutation_stage!(
+    "streaming",
+    |p| Box::new(StreamingLlm::new(p.sink_size, p.streaming_window)),
+    MutationPhase::KvMutate
+);
+
+// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
 
 impl KVCacheStage for StreamingLlm {
     fn name(&self) -> &str {
         "streaming"
     }
 
-    /// Keep `[0..sink_size) ∪ [recent_start..current)`. When `target_len` is specified and
-    /// smaller than `sink + window`, the recent window shrinks to fit (minimum 1). Returns
-    /// `None` when already within budget — a no-op, equivalent to the engine's full-keep plan.
+    /// Keep `[0..sink_size) ∪ [recent_start..current)`. Returns `None` when already within budget.
+    /// Decides via the shared `keep_spec`, so it is byte-identical to the v3 `on_phase`.
     fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-        let current = ctx.current_pos();
-        let target = ctx.target_len();
-        let keep = self.sink_size + self.window_size;
-
-        let effective_window = if target > 0 && target < keep {
-            target.saturating_sub(self.sink_size).max(1)
-        } else {
-            self.window_size
-        };
-        let effective_keep = self.sink_size + effective_window;
-
-        if current <= effective_keep {
-            return None; // within budget — no-op
-        }
-
+        let spec = self.keep_spec(ctx.current_pos(), ctx.target_len())?;
         // prefix(sink) + recent window, score-free (heavy 0) — routed through the T1 compiler.
-        let keep_list = compile_keep_top_k(
-            KeepTopK {
-                current,
-                prefix: self.sink_size,
-                recent: effective_window,
-                heavy: 0,
-            },
-            |_| 0.0,
-        );
+        let keep_list = compile_keep_top_k(spec, |_| 0.0);
         Some(KVCachePlan {
             keep: KeepSpec::LayerWide(keep_list),
             merges: Vec::new(),
@@ -195,6 +224,84 @@ mod tests {
     fn registers_into_slice() {
         let reg = find_stage("streaming").expect("streaming registered in KV_CACHE_STAGES");
         assert_eq!(reg.name, "streaming");
+    }
+
+    /// A mock [`CacheHandle`] that records the keep-set staged by `keep` (the default `keep_top_k`
+    /// routes through it). Only the read scalars the stage uses + `keep` are meaningful.
+    struct CaptureHandle {
+        cur: usize,
+        kept: Option<Vec<usize>>,
+    }
+    impl CacheHandle for CaptureHandle {
+        fn current_pos(&self) -> usize {
+            self.cur
+        }
+        fn n_kv_heads(&self) -> usize {
+            1
+        }
+        fn head_dim(&self) -> usize {
+            4
+        }
+        fn kv_on_device(&self) -> bool {
+            false
+        }
+        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+            None
+        }
+        fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
+            self.kept = Some(keep.to_vec());
+            Ok(())
+        }
+        fn keep_per_head(&mut self, _keep: &[&[usize]]) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn merge(
+            &mut self,
+            _merges: &[argus_extension_api::WeightedMerge],
+        ) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn reencode(&mut self, _target: argus_extension_api::FormatId) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn transition_quant_bits(&mut self, _bits: u8) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn offload(&mut self, _prefix_len: usize) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn recall(&mut self) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+    }
+
+    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages exactly the same
+    /// keep-set the v2 `plan` returns (both route through `keep_spec` → `compile_keep_top_k`), and a
+    /// within-budget call stages nothing. (The engine-side byte-identical compaction is covered by the
+    /// driver tests + the naive-reference oracle.)
+    #[test]
+    fn v3_native_matches_v2_decision() {
+        use argus_extension_api::find_mutation_stage;
+        let reg = find_mutation_stage("streaming").expect("streaming in KV_MUTATION_STAGES");
+        assert_eq!(reg.name, "streaming");
+        assert_eq!(reg.phase, MutationPhase::KvMutate);
+        let stage = (reg.make)(StageParams::default(), &[]);
+        assert_eq!(stage.name(), "streaming");
+
+        let s = StreamingLlm::new(4, 6);
+        for (cur, tgt) in [
+            (15usize, 0usize),
+            (11, 0),
+            (20, 7),
+            (20, 2),
+            (8, 0),
+            (10, 0),
+        ] {
+            let mut h = CaptureHandle { cur, kept: None };
+            s.on_phase(&Ctx { cur, tgt }, &mut h).unwrap();
+            // v3-staged keep == v2 plan keep (None ⇒ nothing staged).
+            assert_eq!(h.kept, keep_of(&s, cur, tgt), "cur={cur} tgt={tgt}");
+        }
     }
 
     // ── keep-list spec, ported verbatim from the original engine streaming_llm.rs unit tests ──
