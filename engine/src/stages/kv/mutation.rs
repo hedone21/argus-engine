@@ -110,25 +110,22 @@ impl StageCtx for ScalarStageCtx {
 
 /// Adapts a plan-returning [`KVCacheStage`] to the imperative [`KVMutationStage`] by applying its
 /// plan through the transactional [`CacheHandle`]. This is the bridge that makes the byte-identical
-/// gate faithful: the same plugin's plan drives both `execute_kv_plan` and the handle.
+/// gate faithful: the same plugin's plan drives both `execute_kv_plan` and the handle. The firing
+/// phase is owned by [`KVMutationDriverStage`] (from the registration), not the adapter.
 pub struct PlanStageAdapter {
     inner: Box<dyn KVCacheStage>,
-    phase: MutationPhase,
 }
 
 impl PlanStageAdapter {
-    /// Wrap a plan-returning stage, firing at `phase`.
-    pub fn new(inner: Box<dyn KVCacheStage>, phase: MutationPhase) -> Self {
-        Self { inner, phase }
+    /// Wrap a plan-returning stage.
+    pub fn new(inner: Box<dyn KVCacheStage>) -> Self {
+        Self { inner }
     }
 }
 
 impl KVMutationStage for PlanStageAdapter {
     fn name(&self) -> &str {
         self.inner.name()
-    }
-    fn phase(&self) -> MutationPhase {
-        self.phase
     }
     fn on_phase(
         &self,
@@ -165,12 +162,25 @@ pub struct KVMutationDriverStage {
     handles: Vec<Arc<StandardFormat>>,
     /// The imperative mutation callback this driver runs.
     stage: Box<dyn KVMutationStage>,
+    /// The lifecycle phase this driver fires its stage at — taken from the stage's registration
+    /// (`MutationStageReg.phase`, the single source of truth). The trait has no `phase()` method, so
+    /// the registered placement phase and the runtime firing phase are the same value by construction.
+    phase: MutationPhase,
 }
 
 impl KVMutationDriverStage {
-    /// `handles` enumerate order must equal layer idx. `stage` is the mutation callback.
-    pub fn new(handles: Vec<Arc<StandardFormat>>, stage: Box<dyn KVMutationStage>) -> Self {
-        Self { handles, stage }
+    /// `handles` enumerate order must equal layer idx. `stage` is the mutation callback; `phase` is its
+    /// registered firing phase (`MutationStageReg.phase`).
+    pub fn new(
+        handles: Vec<Arc<StandardFormat>>,
+        stage: Box<dyn KVMutationStage>,
+        phase: MutationPhase,
+    ) -> Self {
+        Self {
+            handles,
+            stage,
+            phase,
+        }
     }
 }
 
@@ -188,8 +198,8 @@ impl PipelineStage for KVMutationDriverStage {
         phase: &LifecyclePhase,
         _ctx: &mut StageContext<'_>,
     ) -> anyhow::Result<StageOutcome> {
-        // self-filter: only the stage's declared phase.
-        if *phase != lifecycle_of(self.stage.phase()) {
+        // self-filter: only the stage's registered phase (the single placement source of truth).
+        if *phase != lifecycle_of(self.phase) {
             return Ok(StageOutcome::Continue);
         }
 
@@ -369,10 +379,8 @@ mod tests {
         let handle = Arc::new(StandardFormat::new(0, cache_h));
         let driver = KVMutationDriverStage::new(
             vec![handle.clone()],
-            Box::new(PlanStageAdapter::new(
-                (reg.make)(params),
-                MutationPhase::KvMutate,
-            )),
+            Box::new(PlanStageAdapter::new((reg.make)(params))),
+            MutationPhase::KvMutate,
         );
         let mut profiler = OpProfiler::new();
         let mut pctx = make_ctx(&mut profiler);

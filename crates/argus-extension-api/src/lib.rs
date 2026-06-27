@@ -742,11 +742,16 @@ pub trait CacheHandle {
 /// The imperative sibling of [`KVCacheStage`] — a callback that drives a transactional
 /// [`CacheHandle`] at a [`MutationPhase`]. Additive: a technique implements EITHER this or the
 /// plan-returning [`KVCacheStage`], whichever its mutation shape fits.
+///
+/// The stage's lifecycle [`MutationPhase`] is NOT a trait method — it is declared once, at
+/// registration, on [`MutationStageReg::phase`] (the single source of truth the engine reads
+/// pre-`make` to place the stage). Carrying it on the trait too would let the registered phase and a
+/// `phase()` return value disagree — the engine placing the stage at one phase while a driver
+/// self-filters on the other, firing it at no phase. Keeping phase on the registration alone makes
+/// that mismatch unrepresentable.
 pub trait KVMutationStage: Send + Sync {
     /// The technique name (unique within the mutation-stage slice; CLI selector / logging).
     fn name(&self) -> &str;
-    /// The lifecycle phase this stage fires at.
-    fn phase(&self) -> MutationPhase;
     /// Drive the cache through the transactional handle. Reads observe the pre-callback frame; staged
     /// position-mutating ops are committed once when this returns `Ok`. An `Err` aborts the whole
     /// transaction (T-8: bytes untouched).
@@ -856,18 +861,29 @@ pub struct MutationStageReg {
     /// Capabilities the engine reads pre-`make` ([`StageCaps`]) — score reads, default protected
     /// prefix, merge-emitting. Read via [`mutation_stage_caps`] so consumers never name a plugin.
     pub caps: StageCaps,
-    /// The lifecycle phase this stage fires at ([`MutationPhase`]). Carried in the registration so the
-    /// engine can place the stage (PrefillEnd vs KvMutate) before instantiating it.
+    /// The lifecycle phase this stage fires at ([`MutationPhase`]) — the SINGLE source of truth for
+    /// placement. The engine reads it pre-`make` to place the stage (PrefillEnd vs KvMutate); the
+    /// driver fires the made stage at the SAME phase. [`KVMutationStage`] deliberately has no `phase()`
+    /// method, so the registered phase and the runtime phase can never disagree.
     pub phase: MutationPhase,
 }
 
 /// The global mutation-stage registration slice — gathered at link time from all linked technique
-/// crates (mirror of [`KV_CACHE_STAGES`]). Release builds assert via a startup self-test that every
-/// expected technique is registered (fat-LTO + `--gc-sections` may drop unreferenced sections).
+/// crates (mirror of [`KV_CACHE_STAGES`]). fat-LTO + `--gc-sections` may drop unreferenced sections,
+/// so the engine force-links every technique crate; the startup self-test that asserts every expected
+/// technique is registered lands with the production driver wiring (the mirror of
+/// `ensure_builtin_stages_registered`).
 #[distributed_slice]
 pub static KV_MUTATION_STAGES: [MutationStageReg] = [..];
 
 /// Finds a registered mutation-stage technique by name (used at engine construction).
+///
+/// During the v2→v3 migration window both [`KV_CACHE_STAGES`] (plan path) and [`KV_MUTATION_STAGES`]
+/// (this slice) may carry the SAME technique name. The selector namespace
+/// (`eviction plugin --name <name>`) is shared, so the engine resolver MUST prefer this v3 slice (the
+/// migration target) over the v2 one when a name resolves in both — `find_mutation_stage` first, then
+/// `find_stage` as the legacy fallback. (The precedence is enforced engine-side at the selection seam;
+/// these two lookups stay independent.)
 pub fn find_mutation_stage(name: &str) -> Option<&'static MutationStageReg> {
     KV_MUTATION_STAGES.iter().find(|r| r.name == name)
 }
@@ -887,29 +903,31 @@ pub fn mutation_stage_caps(name: &str) -> Option<StageCaps> {
 /// Static registration macro for an imperative [`KVMutationStage`] technique (static-linkme only — no
 /// `.so` C-ABI for the imperative path). The v3 counterpart of [`register_kv_stage!`].
 ///
-/// Two forms:
-/// - 2-arg `($name, $make)` — register a score-free, drop-only `KvMutate` stage (the common case);
-///   `$make` is `fn(StageParams) -> Box<dyn KVMutationStage>` (closures allowed) and the macro wires
-///   an args-ignoring shim.
-/// - 4-arg `($name, $make, $caps, $phase)` — declare explicit [`StageCaps`] / [`MutationPhase`];
-///   `$make` is `fn(StageParams, StageArgs) -> Box<dyn KVMutationStage>` (receives private args).
+/// Two forms — **`$phase` is always explicit** (there is no defaulting form: phase is the placement
+/// source the engine reads pre-`make`, so a silent default would mis-place a `PrefillEnd` technique):
+/// - 3-arg `($name, $make, $phase)` — a score-free, drop-only stage; `$make` is
+///   `fn(StageParams) -> Box<dyn KVMutationStage>` (closures allowed) and the macro wires an
+///   args-ignoring shim. Caps default to [`StageCaps::SCORE_FREE`].
+/// - 4-arg `($name, $make, $caps, $phase)` — declare explicit [`StageCaps`]; `$make` is
+///   `fn(StageParams, StageArgs) -> Box<dyn KVMutationStage>` (receives technique-private args).
 ///
 /// **Callable multiple times** within a single crate: every contributed static is isolated in an
 /// anonymous `const _: () = {}` scope so invocations do not collide (linkme does not rename a static
 /// element's ident, so scope isolation is the only workaround).
 ///
 /// ```ignore
-/// argus_extension_api::register_kv_mutation_stage!("no_eviction", |_p| Box::new(NoEviction));
+/// argus_extension_api::register_kv_mutation_stage!(
+///     "no_eviction", |_p| Box::new(NoEviction), MutationPhase::KvMutate);
 /// ```
 #[macro_export]
 macro_rules! register_kv_mutation_stage {
-    // ── score-free / KvMutate default (no private args) ──
-    ($name:literal, $make:expr) => {
+    // ── score-free form: args-free make + explicit phase (caps default to SCORE_FREE) ──
+    ($name:literal, $make:expr, $phase:expr) => {
         $crate::register_kv_mutation_stage!(
             $name,
             {
-                // args-ignoring shim: the 2-arg form takes no technique-private args, so the
-                // make_with_args shape drops the blob and delegates to the args-free `$make`.
+                // args-ignoring shim: the score-free form takes no technique-private args, so the
+                // make-with-args shape drops the blob and delegates to the args-free `$make`.
                 fn __mwa(
                     p: $crate::StageParams,
                     _args: $crate::StageArgs<'_>,
@@ -922,7 +940,7 @@ macro_rules! register_kv_mutation_stage {
                 __mwa
             },
             $crate::StageCaps::SCORE_FREE,
-            $crate::MutationPhase::KvMutate
+            $phase
         );
     };
     // ── full form: explicit args-aware make + caps + phase ──
@@ -3640,13 +3658,11 @@ mod tests {
     // ── v3 native registry (KV_MUTATION_STAGES) round-trip ──
 
     /// No-op imperative technique for verifying the mutation-stage registration/lookup round-trip.
+    /// Phase is declared at registration (no trait `phase()`), so the stage itself carries none.
     struct DummyMut;
     impl KVMutationStage for DummyMut {
         fn name(&self) -> &str {
             "dummy_mut"
-        }
-        fn phase(&self) -> MutationPhase {
-            MutationPhase::PrefillEnd
         }
         fn on_phase(
             &self,
@@ -3657,7 +3673,7 @@ mod tests {
         }
     }
 
-    // Registered via the full (4-arg) macro form to also exercise caps + phase carriage.
+    // Registered via the full (4-arg) macro form to exercise caps + phase carriage.
     register_kv_mutation_stage!(
         "dummy_mut",
         |_p, _args| Box::new(DummyMut),
@@ -3665,16 +3681,34 @@ mod tests {
         MutationPhase::PrefillEnd
     );
 
+    // Registered via the score-free (3-arg) macro form to compile-cover that arm + its args-ignoring
+    // shim + closure→fn coercion (the common case every migrated drop-only plugin uses).
+    register_kv_mutation_stage!(
+        "dummy_mut_sf",
+        |_p| Box::new(DummyMut),
+        MutationPhase::KvMutate
+    );
+
     #[test]
     fn dummy_mutation_registers_into_slice() {
         let reg = find_mutation_stage("dummy_mut")
             .expect("dummy_mut must be registered in the mutation slice");
         assert_eq!(reg.name, "dummy_mut");
+        // Phase is read from the registration (the SSOT) — the trait has no phase() method.
         assert_eq!(reg.phase, MutationPhase::PrefillEnd);
         assert_eq!(reg.caps, StageCaps::SCORE_FREE);
         let stage = (reg.make)(StageParams::default(), &[]);
         assert_eq!(stage.name(), "dummy_mut");
-        assert_eq!(stage.phase(), MutationPhase::PrefillEnd);
+    }
+
+    #[test]
+    fn dummy_mutation_score_free_3arg_form() {
+        // The 3-arg form: SCORE_FREE caps defaulted, explicit phase carried, args-ignoring shim built.
+        let reg = find_mutation_stage("dummy_mut_sf")
+            .expect("dummy_mut_sf (3-arg form) must be registered");
+        assert_eq!(reg.caps, StageCaps::SCORE_FREE);
+        assert_eq!(reg.phase, MutationPhase::KvMutate);
+        assert_eq!((reg.make)(StageParams::default(), &[]).name(), "dummy_mut");
     }
 
     #[test]
