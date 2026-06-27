@@ -11,12 +11,36 @@
 //! no-op and whose `plan_keep` retained the whole `[0..current)` range — a no-op compaction).
 
 use argus_extension_api::{
-    KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, StageCaps, StageCtx, StageParams,
+    CacheHandle, CacheOpError, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg,
+    KVMutationStage, MutationPhase, StageCaps, StageCtx, StageParams, register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
 
-/// The no-eviction stage. Stateless — `plan()` is always a no-op.
+/// The no-eviction stage. Stateless — never mutates the cache.
 struct NoEviction;
+
+// ── v3 native (imperative) surface — the production path ──
+
+impl KVMutationStage for NoEviction {
+    fn name(&self) -> &str {
+        "none"
+    }
+
+    /// Never evicts — stages nothing, so the transaction commits as a no-op and the cache is
+    /// untouched (the exact behavior of the old `NoEvictionPolicy`).
+    fn on_phase(
+        &self,
+        _ctx: &dyn StageCtx,
+        _cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        Ok(())
+    }
+}
+
+// v3 registration: the engine resolves this via `find_mutation_stage("none")`. Score-free, KvMutate.
+register_kv_mutation_stage!("none", |_p| Box::new(NoEviction), MutationPhase::KvMutate);
+
+// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
 
 impl KVCacheStage for NoEviction {
     fn name(&self) -> &str {
@@ -29,7 +53,7 @@ impl KVCacheStage for NoEviction {
     }
 }
 
-/// Registration — the engine finds this entry via `find_stage("none")`. It takes no parameters.
+/// v2 registration — the engine finds this entry via `find_stage("none")`. It takes no parameters.
 #[distributed_slice(KV_CACHE_STAGES)]
 static NONE: KVCacheStageReg = KVCacheStageReg {
     name: "none",
@@ -78,5 +102,19 @@ mod tests {
         assert_eq!(stage.name(), "none");
         // Even far over target, the plan is a no-op (None) — the cache is never pruned.
         assert!(stage.plan(&Ctx).is_none());
+    }
+
+    /// v3 native registration: "none" resolves in KV_MUTATION_STAGES (score-free, KvMutate) and the
+    /// made stage is a no-op (the byte-identical no-op-vs-naive-reference gate runs engine-side, where
+    /// the driver + oracle live).
+    #[test]
+    fn registers_into_mutation_slice() {
+        use argus_extension_api::{find_mutation_stage, mutation_stage_caps};
+        let reg = find_mutation_stage("none").expect("none registered in KV_MUTATION_STAGES");
+        assert_eq!(reg.name, "none");
+        assert_eq!(reg.phase, MutationPhase::KvMutate);
+        assert!(reg.caps.reads.is_empty());
+        assert!(mutation_stage_caps("none").is_some());
+        assert_eq!((reg.make)(StageParams::default(), &[]).name(), "none");
     }
 }
