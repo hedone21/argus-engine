@@ -176,26 +176,32 @@ impl<'a> EngineCacheHandle<'a> {
                 // P0-2: record the FINAL committed keep-set BEFORE compaction, so the dump's
                 // positions are absolute indices into the pre-eviction `[0, current_pos)` frame
                 // (reencode/merges above are position-preserving, so current_pos == entry_pos here).
-                // No-op unless ARGUS_DUMP_KEEPSET is set / in-memory capture is armed — keeps the
-                // commit path byte-identical otherwise. The v2 `execute_kv_plan` records the same way,
-                // so a handle-driven eviction appears in keepset dumps identically.
-                crate::kv::eviction::keepset_dump::record(
-                    self.cache,
-                    &KeepSpec::LayerWide(keep.clone()),
-                    self.layer_idx,
-                    self.n_layers,
-                );
+                // Gated on `is_active()` so the default disabled path neither allocates the KeepSpec
+                // nor calls record — keeping the commit byte-identical AND allocation-free (the v2
+                // `execute_kv_plan` borrows `&plan.keep` for free; here the keep is a staged `Vec`, so
+                // wrapping it in a KeepSpec would otherwise clone even with the dump off). When active,
+                // a handle-driven eviction appears in keepset dumps identically to the v2 path.
+                if crate::kv::eviction::keepset_dump::is_active() {
+                    crate::kv::eviction::keepset_dump::record(
+                        self.cache,
+                        &KeepSpec::LayerWide(keep.clone()),
+                        self.layer_idx,
+                        self.n_layers,
+                    );
+                }
                 self.cache.compact_keep_positions(&keep, 0)?;
                 self.cache.set_current_pos(keep.len());
                 self.mutated = true;
             }
             Some(Compaction::KeepPerHead(heads)) => {
-                crate::kv::eviction::keepset_dump::record(
-                    self.cache,
-                    &KeepSpec::PerHead(heads.clone()),
-                    self.layer_idx,
-                    self.n_layers,
-                );
+                if crate::kv::eviction::keepset_dump::is_active() {
+                    crate::kv::eviction::keepset_dump::record(
+                        self.cache,
+                        &KeepSpec::PerHead(heads.clone()),
+                        self.layer_idx,
+                        self.n_layers,
+                    );
+                }
                 let new_pos = heads.first().map_or(0, |h| h.len());
                 for (kv_head, keep) in heads.iter().enumerate() {
                     self.cache

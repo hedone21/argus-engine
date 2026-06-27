@@ -153,6 +153,16 @@ fn capture_if_armed(cache: &KVCache, keep_spec: &KeepSpec, layer_idx: usize) {
         });
 }
 
+/// Whether any keep-set dump sink is active: the file dump is configured (`ARGUS_DUMP_KEEPSET`) OR
+/// in-memory capture is armed. Lets a caller that would have to ALLOCATE to call [`record`] (e.g. the
+/// handle commit path, which must build a [`KeepSpec`] from its staged `Vec`) skip that allocation
+/// entirely on the default disabled path — keeping the commit byte-identical AND allocation-free when
+/// the dump is off. (The v2 `execute_kv_plan` caller already holds a `&KVCachePlan`, so it borrows
+/// `&plan.keep` for free and does not need this gate.)
+pub(crate) fn is_active() -> bool {
+    CAPTURE_ARMED.load(Ordering::Relaxed) || dump_path().is_some()
+}
+
 /// Record one layer's FINAL committed keep-set, then rewrite the dump file. No-op
 /// (cached env read) when `ARGUS_DUMP_KEEPSET` is unset. Call BEFORE compaction so
 /// `cache.current_pos()` is still the pre-eviction `seq_len` and the positions are
