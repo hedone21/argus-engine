@@ -829,6 +829,117 @@ pub fn keep_union(sets: &[&[usize]]) -> Vec<usize> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// v3 native registry — KV_MUTATION_STAGES (static-linkme only)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The imperative [`KVMutationStage`] sibling of the plan-returning [`KVCacheStage`] needs its own
+// registration slice so the engine can resolve a technique by name, read its [`StageCaps`] and
+// [`MutationPhase`] BEFORE instantiation, and drive it through the transactional [`CacheHandle`].
+// Mirrors [`KVCacheStageReg`] / [`KV_CACHE_STAGES`], but static-linkme only: no `.so` C-ABI is built
+// for the imperative path (a `CacheHandle` is a `&mut dyn` transaction engine, not a flat fn-ptr
+// table that a stable C-ABI could carry). Caps + phase are carried in the registration so the engine
+// reads them pre-`make`.
+
+/// The registration entry for one imperative mutation-stage technique. A technique crate submits it
+/// via `#[distributed_slice(KV_MUTATION_STAGES)] static FOO: MutationStageReg = ...` (or the
+/// [`register_kv_mutation_stage!`] macro). The sibling of [`KVCacheStageReg`] for the v3 imperative
+/// [`KVMutationStage`] surface.
+pub struct MutationStageReg {
+    /// The CLI selector name (`eviction plugin --name <name>`, or a built-in policy). Unique within
+    /// the slice.
+    pub name: &'static str,
+    /// The factory that builds a technique instance from the common parameters + the technique-private
+    /// [`StageArgs`] blob. (Unlike [`KVCacheStageReg`] there is no separate args-free `make`: the
+    /// imperative path always routes args, and the macro wires an args-ignoring shim for techniques
+    /// that take none.)
+    pub make: fn(StageParams, StageArgs<'_>) -> Box<dyn KVMutationStage>,
+    /// Capabilities the engine reads pre-`make` ([`StageCaps`]) — score reads, default protected
+    /// prefix, merge-emitting. Read via [`mutation_stage_caps`] so consumers never name a plugin.
+    pub caps: StageCaps,
+    /// The lifecycle phase this stage fires at ([`MutationPhase`]). Carried in the registration so the
+    /// engine can place the stage (PrefillEnd vs KvMutate) before instantiating it.
+    pub phase: MutationPhase,
+}
+
+/// The global mutation-stage registration slice — gathered at link time from all linked technique
+/// crates (mirror of [`KV_CACHE_STAGES`]). Release builds assert via a startup self-test that every
+/// expected technique is registered (fat-LTO + `--gc-sections` may drop unreferenced sections).
+#[distributed_slice]
+pub static KV_MUTATION_STAGES: [MutationStageReg] = [..];
+
+/// Finds a registered mutation-stage technique by name (used at engine construction).
+pub fn find_mutation_stage(name: &str) -> Option<&'static MutationStageReg> {
+    KV_MUTATION_STAGES.iter().find(|r| r.name == name)
+}
+
+/// All registered mutation-stage technique names (for self-test / diagnostics).
+pub fn registered_mutation_names() -> Vec<&'static str> {
+    KV_MUTATION_STAGES.iter().map(|r| r.name).collect()
+}
+
+/// The [`StageCaps`] of a statically registered mutation-stage technique, by name. `None` if the name
+/// is not a statically linked mutation stage. The lookup the engine CLI/chat/eval/bench paths use to
+/// read a stage's score-based-ness and default protected prefix without naming any plugin.
+pub fn mutation_stage_caps(name: &str) -> Option<StageCaps> {
+    find_mutation_stage(name).map(|r| r.caps)
+}
+
+/// Static registration macro for an imperative [`KVMutationStage`] technique (static-linkme only — no
+/// `.so` C-ABI for the imperative path). The v3 counterpart of [`register_kv_stage!`].
+///
+/// Two forms:
+/// - 2-arg `($name, $make)` — register a score-free, drop-only `KvMutate` stage (the common case);
+///   `$make` is `fn(StageParams) -> Box<dyn KVMutationStage>` (closures allowed) and the macro wires
+///   an args-ignoring shim.
+/// - 4-arg `($name, $make, $caps, $phase)` — declare explicit [`StageCaps`] / [`MutationPhase`];
+///   `$make` is `fn(StageParams, StageArgs) -> Box<dyn KVMutationStage>` (receives private args).
+///
+/// **Callable multiple times** within a single crate: every contributed static is isolated in an
+/// anonymous `const _: () = {}` scope so invocations do not collide (linkme does not rename a static
+/// element's ident, so scope isolation is the only workaround).
+///
+/// ```ignore
+/// argus_extension_api::register_kv_mutation_stage!("no_eviction", |_p| Box::new(NoEviction));
+/// ```
+#[macro_export]
+macro_rules! register_kv_mutation_stage {
+    // ── score-free / KvMutate default (no private args) ──
+    ($name:literal, $make:expr) => {
+        $crate::register_kv_mutation_stage!(
+            $name,
+            {
+                // args-ignoring shim: the 2-arg form takes no technique-private args, so the
+                // make_with_args shape drops the blob and delegates to the args-free `$make`.
+                fn __mwa(
+                    p: $crate::StageParams,
+                    _args: $crate::StageArgs<'_>,
+                ) -> ::std::boxed::Box<dyn $crate::KVMutationStage> {
+                    let f: fn(
+                        $crate::StageParams,
+                    ) -> ::std::boxed::Box<dyn $crate::KVMutationStage> = $make;
+                    f(p)
+                }
+                __mwa
+            },
+            $crate::StageCaps::SCORE_FREE,
+            $crate::MutationPhase::KvMutate
+        );
+    };
+    // ── full form: explicit args-aware make + caps + phase ──
+    ($name:literal, $make:expr, $caps:expr, $phase:expr) => {
+        const _: () = {
+            #[$crate::distributed_slice($crate::KV_MUTATION_STAGES)]
+            static __MREG: $crate::MutationStageReg = $crate::MutationStageReg {
+                name: $name,
+                make: $make,
+                caps: $caps,
+                phase: $phase,
+            };
+        };
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // GATE-C — Stage-axis `.so` cdylib dlopen plugin C-ABI
 // ════════════════════════════════════════════════════════════════════════════
 //
@@ -3524,6 +3635,57 @@ mod tests {
     #[test]
     fn registered_names_contains_dummy() {
         assert!(registered_names().contains(&"dummy"));
+    }
+
+    // ── v3 native registry (KV_MUTATION_STAGES) round-trip ──
+
+    /// No-op imperative technique for verifying the mutation-stage registration/lookup round-trip.
+    struct DummyMut;
+    impl KVMutationStage for DummyMut {
+        fn name(&self) -> &str {
+            "dummy_mut"
+        }
+        fn phase(&self) -> MutationPhase {
+            MutationPhase::PrefillEnd
+        }
+        fn on_phase(
+            &self,
+            _ctx: &dyn StageCtx,
+            _cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+    }
+
+    // Registered via the full (4-arg) macro form to also exercise caps + phase carriage.
+    register_kv_mutation_stage!(
+        "dummy_mut",
+        |_p, _args| Box::new(DummyMut),
+        StageCaps::SCORE_FREE,
+        MutationPhase::PrefillEnd
+    );
+
+    #[test]
+    fn dummy_mutation_registers_into_slice() {
+        let reg = find_mutation_stage("dummy_mut")
+            .expect("dummy_mut must be registered in the mutation slice");
+        assert_eq!(reg.name, "dummy_mut");
+        assert_eq!(reg.phase, MutationPhase::PrefillEnd);
+        assert_eq!(reg.caps, StageCaps::SCORE_FREE);
+        let stage = (reg.make)(StageParams::default(), &[]);
+        assert_eq!(stage.name(), "dummy_mut");
+        assert_eq!(stage.phase(), MutationPhase::PrefillEnd);
+    }
+
+    #[test]
+    fn mutation_registry_lookups() {
+        assert!(registered_mutation_names().contains(&"dummy_mut"));
+        assert_eq!(
+            mutation_stage_caps("dummy_mut"),
+            Some(StageCaps::SCORE_FREE)
+        );
+        assert!(mutation_stage_caps("not_a_stage").is_none());
+        assert!(find_mutation_stage("not_a_stage").is_none());
     }
 
     // ── GATE-C C-ABI round-trip (in-process verification without a `.so`) ──
