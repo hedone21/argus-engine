@@ -1,8 +1,9 @@
 //! HYBRID v3 — engine-side transaction engine for the imperative [`CacheHandle`] ABI.
 //!
 //! [`EngineCacheHandle`] is the engine's implementation of the additive
-//! [`argus_extension_api::CacheHandle`] surface (the M4 callback class, the imperative sibling of the
-//! plan-returning `KVCacheStage`). It is the *transaction* layer that makes imperative mutation sound:
+//! [`argus_extension_api::CacheHandle`] surface (the M4 callback class, the imperative surface a
+//! [`KVMutationStage`] mutates through). It is the *transaction* layer that makes imperative mutation
+//! sound:
 //!
 //! - **T-1 deferred-commit / single-renumber**: position-mutating ops (`keep`/`evict`/`keep_per_head`)
 //!   only *stage* an intent; the engine applies it once in [`EngineCacheHandle::commit`].
@@ -15,11 +16,11 @@
 //!   never stages and never mutates; `commit` then applies only pre-validated intents.
 //! - **T-9 cl_mem never exposed**: no op hands back a raw device buffer.
 //! - **T-10 keep hardening**: keep-lists are validated ascending + unique + in-range *before* any
-//!   mutation — closing the historical leaky-keep hole in `execute_kv_plan`.
+//!   mutation — closing the historical leaky-keep hole in the v2 plan executor.
 //!
 //! Every op routes to an EXISTING executor (`compact_keep_positions` / `compact_keep_positions_for_head`
 //! / `apply_weighted_merges` / `apply_format_plan`), so a handle-driven keep is byte-identical to the
-//! same keep applied through `execute_kv_plan` (the s1 gate).
+//! same keep applied through the v2 plan executor (the s1 gate).
 
 use crate::kv::kv_cache::KVCache;
 use crate::kv_cache_ops::KVLayout;
@@ -178,7 +179,7 @@ impl<'a> EngineCacheHandle<'a> {
                 // (reencode/merges above are position-preserving, so current_pos == entry_pos here).
                 // Gated on `is_active()` so the default disabled path neither allocates the KeepSpec
                 // nor calls record — keeping the commit byte-identical AND allocation-free (the v2
-                // `execute_kv_plan` borrows `&plan.keep` for free; here the keep is a staged `Vec`, so
+                // the v2 plan executor borrows `&plan.keep` for free; here the keep is a staged `Vec`, so
                 // wrapping it in a KeepSpec would otherwise clone even with the dump off). When active,
                 // a handle-driven eviction appears in keepset dumps identically to the v2 path.
                 if crate::kv::eviction::keepset_dump::is_active() {
@@ -563,7 +564,7 @@ mod tests {
     }
 
     /// A staged keep, when committed, applies via `compact_keep_positions` + `set_current_pos` — the
-    /// same executor `execute_kv_plan` uses. (The full streaming byte-identical gate lands with the
+    /// same executor the v2 plan executor uses. (The full streaming byte-identical gate lands with the
     /// driver in c3; this pins the commit path itself.)
     #[test]
     fn test_keep_commit_compacts() {
@@ -586,7 +587,7 @@ mod tests {
 
     /// P0-2: a keep committed through the handle records the FINAL keep-set into the keepset dump
     /// (in-memory capture), so a handle-driven eviction appears in dumps exactly as the v2
-    /// `execute_kv_plan` path does. Mutation-proof: removing the `keepset_dump::record` call from
+    /// the v2 plan executor path does. Mutation-proof: removing the `keepset_dump::record` call from
     /// `commit`'s Keep arm captures nothing for our fingerprint, failing the assert. Uses a unique
     /// `seq_len` (13) fingerprint + the capture serialization lock for determinism.
     #[test]

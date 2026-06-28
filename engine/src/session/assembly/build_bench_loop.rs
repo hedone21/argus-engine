@@ -49,7 +49,7 @@ pub struct SwapWiringConfig {
 }
 
 /// The `(name, StageParams, owned extra-args)` for the configured `eviction <policy>` — shared by the
-/// v2 [`build_resilience_cache_manager`] (which builds the v2 `KVCacheStage`) and the v3
+/// v2 [`build_resilience_cache_manager`] (which builds the v2 `KVMutationStage`) and the v3
 /// [`resolve_mutation_driver`] (which builds the v3 `KVMutationStage`) so a migrated technique's v3
 /// stage is constructed from byte-identical params to its v2 stage. The keep-set is then identical by
 /// the Phase-1 decision-equivalence gate, making the driver a faithful replacement for `EvictionStage`.

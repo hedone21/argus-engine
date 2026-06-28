@@ -6,12 +6,12 @@
 //! mutation ops on a per-layer [`EngineCacheHandle`], and the engine commits the transaction once per
 //! layer ([`EngineCacheHandle::commit`]).
 //!
-//! Because every handle op routes to the SAME executor `execute_kv_plan` uses
+//! Because every handle op routes to the SAME low-level executors
 //! (`compact_keep_positions` / `apply_weighted_merges` / `apply_format_plan`), a keep applied through
-//! this driver is **byte-identical** to the same keep applied through the plan executor (the s1 gate).
+//! this driver is **byte-identical** to the same keep applied directly (the byte-identity oracle).
 //! The handle commit path also emits the `keepset_dump` observability side-channel (P0-2), so a
-//! handle-driven eviction appears in `ARGUS_DUMP_KEEPSET` / the in-memory capture identically to the
-//! v2 `execute_kv_plan` path.
+//! handle-driven eviction appears in `ARGUS_DUMP_KEEPSET` / the in-memory capture identically to a
+//! direct executor call.
 //!
 //! Read/mutate aliasing: a mutation stage reads its cache state through a [`SnapshotStageCtx`] backed
 //! by OWNED snapshots captured in the entry frame BEFORE the handle is built — scalars + budget
@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, KVCacheStage, KVMutationStage, KeepSpec, MutationPhase, StageCaps,
-    StageCtx, TensorDtype, TensorHandle, TensorKind, TensorShape,
+    KVMutationStage, MutationPhase, StageCaps, StageCtx, TensorDtype, TensorHandle, TensorKind,
+    TensorShape,
 };
 use argus_shared::Level;
 
@@ -143,10 +143,69 @@ impl TensorHandle for PfaSnapHandle<'_> {
     }
 }
 
+/// A current-step Q snapshot handle (`tensor(Query)`), reading a borrowed `[n_kv_heads * head_dim]`
+/// f32 slice (`data[kv_head*head_dim + d]`, `shape = {rows:1, cols:head_dim, per_head:true}`). The
+/// read-stage's faithful current-Q (Quest); the mirror of the deleted `stage_registry::QueryHandle`.
+struct QuerySnapHandle<'a> {
+    data: &'a [f32],
+    head_dim: usize,
+}
+impl TensorHandle for QuerySnapHandle<'_> {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: 1,
+            cols: self.head_dim,
+            per_head: true,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        TensorDtype::F32
+    }
+    fn read_row(&self, _row: usize, kv_head: usize, out: &mut [f32]) {
+        let base = kv_head * self.head_dim;
+        let n = self.head_dim.min(out.len());
+        if base + n <= self.data.len() {
+            out[..n].copy_from_slice(&self.data[base..base + n]);
+        } else {
+            out[..n].fill(0.0);
+        }
+    }
+}
+
+/// A per-kv-head Q running mean/var snapshot handle (`tensor(QueryStats)`), reading a borrowed
+/// `[n_kv_heads * 2 * head_dim]` f32 slice (`data[kv_head*2*head_dim + stat_row*head_dim + d]`,
+/// `stat_row 0 = mean / 1 = var`; `shape = {rows:2, cols:head_dim, per_head:true}`). Dormant fallback
+/// (no production producer); the mirror of the deleted `stage_registry::QueryStatsHandle`.
+struct QueryStatsSnapHandle<'a> {
+    data: &'a [f32],
+    head_dim: usize,
+}
+impl TensorHandle for QueryStatsSnapHandle<'_> {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: 2, // row0 = mean, row1 = var.
+            cols: self.head_dim,
+            per_head: true,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        TensorDtype::F32
+    }
+    fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
+        let base = kv_head * 2 * self.head_dim + row * self.head_dim;
+        let n = self.head_dim.min(out.len());
+        if base + n <= self.data.len() {
+            out[..n].copy_from_slice(&self.data[base..base + n]);
+        } else {
+            out[..n].fill(0.0);
+        }
+    }
+}
+
 /// Dequantize the resident region of `cache`'s K (or V) into an owned `[n_kv_heads * rows * head_dim]`
 /// f32 snapshot (layout matching [`KvSnapHandle`]). Host-only — the caller must gate on
 /// `!kv_on_device()` (a device buffer has no host pointer to dequantize from).
-fn dequant_snapshot(
+pub(crate) fn dequant_snapshot(
     cache: &KVCache,
     rows: usize,
     n_kv_heads: usize,
@@ -190,6 +249,10 @@ pub struct SnapshotStageCtx<'a> {
     key_handle: Option<KvSnapHandle<'a>>,
     value_handle: Option<KvSnapHandle<'a>>,
     prefill_attn_handle: Option<PfaSnapHandle<'a>>,
+    /// (read seam) faithful current-step Q (`tensor(Query)`) — supplied only by [`Self::for_read`].
+    query_handle: Option<QuerySnapHandle<'a>>,
+    /// (read seam) dormant Q running mean/var (`tensor(QueryStats)`) — supplied only by [`Self::for_read`].
+    query_stats_handle: Option<QueryStatsSnapHandle<'a>>,
 }
 
 impl<'a> SnapshotStageCtx<'a> {
@@ -215,6 +278,8 @@ impl<'a> SnapshotStageCtx<'a> {
             key_handle: None,
             value_handle: None,
             prefill_attn_handle: None,
+            query_handle: None,
+            query_stats_handle: None,
         }
     }
 
@@ -237,6 +302,37 @@ impl<'a> SnapshotStageCtx<'a> {
                 cols: cache.current_pos(),
             }),
             ..Self::from_cache(cache, target_len, layer_idx, n_layers)
+        }
+    }
+
+    /// A read-stage ctx exposing `tensor(Key)`/`tensor(Value)` over owned dequant snapshots plus the
+    /// optional faithful current-Q (`tensor(Query)`) and dormant Q running-stats (`tensor(QueryStats)`).
+    /// Used by `StandardFormat::read_plan` (the W-DEVKV / Quest read seam). `cache` must be
+    /// host-resident; `key_snap`/`value_snap` are owned `[n_kv_heads * rows * head_dim]` dequant
+    /// snapshots the caller built from it via [`dequant_snapshot`] (same layout as [`KvSnapHandle`]).
+    pub fn for_read(
+        cache: &KVCache,
+        key_snap: &'a [f32],
+        value_snap: &'a [f32],
+        query: Option<&'a [f32]>,
+        query_stats: Option<&'a [f32]>,
+    ) -> Self {
+        let rows = cache.current_pos();
+        let head_dim = cache.head_dim();
+        Self {
+            key_handle: Some(KvSnapHandle {
+                data: key_snap,
+                rows,
+                head_dim,
+            }),
+            value_handle: Some(KvSnapHandle {
+                data: value_snap,
+                rows,
+                head_dim,
+            }),
+            query_handle: query.map(|data| QuerySnapHandle { data, head_dim }),
+            query_stats_handle: query_stats.map(|data| QueryStatsSnapHandle { data, head_dim }),
+            ..Self::from_cache(cache, 0, 0, 1)
         }
     }
 }
@@ -276,7 +372,11 @@ impl StageCtx for SnapshotStageCtx<'_> {
                 .prefill_attn_handle
                 .as_ref()
                 .map(|h| h as &dyn TensorHandle),
-            _ => None,
+            TensorKind::Query => self.query_handle.as_ref().map(|h| h as &dyn TensorHandle),
+            TensorKind::QueryStats => self
+                .query_stats_handle
+                .as_ref()
+                .map(|h| h as &dyn TensorHandle),
         }
     }
 }
@@ -349,6 +449,8 @@ pub(crate) fn drive_mutation_layer(
             head_dim,
         }),
         prefill_attn_handle: None,
+        query_handle: None,
+        query_stats_handle: None,
     };
     let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
     let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
@@ -366,52 +468,6 @@ pub(crate) fn drive_mutation_layer(
             "mutation stage '{}' panicked during on_phase/commit",
             stage.name()
         )),
-    }
-}
-
-/// Adapts a plan-returning [`KVCacheStage`] to the imperative [`KVMutationStage`] by applying its
-/// plan through the transactional [`CacheHandle`]. This is the bridge that makes the byte-identical
-/// gate faithful: the same plugin's plan drives both `execute_kv_plan` and the handle. The firing
-/// phase is owned by [`KVMutationDriverStage`] (from the registration), not the adapter.
-pub struct PlanStageAdapter {
-    inner: Box<dyn KVCacheStage>,
-}
-
-impl PlanStageAdapter {
-    /// Wrap a plan-returning stage.
-    pub fn new(inner: Box<dyn KVCacheStage>) -> Self {
-        Self { inner }
-    }
-}
-
-impl KVMutationStage for PlanStageAdapter {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-    fn on_phase(
-        &self,
-        ctx: &dyn StageCtx,
-        cache: &mut dyn CacheHandle,
-    ) -> Result<(), CacheOpError> {
-        let Some(plan) = self.inner.plan(ctx) else {
-            return Ok(()); // no-op plan
-        };
-        if plan.channels.is_some() {
-            // Channel-axis selection is a dormant geometry wall (common to the plan executor, which
-            // rejects `KVCachePlan.channels` for the same reason).
-            return Err(CacheOpError::GeometryImmutable);
-        }
-        if !plan.merges.is_empty() {
-            cache.merge(&plan.merges)?;
-        }
-        match &plan.keep {
-            KeepSpec::LayerWide(k) => cache.keep(k)?,
-            KeepSpec::PerHead(heads) => {
-                let refs: Vec<&[usize]> = heads.iter().map(|h| h.as_slice()).collect();
-                cache.keep_per_head(&refs)?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -490,8 +546,8 @@ impl KVMutationDriverStage {
 
     /// Enable the **standard-loop eviction mode** — the driver becomes a faithful drop-in for the
     /// pressure-driven [`EvictionStage::persistent`](super::eviction::EvictionStage), differing only in
-    /// that the keep-set is applied through the v3 [`CacheHandle`] (byte-identical to the v2
-    /// `execute_kv_plan` path, the Phase-1 gate) instead of `force_evict`. Sets the firing gate to
+    /// that the keep-set is applied through the v3 [`CacheHandle`] (byte-identical to the prior in-place
+    /// eviction it replaced, the Phase-1 gate) instead of `force_evict`. Sets the firing gate to
     /// `ctx.step.pressure.band() >= min_band` (episode edge-triggered) and folds in the CacheManager
     /// bookkeeping the v2 path owned: the `MIN_EVICT_TOKENS` budget guard, per-cache
     /// `release_unused_pages` (madvise), and `[CacheEvent]` logging. Without this builder the driver
@@ -699,13 +755,11 @@ impl PipelineStage for KVMutationDriverStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use argus_extension_api::{KVCachePlan, StageParams, find_stage};
+    use argus_extension_api::{CacheHandle, CacheOpError};
 
     use crate::backend::Backend;
     use crate::backend::cpu::CpuBackend;
     use crate::buffer::DType;
-    use crate::kv::eviction::stage_registry::execute_kv_plan;
     use crate::memory::host::shared::SharedBuffer;
     use crate::observability::profile::OpProfiler;
     use crate::pipeline::{Pressure, StepInfo};
@@ -718,8 +772,6 @@ mod tests {
     const KV_HEADS: usize = 2;
     const MAX_SEQ: usize = 32;
     const RESIDENT: usize = 20;
-    const SINK: usize = 4;
-    const WINDOW: usize = 6;
 
     /// Build a SeqMajor cache of `dtype` with a known per-(pos,head,d) pattern in the resident region
     /// of both K and V (V uses a distinct salt). The pattern is written as f32 then encoded to `dtype`,
@@ -811,143 +863,6 @@ mod tests {
             },
             profiler,
         }
-    }
-
-    /// The s1 gate: a StreamingLLM eviction applied through the handle driver is byte-identical to the
-    /// same plan applied through `execute_kv_plan`, for f32 / f16 / q4_0.
-    ///
-    /// Mutation-proof / non-tautological: both caches start byte-identical; only the application path
-    /// differs. The keep-set comes from the REAL `find_stage("streaming")` plugin (one plan instance
-    /// drives `execute_kv_plan`; a second identical instance drives the handle), so if the handle
-    /// commit diverged from the plan executor in ANY byte, the final-buffer comparison would fail.
-    fn streaming_handle_byte_identical(dtype: DType) {
-        let params = StageParams {
-            sink_size: SINK,
-            streaming_window: WINDOW,
-            ..Default::default()
-        };
-        let reg = find_stage("streaming").expect("streaming force-linked");
-
-        // Reference cache: streaming plan -> execute_kv_plan (v2).
-        let mut cache_v2 = make_cache(dtype);
-        let sctx = SnapshotStageCtx::from_cache(&cache_v2, 0, 0, 1);
-        let plan: KVCachePlan = (reg.make)(params)
-            .plan(&sctx)
-            .expect("streaming evicts at resident > sink+window");
-        execute_kv_plan(&mut cache_v2, &plan, 0, 1).unwrap();
-
-        // Handle cache: same streaming plugin driven through KVMutationDriverStage.
-        let cache_h = make_cache(dtype);
-        let handle = Arc::new(StandardFormat::new(0, cache_h));
-        // target_ratio=1.0 → budget = current_pos (no budget-driven shrink), so streaming keeps exactly
-        // sink+window just like the v2 reference (target_len=0) above — the application path is what's
-        // under test, and both sides produce the identical streaming plan.
-        let driver = KVMutationDriverStage::new(
-            vec![handle.clone()],
-            Box::new(PlanStageAdapter::new((reg.make)(params))),
-            MutationPhase::KvMutate,
-            1.0,
-        );
-        let mut profiler = OpProfiler::new();
-        let mut pctx = make_ctx(&mut profiler);
-        let outcome = driver
-            .on_phase(&LifecyclePhase::KvMutate, &mut pctx)
-            .unwrap();
-        assert!(matches!(outcome, StageOutcome::Continue)); // Persistent → stays resident
-        let cache_h = handle.take_inner();
-
-        // Same surviving token count, and byte-identical K and V buffers over the resident region.
-        assert_eq!(cache_v2.current_pos(), cache_h.current_pos());
-        let new_pos = cache_v2.current_pos();
-        assert!(new_pos < RESIDENT, "streaming must have evicted something");
-        for pos in 0..new_pos {
-            for head in 0..KV_HEADS {
-                let off = cache_v2.offset(pos, head);
-                assert_eq!(off, cache_h.offset(pos, head));
-                match dtype {
-                    DType::F32 => {
-                        let a = cache_v2.k_buffer.as_slice::<f32>();
-                        let b = cache_h.k_buffer.as_slice::<f32>();
-                        assert_eq!(
-                            a[off..off + HD],
-                            b[off..off + HD],
-                            "K pos {pos} head {head}"
-                        );
-                        let a = cache_v2.v_buffer.as_slice::<f32>();
-                        let b = cache_h.v_buffer.as_slice::<f32>();
-                        assert_eq!(
-                            a[off..off + HD],
-                            b[off..off + HD],
-                            "V pos {pos} head {head}"
-                        );
-                    }
-                    DType::F16 => {
-                        let a = cache_v2.k_buffer.as_slice::<f16>();
-                        let b = cache_h.k_buffer.as_slice::<f16>();
-                        assert_eq!(
-                            a[off..off + HD],
-                            b[off..off + HD],
-                            "K pos {pos} head {head}"
-                        );
-                        let a = cache_v2.v_buffer.as_slice::<f16>();
-                        let b = cache_h.v_buffer.as_slice::<f16>();
-                        assert_eq!(
-                            a[off..off + HD],
-                            b[off..off + HD],
-                            "V pos {pos} head {head}"
-                        );
-                    }
-                    DType::Q4_0 => {
-                        let bpp = HD / QK4_0;
-                        let bo = off / QK4_0;
-                        let a = cache_v2.k_buffer.as_slice::<BlockQ4_0>();
-                        let b = cache_h.k_buffer.as_slice::<BlockQ4_0>();
-                        for bi in 0..bpp {
-                            assert_eq!(
-                                a[bo + bi].d,
-                                b[bo + bi].d,
-                                "K q4 d pos {pos} head {head} blk {bi}"
-                            );
-                            assert_eq!(
-                                a[bo + bi].qs,
-                                b[bo + bi].qs,
-                                "K q4 qs pos {pos} head {head} blk {bi}"
-                            );
-                        }
-                        let a = cache_v2.v_buffer.as_slice::<BlockQ4_0>();
-                        let b = cache_h.v_buffer.as_slice::<BlockQ4_0>();
-                        for bi in 0..bpp {
-                            assert_eq!(
-                                a[bo + bi].d,
-                                b[bo + bi].d,
-                                "V q4 d pos {pos} head {head} blk {bi}"
-                            );
-                            assert_eq!(
-                                a[bo + bi].qs,
-                                b[bo + bi].qs,
-                                "V q4 qs pos {pos} head {head} blk {bi}"
-                            );
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn streaming_via_handle_byte_identical_f32() {
-        streaming_handle_byte_identical(DType::F32);
-    }
-
-    #[test]
-    fn streaming_via_handle_byte_identical_f16() {
-        streaming_handle_byte_identical(DType::F16);
-    }
-
-    #[test]
-    fn streaming_via_handle_byte_identical_q4_0() {
-        streaming_handle_byte_identical(DType::Q4_0);
     }
 
     /// A budget-driven mutation stage: keeps `[0..target_len)`. Stands in for the score-based class
@@ -1374,97 +1289,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// F4: a LayerWide keep + WeightedMerge plan (d2o shape) through the handle (merge + keep,
-    /// committed) is byte-identical to the same plan through execute_kv_plan — covering the
-    /// merge-commit arm the streaming gate (empty merges) never reached.
-    #[test]
-    fn merge_plan_via_handle_byte_identical() {
-        use argus_extension_api::{KVCachePlan, KeepSpec, MergeAxis, WeightedMerge};
-        let merges = vec![WeightedMerge {
-            into: 0,
-            into_weight: 0.5,
-            from: vec![(5, 0.5)],
-            apply_to: MergeAxis::Both,
-        }];
-        let keep: Vec<usize> = (0..RESIDENT).filter(|&p| p != 5).collect();
-
-        let mut cv2 = make_cache(DType::F32);
-        let plan = KVCachePlan {
-            keep: KeepSpec::LayerWide(keep.clone()),
-            merges: merges.clone(),
-            channels: None,
-        };
-        execute_kv_plan(&mut cv2, &plan, 0, 1).unwrap();
-
-        let mut ch = make_cache(DType::F32);
-        {
-            let mut h = EngineCacheHandle::new(&mut ch, 0, 1);
-            h.merge(&merges).unwrap();
-            h.keep(&keep).unwrap();
-            assert_eq!(h.commit().unwrap(), true);
-        }
-        assert_kv_byte_identical(&cv2, &ch);
-    }
-
-    /// F4: a PerHead keep plan on a HeadMajor cache through keep_per_head is byte-identical to the same
-    /// plan through execute_kv_plan — covering the per-head compaction arm.
-    #[test]
-    fn per_head_plan_via_handle_byte_identical() {
-        use crate::kv_cache_ops::KVLayout;
-        use argus_extension_api::{KVCachePlan, KeepSpec};
-        let build = || {
-            let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-            let sh = Shape::new(vec![1, MAX_SEQ, KV_HEADS, HD]);
-            let total = MAX_SEQ * KV_HEADS * HD;
-            let mut c = KVCache::new(
-                Tensor::new(
-                    sh.clone(),
-                    Arc::new(SharedBuffer::new(total * 4, DType::F32)),
-                    be.clone(),
-                ),
-                Tensor::new(sh, Arc::new(SharedBuffer::new(total * 4, DType::F32)), be),
-                MAX_SEQ,
-            )
-            .with_layout(KVLayout::HeadMajor);
-            c.set_current_pos(RESIDENT);
-            for pos in 0..RESIDENT {
-                for head in 0..KV_HEADS {
-                    let off = c.offset(pos, head);
-                    let kb = c.k_buffer.as_mut_slice::<f32>();
-                    for d in 0..HD {
-                        kb[off + d] = (pos * 100 + head * 10 + d) as f32;
-                    }
-                    let vb = c.v_buffer.as_mut_slice::<f32>();
-                    for d in 0..HD {
-                        vb[off + d] = (pos * 100 + head * 10 + d) as f32 - 0.25;
-                    }
-                }
-            }
-            c
-        };
-        // equal-length per-head keeps (the single shared current_pos invariant): 6 each.
-        let keep0: Vec<usize> = (0..RESIDENT).step_by(2).take(6).collect();
-        let keep1: Vec<usize> = (0..RESIDENT).skip(1).step_by(2).take(6).collect();
-        let heads = vec![keep0, keep1];
-
-        let mut cv2 = build();
-        let plan = KVCachePlan {
-            keep: KeepSpec::PerHead(heads.clone()),
-            merges: vec![],
-            channels: None,
-        };
-        execute_kv_plan(&mut cv2, &plan, 0, 1).unwrap();
-
-        let mut ch = build();
-        {
-            let mut h = EngineCacheHandle::new(&mut ch, 0, 1);
-            let refs: Vec<&[usize]> = heads.iter().map(|x| x.as_slice()).collect();
-            h.keep_per_head(&refs).unwrap();
-            assert_eq!(h.commit().unwrap(), true);
-        }
-        assert_kv_byte_identical(&cv2, &ch);
     }
 
     /// F4: a re-encode (f16 -> f32) through the handle commit is byte-identical to a direct

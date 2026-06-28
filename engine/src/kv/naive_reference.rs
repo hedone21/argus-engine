@@ -5,7 +5,7 @@
 //! way — sharing NO code with `compact_keep_positions` / `compact_keep_positions_for_head` /
 //! `apply_weighted_merges` / [`EngineCacheHandle`](crate::kv::cache_handle::EngineCacheHandle) (the
 //! mutation logic under test). That independence is what makes the byte/value-identity gates
-//! non-tautological once the v2 `execute_kv_plan` reference is deleted (Phase 2).
+//! non-tautological once the v2 plan executor reference is deleted (Phase 2).
 //!
 //! Comparison is at the VALUE level (dequantized f32). Reading the SOURCE (and the committed result)
 //! through the dequant codec is fine — the codec is not the mutation logic. The properties that hold:

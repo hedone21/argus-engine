@@ -1968,7 +1968,7 @@ impl SelectiveRead for StandardFormat {
         query: Option<&[f32]>,
         query_stats: Option<&[f32]>,
     ) -> Option<KVReadPlan> {
-        use crate::kv::eviction::stage_registry::KVStageCtx;
+        use crate::stages::kv::mutation::{SnapshotStageCtx, dequant_snapshot};
         let guard = self.inner.lock().unwrap();
         // W-DEVKV: read stage 가 K/V 내용을 읽으려면(`tensor(Key)`→dequantize_k→as_slice / gather)
         // host-resident 버퍼가 필요하다. **GPU 버퍼면(`is_gpu_buffer()` — device-only OpenCLBuffer /
@@ -1988,13 +1988,16 @@ impl SelectiveRead for StandardFormat {
         // read stage 는 budget(target_len) 을 읽지 않는다(읽기 범위 결정 ≠ keep budget). importance/
         // scores 미공급(None) — read stage 는 `tensor(Key)`/`tensor(Value)` 로 자기 page 메타를
         // incremental 갱신한다(D5). query_stats 는 dormant fallback(현재 production producer 없음).
+        // Build owned K/V dequant snapshots over the (host-resident) cache_ref, then a read ctx that
+        // exposes them as `tensor(Key)`/`tensor(Value)` plus the optional faithful current-Q
+        // (`tensor(Query)`, Quest's 정본 current-Q; `None` on proxy/offload → `tensor(Query)==None`,
+        // byte-identical disabled path) and the dormant `tensor(QueryStats)` fallback.
+        let rows = cache_ref.current_pos();
+        let n_kv_heads = cache_ref.kv_heads();
         let head_dim = cache_ref.head_dim();
-        let mut ctx = KVStageCtx::new(cache_ref, 0, None, None, None, query_stats);
-        // faithful: 현재 step Q `[n_kv_heads*head_dim]` 를 `tensor(Query)` 로 노출(Quest 정본 current-Q).
-        // `None`(proxy/offload) 이면 호출 안 함 → `tensor(Query)==None` (byte-identical disabled path).
-        if let Some(q) = query {
-            ctx = ctx.with_query(q, head_dim);
-        }
+        let key_snap = dequant_snapshot(cache_ref, rows, n_kv_heads, head_dim, true);
+        let value_snap = dequant_snapshot(cache_ref, rows, n_kv_heads, head_dim, false);
+        let ctx = SnapshotStageCtx::for_read(cache_ref, &key_snap, &value_snap, query, query_stats);
         rs.read_plan(&ctx)
     }
 }

@@ -127,7 +127,7 @@ pub fn build_standard_loop(
     // P0-5c/P0-6: the resolved v3 `KVMutationStage` for the chosen `eviction <policy>` (`Some` iff
     // `find_mutation_stage(name)`). When `Some`, a pressure-gated `KVMutationDriverStage` replaces the
     // v2 `EvictionStage` at KvMutate (MUTUALLY EXCLUSIVE — `cache_manager` is `None` then). Applies the
-    // keep-set through the v3 handle (byte-identical to `execute_kv_plan`, the Phase-1 gate).
+    // keep-set through the v3 handle (byte-identical to the v2 plan executor, the Phase-1 gate).
     mutation_driver: Option<MutationDriverSelection>,
     // force_evict target ratio(CLI `--eviction-target-ratio`). `cache_manager=None` 이면 무시.
     eviction_target_ratio: f32,
@@ -245,7 +245,7 @@ pub fn build_standard_loop(
     //
     // P0-5c/P0-6 selector (MUTUALLY EXCLUSIVE at KvMutate): a v3-native technique resolves to
     // `mutation_driver` → a pressure-gated [`KVMutationDriverStage`] applies the keep through the v3
-    // handle (byte-identical to the v2 `execute_kv_plan`). A non-v3 (`.so`) stage falls back to the v2
+    // handle (byte-identical to the v2 plan executor). A non-v3 (`.so`) stage falls back to the v2
     // [`EvictionStage`]. score-based(h2o/d2o)는 accumulator 가 필요해 argus-cli 진입부에서 reject —
     // 여기 도달하는 stage 는 항상 score-free, so the driver's score_cell stays `None` and no
     // `mutation_fired` (T-6) cell is needed: a position-SHRINKING keep is covered by the loop's

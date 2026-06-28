@@ -48,7 +48,7 @@ pub enum EvictionCmd {
 
     /// Plugin-supplied eviction stage, selected by registry name (the only stage selector — the
     /// stage-axis analogue of `--kv-format <name>`). Any technique crate registered statically
-    /// (linkme `KV_CACHE_STAGES`) or dynamically (`--load-plugin`) is selectable with no engine
+    /// (linkme `KV_MUTATION_STAGES`) or dynamically (`--load-plugin`) is selectable with no engine
     /// edit. CLI form: `eviction plugin --name <stage> [--set k=v]...`. Built-ins (sliding/
     /// streaming/h2o/h2o_plus/d2o) and feature-gated stages (caote/rkv) are selected the same way;
     /// a name the registry doesn't know (e.g. a feature-disabled stage) fails at construction.
@@ -70,7 +70,7 @@ impl EvictionCmd {
 }
 
 /// Plugin eviction-stage selector (the stage-axis analogue of `--kv-format <name>`).
-/// `--name <stage>` is resolved against the static `KV_CACHE_STAGES` + dynamic
+/// `--name <stage>` is resolved against the static `KV_MUTATION_STAGES` + dynamic
 /// (`--load-plugin`) registry via `make_stage`.
 #[derive(Args, Debug, Clone)]
 pub struct PluginArgs {
@@ -252,7 +252,7 @@ mod tests {
     // caote/rkv are now selected like any other stage: `eviction plugin --name caote|rkv`. There is
     // no typed subcommand, so the build-time clap-reject isolation moved to a RUNTIME registry miss
     // (B1-3): `plugin --name <name>` always parses; feature-OFF means the stage crate isn't linked,
-    // so `find_stage(name)` resolves to None and construction fails.
+    // so `find_mutation_stage(name)` resolves to None and construction fails.
 
     /// feature ON: caote is registered, so `plugin --name caote` resolves.
     #[cfg(feature = "caote")]
@@ -260,7 +260,7 @@ mod tests {
     fn caote_registered_when_feature_present() {
         let w = parse(&["plugin", "--name", "caote"]);
         assert_eq!(w.ev.as_ref().unwrap().policy_name(), "caote");
-        assert!(argus_extension_api::find_stage("caote").is_some());
+        assert!(argus_extension_api::find_mutation_stage("caote").is_some());
     }
 
     /// feature OFF: `plugin --name caote` parses, but the registry resolves to None (runtime miss
@@ -270,7 +270,7 @@ mod tests {
     fn caote_unregistered_when_feature_absent() {
         let w = parse(&["plugin", "--name", "caote"]);
         assert_eq!(w.ev.as_ref().unwrap().policy_name(), "caote");
-        assert!(argus_extension_api::find_stage("caote").is_none());
+        assert!(argus_extension_api::find_mutation_stage("caote").is_none());
     }
 
     /// feature ON: rkv measurement stage is registered.
@@ -279,7 +279,7 @@ mod tests {
     fn rkv_registered_when_feature_present() {
         let w = parse(&["plugin", "--name", "rkv"]);
         assert_eq!(w.ev.as_ref().unwrap().policy_name(), "rkv");
-        assert!(argus_extension_api::find_stage("rkv").is_some());
+        assert!(argus_extension_api::find_mutation_stage("rkv").is_some());
     }
 
     /// feature OFF: rkv unregistered → runtime registry miss (was a build-time clap reject — the
@@ -289,7 +289,7 @@ mod tests {
     fn rkv_unregistered_when_feature_absent() {
         let w = parse(&["plugin", "--name", "rkv"]);
         assert_eq!(w.ev.as_ref().unwrap().policy_name(), "rkv");
-        assert!(argus_extension_api::find_stage("rkv").is_none());
+        assert!(argus_extension_api::find_mutation_stage("rkv").is_none());
     }
 
     #[test]

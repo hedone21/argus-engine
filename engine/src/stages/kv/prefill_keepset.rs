@@ -2,12 +2,12 @@
 //!
 //! prefill 종료 시 1회 발화한다. `ModelForward` 가 채운 per-layer PFA(`[n_heads_q * prefix_len]`,
 //! SUM-pooled trailing-q_window attention 확률)를 공유 cell 에서 읽어, 등록된 plugin
-//! (`KVCacheStage`, `caps.reads ∋ PrefillAttention`)이 layer 별 keep-set plan 을 산출하고, 엔진이
-//! [`execute_kv_plan`] 으로 적용한다.
+//! (`KVMutationStage`, `caps.reads ∋ PrefillAttention`)이 layer 별 keep-set plan 을 산출하고, 엔진이
+//! the v2 plan executor 으로 적용한다.
 //!
 //! [`EvictionStage`](super::eviction::EvictionStage) 의 take_inner/put_inner UER 를 미러하되,
-//! CacheManager force_evict 대신 **plugin plan + `execute_kv_plan`** 경로를 쓴다(`KVStageCtx` 에 PFA
-//! 슬라이스 주입 → `plan(&ctx)` → `execute_kv_plan`). pos 환류는 driver(decode_loop) 책임
+//! CacheManager force_evict 대신 **plugin plan + the v2 plan executor** 경로를 쓴다(`KVStageCtx` 에 PFA
+//! 슬라이스 주입 → `plan(&ctx)` → the v2 plan executor). pos 환류는 driver(decode_loop) 책임
 //! (`reconcile_kv_pos_after_eviction`).
 //!
 //! **PR1 = LayerWide keep only.** `KeepSpec::PerHead`(HeadMajor 경로)는 R-P1-2. 미무장(cell `None`)
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn prefill_end_applies_layerwide_keepset() {
-        // LayerWide smoke(§6.3): PrefillEnd → take_inner/plan/execute_kv_plan/put_inner. prefix_len=8,
+        // LayerWide smoke(§6.3): PrefillEnd → take_inner/plan/the v2 plan executor/put_inner. prefix_len=8,
         // target_ratio=0.5 → keep 4. odd 위치 선호 → keep {1,3,5,7}. 적용 후 current_pos==4 + 값 검증.
         let prefix_len = 8;
         let n_heads_q = 2; // GQA 2:1 (cache kv_heads=1).
@@ -476,7 +476,7 @@ mod tests {
     }
 
     /// Byte-identical engine verification of the REAL `pyramidkv` stage driven through the full
-    /// PrefillEnd path: PFA → `pyramidkv::plan()` → `execute_kv_plan` (PerHead) → HeadMajor
+    /// PrefillEnd path: PFA → `pyramidkv::plan()` → the v2 plan executor (PerHead) → HeadMajor
     /// per-head compaction. The expected per-layer/per-kv-head keep-sets + pyramid budgets are the
     /// kvpress oracle from `crates/techniques/pyramidkv/reference/gen_engine_fixture.py`
     /// (4 layers, GQA 2:1, k_len=32, window=4, kernel=1, beta=2, compression_ratio=0.5). This is

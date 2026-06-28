@@ -7,7 +7,7 @@
 //!
 //! ## Hot-path cost
 //!
-//! [`record`] is called from the eviction commit path: the v2 `execute_kv_plan`
+//! [`record`] is called from the eviction commit path: the v2 plan executor
 //! (`super::stage_registry`) and the v3 `EngineCacheHandle::commit`
 //! (`crate::kv::cache_handle`). Both pass the FINAL committed keep-set (the same
 //! position-set the engine compacts to), so the dump is path-independent.
@@ -157,7 +157,7 @@ fn capture_if_armed(cache: &KVCache, keep_spec: &KeepSpec, layer_idx: usize) {
 /// in-memory capture is armed. Lets a caller that would have to ALLOCATE to call [`record`] (e.g. the
 /// handle commit path, which must build a [`KeepSpec`] from its staged `Vec`) skip that allocation
 /// entirely on the default disabled path — keeping the commit byte-identical AND allocation-free when
-/// the dump is off. (The v2 `execute_kv_plan` caller already holds a `&KVCachePlan`, so it borrows
+/// the dump is off. (The v2 the v2 plan executor caller already holds a a v2 plan, so it borrows
 /// `&plan.keep` for free and does not need this gate.)
 pub(crate) fn is_active() -> bool {
     CAPTURE_ARMED.load(Ordering::Relaxed) || dump_path().is_some()
