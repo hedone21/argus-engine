@@ -281,6 +281,94 @@ impl StageCtx for SnapshotStageCtx<'_> {
     }
 }
 
+/// Drive a single layer's [`KVMutationStage`] callback through an [`EngineCacheHandle`] and commit it,
+/// returning whether the commit mutated any bytes. The shared per-layer core of the v3 mutation path,
+/// used by [`KVMutationDriverStage`] (the pipeline driver) AND the score-aware eviction adapter
+/// (`StageBackedPolicy`) so both build the read ctx + handle identically.
+///
+/// Builds an owned-snapshot [`SnapshotStageCtx`] in the entry frame (T-3): the score signals
+/// (`importance` flat / `head_scores` per-head / `last_attn`) are borrowed from caller-owned slices,
+/// and raw K/V dequant snapshots are built locally ONLY when `caps.reads` declares the kind AND the
+/// cache is host-resident — so the read view never aliases the `&mut` handle. A panic in the
+/// (untrusted) stage is caught (mirror of P0-5a) so the caller's UER rewrap always runs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_mutation_layer(
+    stage: &dyn KVMutationStage,
+    caps: &StageCaps,
+    cache: &mut KVCache,
+    layer_idx: usize,
+    n_layers: usize,
+    target_len: usize,
+    importance: Option<&[f32]>,
+    head_scores: Option<&[f32]>,
+    last_attn: Option<&[f32]>,
+) -> anyhow::Result<bool> {
+    let current_pos = cache.current_pos();
+    if current_pos == 0 {
+        return Ok(false);
+    }
+    let max_seq = cache.max_seq_len;
+    let n_kv_heads = cache.kv_heads();
+    let head_dim = cache.head_dim();
+    let on_device = cache.k_buffer.buffer().is_gpu_buffer();
+    // Per-layer raw K/V dequant snapshots (P0-3c) — only when the stage declares the read AND the cache
+    // is host-resident (a device buffer has no host pointer). Captured BEFORE the handle (entry frame).
+    let want_key = !on_device && caps.reads.contains(&TensorKind::Key);
+    let want_value = !on_device && caps.reads.contains(&TensorKind::Value);
+    let key_snap: Option<Vec<f32>> =
+        want_key.then(|| dequant_snapshot(cache, current_pos, n_kv_heads, head_dim, true));
+    let value_snap: Option<Vec<f32>> =
+        want_value.then(|| dequant_snapshot(cache, current_pos, n_kv_heads, head_dim, false));
+    let sctx = SnapshotStageCtx {
+        current_pos,
+        target_len,
+        layer_idx,
+        n_layers,
+        n_kv_heads,
+        head_dim,
+        on_device,
+        importance,
+        score_handle: head_scores.map(|data| ScalarSnapHandle {
+            data,
+            rows: current_pos,
+            max_seq,
+        }),
+        attn_handle: last_attn.map(|data| ScalarSnapHandle {
+            data,
+            rows: current_pos,
+            max_seq,
+        }),
+        key_handle: key_snap.as_deref().map(|data| KvSnapHandle {
+            data,
+            rows: current_pos,
+            head_dim,
+        }),
+        value_handle: value_snap.as_deref().map(|data| KvSnapHandle {
+            data,
+            rows: current_pos,
+            head_dim,
+        }),
+        prefill_attn_handle: None,
+    };
+    let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
+    let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        move || -> anyhow::Result<bool> {
+            let mut handle = handle;
+            stage
+                .on_phase(&sctx, &mut handle)
+                .map_err(|e| anyhow::anyhow!("mutation stage '{}' failed: {e}", stage.name()))?;
+            handle.commit()
+        },
+    ));
+    match driven {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "mutation stage '{}' panicked during on_phase/commit",
+            stage.name()
+        )),
+    }
+}
+
 /// Adapts a plan-returning [`KVCacheStage`] to the imperative [`KVMutationStage`] by applying its
 /// plan through the transactional [`CacheHandle`]. This is the bridge that makes the byte-identical
 /// gate faithful: the same plugin's plan drives both `execute_kv_plan` and the handle. The firing
@@ -549,90 +637,22 @@ impl PipelineStage for KVMutationDriverStage {
         let mut any_mutated = false;
         let result = (|| -> anyhow::Result<()> {
             for (layer_idx, cache) in temp.iter_mut().enumerate() {
-                let current_pos = cache.current_pos();
-                if current_pos == 0 {
-                    continue;
-                }
                 // Real per-layer keep budget (P0-3a): a budget-driven stage gets a non-zero target_len
-                // (the `.max(1)` floor in budget_for is the wipe guard).
-                let target_len = self.budget_for(current_pos);
-                let max_seq = cache.max_seq_len;
-                let n_kv_heads = cache.kv_heads();
-                let head_dim = cache.head_dim();
-                let on_device = cache.k_buffer.buffer().is_gpu_buffer();
-                // Per-layer raw K/V dequant snapshots (P0-3c) — built ONLY when the stage declares the
-                // read AND the cache is host-resident (a device buffer has no host pointer). Captured
-                // BEFORE the handle (entry frame, T-3); owned, so they never alias the &mut handle. A
-                // device-resident cache yields None → tensor(Key/Value)==None, and the stage degrades.
-                let want_key = !on_device && self.caps.reads.contains(&TensorKind::Key);
-                let want_value = !on_device && self.caps.reads.contains(&TensorKind::Value);
-                let key_snap: Option<Vec<f32>> = want_key
-                    .then(|| dequant_snapshot(cache, current_pos, n_kv_heads, head_dim, true));
-                let value_snap: Option<Vec<f32>> = want_value
-                    .then(|| dequant_snapshot(cache, current_pos, n_kv_heads, head_dim, false));
-                // Read ctx backed by owned snapshots (NOT the cache) — coexists with the &mut handle:
-                // it borrows the score + K/V snapshots captured above (entry frame, T-3), never the
-                // cache.
-                let sctx = SnapshotStageCtx {
-                    current_pos,
-                    target_len,
+                // (the `.max(1)` floor in budget_for is the wipe guard). The shared per-layer core
+                // builds the read ctx + handle and drives the stage (catch_unwind, P0-5a). A
+                // `current_pos == 0` layer is a no-op inside it.
+                let target_len = self.budget_for(cache.current_pos());
+                any_mutated |= drive_mutation_layer(
+                    self.stage.as_ref(),
+                    &self.caps,
+                    cache,
                     layer_idx,
                     n_layers,
-                    n_kv_heads,
-                    head_dim,
-                    on_device,
-                    importance: importance.as_deref(),
-                    score_handle: head_scores.as_deref().map(|data| ScalarSnapHandle {
-                        data,
-                        rows: current_pos,
-                        max_seq,
-                    }),
-                    attn_handle: last_attn.as_deref().map(|data| ScalarSnapHandle {
-                        data,
-                        rows: current_pos,
-                        max_seq,
-                    }),
-                    key_handle: key_snap.as_deref().map(|data| KvSnapHandle {
-                        data,
-                        rows: current_pos,
-                        head_dim,
-                    }),
-                    value_handle: value_snap.as_deref().map(|data| KvSnapHandle {
-                        data,
-                        rows: current_pos,
-                        head_dim,
-                    }),
-                    // The driver does not inject PFA (that is `PrefillKeepSetStage`'s `for_prefill_attn`
-                    // ctx); a PrefillEnd technique driven here degrades like the v2 unarmed-PFA path.
-                    prefill_attn_handle: None,
-                };
-                let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
-                // catch_unwind (P0-5a, correctness hazard): an (untrusted, native) plugin's on_phase
-                // could panic. Without this, the panic would unwind PAST the `put_inner` rewrap loop
-                // below — leaving the StandardFormat handles empty (take_inner'd, never returned),
-                // corrupting the engine's KV bookkeeping. Convert a panic into an anyhow::Err so the
-                // for-loop after still runs put_inner. (commit()'s `mutated` flag is captured here for
-                // the T-6 plan-invalidation wiring in P0-5b.)
-                let stage = self.stage.as_ref();
-                let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                    move || -> anyhow::Result<bool> {
-                        let mut handle = handle;
-                        stage.on_phase(&sctx, &mut handle).map_err(|e| {
-                            anyhow::anyhow!("mutation stage '{}' failed: {e}", stage.name())
-                        })?;
-                        handle.commit()
-                    },
-                ));
-                match driven {
-                    Ok(Ok(mutated)) => any_mutated |= mutated,
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        return Err(anyhow::anyhow!(
-                            "mutation stage '{}' panicked during on_phase/commit",
-                            self.stage.name()
-                        ));
-                    }
-                }
+                    target_len,
+                    importance.as_deref(),
+                    head_scores.as_deref(),
+                    last_attn.as_deref(),
+                )?;
             }
             Ok(())
         })();
