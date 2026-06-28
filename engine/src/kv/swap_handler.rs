@@ -765,9 +765,9 @@ mod tests {
     /// RES-1 regression: two offloads of the SAME layer with the SAME count (before recall) must NOT
     /// share backing files. With the pre-fix `cache_L{layer}_{0}-{count}` naming the second dump
     /// clobbers the first's file and both records point at it, so recalling the first record returns
-    /// the SECOND dump's bytes (KV corruption). The `s{seq}` segment gives each dump a unique path, so
-    /// each record round-trips its own bytes. Mutation-proof: dropping the seq makes the first recall
-    /// read pattern B and the `expected_a` assertion fails.
+    /// the SECOND dump's bytes (KV corruption). The `s{seq}` segment gives each dump a unique path —
+    /// for BOTH the K and V backing files — so each record round-trips its own bytes. Mutation-proof:
+    /// dropping the seq makes the first recall read pattern B and the `expected_a` assertion fails.
     #[test]
     fn test_repeat_offload_same_layer_count_no_clobber() {
         let dir = unique_tmp_dir("repeat_offload");
@@ -798,14 +798,25 @@ mod tests {
         assert_eq!(n2, count);
 
         // Both dumps are outstanding, same (layer=0, count=3) — but on DISTINCT backing files.
-        let (a_kpath, b_kpath) = {
+        // Check BOTH the K and V paths: the seq is baked into each independently, so a regression
+        // that uniquified only one of them would still corrupt the other.
+        let (a_kpath, b_kpath, a_vpath, b_vpath) = {
             let g = handler.state.lock().unwrap();
             assert_eq!(g.records.len(), 2, "both dumps recorded");
-            (g.records[0].k_path.clone(), g.records[1].k_path.clone())
+            (
+                g.records[0].k_path.clone(),
+                g.records[1].k_path.clone(),
+                g.records[0].v_path.clone(),
+                g.records[1].v_path.clone(),
+            )
         };
         assert_ne!(
             a_kpath, b_kpath,
-            "the two same-(layer,count) dumps must not share a backing file"
+            "the two same-(layer,count) dumps must not share a K backing file"
+        );
+        assert_ne!(
+            a_vpath, b_vpath,
+            "the two same-(layer,count) dumps must not share a V backing file"
         );
 
         // recall_layer pops layer-0 records in insertion order: first the A dump, then the B dump.
@@ -825,6 +836,90 @@ mod tests {
             expected_b,
             "second record must restore dump B"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `recall_caches` (the all-layers / pressure-driven path) restores MULTIPLE outstanding records
+    /// in a single call, each back into ITS OWN layer's cache. The existing `test_recall_restores_data`
+    /// only exercises one record; this covers the loop over several. The records are deliberately
+    /// recorded OUT of layer order (offloaded as 2, 0, 1) and each layer carries a distinct pattern, so
+    /// a mis-dispatch — indexing by loop position instead of `rec.layer_idx`, or reading a sibling's
+    /// backing file — routes a record's bytes into the wrong layer and trips a per-layer byte assert.
+    /// Mutation-proof two ways: hardcoding the recall target to `caches[0]` makes layer 0 over-stack to
+    /// length 20; dispatching by the loop index (`caches[i]`) instead of `rec.layer_idx` mismatches the
+    /// per-layer prefix bytes (this is why the out-of-order offload matters — identity order can't tell
+    /// the two dispatch strategies apart).
+    #[test]
+    fn test_recall_caches_multi_layer_restores_each_own_bytes() {
+        let dir = unique_tmp_dir("recall_caches_multi");
+        let handler = SwapHandler::with_disk(0.5, dir.clone());
+        let (heads, dim, n_layers) = (2usize, 4usize, 3usize);
+
+        // Build N layers, each stamped with a layer-distinct pattern so any cross-layer mixup is
+        // visible (the gap between tags >> the buffer length, so no two layers can alias a value).
+        let mut caches: Vec<KVCache> = (0..n_layers)
+            .map(|_| make_hm_cache_with_data(10, heads, dim))
+            .collect();
+        for (l, cache) in caches.iter_mut().enumerate() {
+            let tag = (l as f32 + 1.0) * 100_000.0;
+            let k_slice = cache.k_buffer.as_mut_slice::<f32>();
+            for (i, x) in k_slice.iter_mut().enumerate() {
+                *x = tag + i as f32;
+            }
+            let v_slice = cache.v_buffer.as_mut_slice::<f32>();
+            for (i, x) in v_slice.iter_mut().enumerate() {
+                *x = -(tag + i as f32);
+            }
+        }
+
+        // Snapshot each layer's OWN prefix (first 5 positions) before offload.
+        let expected: Vec<(Vec<f32>, Vec<f32>)> = caches.iter().map(|c| prefix_kv(c, 5)).collect();
+
+        // Offload in a NON-identity order so the ledger's records are NOT in layer order
+        // (records become [L2, L0, L1]). This is what makes the test able to distinguish a correct
+        // `caches[rec.layer_idx]` dispatch from a positional `caches[loop_index]` bug — under identity
+        // order the two are indistinguishable. offload_count per layer = 10 * 0.5 = 5.
+        let mut offloaded = 0usize;
+        for &l in &[2usize, 0, 1] {
+            offloaded += handler.offload_prefix(l, &mut caches[l], 5).unwrap();
+        }
+        assert_eq!(offloaded, 5 * n_layers, "every layer offloaded its half");
+        {
+            let g = handler.state.lock().unwrap();
+            assert_eq!(
+                g.records.len(),
+                n_layers,
+                "one outstanding record per layer"
+            );
+            assert_eq!(
+                g.records.iter().map(|r| r.layer_idx).collect::<Vec<_>>(),
+                vec![2usize, 0, 1],
+                "records are intentionally NOT in identity layer order"
+            );
+        }
+        for cache in &caches {
+            assert_eq!(cache.current_pos, 5);
+        }
+
+        // ONE recall_caches call restores ALL layers at once.
+        let recalled = handler.recall_caches(&mut caches).unwrap();
+        assert_eq!(recalled, 5 * n_layers, "all layers recalled in one call");
+        assert!(
+            handler.state.lock().unwrap().records.is_empty(),
+            "ledger drained after recall_caches"
+        );
+
+        // Each layer must hold back exactly its OWN prefix — not a sibling's.
+        for (l, cache) in caches.iter().enumerate() {
+            assert_eq!(cache.current_pos, 10, "layer {} restored to full length", l);
+            assert_eq!(
+                prefix_kv(cache, 5),
+                expected[l],
+                "layer {} must restore its OWN prefix bytes, not another layer's",
+                l
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
