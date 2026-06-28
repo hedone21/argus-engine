@@ -14,9 +14,10 @@
 
 use anyhow::{Context, Result};
 use argus_extension_api::{
-    KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage, KeepSpec, PlanAbi,
-    PluginVTableAbi, StageCtx, StageCtxAbi, StageExportAbi, StageParams, TensorDtype, TensorHandle,
-    TensorKind, TensorShape, WeightedMerge, find_qcf_estimator,
+    KV_PLAN_NOOP, KV_PLAN_OK, KV_STAGE_ABI_VERSION, KVCachePlan, KVCacheStage, KVMutationStage,
+    KeepSpec, PlanAbi, PluginVTableAbi, StageCaps, StageCtx, StageCtxAbi, StageExportAbi,
+    StageParams, TensorDtype, TensorHandle, TensorKind, TensorShape, WeightedMerge,
+    find_mutation_stage, find_qcf_estimator,
 };
 use core::ffi::c_void;
 use std::ffi::CStr;
@@ -27,6 +28,7 @@ use super::EvictionPolicy;
 use crate::buffer::DType;
 use crate::kv::dequant::{dequantize_k, dequantize_v};
 use crate::kv::kv_cache::KVCache;
+use crate::stages::kv::mutation::drive_mutation_layer;
 
 // value-aware production 활성화. feature `caote` ON 시 caote crate 를 force-link 한다 —
 // dep 선언만으로는 미참조 rlib 이 링크 제외돼 `#[distributed_slice]` 등록이 누락되기 때문이다.
@@ -96,6 +98,11 @@ use pyramidkv as _;
 ///
 /// pub(crate): the `d2o` plugin's WeightedMerge plan flows through here (apply_weighted_merges +
 /// compact) — the production merge-application path.
+//
+// Phase 2 step 2: StageBackedPolicy + PrefillKeepSetStage migrated to the v3 handle, so the only
+// remaining callers are `#[cfg(test)]` — production-dead. Deleted with the rest of the v2 plan path
+// (KVStageCtx / KVCachePlan) in step 3.
+#[allow(dead_code)]
 pub(crate) fn execute_kv_plan(
     cache: &mut KVCache,
     plan: &KVCachePlan,
@@ -606,18 +613,24 @@ impl StageCtx for KVStageCtx<'_> {
 /// plan 을 [`execute_kv_plan`] 으로 실행한다 — 즉 sliding/streaming/h2o 의 evict 가 in-place(World A)
 /// 에서 plan→compact(World B)로 바뀐다. compact_parity 가 등가성을 보장(무회귀).
 pub struct StageBackedPolicy {
-    stage: Box<dyn KVCacheStage>,
+    stage: Box<dyn KVMutationStage>,
+    /// The stage's declared capabilities (from its `MutationStageReg`) — gates the per-layer raw K/V
+    /// dequant snapshot in [`drive_mutation_layer`] (e.g. caote's `Value` read).
+    caps: StageCaps,
 }
 
 impl StageBackedPolicy {
-    /// 주어진 stage 를 `EvictionPolicy` 표면으로 감싼다.
-    pub fn new(stage: Box<dyn KVCacheStage>) -> Self {
-        Self { stage }
+    /// 주어진 v3 [`KVMutationStage`] + 그 caps 를 `EvictionPolicy` 표면으로 감싼다.
+    pub fn new(stage: Box<dyn KVMutationStage>, caps: StageCaps) -> Self {
+        Self { stage, caps }
     }
 
-    /// 읽기 ctx 로 plan 산출(immutable borrow) → borrow 종료 후 executor 가 `&mut` 로 실행.
-    /// `layer_idx`/`n_layers` 는 per-layer 기법(d2o protected_layers/last-layer protect)용 — 비-layer
-    /// 인지 호출자(직접 evict)는 `(0, 1)` 단일-layer 뷰를 쓴다.
+    /// Drive the stage's imperative `on_phase` through the v3 [`CacheHandle`]
+    /// ([`drive_mutation_layer`]) — byte-identical to the v2 `plan` + `execute_kv_plan` it replaced
+    /// (the Phase-1 decision-equivalence gate). `layer_idx`/`n_layers` 는 per-layer 기법(d2o
+    /// protected_layers/last-layer protect)용 — 비-layer 인지 호출자(직접 evict)는 `(0, 1)` 단일-layer
+    /// 뷰를 쓴다. `last_attn`(AttnWeights, value-aware a_i)는 score accumulator 의
+    /// last_step_head_attn 을 공급할 때 Some — value-aware 기법(caote)이 읽는다.
     fn run(
         &self,
         cache: &mut KVCache,
@@ -627,19 +640,18 @@ impl StageBackedPolicy {
         layer_idx: usize,
         n_layers: usize,
     ) -> Result<()> {
-        let plan = {
-            // last_attn(AttnWeights, value-aware a_i): production eviction 경로가 score accumulator 의
-            // last_step_head_attn 을 공급할 때 Some — value-aware 기법(caote)이 ctx.attn_weight 로 읽는다.
-            // QueryStats(MQ-4 e2e seam)는 production eviction 경로에서 미공급(None) — score-active
-            // 측정 하네스가 별도로 공급한다(dump_importance.rs).
-            let ctx = KVStageCtx::new(cache, target_len, importance, None, last_attn, None)
-                .with_layer(layer_idx, n_layers);
-            self.stage.plan(&ctx)
-        };
-        if let Some(plan) = plan {
-            execute_kv_plan(cache, &plan, layer_idx, n_layers)?;
-        }
-        Ok(())
+        drive_mutation_layer(
+            self.stage.as_ref(),
+            &self.caps,
+            cache,
+            layer_idx,
+            n_layers,
+            target_len,
+            importance,
+            None, // flat-score / value-aware path: no per-head scores (see evict_with_head_scores)
+            last_attn,
+        )
+        .map(|_mutated| ())
     }
 }
 
@@ -695,21 +707,21 @@ impl EvictionPolicy for StageBackedPolicy {
         layer_idx: usize,
         n_layers: usize,
     ) -> Result<()> {
-        let plan = {
-            let ctx = KVStageCtx::new(
-                cache,
-                target_len,
-                Some(flat_importance),
-                Some(head_importance),
-                None,
-                None,
-            );
-            self.stage.plan(&ctx)
-        };
-        if let Some(plan) = plan {
-            execute_kv_plan(cache, &plan, layer_idx, n_layers)?;
-        }
-        Ok(())
+        // Per-head scores reach the stage as `tensor(Scores)` (`head_importance`), the flat fallback as
+        // `importance()` (`flat_importance`); a per-head stage (h2o_plus) emits a per-head keep applied
+        // head-independently by the handle. Byte-identical to the v2 plan + execute_kv_plan.
+        drive_mutation_layer(
+            self.stage.as_ref(),
+            &self.caps,
+            cache,
+            layer_idx,
+            n_layers,
+            target_len,
+            Some(flat_importance),
+            Some(head_importance),
+            None,
+        )
+        .map(|_mutated| ())
     }
 
     fn name(&self) -> &str {
@@ -717,9 +729,26 @@ impl EvictionPolicy for StageBackedPolicy {
     }
 }
 
+/// Resolve a v3 [`KVMutationStage`] by name (static linkme + dynamic `--load-plugin`) and wrap it,
+/// with its declared `caps`, as a legacy [`EvictionPolicy`] via [`StageBackedPolicy`] — the production
+/// constructor for the eviction `CacheManager`'s policy after the v2 plan path was retired (the
+/// eviction kernel `run_policy_eviction` then drives the v3 handle internally). `None` for an unknown /
+/// non-v3 name.
+pub fn make_stage_backed_policy(
+    name: &str,
+    params: &StageParams,
+    args: argus_extension_api::StageArgs<'_>,
+) -> Option<Box<dyn EvictionPolicy>> {
+    let reg = find_mutation_stage(name)?;
+    Some(Box::new(StageBackedPolicy::new(
+        (reg.make)(*params, args),
+        reg.caps,
+    )))
+}
+
 /// Test helper: build the out-of-tree `h2o` stage wrapped as a legacy [`EvictionPolicy`]
 /// (`StageBackedPolicy`). Used by CacheManager / EvictionHandler tests after heavy-hitter was extracted
-/// to the `h2o` plugin crate — production resolves "h2o" the same way (make_stage → plugin).
+/// to the `h2o` plugin crate — production resolves "h2o" the same way (`make_stage_backed_policy`).
 #[cfg(test)]
 pub(crate) fn h2o_backed_policy(
     keep_ratio: f32,
@@ -730,34 +759,30 @@ pub(crate) fn h2o_backed_policy(
         protected_prefix,
         ..Default::default()
     };
-    Box::new(StageBackedPolicy::new(
-        make_stage("h2o", &p).expect("h2o stage registered (force-linked h2o plugin)"),
-    ))
+    make_stage_backed_policy("h2o", &p, &[])
+        .expect("h2o v3 stage registered (force-linked h2o plugin)")
 }
 
 /// Build the out-of-tree `sliding` stage wrapped as a legacy [`EvictionPolicy`]
 /// (`StageBackedPolicy`). Convenience constructor used by CacheManager / EvictionHandler tests (and
 /// engine integration tests) after SlidingWindowPolicy was extracted to the `sliding-window` plugin
-/// crate — production resolves "sliding" the same way (`make_stage` → plugin → StageBackedPolicy).
+/// crate — production resolves "sliding" the same way (`make_stage_backed_policy`).
 pub fn sliding_backed_policy(window: usize, protected_prefix: usize) -> Box<dyn EvictionPolicy> {
     let p = StageParams {
         eviction_window: window,
         protected_prefix,
         ..Default::default()
     };
-    Box::new(StageBackedPolicy::new(make_stage("sliding", &p).expect(
-        "sliding stage registered (force-linked sliding-window plugin)",
-    )))
+    make_stage_backed_policy("sliding", &p, &[])
+        .expect("sliding v3 stage registered (force-linked sliding-window plugin)")
 }
 
 /// Build the out-of-tree `none` stage wrapped as a legacy [`EvictionPolicy`] (`StageBackedPolicy`)
 /// — a no-op policy. Convenience constructor used by tests after NoEvictionPolicy was extracted to
 /// the `no-eviction` plugin crate; production resolves "none" the same way.
 pub fn none_backed_policy() -> Box<dyn EvictionPolicy> {
-    Box::new(StageBackedPolicy::new(
-        make_stage("none", &StageParams::default())
-            .expect("none stage registered (force-linked no-eviction plugin)"),
-    ))
+    make_stage_backed_policy("none", &StageParams::default(), &[])
+        .expect("none v3 stage registered (force-linked no-eviction plugin)")
 }
 
 /// Whether the named stage is score-based (consumes importance) — the generic capability lookup the
@@ -1782,16 +1807,19 @@ mod tests {
         let flat = vec![1.0f32; MAX_SEQ];
 
         // Resolve h2o_plus through the registry (force-linked plugin) and run the per-head path.
-        let stage = make_stage(
-            "h2o_plus",
-            &StageParams {
-                keep_ratio: 0.5,
-                protected_prefix: 4,
-                ..Default::default()
-            },
-        )
-        .expect("h2o_plus stage registered (force-linked h2o-plus plugin)");
-        let policy = StageBackedPolicy::new(stage);
+        let reg = find_mutation_stage("h2o_plus")
+            .expect("h2o_plus v3 stage registered (force-linked h2o-plus plugin)");
+        let policy = StageBackedPolicy::new(
+            (reg.make)(
+                StageParams {
+                    keep_ratio: 0.5,
+                    protected_prefix: 4,
+                    ..Default::default()
+                },
+                &[],
+            ),
+            reg.caps,
+        );
         // target=10, prefix=4, keep_ratio=0.5 → keep=10, hh_budget=3, recent_start=17.
         policy
             .evict_with_head_scores(&mut c, 10, &flat, &head_imp, n_kv_heads, 0, 1)

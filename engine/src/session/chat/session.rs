@@ -22,7 +22,6 @@ use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
-use crate::kv::eviction::stage_registry::StageBackedPolicy;
 use crate::kv::standard_format::StandardFormat;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use crate::session::DecodeLoopBuilder;
@@ -817,17 +816,16 @@ fn build_chat_eviction_internal(
                 .iter()
                 .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
                 .collect();
-            // 정적(linkme) + 동적(--load-plugin dlopen) 통합 조회. miss = unknown.
-            let stage =
-                crate::kv::eviction::stage_registry::make_stage_with_args(name, &params, &extra)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>)",
-                            name,
-                            if cfg!(feature = "caote") { ", caote" } else { "" }
-                        )
-                    })?;
-            Box::new(StageBackedPolicy::new(stage))
+            // 정적(linkme) + 동적(--load-plugin dlopen) 통합 조회. miss = unknown. v3 stage + caps 를
+            // StageBackedPolicy 로 감싸 EvictionPolicy 표면 노출(내부에서 v3 handle 구동).
+            crate::kv::eviction::stage_registry::make_stage_backed_policy(name, &params, &extra)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>)",
+                        name,
+                        if cfg!(feature = "caote") { ", caote" } else { "" }
+                    )
+                })?
         };
         CacheManager::new(
             policy,

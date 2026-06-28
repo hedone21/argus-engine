@@ -21,9 +21,7 @@ use crate::backend::Backend;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::eviction::EvictionPolicy;
-use crate::kv::eviction::stage_registry::{
-    StageBackedPolicy, make_stage_with_args, stage_default_protected_prefix,
-};
+use crate::kv::eviction::stage_registry::stage_default_protected_prefix;
 use crate::kv::kv_cache::KVCache;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
@@ -161,14 +159,13 @@ pub fn build_resilience_cache_manager(
                 .iter()
                 .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
                 .collect();
-            let stage = make_stage_with_args(&policy_name, &params, &extra).ok_or_else(|| {
+            crate::kv::eviction::stage_registry::make_stage_backed_policy(&policy_name, &params, &extra).ok_or_else(|| {
                 anyhow::anyhow!(
                     "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>).",
                     policy_name,
                     if cfg!(feature = "caote") { ", caote" } else { "" }
                 )
-            })?;
-            Box::new(StageBackedPolicy::new(stage))
+            })?
         };
         CacheManager::new(policy, monitor, threshold_bytes, target_ratio)
     };

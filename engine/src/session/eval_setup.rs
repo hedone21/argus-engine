@@ -33,9 +33,7 @@ use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::skip_config::SkipConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::eviction::EvictionPolicy;
-use crate::kv::eviction::stage_registry::{
-    StageBackedPolicy, make_stage_with_args, stage_default_protected_prefix, stage_is_score_based,
-};
+use crate::kv::eviction::stage_registry::{stage_default_protected_prefix, stage_is_score_based};
 use crate::models::transformer::TransformerModel;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor, SystemMonitor};
 use crate::session::bin_setup::{
@@ -205,13 +203,13 @@ fn build_eval_cache_manager(
                 .iter()
                 .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
                 .collect();
-            let stage = make_stage_with_args(name, &params, &extra).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "argus-eval: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o (or --load-plugin <.so>).",
-                    name
-                )
-            })?;
-            Box::new(StageBackedPolicy::new(stage))
+            crate::kv::eviction::stage_registry::make_stage_backed_policy(name, &params, &extra)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "argus-eval: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o (or --load-plugin <.so>).",
+                        name
+                    )
+                })?
         };
         CacheManager::new(
             policy,

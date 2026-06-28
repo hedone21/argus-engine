@@ -17,7 +17,7 @@ use argus_engine::backend::cpu::CpuBackend;
 use argus_engine::buffer::{Buffer, DType};
 use argus_engine::kv::cache_manager::CacheManager;
 use argus_engine::kv::eviction::stage_registry::{
-    StageBackedPolicy, ensure_builtin_stages_registered, make_stage,
+    ensure_builtin_stages_registered, make_stage_backed_policy,
 };
 use argus_engine::kv::kv_cache::KVCache;
 use argus_engine::kv::standard_format::StandardFormat;
@@ -120,9 +120,8 @@ fn make_cache_manager(policy_name: &str, target_ratio: f32) -> CacheManager {
         sink_size: 4,
         streaming_window: 6,
     };
-    let stage = make_stage(policy_name, &params)
-        .unwrap_or_else(|| panic!("make_stage({policy_name}) returned None"));
-    let policy = Box::new(StageBackedPolicy::new(stage));
+    let policy = make_stage_backed_policy(policy_name, &params, &[])
+        .unwrap_or_else(|| panic!("make_stage_backed_policy({policy_name}) returned None"));
     CacheManager::new(policy, Box::new(NoOpMonitor), usize::MAX, target_ratio)
 }
 
