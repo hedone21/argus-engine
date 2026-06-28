@@ -350,14 +350,11 @@ pub fn build_standard_loop(
     if arm_prefill_keepset
         && let Some(registry) = registry.as_ref()
         && let Some(name) = prefill_attn_stage_name.as_ref()
-        && let Some(plugin) = crate::kv::eviction::stage_registry::make_stage(
-            name,
-            &argus_extension_api::StageParams::default(),
-        )
+        && let Some(reg) = argus_extension_api::find_mutation_stage(name)
     {
         registry.submit(Arc::new(PrefillKeepSetStage::new(
             kv_handles.clone(),
-            plugin,
+            (reg.make)(argus_extension_api::StageParams::default(), &[]),
             pfa_cell.clone(),
             n_heads_q,
             eviction_target_ratio,

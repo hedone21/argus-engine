@@ -13,21 +13,23 @@
 //! **PR1 = LayerWide keep only.** `KeepSpec::PerHead`(HeadMajor 경로)는 R-P1-2. 미무장(cell `None`)
 //! 이면 즉시 `Consumed`(no-op).
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
-use argus_extension_api::KVCacheStage;
+use argus_extension_api::KVMutationStage;
 
-use crate::kv::eviction::stage_registry::{KVStageCtx, execute_kv_plan};
+use crate::kv::cache_handle::EngineCacheHandle;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
 use crate::pipeline::{LifecyclePhase, PipelineStage, StageContext, StageLifecycle, StageOutcome};
+use crate::stages::kv::mutation::SnapshotStageCtx;
 
 /// `PrefillEnd` phase 에서 PFA 기반 keep-set 을 1회 적용하는 OneShot Stage.
 pub struct PrefillKeepSetStage {
     /// register 시점 보유 핸들 — enumerate 순서 == layer idx(EvictionStage 와 동일 W1 불변식).
     handles: Vec<Arc<StandardFormat>>,
-    /// keep-set plan 생산 plugin (`caps.reads ∋ PrefillAttention`).
-    stage: Box<dyn KVCacheStage>,
+    /// keep-set 생산 plugin (`caps.reads ∋ PrefillAttention`) — v3 imperative [`KVMutationStage`].
+    stage: Box<dyn KVMutationStage>,
     /// §5.1 producer(`ModelForward`)와 공유하는 PFA cell. `PrefillEnd` 에서 read.
     prefill_attn_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
     /// attention head 수(pre-GQA) — PFA handle shape `rows`.
@@ -41,7 +43,7 @@ impl PrefillKeepSetStage {
     /// 발견 시 submit). `handles` enumerate 순서는 layer idx 와 일치해야 한다.
     pub fn new(
         handles: Vec<Arc<StandardFormat>>,
-        stage: Box<dyn KVCacheStage>,
+        stage: Box<dyn KVMutationStage>,
         prefill_attn_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
         n_heads_q: usize,
         target_ratio: f32,
@@ -84,8 +86,8 @@ impl PipelineStage for PrefillKeepSetStage {
             None => return Ok(StageOutcome::Consumed),
         };
 
-        // UER (Unwrap-Evict-Rewrap, EvictionStage 미러): take_inner → per-layer plan+execute →
-        // put_inner. `?` 전파는 rewrap 이후로 미룬다(placeholder 폐기 보장).
+        // UER (Unwrap-Evict-Rewrap, EvictionStage 미러): take_inner → per-layer (stage.on_phase via the
+        // v3 handle) → put_inner. `?` 전파는 rewrap 이후로 미룬다(placeholder 폐기 보장).
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
         let n_layers = temp.len();
         let result = (|| -> anyhow::Result<()> {
@@ -95,16 +97,39 @@ impl PipelineStage for PrefillKeepSetStage {
                     continue;
                 }
                 let target_len = ((prefix_len as f32) * self.target_ratio) as usize;
-                // plan 생산: PFA 슬라이스를 ctx 에 주입 → plugin 이 keep-set 산출. ctx(=&cache 불변
-                // borrow)는 이 블록에서 종료 → 이후 execute_kv_plan 의 &mut cache 와 비충돌.
-                let plan = {
-                    let ctx = KVStageCtx::new(cache, target_len, None, None, None, None)
-                        .with_layer(layer_idx, n_layers)
-                        .with_prefill_attn(&pfa[layer_idx], self.n_heads_q, prefix_len);
-                    self.stage.plan(&ctx)
-                };
-                if let Some(plan) = plan {
-                    execute_kv_plan(cache, &plan, layer_idx, n_layers)?;
+                // Read ctx with the per-layer PFA slice injected. `for_prefill_attn` copies the cache
+                // scalars and borrows ONLY `pfa` (outside the cache), so it coexists with the `&mut`
+                // handle below — the read view and the write view never alias.
+                let sctx = SnapshotStageCtx::for_prefill_attn(
+                    cache,
+                    target_len,
+                    layer_idx,
+                    n_layers,
+                    &pfa[layer_idx],
+                    self.n_heads_q,
+                );
+                let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
+                // catch_unwind (mirror of `KVMutationDriverStage`, P0-5a): a panic in an untrusted
+                // plugin's on_phase must not unwind past the `put_inner` rewrap below (which would leave
+                // the StandardFormat handles empty). Convert it to an `anyhow::Err`.
+                let stage = self.stage.as_ref();
+                let driven = catch_unwind(AssertUnwindSafe(move || -> anyhow::Result<()> {
+                    let mut handle = handle;
+                    stage.on_phase(&sctx, &mut handle).map_err(|e| {
+                        anyhow::anyhow!("prefill keep-set stage '{}' failed: {e}", stage.name())
+                    })?;
+                    handle.commit()?;
+                    Ok(())
+                }));
+                match driven {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(anyhow::anyhow!(
+                            "prefill keep-set stage '{}' panicked during on_phase/commit",
+                            self.stage.name()
+                        ));
+                    }
                 }
             }
             Ok(())
@@ -127,7 +152,7 @@ mod tests {
     // the production engine — no default-behavior change.
     use pyramidkv as _;
 
-    use argus_extension_api::{KVCachePlan, KeepSpec, StageCtx, TensorKind};
+    use argus_extension_api::{CacheHandle, CacheOpError, StageCtx, TensorKind};
 
     use crate::backend::Backend;
     use crate::backend::cpu::CpuBackend;
@@ -171,11 +196,8 @@ mod tests {
     /// 테스트용 keep-set plugin: PFA 를 GQA-reduce(전 head 합)해 per-token importance 산출 → top
     /// `target_len` 위치 LayerWide keep(ascending). R-P1-2 SnapKV 의 LayerWide 축소판.
     struct TopKPfaStage;
-    impl KVCacheStage for TopKPfaStage {
-        fn name(&self) -> &str {
-            "test.topk_pfa"
-        }
-        fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+    impl TopKPfaStage {
+        fn keep_list(&self, ctx: &dyn StageCtx) -> Option<Vec<usize>> {
             let prefix_len = ctx.current_pos();
             let target = ctx.target_len().min(prefix_len);
             let h = ctx.tensor(TensorKind::PrefillAttention)?;
@@ -194,11 +216,22 @@ mod tests {
             idx.sort_by(|&a, &b| imp[b].partial_cmp(&imp[a]).unwrap());
             let mut keep: Vec<usize> = idx.into_iter().take(target).collect();
             keep.sort_unstable();
-            Some(KVCachePlan {
-                keep: KeepSpec::LayerWide(keep),
-                merges: Vec::new(),
-                channels: None,
-            })
+            Some(keep)
+        }
+    }
+    impl KVMutationStage for TopKPfaStage {
+        fn name(&self) -> &str {
+            "test.topk_pfa"
+        }
+        fn on_phase(
+            &self,
+            ctx: &dyn StageCtx,
+            cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            match self.keep_list(ctx) {
+                Some(keep) => cache.keep(&keep),
+                None => Ok(()),
+            }
         }
     }
 
@@ -331,11 +364,8 @@ mod tests {
     /// kv-head 별 top-`target` 위치 → `KeepSpec::PerHead`(동일 길이, ascending). R-P1-2 SnapKV per-head
     /// 의 축소판(executor 의 per-head 분기 = HeadMajor 전제를 검증).
     struct PerHeadTopKStage;
-    impl KVCacheStage for PerHeadTopKStage {
-        fn name(&self) -> &str {
-            "test.perhead_topk_pfa"
-        }
-        fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+    impl PerHeadTopKStage {
+        fn per_head_keep(&self, ctx: &dyn StageCtx) -> Option<Vec<Vec<usize>>> {
             let prefix_len = ctx.current_pos();
             let n_kv_heads = ctx.n_kv_heads();
             let target = ctx.target_len().min(prefix_len);
@@ -360,11 +390,25 @@ mod tests {
                 keep.sort_unstable();
                 heads.push(keep);
             }
-            Some(KVCachePlan {
-                keep: KeepSpec::PerHead(heads),
-                merges: Vec::new(),
-                channels: None,
-            })
+            Some(heads)
+        }
+    }
+    impl KVMutationStage for PerHeadTopKStage {
+        fn name(&self) -> &str {
+            "test.perhead_topk_pfa"
+        }
+        fn on_phase(
+            &self,
+            ctx: &dyn StageCtx,
+            cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            match self.per_head_keep(ctx) {
+                Some(heads) => {
+                    let refs: Vec<&[usize]> = heads.iter().map(|h| h.as_slice()).collect();
+                    cache.keep_per_head(&refs)
+                }
+                None => Ok(()),
+            }
         }
     }
 
@@ -501,12 +545,9 @@ mod tests {
                 val: "2",
             },
         ];
-        let plugin = crate::kv::eviction::stage_registry::make_stage_with_args(
-            "pyramidkv",
-            &argus_extension_api::StageParams::default(),
-            &blob,
-        )
-        .expect("pyramidkv stage registered (engine dev-dep force-link)");
+        let reg = argus_extension_api::find_mutation_stage("pyramidkv")
+            .expect("pyramidkv v3 stage registered (engine dev-dep force-link)");
+        let plugin = (reg.make)(argus_extension_api::StageParams::default(), &blob);
 
         let stage = PrefillKeepSetStage::new(handles.clone(), plugin, cell, N_Q, 1.0);
         let mut profiler = OpProfiler::new();

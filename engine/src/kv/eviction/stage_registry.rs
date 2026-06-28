@@ -502,6 +502,12 @@ impl<'a> KVStageCtx<'a> {
 
     /// R-P1-1: prefill-end producer 가 채운 `[n_heads x prefix_len]` SUM-pooled PFA 슬라이스 주입.
     /// 미호출 시 `tensor(PrefillAttention)==None` (byte-identical disabled path).
+    //
+    // Phase 2: PrefillKeepSetStage migrated to the v3 handle (it now injects PFA via
+    // `SnapshotStageCtx::for_prefill_attn`), so the only remaining caller is a `#[cfg(test)]` one —
+    // dead in the production lib. Kept (with the rest of `KVStageCtx`/`execute_kv_plan`) only until the
+    // v2 plan path is deleted in Phase 2 step 4.
+    #[allow(dead_code)]
     pub(crate) fn with_prefill_attn(
         mut self,
         data: &'a [f32],

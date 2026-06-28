@@ -112,6 +112,37 @@ impl TensorHandle for KvSnapHandle<'_> {
     }
 }
 
+/// A per-q-head prefill-attention snapshot handle (`tensor(PrefillAttention)`), reading from an owned
+/// `[n_heads_q * cols]` f32 slice (row-major, head outer / pos inner; `per_head: false` — the `kv_head`
+/// arg is ignored, the mirror of `stage_registry`'s PFA handle). The slice lives outside the cache (the
+/// shared PFA producer cell), so it never aliases the `&mut` [`CacheHandle`].
+struct PfaSnapHandle<'a> {
+    data: &'a [f32],
+    rows: usize, // n_heads_q (pre-GQA)
+    cols: usize, // prefix_len
+}
+impl TensorHandle for PfaSnapHandle<'_> {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: self.rows,
+            cols: self.cols,
+            per_head: false,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        TensorDtype::F32
+    }
+    fn read_row(&self, row: usize, _kv_head: usize, out: &mut [f32]) {
+        let base = row * self.cols;
+        let n = self.cols.min(out.len());
+        if base + n <= self.data.len() {
+            out[..n].copy_from_slice(&self.data[base..base + n]);
+        } else {
+            out[..n].fill(0.0);
+        }
+    }
+}
+
 /// Dequantize the resident region of `cache`'s K (or V) into an owned `[n_kv_heads * rows * head_dim]`
 /// f32 snapshot (layout matching [`KvSnapHandle`]). Host-only — the caller must gate on
 /// `!kv_on_device()` (a device buffer has no host pointer to dequantize from).
@@ -158,9 +189,10 @@ pub struct SnapshotStageCtx<'a> {
     attn_handle: Option<ScalarSnapHandle<'a>>,
     key_handle: Option<KvSnapHandle<'a>>,
     value_handle: Option<KvSnapHandle<'a>>,
+    prefill_attn_handle: Option<PfaSnapHandle<'a>>,
 }
 
-impl SnapshotStageCtx<'_> {
+impl<'a> SnapshotStageCtx<'a> {
     /// A scalars-only ctx (no signals) over `cache`'s entry frame — copies, no borrow of `cache` held.
     /// Used by score-free stages and as the no-signal reference in tests.
     pub fn from_cache(
@@ -182,6 +214,29 @@ impl SnapshotStageCtx<'_> {
             attn_handle: None,
             key_handle: None,
             value_handle: None,
+            prefill_attn_handle: None,
+        }
+    }
+
+    /// A ctx exposing `tensor(PrefillAttention)` over a per-layer PFA slice (`[n_heads_q * prefix_len]`,
+    /// the shared producer cell) — used by [`PrefillKeepSetStage`](super::prefill_keepset). Copies the
+    /// cache scalars (no `cache` borrow held) and borrows ONLY `pfa`, so the returned ctx coexists with
+    /// the `&mut` [`EngineCacheHandle`] built from the same cache (`pfa` lives outside the cache).
+    pub fn for_prefill_attn(
+        cache: &KVCache,
+        target_len: usize,
+        layer_idx: usize,
+        n_layers: usize,
+        pfa: &'a [f32],
+        n_heads_q: usize,
+    ) -> Self {
+        Self {
+            prefill_attn_handle: Some(PfaSnapHandle {
+                data: pfa,
+                rows: n_heads_q,
+                cols: cache.current_pos(),
+            }),
+            ..Self::from_cache(cache, target_len, layer_idx, n_layers)
         }
     }
 }
@@ -217,6 +272,10 @@ impl StageCtx for SnapshotStageCtx<'_> {
             TensorKind::AttnWeights => self.attn_handle.as_ref().map(|h| h as &dyn TensorHandle),
             TensorKind::Key => self.key_handle.as_ref().map(|h| h as &dyn TensorHandle),
             TensorKind::Value => self.value_handle.as_ref().map(|h| h as &dyn TensorHandle),
+            TensorKind::PrefillAttention => self
+                .prefill_attn_handle
+                .as_ref()
+                .map(|h| h as &dyn TensorHandle),
             _ => None,
         }
     }
@@ -543,6 +602,9 @@ impl PipelineStage for KVMutationDriverStage {
                         rows: current_pos,
                         head_dim,
                     }),
+                    // The driver does not inject PFA (that is `PrefillKeepSetStage`'s `for_prefill_attn`
+                    // ctx); a PrefillEnd technique driven here degrades like the v2 unarmed-PFA path.
+                    prefill_attn_handle: None,
                 };
                 let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
                 // catch_unwind (P0-5a, correctness hazard): an (untrusted, native) plugin's on_phase
