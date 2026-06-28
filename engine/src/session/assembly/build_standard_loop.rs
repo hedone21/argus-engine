@@ -254,16 +254,23 @@ pub fn build_standard_loop(
         let registry = registry
             .as_ref()
             .expect("registry: mutation_driver.is_some()");
-        registry.submit(Arc::new(
-            KVMutationDriverStage::new(
-                kv_handles.clone(),
-                sel.stage,
-                sel.phase,
-                eviction_target_ratio,
-            )
-            .with_pressure_gate(Level::Warning)
-            .with_caps(sel.caps),
-        ));
+        let mut driver = KVMutationDriverStage::new(
+            kv_handles.clone(),
+            sel.stage,
+            sel.phase,
+            eviction_target_ratio,
+        )
+        .with_caps(sel.caps);
+        // Pressure-gate ONLY a KvMutate-phase eviction (the per-decode-step KV-fill model — the v2
+        // `EvictionStage::persistent` slot this replaces). A PrefillEnd-phase stage fires once at
+        // prefill end and must NOT be gated by the decode-pressure band (which would silently skip it);
+        // it stays the bare driver, firing on its phase. (In argus-cli a PrefillEnd / non-empty-reads
+        // stage is rejected at entry, so this branch is defensive + forward-compatible with Phase 2's
+        // PrefillKeepSetStage migration onto the handle.)
+        if sel.phase == argus_extension_api::MutationPhase::KvMutate {
+            driver = driver.with_pressure_gate(Level::Warning);
+        }
+        registry.submit(Arc::new(driver));
         true
     } else if let Some(cm) = cache_manager {
         let registry = registry

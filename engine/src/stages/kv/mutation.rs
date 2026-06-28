@@ -605,7 +605,12 @@ impl PipelineStage for KVMutationDriverStage {
         if any_mutated && let Some(cell) = self.mutation_fired.as_ref() {
             cell.store(true, Ordering::Relaxed);
         }
-        Ok(StageOutcome::Consumed)
+        // Persistent lifecycle → return `Continue` (mirror of `EvictionStage::persistent`): the driver
+        // stays resident and re-fires on the next pressure episode (or the next PrefillEnd). Returning
+        // `Consumed` would make `PipelineRegistry::dispatch` GC the stage after its first fire (and
+        // `debug_assert` a Persistent/Consumed INV-DECODE-STAGE-007 violation) — disabling eviction for
+        // the rest of the session. The pressure gate's `armed` edge-trigger is what bounds re-firing.
+        Ok(StageOutcome::Continue)
     }
 }
 
@@ -766,7 +771,7 @@ mod tests {
         let outcome = driver
             .on_phase(&LifecyclePhase::KvMutate, &mut pctx)
             .unwrap();
-        assert!(matches!(outcome, StageOutcome::Consumed));
+        assert!(matches!(outcome, StageOutcome::Continue)); // Persistent → stays resident
         let cache_h = handle.take_inner();
 
         // Same surviving token count, and byte-identical K and V buffers over the resident region.
@@ -1487,7 +1492,7 @@ mod tests {
         let outcome = driver
             .on_phase(&LifecyclePhase::KvMutate, &mut ctx)
             .unwrap();
-        assert!(matches!(outcome, StageOutcome::Consumed));
+        assert!(matches!(outcome, StageOutcome::Continue)); // Persistent → stays resident
         assert_eq!(handle.take_inner().current_pos(), 60, "evicted to budget");
     }
 
@@ -1566,6 +1571,31 @@ mod tests {
             handle.take_inner().current_pos(),
             80,
             "delta < MIN_EVICT → skip"
+        );
+    }
+
+    /// INV-DECODE-STAGE-007 regression: a FIRING driver must return `Continue` (not `Consumed`) under
+    /// its `Persistent` lifecycle, else `PipelineRegistry::dispatch` GCs it after the first eviction
+    /// (release) / `debug_assert`s a Persistent/Consumed violation (debug) — silently disabling
+    /// eviction for the rest of the session. The registry side of this invariant is pinned by
+    /// `tests/spec/test_inv_decode_stage_004_005_006_007.rs`; this pins the driver's side.
+    #[test]
+    fn firing_driver_returns_continue_under_persistent_lifecycle() {
+        let handle = Arc::new(StandardFormat::new(0, make_big_cache(200)));
+        let driver = pressure_gated(handle.clone(), 0.3);
+        assert_eq!(driver.lifecycle(), StageLifecycle::Persistent);
+        let mut prof = OpProfiler::new();
+        let mut ctx = make_ctx_pressure(&mut prof, 50); // band met → actually fires + evicts.
+        let outcome = driver
+            .on_phase(&LifecyclePhase::KvMutate, &mut ctx)
+            .unwrap();
+        assert!(
+            matches!(outcome, StageOutcome::Continue),
+            "a Persistent stage that fired must return Continue (INV-DECODE-STAGE-007), not Consumed"
+        );
+        assert!(
+            handle.with_cache_mut(|c| c.current_pos()) < 200,
+            "non-vacuous: the fire actually evicted"
         );
     }
 
