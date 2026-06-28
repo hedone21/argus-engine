@@ -2,8 +2,8 @@
 //! per-layer KV budget allocation** on top of **SnapKV per-head attention scoring**.
 //!
 //! Self-registering stage-axis extension (the `h2o`/`h2o-plus`/`d2o` precedent): depends only on
-//! `argus-extension-api` + `linkme`, implements [`KVCacheStage`], registers under the name
-//! `"pyramidkv"` via `#[distributed_slice(KV_CACHE_STAGES)]`, and is force-linked by the engine
+//! `argus-extension-api` + `linkme`, implements [`KVMutationStage`], registers under the name
+//! `"pyramidkv"` via `register_kv_mutation_stage!`, and is force-linked by the engine
 //! (`use pyramidkv as _;`). Private knobs ride the [`StageArgs`] blob (`eviction plugin --name
 //! pyramidkv --set compression_ratio=<R> --set window_size=<W> ...`).
 //!
@@ -37,14 +37,12 @@
 //! all to recency — so it is always safe to run.
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg,
-    KVMutationStage, KeepSpec, KeepTopK, MutationPhase, StageArgs, StageCaps, StageCtx,
-    StageParams, TensorKind, compile_keep_top_k, register_kv_mutation_stage,
+    CacheHandle, CacheOpError, KVMutationStage, KeepSpec, KeepTopK, MutationPhase, StageArgs,
+    StageCaps, StageCtx, StageParams, TensorKind, compile_keep_top_k, register_kv_mutation_stage,
 };
-use linkme::distributed_slice;
 
-/// The caps shared by the v2 [`KVCacheStageReg`] and the v3 registration: PyramidKV reads the
-/// prefill attention (SnapKV score source); protects no prefix; drop-only.
+/// The caps for the v3 registration: PyramidKV reads the prefill attention (SnapKV score
+/// source); protects no prefix; drop-only.
 const PYRAMIDKV_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::PrefillAttention],
     default_protected_prefix: 0,
@@ -388,39 +386,6 @@ register_kv_mutation_stage!(
     PYRAMIDKV_CAPS,
     MutationPhase::PrefillEnd
 );
-
-// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
-
-impl KVCacheStage for PyramidKv {
-    fn name(&self) -> &str {
-        "pyramidkv"
-    }
-
-    /// Decides via the shared `keep_spec`, so it is byte-identical to the v3 `on_phase`.
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-        self.keep_spec(ctx).map(|keep| KVCachePlan {
-            keep,
-            merges: Vec::new(),
-            channels: None,
-        })
-    }
-}
-
-/// Registration — the engine resolves this via `make_stage_with_args("pyramidkv", ...)`.
-///
-/// `caps.reads = [PrefillAttention]` declares the SnapKV score source; the engine's caps-driven
-/// `find_prefill_attn_stage_name` arms the prefill-attention producer for exactly this stage.
-/// `default_protected_prefix = 0` — kvpress PyramidKV protects no prefix (the recent window + heavy
-/// hitters are the whole keep-set). Drop-only (no weighted merges).
-#[distributed_slice(KV_CACHE_STAGES)]
-static PYRAMIDKV: KVCacheStageReg = KVCacheStageReg {
-    name: "pyramidkv",
-    make: |p: StageParams| Box::new(PyramidKv::new(PyramidKvConfig::from_args(p, &[]))),
-    make_with_args: |p: StageParams, args| {
-        Box::new(PyramidKv::new(PyramidKvConfig::from_args(p, args)))
-    },
-    caps: PYRAMIDKV_CAPS,
-};
 
 #[cfg(test)]
 mod tests;

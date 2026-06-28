@@ -2,8 +2,8 @@
 //! cosine-similarity token-merging compensation (Wan et al., 2024).
 //!
 //! Extracted from the engine core into a self-registering technique crate (the `caote`/`quest`/`h2o`
-//! precedent): depends only on `argus-extension-api` + `linkme`, implements [`KVCacheStage`], and
-//! registers under the name `"d2o"` via `#[distributed_slice(KV_CACHE_STAGES)]`. The engine
+//! precedent): depends only on `argus-extension-api` + `linkme`, implements [`KVMutationStage`], and
+//! registers under the name `"d2o"` via `register_kv_mutation_stage!`. The engine
 //! force-links it (`use d2o as _;`) so `eviction plugin --name d2o` resolves the out-of-tree plugin.
 //!
 //! Algorithm (ported verbatim from the engine `compute_d2o_plan` + `D2OStage::plan`, proven
@@ -26,15 +26,14 @@
 //! [`StageCtx::layer_idx`]/[`StageCtx::n_layers`].
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage,
-    KVCacheStageReg, KVMutationStage, KeepSpec, MergeAxis, MutationPhase, QCF_ESTIMATORS,
-    QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams, TensorKind,
-    WeightedMerge, register_kv_mutation_stage,
+    CacheHandle, CacheOpError, EstimatorCtx, KVMutationStage, MergeAxis, MutationPhase,
+    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
+    TensorKind, WeightedMerge, register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
 use std::sync::Mutex;
 
-/// The merge-producing caps shared by the v2 [`KVCacheStageReg`] and the v3 registration: D2O ranks
+/// The merge-producing caps for the v3 registration: D2O ranks
 /// by importance (Scores) and, on the off-device merge path, reads cached K (Key) for the Eq.8
 /// matching; protects 4 sinks by default.
 const D2O_CAPS: StageCaps = StageCaps {
@@ -397,9 +396,9 @@ fn compute_d2o_plan(
 
 // ── D2OStage ─────────────────────────────────────────────────────
 
-/// D2O as a plan-returning [`KVCacheStage`]. `plan(ctx)` runs [`compute_d2o_plan`] (K read via
-/// `ctx.dequant_k`) and emits retain_all keep + Eq.11 [`WeightedMerge`]s; the engine executor
-/// applies them. EMA τ is held in `Mutex<D2OState>` and accumulates across calls (per layer / per
+/// D2O as an imperative [`KVMutationStage`]. `on_phase(ctx, cache)` runs [`compute_d2o_plan`] (K read
+/// via `ctx.dequant_k`) and stages retain_all keep + Eq.11 [`WeightedMerge`]s onto the cache handle.
+/// EMA τ is held in `Mutex<D2OState>` and accumulates across calls (per layer / per
 /// decode step), matching the former engine handler's single shared state.
 pub struct D2OStage {
     config: D2OConfig,
@@ -430,9 +429,9 @@ impl D2OStage {
 }
 
 impl D2OStage {
-    /// The (keep, merges) decision (`None` = protected layer / no-op), shared by the v3 `on_phase` and
-    /// the v2 `plan` so they decide byte-identically. Merges are emitted only off-device
-    /// (`!kv_on_device()`); a device-resident cache degrades to keep-only (empty merges).
+    /// The (keep, merges) decision (`None` = protected layer / no-op) driving the v3 `on_phase`.
+    /// Merges are emitted only off-device (`!kv_on_device()`); a device-resident cache degrades to
+    /// keep-only (empty merges).
     #[allow(clippy::type_complexity)]
     fn compute_plan(&self, ctx: &dyn StageCtx) -> Option<(Vec<usize>, Vec<WeightedMerge>)> {
         // Per-layer protection (formerly the handler's per-layer loop skip).
@@ -496,7 +495,7 @@ impl KVMutationStage for D2OStage {
 
     /// Stage the Eq.11 weighted merges (off-device only) then the retain-all keep, or no-op on a
     /// protected layer. On a device-resident cache `compute_plan` yields no merges, so this stages
-    /// keep-only WITHOUT aborting (T-8). Byte-identical to the v2 plan via the shared `compute_plan`.
+    /// keep-only WITHOUT aborting (T-8).
     fn on_phase(
         &self,
         ctx: &dyn StageCtx,
@@ -520,40 +519,6 @@ register_kv_mutation_stage!(
     D2O_CAPS,
     MutationPhase::KvMutate
 );
-
-// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
-
-impl KVCacheStage for D2OStage {
-    fn name(&self) -> &str {
-        "d2o"
-    }
-
-    /// Decides via the shared `compute_plan`, so it is byte-identical to the v3 `on_phase`.
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-        self.compute_plan(ctx)
-            .map(|(retain_all, merges)| KVCachePlan {
-                keep: KeepSpec::LayerWide(retain_all),
-                merges,
-                channels: None,
-            })
-    }
-}
-
-/// Registration — the engine finds this via `find_stage("d2o")` and builds it through
-/// `make_stage_with_args("d2o", &params, &blob)`. `keep_ratio`/`protected_prefix` flow in from
-/// [`StageParams`]; the d2o-private knobs (ema_beta/merge_e/target_ratio/layer_alloc/protected_layers/
-/// merge_axis) ride the [`StageArgs`] blob and are parsed by [`D2OConfig::from_args`]. The plain
-/// `make` (empty blob) keeps the prior `make_stage("d2o")` behavior (only keep_ratio/protected_prefix).
-#[distributed_slice(KV_CACHE_STAGES)]
-static D2O: KVCacheStageReg = KVCacheStageReg {
-    name: "d2o",
-    make: |p: StageParams| Box::new(D2OStage::new(D2OConfig::from_args(p, &[]))),
-    make_with_args: |p: StageParams, args| Box::new(D2OStage::new(D2OConfig::from_args(p, args))),
-    // D2O ranks tokens by accumulated importance (Scores) and, on the off-device merge
-    // path, dequantizes cached K for the Eq.8 nearest-neighbour matching
-    // (ctx.dequant_k => Key); protect 4 attention sinks by default.
-    caps: D2O_CAPS,
-};
 
 // ── QCF estimator (observer/score axis) ──────────────────────────
 
@@ -809,7 +774,7 @@ static D2O_QCF: QcfEstimatorReg = QcfEstimatorReg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argus_extension_api::{TensorDtype, TensorHandle, TensorKind, TensorShape, find_stage};
+    use argus_extension_api::{TensorDtype, TensorHandle, TensorKind, TensorShape};
 
     // ── cosine_similarity ──
 
@@ -1014,7 +979,7 @@ mod tests {
         assert!(passing2.is_empty(), "sim 0 < τ 0.3 → nothing merges");
     }
 
-    // ── D2OStage::plan (protection / kv_on_device / merge structure / registration) ──
+    // ── D2OStage / on_phase (kv_on_device / merge structure / registration) ──
 
     /// Minimal K-providing tensor handle: `k[(row*n_kv_heads + kv_head)*head_dim + d]`.
     struct KeyData {
@@ -1102,45 +1067,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stage_protected_layer_is_noop() {
-        let stage = D2OStage::new(D2OConfig {
-            protected_layers: vec![2],
-            ..D2OConfig::default()
-        });
-        let mut ctx = base_ctx();
-        ctx.layer_idx = 2; // in protected_layers → plan None.
-        assert!(stage.plan(&ctx).is_none());
-        ctx.layer_idx = 1; // not protected → plan Some.
-        assert!(stage.plan(&ctx).is_some());
-    }
-
-    #[test]
-    fn stage_last_layer_protected_under_layer_allocation() {
-        let stage = D2OStage::new(D2OConfig {
-            use_layer_allocation: true,
-            ..D2OConfig::default()
-        });
-        let mut ctx = base_ctx();
-        ctx.layer_idx = 3; // n_layers=4 → last layer protected when use_layer_allocation.
-        assert!(stage.plan(&ctx).is_none());
-        ctx.layer_idx = 0;
-        assert!(stage.plan(&ctx).is_some());
-    }
-
-    #[test]
-    fn stage_on_device_degrades_to_keep_only() {
-        let stage = D2OStage::new(D2OConfig::default());
-        let mut ctx = base_ctx();
-        ctx.on_device = true; // device-only → no K read, no merges.
-        let plan = stage.plan(&ctx).expect("still evicts (keep-only)");
-        assert!(plan.merges.is_empty(), "on-device → no merges");
-        match plan.keep {
-            KeepSpec::LayerWide(k) => assert_eq!(k.len(), 12, "keep target_len tokens"),
-            KeepSpec::PerHead(_) => panic!("d2o is layer-wide"),
-        }
-    }
-
     /// A mock [`CacheHandle`] capturing the staged merges + keep.
     #[derive(Default)]
     struct CaptureHandle {
@@ -1188,11 +1114,11 @@ mod tests {
         }
     }
 
-    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages the same merges + keep
-    /// the v2 `plan` produces (both via the shared `compute_plan`), and on a device-resident cache it
-    /// stages keep-only without a merge (T-8). Fresh stage instances so the EMA state doesn't carry.
+    /// v3 native registration + DECISION coverage: the v3 `on_phase` stages exactly the merges + keep
+    /// the shared `compute_plan` decides, and on a device-resident cache it stages keep-only without a
+    /// merge (T-8). Fresh stage instances so the EMA state doesn't carry.
     #[test]
-    fn v3_native_matches_v2_decision() {
+    fn v3_native_stages_shared_decision() {
         use argus_extension_api::find_mutation_stage;
         let reg = find_mutation_stage("d2o").expect("d2o in KV_MUTATION_STAGES");
         assert_eq!(reg.name, "d2o");
@@ -1200,15 +1126,14 @@ mod tests {
         assert!(reg.caps.produces_merge_plan);
         assert_eq!((reg.make)(StageParams::default(), &[]).name(), "d2o");
 
-        // host path: merges + keep.
-        let plan = D2OStage::new(D2OConfig::default())
-            .plan(&base_ctx())
-            .expect("plan Some");
-        let (v2_keep, v2_merges) = match plan.keep {
-            KeepSpec::LayerWide(k) => (k, plan.merges),
-            KeepSpec::PerHead(_) => panic!("d2o is layer-wide"),
-        };
-        assert!(!v2_merges.is_empty(), "host base_ctx must produce merges");
+        // host path: merges + keep (the shared decision the v3 on_phase stages).
+        let (expected_keep, expected_merges) = D2OStage::new(D2OConfig::default())
+            .compute_plan(&base_ctx())
+            .expect("compute_plan Some");
+        assert!(
+            !expected_merges.is_empty(),
+            "host base_ctx must produce merges"
+        );
         let mut h = CaptureHandle::default();
         <D2OStage as KVMutationStage>::on_phase(
             &D2OStage::new(D2OConfig::default()),
@@ -1225,10 +1150,10 @@ mod tests {
         };
         assert_eq!(
             h.merged.map(sort_by_into),
-            Some(sort_by_into(v2_merges)),
-            "v3 stages the same set of merges as v2"
+            Some(sort_by_into(expected_merges)),
+            "v3 stages the same set of merges as the shared decision"
         );
-        assert_eq!(h.kept, Some(v2_keep));
+        assert_eq!(h.kept, Some(expected_keep));
 
         // device path: keep-only, no merge call.
         let mut dctx = base_ctx();
@@ -1247,16 +1172,9 @@ mod tests {
     #[test]
     fn stage_produces_normalized_weighted_merges() {
         let stage = D2OStage::new(D2OConfig::default());
-        let plan = stage.plan(&base_ctx()).expect("plan Some");
-        let keep: Vec<usize> = match &plan.keep {
-            KeepSpec::LayerWide(k) => k.clone(),
-            KeepSpec::PerHead(_) => panic!("d2o is layer-wide"),
-        };
-        assert!(
-            !plan.merges.is_empty(),
-            "merge enabled → some merges expected"
-        );
-        for m in &plan.merges {
+        let (keep, merges) = stage.compute_plan(&base_ctx()).expect("compute_plan Some");
+        assert!(!merges.is_empty(), "merge enabled → some merges expected");
+        for m in &merges {
             assert!(
                 keep.contains(&m.into),
                 "merge target must be a retained token"
@@ -1273,18 +1191,5 @@ mod tests {
                 "Eq.11 weights sum to 1, got {total}"
             );
         }
-    }
-
-    #[test]
-    fn registers_into_slice_and_make_from_params() {
-        assert_eq!(find_stage("d2o").expect("d2o registered").name, "d2o");
-        let stage = (find_stage("d2o").unwrap().make)(StageParams {
-            eviction_window: 0,
-            protected_prefix: 4,
-            keep_ratio: 0.75,
-            sink_size: 0,
-            streaming_window: 0,
-        });
-        assert_eq!(stage.name(), "d2o");
     }
 }

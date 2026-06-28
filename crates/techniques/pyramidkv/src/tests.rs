@@ -10,9 +10,7 @@
 //!   broken lower-index-first on both sides.
 
 use super::*;
-use argus_extension_api::{
-    StageArgs, TensorDtype, TensorHandle, TensorKind, TensorShape, find_stage,
-};
+use argus_extension_api::{TensorDtype, TensorHandle, TensorKind, TensorShape};
 
 // ── shared deterministic attention generator (mirrors reference/pyramidkv_select_ref.py) ──
 
@@ -120,28 +118,19 @@ fn cr_args(cr: &str, window: usize, kernel: usize, beta: u32) -> Vec<(String, St
     ]
 }
 
-fn make_pyramidkv(args: &[(String, String)]) -> Box<dyn KVCacheStage> {
+/// Build a concrete `PyramidKv` from CLI-style args and return its v3 keep-set decision — the
+/// shared `keep_spec` both `on_phase` arms route through (replaces the removed v2 `plan()` in the
+/// shape tests below).
+fn keep_spec_for(args: &[(String, String)], ctx: &Ctx) -> Option<KeepSpec> {
     let blob: Vec<argus_extension_api::PluginArg> = args
         .iter()
         .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
         .collect();
-    let reg = find_stage("pyramidkv").expect("pyramidkv registered");
-    (reg.make_with_args)(StageParams::default(), &blob as StageArgs)
+    let stage = PyramidKv::new(PyramidKvConfig::from_args(StageParams::default(), &blob));
+    stage.keep_spec(ctx)
 }
 
-// ── 1. registration ──────────────────────────────────────────────────────────
-
-#[test]
-fn registers_with_prefill_attention_caps() {
-    let reg = find_stage("pyramidkv").expect("pyramidkv registered in KV_CACHE_STAGES");
-    assert_eq!(reg.name, "pyramidkv");
-    assert!(reg.caps.reads.contains(&TensorKind::PrefillAttention));
-    // kvpress PyramidKV protects no prefix.
-    assert_eq!(reg.caps.default_protected_prefix, 0);
-    assert!(!reg.caps.produces_merge_plan);
-}
-
-// ── 2. per-layer budget == kvpress get_layer_budget (CSV oracle) ──────────────
+// ── 1. per-layer budget == kvpress get_layer_budget (CSV oracle) ──────────────
 
 #[test]
 fn budget_matches_kvpress_grid() {
@@ -242,61 +231,7 @@ fn per_head_keep_hand_traced() {
     assert_eq!(got, vec![vec![1usize, 3, 4, 5]]);
 }
 
-// ── 4. full plan() wiring: budget + per-head selection → PerHead plan ──────────
-
-#[test]
-fn plan_wires_budget_to_per_head_selection() {
-    // Pyramid branch (n_layers>1). plan() must use get_layer_budget for n_kept and per_head_keep
-    // for the positions → assert it equals the composition computed here.
-    let (current, n_kv, n_q) = (512usize, 4usize, 4usize);
-    let (cr, window, kernel, beta, n_layers, layer_idx) =
-        ("0.5", 8usize, 5usize, 20u32, 16usize, 3usize);
-    let attn = synth_attn(n_q, current, 123);
-    let stage = make_pyramidkv(&cr_args(cr, window, kernel, beta));
-
-    let ctx = Ctx {
-        current,
-        target: 0, // explicit compression_ratio drives the budget; target_len unused
-        layer_idx,
-        n_layers,
-        n_kv_heads: n_kv,
-        pfa: Some(PfaHandle {
-            data: attn.clone(),
-            rows: n_q,
-            cols: current,
-        }),
-        ..Default::default()
-    };
-    let plan = stage.plan(&ctx).expect("plan Some");
-
-    let n_kept = get_layer_budget(current, 0.5, window, beta, n_layers, layer_idx);
-    assert!(n_kept > window && n_kept < current, "n_kept={n_kept}");
-    let expected = per_head_keep(
-        |qh, out| {
-            let base = qh * current;
-            out.copy_from_slice(&attn[base..base + current]);
-        },
-        n_q,
-        n_kv,
-        current,
-        current,
-        window,
-        kernel,
-        n_kept - window,
-    );
-    match plan.keep {
-        KeepSpec::PerHead(heads) => {
-            assert_eq!(heads, expected);
-            for h in &heads {
-                assert_eq!(h.len(), n_kept); // equal-length invariant
-            }
-        }
-        KeepSpec::LayerWide(_) => panic!("expected PerHead when PFA is supplied"),
-    }
-    assert!(plan.merges.is_empty());
-}
-
-// ── v3 native (imperative) decision equivalence ──────────────────────────────
+// ── v3 native (imperative) decision ──────────────────────────────────────────
 
 /// A mock [`CacheHandle`] capturing keep / keep_per_head.
 #[derive(Default)]
@@ -350,24 +285,29 @@ impl CacheHandle for CaptureHandle {
     }
 }
 
-/// v3 native registration (PrefillEnd phase) + DECISION equivalence: the v3 `on_phase` stages the
-/// per-head SnapKV keep the v2 `plan` returns (both via the shared `keep_spec`).
+/// v3 native registration (PrefillEnd phase) + per-head decision: the v3 `on_phase` stages the
+/// per-head SnapKV keep-set via `keep_per_head`. The expected keep is an independent
+/// `get_layer_budget` × `per_head_keep` composition.
 #[test]
-fn v3_native_matches_v2_decision() {
+fn v3_native_per_head_decision() {
     let reg = argus_extension_api::find_mutation_stage("pyramidkv")
         .expect("pyramidkv in KV_MUTATION_STAGES");
     assert_eq!(reg.name, "pyramidkv");
     assert_eq!(reg.phase, MutationPhase::PrefillEnd);
     assert!(reg.caps.reads.contains(&TensorKind::PrefillAttention));
+    // kvpress PyramidKV protects no prefix; drop-only.
+    assert_eq!(reg.caps.default_protected_prefix, 0);
+    assert!(!reg.caps.produces_merge_plan);
 
     let (current, n_kv, n_q) = (512usize, 4usize, 4usize);
+    let (window, kernel, beta, n_layers, layer_idx) = (8usize, 5usize, 20u32, 16usize, 3usize);
     let attn = synth_attn(n_q, current, 123);
-    let args = cr_args("0.5", 8, 5, 20);
+    let args = cr_args("0.5", window, kernel, beta);
     let ctx = Ctx {
         current,
         target: 0,
-        layer_idx: 3,
-        n_layers: 16,
+        layer_idx,
+        n_layers,
         n_kv_heads: n_kv,
         pfa: Some(PfaHandle {
             data: attn.clone(),
@@ -376,11 +316,24 @@ fn v3_native_matches_v2_decision() {
         }),
         ..Default::default()
     };
-    // v2 decision via the registered (boxed) stage.
-    let v2_heads = match make_pyramidkv(&args).plan(&ctx).unwrap().keep {
-        KeepSpec::PerHead(h) => h,
-        KeepSpec::LayerWide(_) => panic!("expected PerHead"),
-    };
+
+    // Independent oracle: budget (get_layer_budget) × per-head selection (per_head_keep).
+    let n_kept = get_layer_budget(current, 0.5, window, beta, n_layers, layer_idx);
+    assert!(n_kept > window && n_kept < current, "n_kept={n_kept}");
+    let expected = per_head_keep(
+        |qh, out| {
+            let base = qh * current;
+            out.copy_from_slice(&attn[base..base + current]);
+        },
+        n_q,
+        n_kv,
+        current,
+        current,
+        window,
+        kernel,
+        n_kept - window,
+    );
+
     // v3 decision via a concrete PyramidKv built from the same config.
     let blob: Vec<argus_extension_api::PluginArg> = args
         .iter()
@@ -393,12 +346,15 @@ fn v3_native_matches_v2_decision() {
         ..Default::default()
     };
     <PyramidKv as KVMutationStage>::on_phase(&v3, &ctx, &mut h).unwrap();
-    assert_eq!(h.kept_per_head, Some(v2_heads));
+    assert_eq!(h.kept_per_head, Some(expected));
+    for head in h.kept_per_head.as_ref().unwrap() {
+        assert_eq!(head.len(), n_kept); // equal-length PerHead invariant
+    }
     assert_eq!(h.kept, None, "per-head path uses keep_per_head, not keep");
 }
 
-/// v3 DECISION equivalence on the OTHER on_phase arms: the layer-wide degraded fallback (no PFA,
-/// flat importance) stages `cache.keep` matching the v2 plan; and the no-op (cr==0) stages nothing.
+/// v3 DECISION on the OTHER on_phase arms: the layer-wide degraded fallback (no PFA, flat
+/// importance) stages `cache.keep`; and the no-op (cr==0) stages nothing.
 #[test]
 fn v3_native_layerwide_and_noop_arms() {
     let blob_args = cr_args("0.5", 8, 5, 20);
@@ -418,7 +374,7 @@ fn v3_native_layerwide_and_noop_arms() {
         pfa: None,
         importance: Some((0..64).map(|i| (i % 11) as f32).collect()),
     };
-    let v2_lw = match make_pyramidkv(&blob_args).plan(&lw_ctx).unwrap().keep {
+    let expected_lw = match keep_spec_for(&blob_args, &lw_ctx).unwrap() {
         KeepSpec::LayerWide(k) => k,
         KeepSpec::PerHead(_) => panic!("no-PFA fallback is layer-wide"),
     };
@@ -428,7 +384,7 @@ fn v3_native_layerwide_and_noop_arms() {
         ..Default::default()
     };
     <PyramidKv as KVMutationStage>::on_phase(&v3, &lw_ctx, &mut h).unwrap();
-    assert_eq!(h.kept, Some(v2_lw));
+    assert_eq!(h.kept, Some(expected_lw));
     assert_eq!(h.kept_per_head, None, "fallback uses layer-wide keep");
 
     // (2) no-op: compression_ratio == 0 (no explicit cr, no target) → plan None, on_phase stages nothing.
@@ -442,10 +398,7 @@ fn v3_native_layerwide_and_noop_arms() {
         pfa: None,
         importance: None,
     };
-    assert!(
-        make_pyramidkv(&[]).plan(&noop_ctx).is_none(),
-        "cr==0 → no-op plan"
-    );
+    assert!(keep_spec_for(&[], &noop_ctx).is_none(), "cr==0 → no-op");
     let mut h2 = CaptureHandle {
         cur: 64,
         n_kv: 4,
@@ -461,7 +414,6 @@ fn v3_native_layerwide_and_noop_arms() {
 #[test]
 fn zero_compression_is_noop() {
     // No explicit compression_ratio and no engine target_len ⇒ cr=0 ⇒ None (kvpress: cr==0 no-op).
-    let stage = make_pyramidkv(&[]);
     let ctx = Ctx {
         current: 128,
         target: 0,
@@ -473,13 +425,12 @@ fn zero_compression_is_noop() {
         }),
         ..Default::default()
     };
-    assert!(stage.plan(&ctx).is_none());
+    assert!(keep_spec_for(&[], &ctx).is_none());
 }
 
 #[test]
 fn budget_covers_everything_is_noop() {
     // Tiny compression ⇒ n_kept >= current ⇒ nothing to evict.
-    let stage = make_pyramidkv(&cr_args("0.01", 8, 5, 20));
     let ctx = Ctx {
         current: 50, // n_kept = round(50*0.99)=50 >= current
         n_layers: 1,
@@ -491,14 +442,14 @@ fn budget_covers_everything_is_noop() {
         }),
         ..Default::default()
     };
-    assert!(stage.plan(&ctx).is_none());
+    assert!(keep_spec_for(&cr_args("0.01", 8, 5, 20), &ctx).is_none());
 }
 
 #[test]
 fn compression_ratio_derived_from_target_len() {
     // No explicit compression_ratio: derive cr = 1 - target_len/current. current=200, target=120
     // ⇒ cr=0.4. With n_layers=1 the budget falls back to uniform round(200*0.6)=120 = target.
-    let stage = make_pyramidkv(&[("window_size".to_string(), "8".to_string())]);
+    let args = [("window_size".to_string(), "8".to_string())];
     let ctx = Ctx {
         current: 200,
         target: 120,
@@ -511,8 +462,7 @@ fn compression_ratio_derived_from_target_len() {
         }),
         ..Default::default()
     };
-    let plan = stage.plan(&ctx).expect("plan Some");
-    match plan.keep {
+    match keep_spec_for(&args, &ctx).expect("keep Some") {
         KeepSpec::PerHead(heads) => assert_eq!(heads[0].len(), 120),
         KeepSpec::LayerWide(_) => panic!("expected PerHead"),
     }
@@ -520,8 +470,7 @@ fn compression_ratio_derived_from_target_len() {
 
 #[test]
 fn degraded_layerwide_fallback_without_pfa() {
-    // No PFA handle but flat importance present ⇒ layer-wide pyramid-budgeted H2O-style plan.
-    let stage = make_pyramidkv(&cr_args("0.5", 8, 5, 20));
+    // No PFA handle but flat importance present ⇒ layer-wide pyramid-budgeted H2O-style keep.
     let mut imp = vec![0.0f32; 128];
     for (i, &p) in [10usize, 20, 30, 40].iter().enumerate() {
         imp[p] = 100.0 - i as f32;
@@ -534,8 +483,7 @@ fn degraded_layerwide_fallback_without_pfa() {
         importance: Some(imp),
         ..Default::default()
     };
-    let plan = stage.plan(&ctx).expect("plan Some");
-    match plan.keep {
+    match keep_spec_for(&cr_args("0.5", 8, 5, 20), &ctx).expect("keep Some") {
         KeepSpec::LayerWide(k) => {
             assert_eq!(k.len(), 64);
             // window (last 8) always kept; the high-importance positions kept as heavy hitters.
@@ -553,7 +501,6 @@ fn degraded_layerwide_fallback_without_pfa() {
 #[test]
 fn recency_fallback_without_any_scores() {
     // No PFA, no importance ⇒ recency: keep the most-recent n_kept, layer-wide.
-    let stage = make_pyramidkv(&cr_args("0.5", 8, 5, 20));
     let ctx = Ctx {
         current: 128,
         n_layers: 1, // n_kept=64
@@ -562,8 +509,7 @@ fn recency_fallback_without_any_scores() {
         importance: None,
         ..Default::default()
     };
-    let plan = stage.plan(&ctx).expect("plan Some");
-    match plan.keep {
+    match keep_spec_for(&cr_args("0.5", 8, 5, 20), &ctx).expect("keep Some") {
         KeepSpec::LayerWide(k) => assert_eq!(k, (64..128).collect::<Vec<_>>()),
         KeepSpec::PerHead(_) => panic!("expected LayerWide recency"),
     }
@@ -577,7 +523,6 @@ fn degenerate_cr_floors_to_window_never_empty() {
     // round to 0, yielding an EMPTY keep-list that empties the cache. The window floor must keep at
     // least the recent window. current=64, window=8, cr≈1 ⇒ raw budget round(64*1e-6)=0 → floored
     // to window=8 → keep the last 8 (non-empty), NOT [].
-    let stage = make_pyramidkv(&cr_args("0.999999", 8, 5, 20));
     let ctx = Ctx {
         current: 64,
         n_layers: 1,
@@ -589,8 +534,9 @@ fn degenerate_cr_floors_to_window_never_empty() {
         }),
         ..Default::default()
     };
-    let plan = stage.plan(&ctx).expect("plan Some (must evict, not empty)");
-    match plan.keep {
+    let keep = keep_spec_for(&cr_args("0.999999", 8, 5, 20), &ctx)
+        .expect("keep Some (must evict, not empty)");
+    match keep {
         KeepSpec::LayerWide(k) => {
             assert_eq!(
                 k,
@@ -612,7 +558,6 @@ fn even_kernel_is_forced_odd() {
     let n_q = 4usize;
     let attn = synth_attn(n_q, current, 314);
     let mk = |k: usize| {
-        let stage = make_pyramidkv(&cr_args("0.5", 8, k, 20));
         let ctx = Ctx {
             current,
             n_layers: 8,
@@ -625,7 +570,7 @@ fn even_kernel_is_forced_odd() {
             }),
             ..Default::default()
         };
-        stage.plan(&ctx).expect("plan Some")
+        keep_spec_for(&cr_args("0.5", 8, k, 20), &ctx).expect("keep Some")
     };
     assert_eq!(mk(2), mk(3), "kernel_size=2 must be forced to 3");
     // sanity: 3 and 5 differ (pooling actually matters), so the equality above isn't trivial.
@@ -636,8 +581,7 @@ fn even_kernel_is_forced_odd() {
 fn pfa_invalid_gqa_falls_back_to_layerwide() {
     // Adversarial coverage gap: PFA present but n_q (3) not a multiple of n_kv (2) ⇒ per-head SnapKV
     // is undefined, so the stage must DEGRADE to the layer-wide path (here, recency — no importance),
-    // never emit a malformed PerHead plan.
-    let stage = make_pyramidkv(&cr_args("0.5", 8, 5, 20));
+    // never emit a malformed PerHead keep.
     let ctx = Ctx {
         current: 128,
         n_layers: 1, // n_kept = 64 > window
@@ -649,8 +593,7 @@ fn pfa_invalid_gqa_falls_back_to_layerwide() {
         }),
         ..Default::default()
     };
-    let plan = stage.plan(&ctx).expect("plan Some");
-    match plan.keep {
+    match keep_spec_for(&cr_args("0.5", 8, 5, 20), &ctx).expect("keep Some") {
         KeepSpec::LayerWide(k) => assert_eq!(k, (64..128).collect::<Vec<_>>()),
         KeepSpec::PerHead(_) => panic!("invalid GQA geometry must not produce PerHead"),
     }
@@ -661,7 +604,6 @@ fn window_only_keep_when_budget_equals_window() {
     // The n_kept == window boundary (after the floor) keeps exactly the recent window, layer-wide —
     // matching kvpress's window-forced set when the budget equals the window. Pick params where the
     // uniform fallback lands at the window: current=80, cr=0.9, window=8 ⇒ round(80*0.1)=8.
-    let stage = make_pyramidkv(&cr_args("0.9", 8, 5, 20));
     let ctx = Ctx {
         current: 80,
         n_layers: 1,
@@ -673,8 +615,7 @@ fn window_only_keep_when_budget_equals_window() {
         }),
         ..Default::default()
     };
-    let plan = stage.plan(&ctx).expect("plan Some");
-    match plan.keep {
+    match keep_spec_for(&cr_args("0.9", 8, 5, 20), &ctx).expect("keep Some") {
         KeepSpec::LayerWide(k) => assert_eq!(k, (72..80).collect::<Vec<_>>()),
         KeepSpec::PerHead(_) => panic!("budget==window is the layer-wide window-only keep"),
     }

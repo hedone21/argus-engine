@@ -1,8 +1,8 @@
 //! H2O (Heavy-Hitter Oracle) technique crate — attention-score-based KV eviction (Zhang et al., 2023).
 //!
 //! Extracted from the engine core into a self-registering technique crate (the `caote`/`quest`
-//! precedent): depends only on `argus-extension-api` + `linkme`, implements [`KVCacheStage`], and
-//! registers under the name `"h2o"` via `#[distributed_slice(KV_CACHE_STAGES)]`. The engine
+//! precedent): depends only on `argus-extension-api` + `linkme`, implements [`KVMutationStage`], and
+//! registers under the name `"h2o"` via `register_kv_mutation_stage!`. The engine
 //! force-links it (`use h2o as _;`) so `eviction plugin --name h2o` resolves the out-of-tree plugin.
 //!
 //! 3-partition model: `[Protected Prefix] [Heavy Hitters (score-ranked)] [Recent Window]`. After
@@ -11,18 +11,17 @@
 //! read from [`StageCtx::importance`]. When no scores are supplied the stage degrades to recency
 //! (prefix + most-recent), matching the engine's score-free fallback.
 //!
-//! The stage only reads `current_pos`/`target_len`/`importance` and returns a layer-wide
-//! keep-list; the engine executes the compaction (plan-returning, D1).
+//! The stage only reads `current_pos`/`target_len`/`importance` and stages a layer-wide
+//! keep-set on the cache handle (imperative, v3).
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage,
-    KVCacheStageReg, KVMutationStage, KeepSpec, KeepTopK, MutationPhase, QCF_ESTIMATORS,
-    QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams, TensorKind,
-    compile_keep_top_k, redistribute_value, register_kv_mutation_stage,
+    CacheHandle, CacheOpError, EstimatorCtx, KVMutationStage, KeepTopK, MutationPhase,
+    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
+    TensorKind, compile_keep_top_k, redistribute_value, register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
 
-/// The score-based caps shared by the v2 [`KVCacheStageReg`] and the v3 registration: H2O reads
+/// The score-based caps for the v3 registration: H2O reads
 /// accumulated importance (Scores) and protects 4 sinks by default.
 const H2O_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::Scores],
@@ -48,10 +47,9 @@ impl H2o {
 
 impl H2o {
     /// The keep-list (`None` = no-op within budget / nothing to prune), ported verbatim from the
-    /// engine `H2OPolicy::plan_keep`. Shared by the v3 `on_phase` and the v2 `plan` so they decide
-    /// byte-identically. The 3-partition T1 shape is routed through `compile_keep_top_k` (the policy
-    /// supplies budgets + a score fn; the compiler owns the recency window + STABLE top-k + ascending
-    /// re-sort).
+    /// engine `H2OPolicy::plan_keep`. Drives the v3 `on_phase`. The 3-partition T1 shape is routed
+    /// through `compile_keep_top_k` (the policy supplies budgets + a score fn; the compiler owns the
+    /// recency window + STABLE top-k + ascending re-sort).
     fn keep_list(
         &self,
         current: usize,
@@ -109,7 +107,7 @@ impl KVMutationStage for H2o {
     }
 
     /// Stage the heavy-hitter keep-set (or no-op within budget). The driver supplies accumulated
-    /// importance through `ctx.importance()`; byte-identical to the v2 plan via the shared `keep_list`.
+    /// importance through `ctx.importance()`; the keep-set is decided by the shared `keep_list`.
     fn on_phase(
         &self,
         ctx: &dyn StageCtx,
@@ -128,38 +126,6 @@ register_kv_mutation_stage!(
     H2O_CAPS,
     MutationPhase::KvMutate
 );
-
-// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
-
-impl KVCacheStage for H2o {
-    fn name(&self) -> &str {
-        "h2o"
-    }
-
-    /// Heavy-hitter keep-list (`None` within budget). Decides via the shared `keep_list`, so it is
-    /// byte-identical to the v3 `on_phase`.
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-        self.keep_list(ctx.current_pos(), ctx.target_len(), ctx.importance())
-            .map(|keep_list| KVCachePlan {
-                keep: KeepSpec::LayerWide(keep_list),
-                merges: Vec::new(),
-                channels: None,
-            })
-    }
-}
-
-/// Registration — the engine finds this via `find_stage("h2o")`. `keep_ratio`/`protected_prefix`
-/// flow in from [`StageParams`] (CLI `eviction plugin --name h2o --set keep_ratio=<R>` +
-/// `--protected-prefix <N>`).
-#[distributed_slice(KV_CACHE_STAGES)]
-static H2O: KVCacheStageReg = KVCacheStageReg {
-    name: "h2o",
-    make: |p: StageParams| Box::new(H2o::new(p.keep_ratio, p.protected_prefix)),
-    // h2o takes no technique-private args — drop the blob, build from StageParams.
-    make_with_args: |p: StageParams, _args| Box::new(H2o::new(p.keep_ratio, p.protected_prefix)),
-    // H2O selects heavy hitters by accumulated importance (score-based); protect 4 sinks by default.
-    caps: H2O_CAPS,
-};
 
 // ── QCF estimator (observer/score axis) ──────────────────────────
 
@@ -258,7 +224,7 @@ static H2O_QCF: QcfEstimatorReg = QcfEstimatorReg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argus_extension_api::{TensorHandle, TensorKind, find_stage};
+    use argus_extension_api::{TensorHandle, TensorKind};
 
     struct Ctx {
         cur: usize,
@@ -289,16 +255,8 @@ mod tests {
         }
     }
 
-    fn keep_of(stage: &dyn KVCacheStage, ctx: &Ctx) -> Option<Vec<usize>> {
-        stage.plan(ctx).map(|p| match p.keep {
-            KeepSpec::LayerWide(k) => k,
-            KeepSpec::PerHead(_) => panic!("h2o is layer-wide"),
-        })
-    }
-
-    #[test]
-    fn registers_into_slice() {
-        assert_eq!(find_stage("h2o").expect("h2o registered").name, "h2o");
+    fn keep_of(stage: &H2o, ctx: &Ctx) -> Option<Vec<usize>> {
+        stage.keep_list(ctx.current_pos(), ctx.target_len(), ctx.importance())
     }
 
     /// A mock [`CacheHandle`] capturing the keep staged by `keep`.
@@ -349,11 +307,11 @@ mod tests {
         }
     }
 
-    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages the keep the v2 `plan`
-    /// returns (both via the shared `keep_list`), for the score-free AND score-based (importance)
-    /// cases, and within-budget stages nothing.
+    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages the keep the shared
+    /// `keep_list` returns, for the score-free AND score-based (importance) cases, and within-budget
+    /// stages nothing.
     #[test]
-    fn v3_native_matches_v2_decision() {
+    fn v3_native_matches_keep_list_decision() {
         use argus_extension_api::find_mutation_stage;
         let reg = find_mutation_stage("h2o").expect("h2o in KV_MUTATION_STAGES");
         assert_eq!(reg.name, "h2o");
@@ -445,18 +403,5 @@ mod tests {
         );
         // keep = [0..4) ∪ {6,9,12,14} ∪ [16..20)
         assert_eq!(keep, Some(vec![0, 1, 2, 3, 6, 9, 12, 14, 16, 17, 18, 19]));
-    }
-
-    #[test]
-    fn make_from_params() {
-        let p = StageParams {
-            eviction_window: 0,
-            protected_prefix: 4,
-            keep_ratio: 0.5,
-            sink_size: 0,
-            streaming_window: 0,
-        };
-        let stage = (find_stage("h2o").unwrap().make)(p);
-        assert_eq!(stage.name(), "h2o");
     }
 }

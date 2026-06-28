@@ -10,15 +10,13 @@
 //! per-head 는 단계 ⑤ executor 대기). feature `caote` 설치 시 `eviction caote` 서브커맨드로 선택.
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg,
-    KVMutationStage, KeepSpec, MutationPhase, StageCaps, StageCtx, StageParams, TensorKind,
+    CacheHandle, CacheOpError, KVMutationStage, MutationPhase, StageCaps, StageCtx, TensorKind,
     register_kv_mutation_stage,
 };
-use linkme::distributed_slice;
 
-/// The score-based caps shared by the v2 [`KVCacheStageReg`] and the v3 registration: CAOTE weights
-/// criticality by the attention weight `a_i` (AttnWeights) and reads cached V (Value), falling back to
-/// flat importance (Scores); protects 4 sinks by default.
+/// The score-based caps for the v3 registration: CAOTE weights criticality by the attention weight
+/// `a_i` (AttnWeights) and reads cached V (Value), falling back to flat importance (Scores);
+/// protects 4 sinks by default.
 const CAOTE_CAPS: StageCaps = StageCaps {
     reads: &[
         TensorKind::Scores,
@@ -43,9 +41,9 @@ fn weight(ctx: &dyn StageCtx, use_aw: bool, kv_head: usize, pos: usize) -> f32 {
 }
 
 impl Caote {
-    /// The value-aware criticality keep-list (`None` = no-op within budget), shared by the v3
-    /// `on_phase` and the v2 `plan` so they decide byte-identically. CAOTE uses its OWN unstable sort
-    /// (NOT `keep_top_k` — the tie-break differs): top-`tgt` criticality, then ascending.
+    /// The value-aware criticality keep-list (`None` = no-op within budget), used by the v3
+    /// `on_phase`. CAOTE uses its OWN unstable sort (NOT `keep_top_k` — the tie-break differs):
+    /// top-`tgt` criticality, then ascending.
     fn compute_keep(&self, ctx: &dyn StageCtx) -> Option<Vec<usize>> {
         let cur = ctx.current_pos();
         let tgt = ctx.target_len();
@@ -117,8 +115,8 @@ impl KVMutationStage for Caote {
 
     /// Stage the value-aware criticality keep-set (or no-op within budget). The driver supplies V via
     /// `ctx.tensor(Value)` (P0-3c V snapshot, armed by `CAOTE_CAPS.reads ∋ Value`) and the attention
-    /// weight / importance via `ctx.attn_weight` / `ctx.importance`. Byte-identical to the v2 plan via
-    /// the shared `compute_keep`.
+    /// weight / importance via `ctx.attn_weight` / `ctx.importance`. Computed via the shared
+    /// `compute_keep`.
     fn on_phase(
         &self,
         ctx: &dyn StageCtx,
@@ -138,115 +136,10 @@ register_kv_mutation_stage!(
     MutationPhase::KvMutate
 );
 
-// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
-
-impl KVCacheStage for Caote {
-    fn name(&self) -> &str {
-        "caote"
-    }
-
-    /// Decides via the shared `compute_keep`, so it is byte-identical to the v3 `on_phase`.
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-        self.compute_keep(ctx).map(|keep| KVCachePlan {
-            keep: KeepSpec::LayerWide(keep),
-            merges: Vec::new(),
-            channels: None,
-        })
-    }
-}
-
-/// 등록 — 엔진은 construction 시 `find_stage("caote")` 로 이 항목을 찾는다.
-#[distributed_slice(KV_CACHE_STAGES)]
-static CAOTE: KVCacheStageReg = KVCacheStageReg {
-    name: "caote",
-    make: |_params: StageParams| Box::new(Caote),
-    // caote takes no technique-private args — drop the blob.
-    make_with_args: |_params: StageParams, _args| Box::new(Caote),
-    // CAOTE weights criticality by the attention weight a_i when available
-    // (ctx.attn_weight / has_attn_weights => AttnWeights) and reads cached V
-    // (ctx.dequant_v => Value), falling back to flat importance (Scores). It is
-    // score-based (non-empty reads). Protect 4 attention sinks by default.
-    caps: CAOTE_CAPS,
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argus_extension_api::{TensorDtype, TensorHandle, TensorShape, find_stage};
-
-    /// V 미공급 mock — fallback(importance 랭킹) 경로 검증용.
-    struct MockCtx {
-        cur: usize,
-        tgt: usize,
-        imp: Vec<f32>,
-    }
-    impl StageCtx for MockCtx {
-        fn current_pos(&self) -> usize {
-            self.cur
-        }
-        fn target_len(&self) -> usize {
-            self.tgt
-        }
-        fn layer_idx(&self) -> usize {
-            0
-        }
-        fn importance(&self) -> Option<&[f32]> {
-            Some(&self.imp)
-        }
-        fn n_kv_heads(&self) -> usize {
-            1
-        }
-        fn head_dim(&self) -> usize {
-            4
-        }
-        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
-            None // value-unaware → CAOTE fallback
-        }
-    }
-
-    fn params() -> StageParams {
-        StageParams {
-            eviction_window: 0,
-            protected_prefix: 0,
-            keep_ratio: 0.0,
-            sink_size: 0,
-            streaming_window: 0,
-        }
-    }
-
-    #[test]
-    fn registers_into_slice() {
-        let reg = find_stage("caote").expect("caote 등록이 슬라이스에 있어야 한다");
-        assert_eq!(reg.name, "caote");
-    }
-
-    #[test]
-    fn fallback_ranks_by_importance_without_value() {
-        let stage = (find_stage("caote").unwrap().make)(params());
-        assert_eq!(stage.name(), "caote");
-        // importance: pos 1,3 이 최대 → tgt=2 면 {1,3} 유지(ascending).
-        let ctx = MockCtx {
-            cur: 5,
-            tgt: 2,
-            imp: vec![0.1, 9.0, 0.2, 8.0, 0.3],
-        };
-        let plan = stage.plan(&ctx).expect("plan Some");
-        match plan.keep {
-            KeepSpec::LayerWide(k) => assert_eq!(k, vec![1, 3]),
-            KeepSpec::PerHead(_) => panic!("v1 은 LayerWide"),
-        }
-        assert!(plan.merges.is_empty());
-        // current <= target → no-op.
-        assert!(
-            stage
-                .plan(&MockCtx {
-                    cur: 2,
-                    tgt: 5,
-                    imp: vec![],
-                })
-                .is_none()
-        );
-    }
+    use argus_extension_api::{TensorDtype, TensorHandle, TensorShape};
 
     /// head_dim=2 V handle (one [f32; 2] row per position).
     struct VHandle {
@@ -324,32 +217,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn value_aware_criticality_uses_attn_weights_and_value() {
-        // a_i = [0.1, 0.2, 0.3, 0.4]; v = [[1,0],[0,1],[1,1],[2,2]].
-        // o_h = Σ a_i·v_i = [1.2, 1.3]; crit_i = a_i·‖v_i − o_h‖ →
-        //   [0.1315, 0.2474, 0.1082, 0.4252]. top-2 = {3,1} → keep [1,3].
-        // Weight-only fallback would rank by a_i → {3,2} → keep [2,3]; asserting [1,3] proves
-        // the value-aware (Value + AttnWeights) path actually ran.
-        let stage = (find_stage("caote").unwrap().make)(params());
-        let ctx = ValueAwareCtx {
-            cur: 4,
-            tgt: 2,
-            v: VHandle {
-                rows: vec![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 2.0]],
-            },
-            a: AHandle {
-                a: vec![0.1, 0.2, 0.3, 0.4],
-            },
-        };
-        let plan = stage.plan(&ctx).expect("plan Some");
-        match plan.keep {
-            KeepSpec::LayerWide(k) => assert_eq!(k, vec![1, 3], "value-aware keep-set"),
-            KeepSpec::PerHead(_) => panic!("v1 은 LayerWide"),
-        }
-        assert!(plan.merges.is_empty());
-    }
-
     /// A mock [`CacheHandle`] capturing the keep staged by `keep`.
     struct CaptureHandle {
         kept: Option<Vec<usize>>,
@@ -397,17 +264,23 @@ mod tests {
         }
     }
 
-    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages exactly the
-    /// value-aware criticality keep the v2 `plan` returns (both via the shared `compute_keep`, which
-    /// uses CAOTE's own unstable sort, NOT keep_top_k).
+    /// v3 native registration + DECISION: the v3 `on_phase` stages exactly the value-aware
+    /// criticality keep-set via the shared `compute_keep` (which uses CAOTE's own unstable sort,
+    /// NOT keep_top_k).
     #[test]
-    fn v3_native_matches_v2_decision() {
+    fn v3_native_value_aware_decision() {
         use argus_extension_api::find_mutation_stage;
         let reg = find_mutation_stage("caote").expect("caote in KV_MUTATION_STAGES");
         assert_eq!(reg.name, "caote");
         assert_eq!(reg.caps, CAOTE_CAPS);
-        assert_eq!((reg.make)(StageParams::default(), &[]).name(), "caote");
+        assert_eq!(
+            (reg.make)(argus_extension_api::StageParams::default(), &[]).name(),
+            "caote"
+        );
 
+        // a_i = [0.1,0.2,0.3,0.4]; v = [[1,0],[0,1],[1,1],[2,2]]; o_h = Σ a_i·v_i = [1.2,1.3];
+        // crit_i = a_i·‖v_i − o_h‖ → top-2 = {3,1} → keep [1,3]. Weight-only fallback would keep
+        // [2,3], so asserting [1,3] proves the value-aware (Value + AttnWeights) path ran.
         let ctx = ValueAwareCtx {
             cur: 4,
             tgt: 2,
@@ -418,13 +291,8 @@ mod tests {
                 a: vec![0.1, 0.2, 0.3, 0.4],
             },
         };
-        let v2_keep = match Caote.plan(&ctx).unwrap().keep {
-            KeepSpec::LayerWide(k) => k,
-            KeepSpec::PerHead(_) => panic!("caote is layer-wide"),
-        };
         let mut h = CaptureHandle { kept: None };
         <Caote as KVMutationStage>::on_phase(&Caote, &ctx, &mut h).unwrap();
-        assert_eq!(h.kept, Some(v2_keep));
         assert_eq!(h.kept, Some(vec![1, 3]), "value-aware keep");
     }
 }

@@ -5,10 +5,10 @@
 //!
 //! Extracted from the engine core into a self-registering technique crate (the
 //! `streaming-llm`/`h2o`/`d2o` precedent): depends only on `argus-extension-api` + `linkme`,
-//! implements [`KVCacheStage`], and registers under the name `"rkv"` via
-//! `#[distributed_slice(KV_CACHE_STAGES)]`. The engine force-links it under the `rkv` feature with
-//! `#[cfg(feature = "rkv")] use rkv as _;` and finds it via `find_stage("rkv")` — feature OFF =
-//! unlinked + `eviction rkv` subcommand absent (production catalog unchanged).
+//! implements [`KVMutationStage`], and registers under the name `"rkv"` via
+//! `register_kv_mutation_stage!`. The engine force-links it under the `rkv` feature with
+//! `#[cfg(feature = "rkv")] use rkv as _;` and finds it via `find_mutation_stage("rkv")` — feature
+//! OFF = unlinked + `eviction rkv` subcommand absent (production catalog unchanged).
 //!
 //! **수식** (per-KV-head, §2.1):
 //! 1. redundancy R: K(key) pairwise cosine N×N 행렬의 row-mean → softmax 정규화.
@@ -29,14 +29,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg,
-    KVMutationStage, KeepSpec, MutationPhase, StageArgs, StageCaps, StageCtx, StageParams,
+    CacheHandle, CacheOpError, KVMutationStage, MutationPhase, StageArgs, StageCaps, StageCtx,
     TensorKind, register_kv_mutation_stage,
 };
-use linkme::distributed_slice;
 
-/// The score-based caps shared by the v2 [`KVCacheStageReg`] and the v3 registration: R-KV reads
-/// cached K (redundancy matrix R) + importance (the fusion term I), protecting 4 sinks by default.
+/// The score-based caps for the v3 registration: R-KV reads cached K (redundancy matrix R) +
+/// importance (the fusion term I), protecting 4 sinks by default.
 const RKV_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::Key, TensorKind::Scores],
     default_protected_prefix: 4,
@@ -114,7 +112,7 @@ pub struct RedundancyStats {
     pub redundant_fraction: f32,
 }
 
-/// R-KV stage — `KVCacheStage` 구현체. λ/α/τ 는 [`RkvConfig`] 보유(plan 간 불변, 상태는 없음).
+/// R-KV stage — `KVMutationStage` 구현체. λ/α/τ 는 [`RkvConfig`] 보유(plan 간 불변, 상태는 없음).
 ///
 /// 측정 hook 이 마지막 계산 stats 를 보관하도록 `Mutex<Vec<RedundancyStats>>`를 둔다 — 측정 schedule
 /// 이 plan() 호출 후 [`last_stats`](Self::last_stats)로 읽는다(stderr/CSV 덤프).
@@ -158,7 +156,7 @@ fn dump_redundancy_stats(layer: usize, stats: &[RedundancyStats]) {
 impl RkvStage {
     /// The redundancy + importance fusion keep-list (`None` = no-op within budget / no K tensor),
     /// including the measurement side-effects (plan_calls / dump / last_stats via interior
-    /// mutability). Shared by the v3 `on_phase` and the v2 `plan` so they decide byte-identically.
+    /// mutability). Drives the v3 `on_phase`.
     fn compute_keep(&self, ctx: &dyn StageCtx) -> Option<Vec<usize>> {
         let n = ctx.current_pos();
         let target = ctx.target_len();
@@ -213,8 +211,8 @@ impl KVMutationStage for RkvStage {
     }
 
     /// Stage the fusion keep-list (or no-op). The driver supplies K via `ctx.tensor(Key)` (P0-3c K
-    /// snapshot, armed by `RKV_CAPS.reads ∋ Key`) and importance via `ctx.importance()`.
-    /// Byte-identical to the v2 plan via the shared `compute_keep`.
+    /// snapshot, armed by `RKV_CAPS.reads ∋ Key`) and importance via `ctx.importance()`, deciding
+    /// via the shared `compute_keep`.
     fn on_phase(
         &self,
         ctx: &dyn StageCtx,
@@ -233,23 +231,6 @@ register_kv_mutation_stage!(
     RKV_CAPS,
     MutationPhase::KvMutate
 );
-
-// ── v2 plan-returning surface (kept for the migration window; removed in Phase 2) ──
-
-impl KVCacheStage for RkvStage {
-    fn name(&self) -> &str {
-        "rkv"
-    }
-
-    /// Decides via the shared `compute_keep`, so it is byte-identical to the v3 `on_phase`.
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-        self.compute_keep(ctx).map(|keep| KVCachePlan {
-            keep: KeepSpec::LayerWide(keep),
-            merges: Vec::new(),
-            channels: None,
-        })
-    }
-}
 
 /// N×N pairwise cosine 행렬의 **row-mean redundancy R** + 1단 게이트 지표(MPC, redundant fraction).
 pub(crate) fn redundancy_row_mean(
@@ -361,23 +342,10 @@ pub(crate) fn select_keep(z: &[f32], n: usize, target: usize, recent_alpha: usiz
     (0..n).filter(|&p| kept[p]).collect()
 }
 
-/// Registration — `find_stage("rkv")`. λ rides the opaque [`StageArgs`] blob (`lambda` key);
-/// α/τ are measurement constants. Score-based (fusion includes the importance term).
-#[distributed_slice(KV_CACHE_STAGES)]
-static RKV: KVCacheStageReg = KVCacheStageReg {
-    name: "rkv",
-    make: |_p: StageParams| Box::new(RkvStage::new(RkvConfig::default())),
-    make_with_args: |_p: StageParams, args| Box::new(RkvStage::new(RkvConfig::from_args(args))),
-    // R-KV reads cached K for the redundancy matrix R (ctx.tensor(Key)/dequant_k => Key)
-    // and the importance term I for the fusion Z = λ·I − (1−λ)·R (Scores), so it is
-    // score-based; protect 4 attention sinks by default (same as the other score-based stages).
-    caps: RKV_CAPS,
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argus_extension_api::{PluginArg, TensorDtype, TensorHandle, TensorShape, find_stage};
+    use argus_extension_api::{PluginArg, TensorDtype, TensorHandle, TensorShape};
 
     /// 동일 벡터 N개 → 모든 pairwise cosine ≈ 1 → R 균등(≈1), MPC≈1, redundant_fraction=1.
     #[test]
@@ -487,14 +455,6 @@ mod tests {
     }
 
     #[test]
-    fn registers_with_score_based_caps() {
-        let reg = find_stage("rkv").expect("rkv registered in KV_CACHE_STAGES");
-        assert_eq!(reg.name, "rkv");
-        assert!(!reg.caps.reads.is_empty(), "rkv fusion includes importance");
-        assert_eq!(reg.caps.default_protected_prefix, 4);
-    }
-
-    #[test]
     fn from_args_parses_lambda() {
         let cfg = RkvConfig::from_args(&[PluginArg {
             key: "lambda",
@@ -569,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_keeps_target_len_and_dumps_stats() {
+    fn compute_keep_target_len_and_dumps_stats() {
         // 8 tokens, distinct K per token, target=4 → keep 4 ascending, last_stats populated.
         let head_dim = 3;
         let n = 8;
@@ -585,14 +545,9 @@ mod tests {
             importance: vec![1.0; n],
         };
         let stage = RkvStage::new(RkvConfig::default());
-        let plan = stage.plan(&ctx).expect("rkv plan Some (target<n)");
-        match plan.keep {
-            KeepSpec::LayerWide(keep) => {
-                assert_eq!(keep.len(), 4, "target_len=4 만큼 보존");
-                assert!(keep.windows(2).all(|w| w[0] < w[1]), "ascending");
-            }
-            KeepSpec::PerHead(_) => panic!("rkv prototype is layer-wide"),
-        }
+        let keep = stage.compute_keep(&ctx).expect("rkv keep Some (target<n)");
+        assert_eq!(keep.len(), 4, "target_len=4 만큼 보존");
+        assert!(keep.windows(2).all(|w| w[0] < w[1]), "ascending");
         let stats = stage.last_stats();
         assert_eq!(stats.len(), 1, "kv_heads=1 → stats 1개");
         assert!(stats[0].mpc.is_finite());
@@ -646,16 +601,19 @@ mod tests {
         }
     }
 
-    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages the fusion keep the v2
-    /// `plan` returns (both via the shared `compute_keep`). Uses fresh stage instances so the
-    /// interior-mutable measurement counters don't cross-contaminate.
+    /// v3 native registration + DECISION check: the v3 `on_phase` stages exactly the fusion keep the
+    /// shared `compute_keep` computes. Uses fresh stage instances so the interior-mutable measurement
+    /// counters don't cross-contaminate.
     #[test]
-    fn v3_native_matches_v2_decision() {
+    fn v3_native_stages_compute_keep() {
         use argus_extension_api::find_mutation_stage;
         let reg = find_mutation_stage("rkv").expect("rkv in KV_MUTATION_STAGES");
         assert_eq!(reg.name, "rkv");
         assert_eq!(reg.caps, RKV_CAPS);
-        assert_eq!((reg.make)(StageParams::default(), &[]).name(), "rkv");
+        assert_eq!(
+            (reg.make)(argus_extension_api::StageParams::default(), &[]).name(),
+            "rkv"
+        );
 
         let build_ctx = || {
             let (head_dim, n) = (3usize, 8usize);
@@ -671,14 +629,9 @@ mod tests {
                 importance: vec![1.0; n],
             }
         };
-        let v2_keep = match RkvStage::new(RkvConfig::default())
-            .plan(&build_ctx())
-            .unwrap()
-            .keep
-        {
-            KeepSpec::LayerWide(k) => k,
-            KeepSpec::PerHead(_) => panic!("rkv is layer-wide"),
-        };
+        let expected_keep = RkvStage::new(RkvConfig::default())
+            .compute_keep(&build_ctx())
+            .expect("compute_keep Some (target<n)");
         let mut h = CaptureHandle { kept: None };
         <RkvStage as KVMutationStage>::on_phase(
             &RkvStage::new(RkvConfig::default()),
@@ -686,6 +639,6 @@ mod tests {
             &mut h,
         )
         .unwrap();
-        assert_eq!(h.kept, Some(v2_keep));
+        assert_eq!(h.kept, Some(expected_keep));
     }
 }
