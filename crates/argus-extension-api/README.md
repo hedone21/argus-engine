@@ -11,13 +11,13 @@ surface for all three:
 
 | Axis | Trait | Register with | Engine looks it up via |
 |------|-------|---------------|------------------------|
-| stage (resident-token adjustment) | [`KVCacheStage`] (evict/merge) or [`KVReadStage`] (query-aware read) | `register_kv_stage!` macro, or `#[distributed_slice(KV_READ_STAGES)]` (read) | `find_stage(name)` / `find_read_stage(name)` |
+| stage (resident-token adjustment) | [`KVMutationStage`] (evict/merge) or [`KVReadStage`] (query-aware read) | `register_kv_mutation_stage!` macro, or `#[distributed_slice(KV_READ_STAGES)]` (read) | `find_mutation_stage(name)` / `find_read_stage(name)` |
 | format (storage representation) | [`KVFormat`] | `register_kv_format!` macro | `find_kv_format(name)` |
 | backend-capability (fused GPU kernel) | [`QuantAttnBackend`] | `register_quant_attn_plugin!` macro | (dynamic backend registry) |
 
 A technique never references engine types (`KVCache`/`Backend`); it reads cache state through
-the abstractions this crate defines (e.g. [`StageCtx`]) and returns a *plan*. The engine owns
-all buffer mutation.
+the abstractions this crate defines (e.g. [`StageCtx`]) and stages mutations imperatively on a
+transactional [`CacheHandle`]. The engine owns the commit.
 
 > **New here?** This README is the terse registration reference. For a hands-on onboarding
 > guide that copies a template crate and selects it at runtime, see
@@ -27,35 +27,36 @@ all buffer mutation.
 
 1. Create `crates/techniques/<name>/` with a `Cargo.toml` depending on `argus-extension-api` and
    `linkme`.
-2. Implement [`KVCacheStage`] and register it in one line:
+2. Implement [`KVMutationStage`] and register it in one line:
 
 ```rust
-use argus_extension_api::{KVCachePlan, KVCacheStage, KeepSpec, StageCtx, StageParams};
+use argus_extension_api::{
+    CacheHandle, CacheOpError, KVMutationStage, MutationPhase, StageCtx,
+};
 
 struct KeepRecent;
 
-impl KVCacheStage for KeepRecent {
+impl KVMutationStage for KeepRecent {
     fn name(&self) -> &str { "example_keep_recent" }
 
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
+    fn on_phase(&self, ctx: &dyn StageCtx, cache: &mut dyn CacheHandle)
+        -> Result<(), CacheOpError>
+    {
         let (current, target) = (ctx.current_pos(), ctx.target_len());
-        if current <= target { return None; } // no-op
-        Some(KVCachePlan {
-            keep: KeepSpec::LayerWide((current - target..current).collect()),
-            merges: Vec::new(),
-        })
+        if current <= target { return Ok(()); } // no-op
+        cache.keep(&(current - target..current).collect::<Vec<_>>())
     }
 }
 
-argus_extension_api::register_kv_stage!("example_keep_recent", |_p: StageParams| Box::new(KeepRecent));
-argus_extension_api::export_plugin!(); // only needed for the dynamic `.so` path (see below)
+argus_extension_api::register_kv_mutation_stage!(
+    "example_keep_recent", |_p| Box::new(KeepRecent), MutationPhase::KvMutate);
 ```
 
 Working template: [`crates/techniques/example-keep-recent`](../techniques/example-keep-recent).
 
 > Knobs beyond `StageParams`'s five common fields (e.g. d2o's `merge_axis`/`protected_layers`)
-> ride an opaque `key=value` blob: register a direct `KVCacheStageReg` literal with
-> `make_with_args(StageParams, StageArgs)` and parse the blob in the plugin (the engine never
+> ride an opaque `key=value` blob: register a direct `MutationStageReg` literal with a
+> `make(StageParams, StageArgs)` factory and parse the blob in the plugin (the engine never
 > names your config type). See [`docs/plugins.md`](../../docs/plugins.md) → *Passing
 > technique-private params*; `crates/techniques/d2o` is the worked example.
 
@@ -103,18 +104,18 @@ Working reference: the `quest` builtin in
 
 ## Static vs dynamic (`.so`)
 
-Each `register_*!` macro wires the technique both ways:
-
-- **Static** (default): the technique links into the engine and is discovered through the
-  `KV_CACHE_STAGES` / `KV_FORMATS` / `KV_READ_STAGES` slices at construction. A one-line path
-  dependency on your crate force-links it.
-- **Dynamic** (`--features plugin-cdylib`): the crate builds as a `cdylib`; `export_plugin!()`
-  emits the `.so` entry point so the host can `dlopen` it with no recompile, e.g.
-  `argus-bench --load-plugin <plugin>.so eviction plugin --name <name>` (a format uses
-  `--kv-format <name>`; a backend capability uses `--backend-cap <name>`).
+- **Static** (default, and the ONLY path for KV mutation stages): the technique links into the
+  engine and is discovered through the `KV_MUTATION_STAGES` / `KV_FORMATS` / `KV_READ_STAGES`
+  slices at construction. A one-line path dependency on your crate force-links it.
+- **Dynamic** (`--features plugin-cdylib`, **format + backend-capability axes only**): the crate
+  builds as a `cdylib`; `export_plugin!()` emits the `.so` format/backend entry points so the host
+  can `dlopen` it with no recompile, e.g. `argus-bench --load-plugin <plugin>.so --kv-format <name>`
+  (a backend capability uses `--backend-cap <name>`). KV mutation stages have no `.so` C-ABI — a
+  `CacheHandle` is a `&mut dyn` transaction engine, not a flat fn-ptr table — so they register
+  statically only and are selected with `eviction plugin --name <name>`.
 
 Keep `plugin-cdylib` off for static builds so the `#[no_mangle]` C-ABI symbols won't
 collide with a force-linked copy.
 
-See the `example-*` crates for bundles (stage + format in one `.so`), multi-format
-plugins, and rollback/error-path vehicles.
+See the `example-*` crates for bundles (a static KV stage + a dynamic format in one crate),
+multi-format plugins, and rollback/error-path vehicles.

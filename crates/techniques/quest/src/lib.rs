@@ -263,7 +263,7 @@ impl KVReadStage for Quest {
     }
 }
 
-/// 등록 — 엔진은 `find_read_stage("quest")` 로 이 항목을 찾는다(`KVCacheStageReg` 거울).
+/// 등록 — 엔진은 `find_read_stage("quest")` 로 이 항목을 찾는다(`MutationStageReg` 거울).
 #[distributed_slice(KV_READ_STAGES)]
 static QUEST: KVReadStageReg = KVReadStageReg {
     name: "quest",

@@ -20,7 +20,8 @@ pub mod build_bench_quant_window_loop;
 pub mod build_standard_loop;
 
 pub use build_bench_loop::{
-    SwapWiringConfig, build_bench_loop, build_local_pressure_source, build_resilience_cache_manager,
+    MutationDriverSelection, SwapWiringConfig, build_bench_loop, build_local_pressure_source,
+    build_resilience_cache_manager, resolve_mutation_driver,
 };
 pub use build_bench_quant_window_loop::build_bench_quant_window_loop;
 pub use build_standard_loop::{build_standard_loop, is_standard_happy_path};

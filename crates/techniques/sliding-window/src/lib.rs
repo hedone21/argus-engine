@@ -2,9 +2,9 @@
 //!
 //! Extracted from the engine core into a self-registering technique crate (the
 //! `streaming-llm`/`h2o`/`d2o` precedent): depends only on `argus-extension-api` + `linkme`,
-//! implements [`KVCacheStage`], and registers under the name `"sliding"` via
-//! `#[distributed_slice(KV_CACHE_STAGES)]`. The engine force-links it with a one-line
-//! `use sliding_window as _;` and finds it via `find_stage("sliding")`.
+//! implements [`KVMutationStage`], and registers under the name `"sliding"` via
+//! `register_kv_mutation_stage!`. The engine force-links it with a one-line
+//! `use sliding_window as _;` and finds it via `find_mutation_stage("sliding")`.
 //!
 //! Keeps the most recent `window_size` tokens plus a protected prefix of `protected_prefix` tokens
 //! (e.g. system prompt / attention sinks):
@@ -12,17 +12,17 @@
 //! [Protected Prefix] [ ... evicted ... ] [Recent Window]
 //! ```
 //! The stage is pure position arithmetic — it reads only `current_pos`/`target_len` from
-//! [`StageCtx`] and returns a layer-wide keep-list; the engine executes the compaction
-//! (plan-returning, D1). It never references engine types (`KVCache`/`Backend`).
+//! [`StageCtx`] and stages a layer-wide keep-list on the [`CacheHandle`], which executes the
+//! compaction. It never references engine types (`KVCache`/`Backend`).
 //!
 //! Ported verbatim from the original engine `SlidingWindowPolicy::plan_keep` (the keep-list that
 //! `compact_parity` proved bit-identical to its in-place `evict`), so the World-B application is
 //! unchanged.
 
 use argus_extension_api::{
-    EstimatorCtx, KV_CACHE_STAGES, KVCachePlan, KVCacheStage, KVCacheStageReg, KeepSpec, KeepTopK,
-    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
-    compile_keep_top_k, redistribute_value,
+    CacheHandle, CacheOpError, EstimatorCtx, KVMutationStage, KeepTopK, MutationPhase,
+    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCtx, StageParams,
+    compile_keep_top_k, redistribute_value, register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
 
@@ -42,66 +42,60 @@ impl SlidingWindow {
             protected_prefix: protected_prefix.max(4),
         }
     }
+
+    /// The keep-list (ascending, prefix-inclusive): `[0..protected_prefix) ∪ [recent_start..current)`,
+    /// or the full range `[0..current)` when within budget. The retained count is `target_len` clamped
+    /// to `[protected_prefix + 16, window_size + protected_prefix]`. Drives the v3 `on_phase` — the
+    /// verbatim port of `SlidingWindowPolicy::plan_keep`.
+    fn keep_list(&self, current: usize, target: usize) -> Vec<usize> {
+        let max_keep = self.window_size + self.protected_prefix;
+        let min_keep = (self.protected_prefix + 16).min(max_keep);
+        let keep = target.clamp(min_keep, max_keep);
+        if current <= keep {
+            return (0..current).collect();
+        }
+        let removable_count = current - self.protected_prefix;
+        let tokens_to_keep_after_prefix = keep.saturating_sub(self.protected_prefix);
+        if tokens_to_keep_after_prefix >= removable_count {
+            return (0..current).collect();
+        }
+        // prefix + recent window, score-free (heavy 0) — routed through the T1 compiler.
+        compile_keep_top_k(
+            KeepTopK {
+                current,
+                prefix: self.protected_prefix,
+                recent: tokens_to_keep_after_prefix,
+                heavy: 0,
+            },
+            |_| 0.0,
+        )
+    }
 }
 
-impl KVCacheStage for SlidingWindow {
+// ── v3 native (imperative) surface — the production path ──
+
+impl KVMutationStage for SlidingWindow {
     fn name(&self) -> &str {
         "sliding"
     }
 
-    /// Keep `[0..protected_prefix) ∪ [protected_prefix + prune_count..current)`, ascending and
-    /// prefix-inclusive. The retained count is `target_len` clamped to `[protected_prefix + 16,
-    /// window_size + protected_prefix]`. When already within budget the full range is kept (a
-    /// no-op compaction). This is the verbatim port of the old `SlidingWindowPolicy::plan_keep`.
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-        let current = ctx.current_pos();
-        let max_keep = self.window_size + self.protected_prefix;
-        let min_keep = (self.protected_prefix + 16).min(max_keep);
-        let keep = ctx.target_len().clamp(min_keep, max_keep);
-
-        let keep_list: Vec<usize> = if current <= keep {
-            (0..current).collect()
-        } else {
-            let removable_count = current - self.protected_prefix;
-            let tokens_to_keep_after_prefix = keep.saturating_sub(self.protected_prefix);
-            if tokens_to_keep_after_prefix >= removable_count {
-                (0..current).collect()
-            } else {
-                // prefix + recent window, score-free (heavy 0) — routed through the T1 compiler.
-                compile_keep_top_k(
-                    KeepTopK {
-                        current,
-                        prefix: self.protected_prefix,
-                        recent: tokens_to_keep_after_prefix,
-                        heavy: 0,
-                    },
-                    |_| 0.0,
-                )
-            }
-        };
-        Some(KVCachePlan {
-            keep: KeepSpec::LayerWide(keep_list),
-            merges: Vec::new(),
-            channels: None,
-        })
+    /// Stage the keep-list (always — a full-keep no-op compaction still records the keep-set dump,
+    /// matching the v2 path, which always returns a plan). Byte-identical to the v2 plan via the
+    /// shared `keep_list`.
+    fn on_phase(
+        &self,
+        ctx: &dyn StageCtx,
+        cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        cache.keep(&self.keep_list(ctx.current_pos(), ctx.target_len()))
     }
 }
 
-/// Registration — the engine finds this entry at construction via `find_stage("sliding")`.
-/// `eviction_window`/`protected_prefix` flow in from [`StageParams`] (CLI `eviction plugin --name
-/// sliding --set window=<N>` + `--protected-prefix`).
-#[distributed_slice(KV_CACHE_STAGES)]
-static SLIDING: KVCacheStageReg = KVCacheStageReg {
-    name: "sliding",
-    make: |p: StageParams| Box::new(SlidingWindow::new(p.eviction_window, p.protected_prefix)),
-    // sliding takes no technique-private args — drop the blob, build from StageParams.
-    make_with_args: |p: StageParams, _args| {
-        Box::new(SlidingWindow::new(p.eviction_window, p.protected_prefix))
-    },
-    // Sliding is score-free (recency only); the constructor clamps the prefix to a 4-sink minimum,
-    // so declare no stage default and let the engine pick the fallback.
-    caps: StageCaps::SCORE_FREE,
-};
+register_kv_mutation_stage!(
+    "sliding",
+    |p| Box::new(SlidingWindow::new(p.eviction_window, p.protected_prefix)),
+    MutationPhase::KvMutate
+);
 
 // ── QCF estimator (observer/score axis) ──────────────────────────
 
@@ -147,7 +141,7 @@ static SLIDING_QCF: QcfEstimatorReg = QcfEstimatorReg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argus_extension_api::{TensorHandle, TensorKind, find_stage};
+    use argus_extension_api::{TensorHandle, TensorKind};
 
     /// Minimal StageCtx — SlidingWindow only reads `current_pos`/`target_len`.
     struct Ctx {
@@ -178,22 +172,75 @@ mod tests {
         }
     }
 
-    fn keep_of(stage: &dyn KVCacheStage, cur: usize, tgt: usize) -> Vec<usize> {
-        match stage
-            .plan(&Ctx { cur, tgt })
-            .expect("sliding always returns a plan")
-            .keep
-        {
-            KeepSpec::LayerWide(k) => k,
-            KeepSpec::PerHead(_) => panic!("sliding is layer-wide"),
+    fn keep_of(stage: &SlidingWindow, cur: usize, tgt: usize) -> Vec<usize> {
+        stage.keep_list(cur, tgt)
+    }
+
+    /// A mock [`CacheHandle`] capturing the keep staged by `keep`.
+    struct CaptureHandle {
+        cur: usize,
+        kept: Option<Vec<usize>>,
+    }
+    impl CacheHandle for CaptureHandle {
+        fn current_pos(&self) -> usize {
+            self.cur
+        }
+        fn n_kv_heads(&self) -> usize {
+            1
+        }
+        fn head_dim(&self) -> usize {
+            4
+        }
+        fn kv_on_device(&self) -> bool {
+            false
+        }
+        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+            None
+        }
+        fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
+            self.kept = Some(keep.to_vec());
+            Ok(())
+        }
+        fn keep_per_head(&mut self, _keep: &[&[usize]]) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn merge(
+            &mut self,
+            _merges: &[argus_extension_api::WeightedMerge],
+        ) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn reencode(&mut self, _target: argus_extension_api::FormatId) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn transition_quant_bits(&mut self, _bits: u8) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn offload(&mut self, _prefix_len: usize) -> Result<(), CacheOpError> {
+            Ok(())
+        }
+        fn recall(&mut self) -> Result<(), CacheOpError> {
+            Ok(())
         }
     }
 
+    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages exactly the keep-list
+    /// the shared `keep_list` produces, including the full-keep no-op case (sliding always stages a
+    /// keep, so the keep-set dump is recorded even when nothing is evicted).
     #[test]
-    fn registers_into_slice() {
-        let reg = find_stage("sliding").expect("sliding registered in KV_CACHE_STAGES");
+    fn v3_native_matches_v2_decision() {
+        use argus_extension_api::find_mutation_stage;
+        let reg = find_mutation_stage("sliding").expect("sliding in KV_MUTATION_STAGES");
         assert_eq!(reg.name, "sliding");
-        assert!(reg.caps.reads.is_empty(), "sliding is score-free");
+        assert_eq!(reg.phase, MutationPhase::KvMutate);
+        assert_eq!((reg.make)(StageParams::default(), &[]).name(), "sliding");
+
+        let s = SlidingWindow::new(10, 4);
+        for (cur, tgt) in [(8usize, 0usize), (30, 0), (50, 20), (14, 14), (100, 5)] {
+            let mut h = CaptureHandle { cur, kept: None };
+            s.on_phase(&Ctx { cur, tgt }, &mut h).unwrap();
+            assert_eq!(h.kept, Some(keep_of(&s, cur, tgt)), "cur={cur} tgt={tgt}");
+        }
     }
 
     #[test]
@@ -220,18 +267,5 @@ mod tests {
         // current=12 → removable=8, keep_after_prefix=4, prune_count=4 → keep [0..4) ∪ [8..12).
         let stage = SlidingWindow::new(4, 4);
         assert_eq!(keep_of(&stage, 12, 6), vec![0, 1, 2, 3, 8, 9, 10, 11]);
-    }
-
-    #[test]
-    fn make_from_params() {
-        let p = StageParams {
-            eviction_window: 10,
-            protected_prefix: 4,
-            keep_ratio: 0.0,
-            sink_size: 0,
-            streaming_window: 0,
-        };
-        let stage = (find_stage("sliding").unwrap().make)(p);
-        assert_eq!(stage.name(), "sliding");
     }
 }

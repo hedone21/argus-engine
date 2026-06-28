@@ -724,7 +724,7 @@ pub struct Args {
     pub kv_format: Option<String>,
 
     /// GATE-C: runtime plugin `.so` paths (repeatable). dlopen'd once at startup and routed
-    /// to the dynamic stage/format/backend-cap registries via the `register_kv_stages_v2` /
+    /// to the dynamic stage/format/backend-cap registries via the `register_kv_formats_v2` /
     /// `register_kv_formats_v2` / `register_backend_caps_v2` entry symbols. Select a loaded
     /// technique by name: `--kv-format <name>` (format), `eviction plugin --name <name>`
     /// (stage), `--backend-cap <name>` (backend capability). Built-in name collisions

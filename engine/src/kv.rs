@@ -30,7 +30,7 @@ pub mod read;
 pub mod standard_format;
 // HYBRID v3 — engine-side transaction engine implementing the imperative `CacheHandle` ABI
 // (the M4 callback class). Stages position-mutating ops and commits them once per callback
-// (single renumber), routing every op to an existing executor (execute_kv_plan / apply_weighted_merges
+// (single renumber), routing every op to an existing executor (the v2 plan executor / apply_weighted_merges
 // / apply_format_plan / swap_handler). The format twin of the plan executor in eviction/stage_registry.
 pub mod cache_handle;
 // HYBRID v3 — the declarative coordinate map for KV techniques (axis cell + phase + signal edges).
@@ -40,6 +40,11 @@ pub mod descriptor;
 // Shared KV dequantization + similarity helpers (formerly in d2o_handler; weighted-merge was extracted to
 // the out-of-tree `d2o` plugin crate). Consumed by the StageCtx Key/Value handles + R-KV stage.
 pub(crate) mod dequant;
+// Oracle (R-1/R-2): a handle-INDEPENDENT naive reference for KV mutations, used by the byte/value
+// identity gates (it shares no code with compact_keep_positions / apply_weighted_merges /
+// EngineCacheHandle, so it is a non-tautological reference once the v2 plan executor is deleted).
+#[cfg(test)]
+pub(crate) mod naive_reference;
 // Pressure pipeline handlers (구 core/pressure/ 내용 flat 병합)
 pub mod eviction_handler;
 pub mod quantize_handler;

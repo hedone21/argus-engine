@@ -1,6 +1,6 @@
 //! HYBRID v3 — the declarative coordinate map for KV techniques.
 //!
-//! The imperative `CacheHandle` / `KVCacheStage` / producer traits carry a technique's *behavior*;
+//! The imperative `CacheHandle` / `KVMutationStage` / producer traits carry a technique's *behavior*;
 //! this module carries its *coordinates*. A [`KvTechniqueDescriptor`] is pure data: the axis cell a
 //! technique occupies (stage ⊥ format ⊥ hardware, plus the observer score/read producer axes), the
 //! phase it acts at, and the signal edges it reads / produces. Together [`KV_TECHNIQUE_DESCRIPTORS`]
@@ -42,7 +42,7 @@ pub enum KvAxis {
 }
 
 /// Declarative coordinate-map entry for one KV technique. Pure data — the behavior lives in the
-/// technique's `KVCacheStage` / `KVMutationStage` / score-or-read producer impl.
+/// technique's `KVMutationStage` / score-or-read producer impl.
 #[derive(Clone, Copy, Debug)]
 pub struct KvTechniqueDescriptor {
     /// Technique name (matches the registry name; unique within the map).
@@ -75,7 +75,7 @@ pub const ENGINE_INTRINSIC: &[TensorKind] = &[
 
 /// The central coordinate map — the built-in KV techniques. `phase` is the consumption phase
 /// (`KvMutate`, the per-step KV-mutation slot). The `reads`/`produces` SSOT differs by axis: the 5
-/// Stage techniques mirror their `KVCacheStageReg.caps.reads`; `attn_score` mirrors
+/// Stage techniques mirror their `MutationStageReg.caps.reads`; `attn_score` mirrors
 /// `ScoreProducerReg.produces`; `quest` mirrors `KVReadStageReg` (its runtime-consumed query signals,
 /// not `StageCaps` — a read stage has none). `produces` is empty for the stage techniques (they
 /// mutate, they do not feed a signal).
@@ -212,16 +212,16 @@ mod tests {
     }
 
     /// Every descriptor name resolves to a LIVE registration in the registry for its axis (Stage →
-    /// find_stage, Score → find_score_producer, Read → find_read_stage). This closes the
+    /// find_mutation_stage, Score → find_score_producer, Read → find_read_stage). This closes the
     /// descriptor↔registry loop: a registry rename or a descriptor typo (e.g. "h2o-plus" vs the
     /// registered "h2o_plus") fails here instead of silently passing the hardcoded-name test above.
     /// Mutation-proof: misspelling any descriptor name flips the matching assert to None.
     #[test]
     fn descriptor_names_resolve_to_live_registrations() {
-        use argus_extension_api::{find_read_stage, find_score_producer, find_stage};
+        use argus_extension_api::{find_mutation_stage, find_read_stage, find_score_producer};
         for d in KV_TECHNIQUE_DESCRIPTORS {
             let resolved = match d.axis {
-                KvAxis::Stage => find_stage(d.name).is_some(),
+                KvAxis::Stage => find_mutation_stage(d.name).is_some(),
                 KvAxis::Score => find_score_producer(d.name).is_some(),
                 KvAxis::Read => find_read_stage(d.name).is_some(),
                 // No name-keyed registry for the format/hardware axes (no built-in occupies them).
@@ -288,17 +288,17 @@ mod tests {
     /// Pass2-TR1/DM1: each descriptor's reads/produces actually MATCHES the live registry it claims to
     /// mirror (the SSOT prose at the top of this module), so a future registry caps edit cannot silently
     /// desync the coordinate map while every other descriptor test stays green. Stage axis ->
-    /// `KVCacheStageReg.caps.reads`; Score axis -> `ScoreProducerReg.produces`; the Read axis (quest,
+    /// `MutationStageReg.caps.reads`; Score axis -> `ScoreProducerReg.produces`; the Read axis (quest,
     /// whose `KVReadStageReg` carries no reads field) is pinned directly to `[Key, Query]` — guarding
     /// the F3 accuracy fix (quest reads `Query`, NOT the never-armed `QueryStats`). Mutation-proof:
     /// reverting any descriptor read/produce edge — or a registry `caps.reads` — fails this assert.
     #[test]
     fn descriptor_reads_produces_match_live_registry() {
-        use argus_extension_api::{find_score_producer, find_stage};
+        use argus_extension_api::{find_mutation_stage, find_score_producer};
         for d in KV_TECHNIQUE_DESCRIPTORS {
             match d.axis {
                 KvAxis::Stage => {
-                    let reg = find_stage(d.name).expect("stage registered");
+                    let reg = find_mutation_stage(d.name).expect("stage registered");
                     assert_eq!(
                         reg.caps.reads, d.reads,
                         "descriptor '{}' reads drifted from registry caps.reads",

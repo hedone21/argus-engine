@@ -1,12 +1,12 @@
 //! Engine-tier KV-mode registry — the FORMAT-axis analog of the eviction STAGE
-//! registry (`KV_CACHE_STAGES` / `find_stage`).
+//! registry (`KV_MUTATION_STAGES` / `find_stage`).
 //!
 //! 설계 SSOT: `docs/design/format-axis-mode-knob-declaration.md` (A′ — Minimal
 //! Mirror + build-fn-ptr seam).
 //!
 //! 엔진 코어는 더 이상 `KvMode::QuantWindow` 같은 **구체 기술 정체성에 match 하지 않는다**.
 //! `--kv-mode <name>` 는 런타임 문자열이 되어 이 레지스트리 [`KV_MODES`] 에 대해 resolve
-//! 된다(STAGE 축의 `find_stage`/`KV_CACHE_STAGES` 와 동형). 6개 dispatch 지점은 이름 대신
+//! 된다(STAGE 축의 `find_stage`/`KV_MUTATION_STAGES` 와 동형). 6개 dispatch 지점은 이름 대신
 //! [`mode_caps`] 의 선언 bool([`ModeCaps`])을 읽고, chat 빌더는 [`KvModeReg::build`] fn-ptr
 //! 로 whole-pipeline `Box<dyn Forward>` 를 조립한다.
 //!
@@ -113,7 +113,7 @@ pub struct KvModeReg {
 }
 
 /// The global KV-mode registration slice (gathered at link time, like
-/// `KV_CACHE_STAGES`). Builtins (`standard`/`kivi`/`offload`) register below.
+/// `KV_MUTATION_STAGES`). Builtins (`standard`/`kivi`/`offload`) register below.
 #[distributed_slice]
 pub static KV_MODES: [KvModeReg];
 

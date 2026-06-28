@@ -1,6 +1,6 @@
 //! D3 — engine-side executor for [`KVFormatPlan`] (the format / precision axis).
 //!
-//! `apply_format_plan` is the format twin of the eviction executor `execute_kv_plan`. It applies a
+//! `apply_format_plan` is the format twin of the eviction executor the v2 plan executor. It applies a
 //! plugin-produced [`KVFormatPlan`] to the engine's KV container.
 //!
 //! Honesty contract (the reason this exists rather than silently no-op'ing): a plan whose effective
@@ -25,7 +25,7 @@
 //! [`FormatReencodeStage`](crate::stages::kv::format_reencode::FormatReencodeStage) — a `PrefillEnd`
 //! pipeline stage armed when `--kv-format` resolves to a registered `KVFormatPolicy`. This module is
 //! the *runtime* (post-allocation) re-encode executor, the format twin of the eviction executor
-//! `execute_kv_plan` (kv::eviction::stage_registry). Production format-honesty *also* relies, at
+//! the v2 plan executor (kv::eviction::stage_registry). Production format-honesty *also* relies, at
 //! construction time, on the twin
 //! [`per_layer_storage_from_policy`](crate::session::bin_setup::per_layer_storage_from_policy)
 //! (bin_setup.rs:578, rejecting override-bearing plans at bin_setup.rs:599 *before* allocation). The

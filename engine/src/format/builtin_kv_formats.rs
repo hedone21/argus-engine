@@ -2,7 +2,7 @@
 //!
 //! 설계 SSOT: `docs/adr/0005-format-backend-capability-plugin-unification.md` D3(format
 //! plugin = 순수 descriptor) / D6(3축 평행 linkme registry). 거울 = `pressure/eviction/
-//! stage_registry.rs`(KV_CACHE_STAGES 빌트인 등록 + `ensure_builtin_stages_registered`).
+//! stage_registry.rs`(KV_MUTATION_STAGES 빌트인 등록 + `ensure_builtin_stages_registered`).
 //!
 //! format 축의 plugin 표면은 `argus_extension_api::KVFormat`(name + layout, 버퍼 0)이다. 여기서
 //! 그 표면의 **내장 멤버**(f32/f16/q4_0/q8_0)를 `#[distributed_slice(KV_FORMATS)]` 로 등록한다.

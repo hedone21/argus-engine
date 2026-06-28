@@ -5,7 +5,7 @@
 //! KV 캐시의 **state 책임**(geometry · mutation · attention)을 **storage-format-agnostic**
 //! 하게 제공하는 base trait — geometry 3(`idx`/`current_pos`/`capacity`) + mutation 2
 //! (`write_kv`/`write_kv_batch`) + attention 1(`attention_into`) = **6 method**.
-//! `compact` 는 에서 폐기 — production 정본은 `execute_kv_plan`(stage_registry.rs).
+//! `compact` 는 에서 폐기 — production 정본은 the v2 plan executor(stage_registry.rs).
 //! base-trait-handle 을 든 Stage 는 geometry·mutation 만 알고, forward 는 `attention_into` 로
 //! q→out 만 보므로 양쪽 다 dtype/codebook/rotation/sparse pattern 을 모른다(impl 이 캡슐화,
 //! `INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`).

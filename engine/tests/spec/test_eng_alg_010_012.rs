@@ -12,9 +12,7 @@
 use argus_engine::backend::cpu::CpuBackend;
 use argus_engine::buffer::{Buffer, DType};
 use argus_engine::kv::eviction::EvictionPolicy;
-use argus_engine::kv::eviction::stage_registry::{
-    StageBackedPolicy, make_stage, sliding_backed_policy,
-};
+use argus_engine::kv::eviction::stage_registry::{StageBackedPolicy, sliding_backed_policy};
 use argus_engine::kv::kv_cache::KVCache;
 use argus_engine::memory::host::shared::SharedBuffer;
 use argus_engine::shape::Shape;
@@ -62,16 +60,17 @@ fn make_cache_with_data(num_tokens: usize) -> KVCache {
 /// H2O was extracted to the `h2o` plugin crate; build the stage by registry name and wrap it as
 /// a legacy EvictionPolicy (StageBackedPolicy) — the same seam production uses to resolve "h2o".
 fn h2o_policy(keep_ratio: f32, protected_prefix: usize) -> StageBackedPolicy {
+    let reg = argus_extension_api::find_mutation_stage("h2o").expect("h2o v3 stage registered");
     StageBackedPolicy::new(
-        make_stage(
-            "h2o",
-            &StageParams {
+        (reg.make)(
+            StageParams {
                 keep_ratio,
                 protected_prefix,
                 ..Default::default()
             },
-        )
-        .expect("h2o stage registered"),
+            &[],
+        ),
+        reg.caps,
     )
 }
 

@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use argus_extension_api::{FormatId, KVFormatPlan, KVFormatPolicy, StageCtx};
 
+use super::mutation::SnapshotStageCtx;
 use crate::buffer::DType;
-use crate::kv::eviction::stage_registry::KVStageCtx;
 use crate::kv::format_apply::apply_format_plan;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
@@ -160,8 +160,12 @@ impl PipelineStage for FormatReencodeStage {
                 // plan production: the ctx borrows `&cache` immutably and is dropped before the
                 // `&mut cache` re-encode below (no borrow conflict).
                 let plan = {
-                    let ctx = KVStageCtx::new(cache, cache.current_pos(), None, None, None, None)
-                        .with_layer(layer_idx, n_layers);
+                    let ctx = SnapshotStageCtx::from_cache(
+                        cache,
+                        cache.current_pos(),
+                        layer_idx,
+                        n_layers,
+                    );
                     self.policy.assign(&ctx)
                 };
                 if let Some(plan) = plan {

@@ -32,6 +32,7 @@ use crate::kv::kv_cache::KVCache;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::pipeline::PressureSource;
+use crate::session::assembly::build_bench_loop::MutationDriverSelection;
 use crate::session::chat::stream_stage::{ChatStreamSlot, ChatStreamStage};
 use crate::session::cli::Args;
 use crate::session::command_dispatcher::CommandDispatcher;
@@ -42,6 +43,7 @@ use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 use crate::stages::kv::eviction::EvictionStage;
 use crate::stages::kv::format_reencode::FormatReencodeStage;
+use crate::stages::kv::mutation::KVMutationDriverStage;
 use crate::stages::kv::prefill_keepset::PrefillKeepSetStage;
 
 /// argus-cli score-free eviction 의 KV-fill high-water (점유율 percent). `pos >= 85% * max_seq_len`
@@ -119,7 +121,14 @@ pub fn build_standard_loop(
     read_stage_name: Option<&str>,
     // score-free eviction `CacheManager`(sliding/streaming/`--load-plugin` stage). `None` =
     // 순수 happy-path(eviction none) — 아래 eviction 배선 전체 미진입 = 기존과 byte-identical.
+    // v3-native techniques resolve to `mutation_driver` instead (below); a `Some` here is the v2
+    // fallback for a non-v3 (dynamically-loaded `.so`) stage during the migration window.
     cache_manager: Option<CacheManager>,
+    // P0-5c/P0-6: the resolved v3 `KVMutationStage` for the chosen `eviction <policy>` (`Some` iff
+    // `find_mutation_stage(name)`). When `Some`, a pressure-gated `KVMutationDriverStage` replaces the
+    // v2 `EvictionStage` at KvMutate (MUTUALLY EXCLUSIVE — `cache_manager` is `None` then). Applies the
+    // keep-set through the v3 handle (byte-identical to the v2 plan executor, the Phase-1 gate).
+    mutation_driver: Option<MutationDriverSelection>,
     // force_evict target ratio(CLI `--eviction-target-ratio`). `cache_manager=None` 이면 무시.
     eviction_target_ratio: f32,
     // argus-cli per-token streaming subscriber. `Some(slot)` submits a DecodeEnd `ChatStreamStage`
@@ -221,39 +230,73 @@ pub fn build_standard_loop(
     // eviction(CM) 또는 resilience 가 있을 때만 registry 를 만든다. 둘 다 없으면(순수 happy-path,
     // eviction none + no-resilience) registry/dispatcher/pos-handle/pressure 미배선 = 기존과
     // byte-identical 조립(INV: 회귀 0).
+    let has_mutation_driver = mutation_driver.is_some();
     let needs_registry = resilience.is_some()
         || cache_manager.is_some()
+        || has_mutation_driver
         || stream_slot.is_some()
         || arm_prefill_keepset
         || arm_format_reencode;
     let registry = needs_registry.then(|| Arc::new(PipelineRegistry::new()));
 
-    // score-free eviction(sliding/streaming/`--load-plugin` stage): KV-fill 압력 구동 Persistent
-    // EvictionStage + [`KvFillPressureSource`]. chat 의 turn-경계 evict 와 달리 단일 프롬프트는 turn
-    // 경계가 없으므로, KV 점유율이 high-water 를 넘으면 Warning 밴드를 보고하는 source 로 stage 를
-    // 구동한다(메모리 압력·manager 무관 — free-RAM 머신에서도 발화). score-based(h2o/d2o)는
-    // accumulator 가 필요해 argus-cli 진입부에서 reject — 여기 도달하는 CM 은 항상 score-free.
-    let pressure_source: Option<Arc<dyn PressureSource>> = match cache_manager {
-        Some(cm) => {
-            let registry = registry
-                .as_ref()
-                .expect("registry: cache_manager.is_some()");
-            let shared_cm = Arc::new(Mutex::new(cm));
-            registry.submit(Arc::new(EvictionStage::persistent(
-                kv_handles.clone(),
-                shared_cm,
-                eviction_target_ratio,
-                Level::Warning,
-            )));
-            kv_pos_handle.clone().map(|h| {
-                Arc::new(KvFillPressureSource::new(
-                    h,
-                    max_seq_len,
-                    KV_FILL_HIGH_WATER_PCT,
-                )) as Arc<dyn PressureSource>
-            })
+    // KV-fill 압력 구동 eviction: KV 점유율이 high-water 를 넘으면 Warning 밴드를 보고하는
+    // [`KvFillPressureSource`] 로 KvMutate 단계 stage 를 구동한다(chat 의 turn-경계 evict 와 달리 단일
+    // 프롬프트는 turn 경계가 없으므로 — 메모리 압력·manager 무관, free-RAM 머신에서도 발화).
+    //
+    // P0-5c/P0-6 selector (MUTUALLY EXCLUSIVE at KvMutate): a v3-native technique resolves to
+    // `mutation_driver` → a pressure-gated [`KVMutationDriverStage`] applies the keep through the v3
+    // handle (byte-identical to the v2 plan executor). A non-v3 (`.so`) stage falls back to the v2
+    // [`EvictionStage`]. score-based(h2o/d2o)는 accumulator 가 필요해 argus-cli 진입부에서 reject —
+    // 여기 도달하는 stage 는 항상 score-free, so the driver's score_cell stays `None` and no
+    // `mutation_fired` (T-6) cell is needed: a position-SHRINKING keep is covered by the loop's
+    // pos-shrink reflux (`kv_pos_handle` below).
+    let evict_configured = if let Some(sel) = mutation_driver {
+        let registry = registry
+            .as_ref()
+            .expect("registry: mutation_driver.is_some()");
+        let mut driver = KVMutationDriverStage::new(
+            kv_handles.clone(),
+            sel.stage,
+            sel.phase,
+            eviction_target_ratio,
+        )
+        .with_caps(sel.caps);
+        // Pressure-gate ONLY a KvMutate-phase eviction (the per-decode-step KV-fill model — the v2
+        // `EvictionStage::persistent` slot this replaces). A PrefillEnd-phase stage fires once at
+        // prefill end and must NOT be gated by the decode-pressure band (which would silently skip it);
+        // it stays the bare driver, firing on its phase. (In argus-cli a PrefillEnd / non-empty-reads
+        // stage is rejected at entry, so this branch is defensive + forward-compatible with Phase 2's
+        // PrefillKeepSetStage migration onto the handle.)
+        if sel.phase == argus_extension_api::MutationPhase::KvMutate {
+            driver = driver.with_pressure_gate(Level::Warning);
         }
-        None => None,
+        registry.submit(Arc::new(driver));
+        true
+    } else if let Some(cm) = cache_manager {
+        let registry = registry
+            .as_ref()
+            .expect("registry: cache_manager.is_some()");
+        let shared_cm = Arc::new(Mutex::new(cm));
+        registry.submit(Arc::new(EvictionStage::persistent(
+            kv_handles.clone(),
+            shared_cm,
+            eviction_target_ratio,
+            Level::Warning,
+        )));
+        true
+    } else {
+        false
+    };
+    let pressure_source: Option<Arc<dyn PressureSource>> = if evict_configured {
+        kv_pos_handle.clone().map(|h| {
+            Arc::new(KvFillPressureSource::new(
+                h,
+                max_seq_len,
+                KV_FILL_HIGH_WATER_PCT,
+            )) as Arc<dyn PressureSource>
+        })
+    } else {
+        None
     };
 
     // β-4: resilience-on 이면 dispatcher 를 구성한다 — control 디렉티브(Throttle/SetTargetTbt/
@@ -307,14 +350,11 @@ pub fn build_standard_loop(
     if arm_prefill_keepset
         && let Some(registry) = registry.as_ref()
         && let Some(name) = prefill_attn_stage_name.as_ref()
-        && let Some(plugin) = crate::kv::eviction::stage_registry::make_stage(
-            name,
-            &argus_extension_api::StageParams::default(),
-        )
+        && let Some(reg) = argus_extension_api::find_mutation_stage(name)
     {
         registry.submit(Arc::new(PrefillKeepSetStage::new(
             kv_handles.clone(),
-            plugin,
+            (reg.make)(argus_extension_api::StageParams::default(), &[]),
             pfa_cell.clone(),
             n_heads_q,
             eviction_target_ratio,

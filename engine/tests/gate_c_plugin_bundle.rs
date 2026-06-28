@@ -21,12 +21,8 @@ use std::process::Command;
 
 use argus_engine::format::dynamic_format_registry::{dynamic_registered_format_names, make_format};
 use argus_engine::format::{decode_via_descriptor, encode_via_descriptor};
-use argus_engine::kv::eviction::stage_registry::{dynamic_registered_stage_names, make_stage};
 use argus_engine::session::plugin_dispatch::register_dynamic_plugins;
-use argus_extension_api::{
-    KVLayoutDesc, KeepSpec, Packing, ScaleLayout, StageCtx, StageParams, TensorHandle, TensorKind,
-    find_kv_format,
-};
+use argus_extension_api::{KVLayoutDesc, Packing, ScaleLayout, find_kv_format};
 
 /// q4_0-like 알려진 정답 descriptor(mf_q4 / bundle_fmt / synth_q4 공유).
 fn known_q4() -> KVLayoutDesc {
@@ -69,46 +65,6 @@ fn build_plugin_so(pkg: &str, with_export: bool, dst_name: &str) -> PathBuf {
     dst
 }
 
-/// plan-identity / PerHead bail 용 최소 StageCtx.
-struct Ctx {
-    cur: usize,
-    tgt: usize,
-    heads: usize,
-}
-impl StageCtx for Ctx {
-    fn current_pos(&self) -> usize {
-        self.cur
-    }
-    fn target_len(&self) -> usize {
-        self.tgt
-    }
-    fn layer_idx(&self) -> usize {
-        0
-    }
-    fn importance(&self) -> Option<&[f32]> {
-        None
-    }
-    fn n_kv_heads(&self) -> usize {
-        self.heads
-    }
-    fn head_dim(&self) -> usize {
-        1
-    }
-    fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
-        None
-    }
-}
-
-fn params() -> StageParams {
-    StageParams {
-        eviction_window: 0,
-        protected_prefix: 0,
-        keep_ratio: 0.0,
-        sink_size: 0,
-        streaming_window: 0,
-    }
-}
-
 #[test]
 fn gate_c_v2_bundle_multivtable_and_rejects() {
     // ── vehicle .so 빌드 ──
@@ -117,7 +73,6 @@ fn gate_c_v2_bundle_multivtable_and_rejects() {
     let kv_off = build_plugin_so("example-kv-format", false, "libexample_kv_format_off.so");
     let rollback = build_plugin_so("example-rollback", true, "libexample_rollback_v2.so");
     let bundle = build_plugin_so("example-bundle", true, "libexample_bundle_v2.so");
-    let keep_recent = build_plugin_so("example-keep-recent", true, "libexample_keep_recent_v2.so");
     let multi = build_plugin_so(
         "example-multi-format",
         true,
@@ -170,28 +125,13 @@ fn gate_c_v2_bundle_multivtable_and_rejects() {
 
     // ════ SUCCESS 단언 (영구 등록) ════
 
-    // (5) 번들 양축 등록: 한 .so(stage 2 + format 1) 1회 dlopen → 양축 가시화(CF4 ②③).
+    // (5) bundle .so 의 format 축 등록: stage 축은 static-linkme 전용이라 .so 의 stage vtable 은
+    // 동적 경로에 없고 format(bundle_fmt)만 동적 등록된다(CF4 ②③).
     register_dynamic_plugins(std::slice::from_ref(&bundle)).expect("bundle 등록 성공");
-    let snames = dynamic_registered_stage_names();
     let fnames = dynamic_registered_format_names();
-    assert!(
-        snames.contains(&"bundle_keep".to_string()),
-        "stage bundle_keep: {snames:?}"
-    );
-    assert!(
-        snames.contains(&"bundle_perhead".to_string()),
-        "stage bundle_perhead: {snames:?}"
-    );
     assert!(
         fnames.contains(&"bundle_fmt".to_string()),
         "format bundle_fmt: {fnames:?}"
-    );
-
-    // (6) wrong-type graceful: stage-only .so → stage 1 + format 0, 전체 Ok(bail 아님).
-    register_dynamic_plugins(std::slice::from_ref(&keep_recent)).expect("stage-only .so Ok");
-    assert!(
-        dynamic_registered_stage_names().contains(&"example_keep_recent".to_string()),
-        "wrong-type graceful: 단일축 stage .so 등록"
     );
 
     // (7) multi-format 서로 다른 descriptor-identity(CF4 ④): N개 등록 + 각자 고유 desc.
@@ -224,43 +164,7 @@ fn gate_c_v2_bundle_multivtable_and_rejects() {
     decode_via_descriptor(&d_q4, &enc_dyn, &mut dec);
     assert!(dec.iter().all(|v| v.is_finite()), "decode 유한");
 
-    // (9) stage plan-identity: 멀티-stage 인덱스 바인딩 — bundle_keep 이 LayerWide 정답.
-    let keep = make_stage("bundle_keep", &params()).expect("make_stage bundle_keep");
-    let plan = keep
-        .plan(&Ctx {
-            cur: 100,
-            tgt: 30,
-            heads: 4,
-        })
-        .expect("plan Some");
-    match plan.keep {
-        KeepSpec::LayerWide(k) => assert_eq!(k, (70..100).collect::<Vec<_>>(), "LayerWide keep"),
-        KeepSpec::PerHead(_) => panic!("bundle_keep 은 LayerWide 여야"),
-    }
-    assert!(
-        keep.plan(&Ctx {
-            cur: 20,
-            tgt: 30,
-            heads: 4
-        })
-        .is_none(),
-        "current<=target → no-op(None)"
-    );
-
-    // (10) PerHead bail: bundle_perhead 는 PerHead keep 산출 → host(DynStage)가 마샬링 단계 bail → None.
-    let ph = make_stage("bundle_perhead", &params()).expect("make_stage bundle_perhead");
-    assert_eq!(ph.name(), "bundle_perhead", "멀티-stage 이름↔vtable 바인딩");
-    assert!(
-        ph.plan(&Ctx {
-            cur: 100,
-            tgt: 30,
-            heads: 4
-        })
-        .is_none(),
-        "PerHead keep → host bail(None, silent garbage 방지)"
-    );
-
-    // (11) 동적 중복 reject(CF4 ⑥): 같은 multi-format .so 재등록 → 이미 등록됨.
+    // (9) 동적 중복 reject(CF4 ⑥): 같은 multi-format .so 재등록 → 이미 등록됨.
     let e = register_dynamic_plugins(std::slice::from_ref(&multi))
         .unwrap_err()
         .to_string();
