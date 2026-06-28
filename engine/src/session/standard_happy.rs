@@ -196,12 +196,19 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         None
     };
 
-    // argus-cli eviction(공용 path): score-free `CacheManager`(none/sliding/streaming/
-    // `--load-plugin` stage)를 CLI `eviction <policy>` 로 구성한다. `eviction none` 이고 swap-dir
-    // 도 없으면 None → build_standard_loop 의 eviction 배선 미진입(기존 happy-path 와 byte-identical,
-    // 회귀 0). score-based(h2o/d2o)·offload(--swap-dir)·기타 미지원 모드는 argus_cli 진입부에서
-    // 이미 reject 되므로 여기 도달하는 정책은 항상 score-free.
-    let cache_manager = crate::session::assembly::build_resilience_cache_manager(&args, &backend)?;
+    // argus-cli eviction(공용 path): CLI `eviction <policy>` 를 해석한다. P0-6 selector — a v3-native
+    // technique (all built-ins after Phase 1) resolves to a `MutationDriverSelection` and is driven by
+    // the v3 `KVMutationDriverStage`; the v2 `CacheManager`/`EvictionStage` path is then skipped
+    // (MUTUALLY EXCLUSIVE) and kept only as the fallback for a non-v3 (dynamically-loaded `.so`) stage.
+    // `eviction none` (and no swap-dir) → both `None` → build_standard_loop 의 eviction 배선 미진입
+    // (기존 happy-path 와 byte-identical, 회귀 0). score-based(h2o/d2o)·offload(--swap-dir)·기타
+    // 미지원 모드는 argus_cli 진입부에서 이미 reject 되므로 여기 도달하는 정책은 항상 score-free.
+    let mutation_driver = crate::session::assembly::resolve_mutation_driver(&args);
+    let cache_manager = if mutation_driver.is_some() {
+        None
+    } else {
+        crate::session::assembly::build_resilience_cache_manager(&args, &backend)?
+    };
 
     // Per-token streaming slot: the decode loop's ChatStreamStage emits each kept token into it.
     // Armed below for the synchronous run() so tokens print as they land (instead of one batch
@@ -223,6 +230,7 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         resilience,
         args.effective_read_stage(),
         cache_manager,
+        mutation_driver,
         args.eviction_target_ratio(),
         Some(Arc::clone(&stream_slot)),
         args.kv_format.as_deref(),

@@ -20,8 +20,11 @@
 //! than the cache, so the `&dyn StageCtx` read view and the `&mut dyn CacheHandle` write view never
 //! alias — and both observe the entry frame (the cache is untouched until `commit`).
 //!
-//! The driver is NOT registered into the pipeline yet (the `KV_MUTATION_STAGES` slice / production
-//! wiring is P0-5/P0-6); it is constructed directly and exercised by the gates below.
+//! Production wiring (P0-5c/P0-6): `build_standard_loop` resolves the chosen `eviction <policy>` to a
+//! v3 stage via `resolve_mutation_driver` (`find_mutation_stage`) and, when one exists, registers this
+//! driver in [`with_pressure_gate`](KVMutationDriverStage::with_pressure_gate) mode as a faithful
+//! drop-in for the v2 `EvictionStage` (MUTUALLY EXCLUSIVE at KvMutate). The bare `new()` path stays the
+//! direct-construction surface the gates below exercise.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

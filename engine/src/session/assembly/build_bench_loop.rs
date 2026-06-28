@@ -13,6 +13,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
+use argus_extension_api::{
+    KVMutationStage, MutationPhase, StageCaps, StageParams, find_mutation_stage,
+};
+
 use crate::backend::Backend;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
@@ -46,6 +50,68 @@ pub struct SwapWiringConfig {
     pub phase_max_chunks_per_token: usize,
 }
 
+/// The `(name, StageParams, owned extra-args)` for the configured `eviction <policy>` — shared by the
+/// v2 [`build_resilience_cache_manager`] (which builds the v2 `KVCacheStage`) and the v3
+/// [`resolve_mutation_driver`] (which builds the v3 `KVMutationStage`) so a migrated technique's v3
+/// stage is constructed from byte-identical params to its v2 stage. The keep-set is then identical by
+/// the Phase-1 decision-equivalence gate, making the driver a faithful replacement for `EvictionStage`.
+fn eviction_policy_params(args: &Args) -> (String, StageParams, Vec<(String, String)>) {
+    let policy_name = args.eviction_policy().to_string();
+    // Score-based stages declare a protected-prefix (4 sinks); score-free ones declare 0 → protect 4
+    // sinks by default. No per-name branch.
+    let actual_protected_prefix = args.protected_prefix().unwrap_or_else(|| {
+        match stage_default_protected_prefix(&policy_name) {
+            0 => 4,
+            cap => cap,
+        }
+    });
+    let streaming_window = if args.streaming_window() > 0 {
+        args.streaming_window()
+    } else if args.kv_budget() > 0 {
+        args.kv_budget().saturating_sub(args.sink_size())
+    } else {
+        args.eviction_window()
+    };
+    let params = StageParams {
+        eviction_window: args.eviction_window(),
+        protected_prefix: actual_protected_prefix,
+        keep_ratio: args.keep_ratio(),
+        sink_size: args.sink_size(),
+        streaming_window,
+    };
+    (policy_name, params, args.stage_args())
+}
+
+/// A resolved v3 mutation-stage selection for the production driver: the stage instance plus the
+/// (caps, phase) the driver needs at construction (the same `MutationStageReg` data the registry
+/// carries pre-`make`). Returned by [`resolve_mutation_driver`].
+pub struct MutationDriverSelection {
+    pub stage: Box<dyn KVMutationStage>,
+    pub caps: StageCaps,
+    pub phase: MutationPhase,
+}
+
+/// Resolve the configured `eviction <policy>` to a native v3 [`KVMutationStage`] selection, or `None`
+/// when the policy is `none` or has no v3 registration (a v2-only / dynamically-loaded `.so` stage —
+/// the caller falls back to the v2 `EvictionStage` path). The v3 stage is built from the SAME
+/// `eviction_policy_params` the v2 `CacheManager` uses, so the driver applies the identical keep-set.
+pub fn resolve_mutation_driver(args: &Args) -> Option<MutationDriverSelection> {
+    let (policy_name, params, extra_owned) = eviction_policy_params(args);
+    if policy_name == "none" {
+        return None;
+    }
+    let reg = find_mutation_stage(&policy_name)?;
+    let extra: Vec<argus_extension_api::PluginArg> = extra_owned
+        .iter()
+        .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
+        .collect();
+    Some(MutationDriverSelection {
+        stage: (reg.make)(params, &extra),
+        caps: reg.caps,
+        phase: reg.phase,
+    })
+}
+
 /// CLI `eviction <policy>` + `--swap-dir` 로 resilience-driven force eviction /
 /// KvOffload 용 [`CacheManager`] 를 구성한다. `eviction=none` 이고 `--swap-dir`
 /// 도 없으면 `None`.
@@ -62,21 +128,15 @@ pub fn build_resilience_cache_manager(
     args: &Args,
     backend: &Arc<dyn Backend>,
 ) -> Result<Option<CacheManager>> {
-    let policy_name = args.eviction_policy();
     let swap_dir = args.swap_dir.clone();
-    if policy_name == "none" && swap_dir.is_none() {
+    if args.eviction_policy() == "none" && swap_dir.is_none() {
         return Ok(None);
     }
 
-    // Score-based stages declare a protected-prefix (4 sinks); score-free ones declare 0 → bench
-    // protects 4 sinks by default (sliding clamps to ≥4 anyway; streaming derives its own sink and
-    // ignores the value). No per-name branch.
-    let actual_protected_prefix = args.protected_prefix().unwrap_or_else(|| {
-        match stage_default_protected_prefix(policy_name) {
-            0 => 4,
-            cap => cap,
-        }
-    });
+    // The policy name + StageParams + extra-args, shared verbatim with the v3 `resolve_mutation_driver`
+    // (protected-prefix / streaming-window derivation lives in the helper) so the v2 stage built here
+    // and the v3 stage the driver builds receive byte-identical params.
+    let (policy_name, params, extra_owned) = eviction_policy_params(args);
 
     let monitor: Box<dyn crate::resilience::sys_monitor::SystemMonitor> =
         if backend.is_discrete_gpu() {
@@ -90,39 +150,18 @@ pub fn build_resilience_cache_manager(
     // linkme fat-LTO 생존 self-test: 빌트인 stage 미등록 시 fail-fast.
     crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
 
-    // Heavy-hitter keep-ratio = the active variant's own keep_ratio (h2o/h2o_plus → 0.5 default,
-    // d2o → 0.75 default), identical to the chat/eval path — no `name == "d2o"` test. (The prior
-    // bench code coupled d2o's keep-ratio to --eviction-target-ratio; that only matched for default
-    // ratios and silently changed h2o/h2o_plus, so the generic accessor is used instead. The overall
-    // d2o budget is still driven by --eviction-target-ratio via the engine-resolved target_len.)
-    let keep_ratio = args.keep_ratio();
     let mut cm = {
         // Every policy (none/sliding/streaming/h2o/h2o_plus/d2o/rkv) resolves through the plugin
         // registry by name (static linkme + dynamic --load-plugin); eviction=none + swap-dir (AB-3)
         // flows through make_stage("none") = a no-op stage. This site names no plugin.
         let policy: Box<dyn EvictionPolicy> = {
-            let streaming_window = if args.streaming_window() > 0 {
-                args.streaming_window()
-            } else if args.kv_budget() > 0 {
-                args.kv_budget().saturating_sub(args.sink_size())
-            } else {
-                args.eviction_window()
-            };
-            let params = argus_extension_api::StageParams {
-                eviction_window: args.eviction_window(),
-                protected_prefix: actual_protected_prefix,
-                keep_ratio,
-                sink_size: args.sink_size(),
-                streaming_window,
-            };
             // Technique-private knobs ride the opaque StageArgs blob (each plugin parses its own keys;
             // the engine knows none). Built generically by `Args::stage_args()`.
-            let extra_owned = args.stage_args();
             let extra: Vec<argus_extension_api::PluginArg> = extra_owned
                 .iter()
                 .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
                 .collect();
-            let stage = make_stage_with_args(policy_name, &params, &extra).ok_or_else(|| {
+            let stage = make_stage_with_args(&policy_name, &params, &extra).ok_or_else(|| {
                 anyhow::anyhow!(
                     "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>).",
                     policy_name,
@@ -393,4 +432,38 @@ pub fn build_bench_loop(
         None => builder,
     };
     Ok(builder.build())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// P0-6 selector: a v3-native built-in resolves to a driver selection; `none` and a non-v3
+    /// (unknown / `.so`) name return `None` so the caller keeps the v2 `EvictionStage` fallback.
+    #[test]
+    fn resolve_mutation_driver_selects_v3_for_native_builtin() {
+        // `eviction` 미지정(=none) → 드라이버 없음.
+        let args = Args::parse_from(["argus_engine"]);
+        assert!(resolve_mutation_driver(&args).is_none(), "none → no driver");
+
+        // sliding 은 Phase-1 v3-native 빌트인 → KvMutate 에서 드라이버 선택.
+        let args = Args::parse_from(["argus_engine", "eviction", "plugin", "--name", "sliding"]);
+        let sel = resolve_mutation_driver(&args).expect("sliding registers a v3 KVMutationStage");
+        assert_eq!(sel.phase, MutationPhase::KvMutate);
+        assert_eq!(sel.stage.name(), "sliding");
+
+        // 미등록(비-v3 / `.so`) 이름 → None → 호출처가 v2 EvictionStage 로 폴백.
+        let args = Args::parse_from([
+            "argus_engine",
+            "eviction",
+            "plugin",
+            "--name",
+            "definitely_not_a_stage",
+        ]);
+        assert!(
+            resolve_mutation_driver(&args).is_none(),
+            "non-v3 name → v2 fallback"
+        );
+    }
 }
