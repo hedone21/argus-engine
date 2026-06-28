@@ -7,8 +7,8 @@ license.workspace = true
 publish = false
 
 [lib]
-# GATE-C v3: 한 `.so` 가 stage(register_kv_stages_v2) + format(register_kv_formats_v2)
-# 양축을 동시 export 하는 번들. cdylib = dlopen `.so`.
+# GATE-C v3: 한 `.so` 가 format(register_kv_formats_v2) 축을 export 하는 번들(stage 축은
+# static-linkme 전용). cdylib = dlopen `.so`.
 crate-type = ["cdylib", "rlib"]
 
 # 번들 예제 — `argus-extension-api` + `linkme` 만 의존(엔진 force-link 안 함). 한 plugin `.so` 가 stage 1 +

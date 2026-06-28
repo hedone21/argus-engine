@@ -8,7 +8,7 @@ publish = false
 
 [lib]
 # GATE-C: rlib = static dev-dep (stage_registry visibility test), cdylib = dlopen `.so`
-# (`register_kv_stage_v1` C-ABI export when built with `--features plugin-cdylib`).
+# (stage 축은 static-linkme 전용이라 `.so` 는 capability-0; cdylib 빌드는 빌드 호환용).
 crate-type = ["cdylib", "rlib"]
 
 # Example technique crate — depends on `argus-extension-api` (the extension API) + `linkme`
@@ -20,7 +20,7 @@ argus-extension-api = { path = "../../argus-extension-api" }
 linkme = "0.3"
 
 [features]
-# GATE-C: enables the cdylib C-ABI export (`register_kv_stage_v1`). Keep it OFF for the
+# GATE-C: enables the cdylib build (no dynamic KV-stage export — stage axis is static-linkme
 # static force-link build to avoid `#[no_mangle]` symbol collisions; turn it on only when
 # producing a `.so`.
 plugin-cdylib = []

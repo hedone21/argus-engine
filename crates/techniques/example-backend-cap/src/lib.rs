@@ -54,5 +54,5 @@ argus_extension_api::register_quant_attn_plugin!(
     "synth_kivi_attn",
     |_a: &QuantAttnMakeArgs| -> Box<dyn QuantAttnBackend> { Box::new(SynthKivi) }
 );
-// .so 당 1회 — register_kv_stages_v2 / register_kv_formats_v2 / register_backend_caps_v2 엔트리 emit.
+// .so 당 1회 — register_kv_formats_v2 / register_backend_caps_v2 엔트리 emit(stage 축은 static-linkme 전용).
 argus_extension_api::export_plugin!();

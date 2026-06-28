@@ -523,7 +523,7 @@ fn make_kivi(args: &QuantAttnMakeArgs) -> Box<dyn QuantAttnBackend> {
 // Static (linkme name survival) + dynamic (cdylib C-ABI vtable) registration. KEEP the
 // `"kivi_abi"` registry key byte-exact (the `--backend-cap kivi_abi` selector).
 argus_extension_api::register_quant_attn_plugin!("kivi_abi", make_kivi);
-// One per `.so` — emits the register_kv_stages_v2 / _formats_v2 / _backend_caps_v2 entries.
+// One per `.so` — emits the register_kv_formats_v2 / _backend_caps_v2 entries (stage axis is static-linkme only).
 argus_extension_api::export_plugin!();
 
 #[cfg(test)]

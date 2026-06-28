@@ -1,6 +1,6 @@
 //! capability-0 vehicle — `register_kv_format!` 는 호출하되 [`export_plugin!`](argus_extension_api::export_plugin)
 //! 를 **고의로 누락**한다. plugin-cdylib 빌드 시 `PLUGIN_KV_FORMAT_VTABLES` 슬라이스
-//! 기여는 있으나 `register_kv_formats_v2`/`register_kv_stages_v2` entry 심볼이 없다 → host
+//! 기여는 있으나 `register_kv_formats_v2`/`register_backend_caps_v2` entry 심볼이 없다 → host
 //! `register_dynamic_plugins` 가 두 축 dlsym 모두 실패 → `n==0` → **capability-0 reject**.
 //!
 //! 작성자가 `export_plugin!()` 를 잊은 현실적 실수를 fail-fast 로 잡는지 검증하는 vehicle. 엔진

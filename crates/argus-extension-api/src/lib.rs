@@ -1,13 +1,13 @@
 //! argus-extension-api — the additive surface where extension techniques (stage axis) register themselves with **zero engine-core modifications**.
 //!
 //! extension mechanism = statically linked technique crate + linkme auto-registration. Each technique, in its own crate
-//! (`crates/techniques/<name>/`), depends only on this crate, implements [`KVCacheStage`], and
-//! submits itself to the [`KV_CACHE_STAGES`] slice via `#[distributed_slice]`. At construction
+//! (`crates/techniques/<name>/`), depends only on this crate, implements [`KVMutationStage`], and
+//! submits itself to the [`KV_MUTATION_STAGES`] slice via `#[distributed_slice]`. At construction
 //! time the engine reads that slice to pick a technique (removing closed match arms → OCP).
 //!
-//! stage-axis extension techniques (eviction/merge) are unified under a **single plan-returning trait [`KVCacheStage`]**
-//! (a sibling of the engine-side storage-representation trait `KVCacheFormat`). A technique merely *reads* [`StageCtx`] and returns a [`KVCachePlan`]
-//! (retained tokens + weighted merge plan); it never mutates buffers directly — mutation is the engine's exclusive job, executing the plan
+//! stage-axis extension techniques (eviction/merge) are unified under a **single plan-returning trait [`KVMutationStage`]**
+//! (a sibling of the engine-side storage-representation trait `KVCacheFormat`). A technique *reads* [`StageCtx`] and stages mutations on a transactional [`CacheHandle`]
+//! (retained tokens + weighted merges); it never mutates buffers directly — the engine owns the commit
 //! via `compact` (D1). State (d2o EMA, etc.) is held by the plugin struct itself via `&self` + interior mutability
 //! (D4); it is not threaded through the ctx.
 //!
@@ -18,7 +18,7 @@
 
 use core::ffi::{c_char, c_void};
 
-/// Re-exports linkme's proc-macro so the `register_kv_stage!` macro can reference the `distributed_slice` attribute by path
+/// Re-exports linkme's proc-macro so the `register_kv_mutation_stage!` macro can reference the `distributed_slice` attribute by path
 /// from a plugin crate (so the plugin need not depend on linkme directly).
 /// This crate's own internal registration (`#[distributed_slice]`) also uses this import. (The macro itself, not the crate,
 /// must be re-exported directly so the proc-macro attribute path resolves.)
@@ -321,58 +321,12 @@ pub enum KeepSpec {
     PerHead(Vec<Vec<usize>>),
 }
 
-/// (D1) The channel-axis (head_dim index) selection — the orthogonal twin of [`KeepSpec`] (which
-/// selects token POSITIONS). ThinK and KVCompose prune KEY head_dim CHANNELS, an axis [`KeepSpec`]
-/// cannot express (channel ⊥ token). This is a DORMANT typed surface: a plugin can DESCRIBE channel
-/// intent, but no current container can store a narrowed/ragged head_dim (head_dim is a single
-/// per-cache scalar woven through every offset/alloc/attention-kernel call), so the engine executor
-/// REJECTS any `Some(ChannelKeep)` plan cleanly rather than silently ignoring it. Faithful channel
-/// pruning needs a narrowed-head_dim container + paired attention kernel (L3 / engine-core).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChannelKeep {
-    /// Kept head_dim channel indices shared by all heads (ascending).
-    LayerWide(Vec<usize>),
-    /// Per-kv-head kept channel indices (`[n_kv_heads][channels]`, each ascending).
-    PerHead(Vec<Vec<usize>>),
-}
-
-/// The plan a technique produces. `keep` (exclusive) ⊥ `merges` (orthogonal). `new_pos` is not carried — the engine
-/// derives it from `keep.len()` (assuming all heads of [`KeepSpec::PerHead`] are of equal length).
-#[derive(Clone, Debug, PartialEq)]
-pub struct KVCachePlan {
-    /// The shape of retained tokens.
-    pub keep: KeepSpec,
-    /// Weighted merge instructions (empty Vec if none).
-    pub merges: Vec<WeightedMerge>,
-    /// (D1) Optional channel-axis (head_dim index) selection — the orthogonal twin of `keep`
-    /// (ThinK-style key-channel pruning). `None` = all channels kept (byte-identical, the default for
-    /// every token-axis technique). `Some` is a DORMANT surface today: no container can store a
-    /// narrowed/ragged head_dim, so the engine executor (`execute_kv_plan`) REJECTS it cleanly — it
-    /// never silently no-ops. See [`ChannelKeep`].
-    pub channels: Option<ChannelKeep>,
-}
-
-/// The stage-axis extension technique surface — it adjusts resident tokens (a sibling of the engine-side storage-representation trait `KVCacheFormat`).
-//
-///
-/// plan-returning, not self-mutating (D1): rather than touching buffers directly, it returns a [`KVCachePlan`] which the engine
-/// executes via `KVCacheFormat::compact`. Hence this trait does not take engine types like `&mut KVCache`,
-/// only the [`StageCtx`] read abstraction — consistent with a C-ABI future (`cdylib` promotion), and keeping technique crates from coupling to
-/// engine internals.
-pub trait KVCacheStage: Send + Sync {
-    /// The technique name (matched against the CLI `eviction plugin --name <name>` selector, also for logging). Must be unique within the slice.
-    fn name(&self) -> &str;
-
-    /// Computes the retain/merge plan. `None` = not applied (no-op). Computed from ctx reads + impl state (Mutex).
-    fn plan(&self, ctx: &dyn StageCtx) -> Option<KVCachePlan>;
-}
-
 /// The common parameters needed to create a technique instance. The engine maps CLI args into this struct and passes it along
 /// (carrying only flat values so argus-extension-api does not depend on the engine's args type).
 ///
 /// NOTE: technique-private parameters (e.g. d2o's `ema_beta`/`merge_e`/`merge_axis`/`protected_layers`)
 /// are deliberately **not carried here** — rather than bloat this shared struct, they ride the opaque
-/// [`StageArgs`] blob into [`KVCacheStageReg::make_with_args`], where the plugin parses its own params
+/// [`StageArgs`] blob into [`MutationStageReg::make_with_args`], where the plugin parses its own params
 /// (see `d2o::D2OConfig::from_args`). This keeps the engine from knowing any plugin's private knobs.
 /// The 5 fields below are the common params shared by the built-ins (sliding/streaming/h2o/no_eviction).
 #[repr(C)] // GATE-C: the `.so` C-ABI passes it by value as a POD (the make-thunk argument).
@@ -403,12 +357,12 @@ pub struct PluginArg<'a> {
     pub val: &'a str,
 }
 
-/// The technique-private argument blob passed to [`KVCacheStageReg::make_with_args`]. Empty (`&[]`)
+/// The technique-private argument blob passed to [`MutationStageReg::make_with_args`]. Empty (`&[]`)
 /// for built-ins served entirely by [`StageParams`].
 pub type StageArgs<'a> = &'a [PluginArg<'a>];
 
 /// Plugin-declared capabilities the engine reads **before** instantiating a stage (off the
-/// [`KVCacheStageReg`], not via a trait method — the decision precedes `make`). This is the surface
+/// [`MutationStageReg`], not via a trait method — the decision precedes `make`). This is the surface
 /// that lets the engine CLI/chat/eval/bench paths stay free of any plugin-name knowledge: instead of
 /// `matches!(name, "h2o" | "d2o" | ...)` capability lists and `match name { ... => 4 }` prefix
 /// tables, each consumer reads these caps generically through [`stage_caps`].
@@ -437,9 +391,9 @@ pub struct StageCaps {
 
 impl StageCaps {
     /// Score-free defaults — no reads, no stage-declared prefix, drop-only (`{ &[], 0, false }`).
-    /// Used by the `register_kv_stage!` macro so macro-registered (and example) plugins compile
+    /// Used by the `register_kv_mutation_stage!` macro so macro-registered (and example) plugins compile
     /// unchanged: a score-free drop-only LayerWide technique is the common case, and any stage that
-    /// needs scores / emits merges declares them via a direct-literal [`KVCacheStageReg`].
+    /// needs scores / emits merges declares them via a direct-literal [`MutationStageReg`].
     pub const SCORE_FREE: StageCaps = StageCaps {
         reads: &[],
         default_protected_prefix: 0,
@@ -447,53 +401,11 @@ impl StageCaps {
     };
 }
 
-/// The registration entry for one stage technique. A technique crate submits it via
-/// `#[distributed_slice(KV_CACHE_STAGES)] static FOO: KVCacheStageReg = ...`.
-pub struct KVCacheStageReg {
-    /// The CLI selector name (`eviction plugin --name <name>`, or a built-in `eviction <policy>`). Must be unique within the slice.
-    pub name: &'static str,
-    /// The factory that builds a technique instance from the common parameters (no private args).
-    pub make: fn(StageParams) -> Box<dyn KVCacheStage>,
-    /// Like [`KVCacheStageReg::make`] but also receives the technique-private [`StageArgs`] blob —
-    /// CLI knobs that do not fit [`StageParams`]. Techniques that take no private args set this to a
-    /// shim that drops the blob and delegates to `make` (`register_kv_stage!` wires that shim
-    /// automatically). The engine calls this via `make_stage_with_args`; `make_stage` passes `&[]`.
-    pub make_with_args: fn(StageParams, StageArgs<'_>) -> Box<dyn KVCacheStage>,
-    /// Capabilities the engine reads pre-`make` ([`StageCaps`]) — whether the stage is score-based and
-    /// its default protected prefix. Read via [`stage_caps`] so consumers never name a plugin.
-    pub caps: StageCaps,
-}
-
-/// The global registration slice — the registrations of all linked technique crates are gathered at **link time**.
-///
-/// fat-LTO + `--gc-sections` may silently drop unreferenced sections — in release
-/// builds the engine asserts via a startup self-test that all expected techniques are registered, failing fast.
-#[distributed_slice]
-pub static KV_CACHE_STAGES: [KVCacheStageReg] = [..];
-
-/// Finds a registered technique by name (used at engine construction).
-pub fn find_stage(name: &str) -> Option<&'static KVCacheStageReg> {
-    KV_CACHE_STAGES.iter().find(|r| r.name == name)
-}
-
-/// All registered technique names (for self-test / diagnostics).
-pub fn registered_names() -> Vec<&'static str> {
-    KV_CACHE_STAGES.iter().map(|r| r.name).collect()
-}
-
-/// The [`StageCaps`] of a statically registered technique, by name. `None` if the name is not a
-/// statically linked stage. This is the lookup the engine CLI/chat/eval/bench paths use to read a
-/// stage's score-based-ness and default protected prefix **without naming any plugin** — the one
-/// site that makes the name-match collapse possible.
-pub fn stage_caps(name: &str) -> Option<StageCaps> {
-    find_stage(name).map(|r| r.caps)
-}
-
 // ════════════════════════════════════════════════════════════════════════════
 // HYBRID v3 — imperative CacheHandle mutation surface (M4 callback class)
 // ════════════════════════════════════════════════════════════════════════════
 //
-// The plan-returning [`KVCacheStage`] above expresses one declarative shape per call (a keep-set +
+// The plan-returning [`KVMutationStage`] above expresses one declarative shape per call (a keep-set +
 // merges). HYBRID v3 adds an imperative sibling for the composite / stateful / escape-hatch class: a
 // [`KVMutationStage`] callback that drives a transactional [`CacheHandle`]. The two coexist (this is
 // purely additive); a technique picks whichever surface fits.
@@ -739,9 +651,9 @@ pub trait CacheHandle {
     }
 }
 
-/// The imperative sibling of [`KVCacheStage`] — a callback that drives a transactional
+/// The imperative sibling of [`KVMutationStage`] — a callback that drives a transactional
 /// [`CacheHandle`] at a [`MutationPhase`]. Additive: a technique implements EITHER this or the
-/// plan-returning [`KVCacheStage`], whichever its mutation shape fits.
+/// plan-returning [`KVMutationStage`], whichever its mutation shape fits.
 ///
 /// The stage's lifecycle [`MutationPhase`] is NOT a trait method — it is declared once, at
 /// registration, on [`MutationStageReg::phase`] (the single source of truth the engine reads
@@ -837,24 +749,24 @@ pub fn keep_union(sets: &[&[usize]]) -> Vec<usize> {
 // v3 native registry — KV_MUTATION_STAGES (static-linkme only)
 // ════════════════════════════════════════════════════════════════════════════
 //
-// The imperative [`KVMutationStage`] sibling of the plan-returning [`KVCacheStage`] needs its own
+// The imperative [`KVMutationStage`] sibling of the plan-returning [`KVMutationStage`] needs its own
 // registration slice so the engine can resolve a technique by name, read its [`StageCaps`] and
 // [`MutationPhase`] BEFORE instantiation, and drive it through the transactional [`CacheHandle`].
-// Mirrors [`KVCacheStageReg`] / [`KV_CACHE_STAGES`], but static-linkme only: no `.so` C-ABI is built
+// Mirrors [`MutationStageReg`] / [`KV_MUTATION_STAGES`], but static-linkme only: no `.so` C-ABI is built
 // for the imperative path (a `CacheHandle` is a `&mut dyn` transaction engine, not a flat fn-ptr
 // table that a stable C-ABI could carry). Caps + phase are carried in the registration so the engine
 // reads them pre-`make`.
 
 /// The registration entry for one imperative mutation-stage technique. A technique crate submits it
 /// via `#[distributed_slice(KV_MUTATION_STAGES)] static FOO: MutationStageReg = ...` (or the
-/// [`register_kv_mutation_stage!`] macro). The sibling of [`KVCacheStageReg`] for the v3 imperative
+/// [`register_kv_mutation_stage!`] macro). The sibling of [`MutationStageReg`] for the v3 imperative
 /// [`KVMutationStage`] surface.
 pub struct MutationStageReg {
     /// The CLI selector name (`eviction plugin --name <name>`, or a built-in policy). Unique within
     /// the slice.
     pub name: &'static str,
     /// The factory that builds a technique instance from the common parameters + the technique-private
-    /// [`StageArgs`] blob. (Unlike [`KVCacheStageReg`] there is no separate args-free `make`: the
+    /// [`StageArgs`] blob. (Unlike [`MutationStageReg`] there is no separate args-free `make`: the
     /// imperative path always routes args, and the macro wires an args-ignoring shim for techniques
     /// that take none.)
     pub make: fn(StageParams, StageArgs<'_>) -> Box<dyn KVMutationStage>,
@@ -869,7 +781,7 @@ pub struct MutationStageReg {
 }
 
 /// The global mutation-stage registration slice — gathered at link time from all linked technique
-/// crates (mirror of [`KV_CACHE_STAGES`]). fat-LTO + `--gc-sections` may drop unreferenced sections,
+/// crates (mirror of [`KV_MUTATION_STAGES`]). fat-LTO + `--gc-sections` may drop unreferenced sections,
 /// so the engine force-links every technique crate; the startup self-test that asserts every expected
 /// technique is registered lands with the production driver wiring (the mirror of
 /// `ensure_builtin_stages_registered`).
@@ -878,7 +790,7 @@ pub static KV_MUTATION_STAGES: [MutationStageReg] = [..];
 
 /// Finds a registered mutation-stage technique by name (used at engine construction).
 ///
-/// During the v2→v3 migration window both [`KV_CACHE_STAGES`] (plan path) and [`KV_MUTATION_STAGES`]
+/// During the v2→v3 migration window both [`KV_MUTATION_STAGES`] (plan path) and [`KV_MUTATION_STAGES`]
 /// (this slice) may carry the SAME technique name. The selector namespace
 /// (`eviction plugin --name <name>`) is shared, so the engine resolver MUST prefer this v3 slice (the
 /// migration target) over the v2 one when a name resolves in both — `find_mutation_stage` first, then
@@ -901,7 +813,7 @@ pub fn mutation_stage_caps(name: &str) -> Option<StageCaps> {
 }
 
 /// Static registration macro for an imperative [`KVMutationStage`] technique (static-linkme only — no
-/// `.so` C-ABI for the imperative path). The v3 counterpart of [`register_kv_stage!`].
+/// `.so` C-ABI for the imperative path). The v3 counterpart of [`register_kv_mutation_stage!`].
 ///
 /// Two forms — **`$phase` is always explicit** (there is no defaulting form: phase is the placement
 /// source the engine reads pre-`make`, so a silent default would mis-place a `PrefillEnd` technique):
@@ -957,485 +869,6 @@ macro_rules! register_kv_mutation_stage {
     };
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// GATE-C — Stage-axis `.so` cdylib dlopen plugin C-ABI
-// ════════════════════════════════════════════════════════════════════════════
-//
-// Static registration (`KV_CACHE_STAGES` + `find_stage`) is left in place (D3 additive), and a `.so` plugin
-// adds a surface that exposes the same `KVCacheStage` over a C-ABI. trait objects (`&dyn StageCtx`,
-// `Box<dyn KVCacheStage>`) are C-ABI-unstable, so they are flattened into a fn-ptr table ([`StageCtxAbi`]) + an opaque
-// handle (D2). The [`AbiStageCtx`] adapter re-implements `StageCtx` on top of `StageCtxAbi`,
-// so plugin authors write the same `impl KVCacheStage` code whether static or dynamic.
-
-/// The ABI version of the `register_kv_stages_v2` envelope ([`StageExportAbi`]). The host refuses to load on mismatch.
-pub const KV_STAGE_ABI_VERSION: u32 = 2;
-
-/// [`PluginVTableAbi::plan`] return code: success (`out_plan` filled).
-pub const KV_PLAN_OK: i32 = 0;
-/// [`PluginVTableAbi::plan`] return code: no-op (`None` — eviction not applied).
-pub const KV_PLAN_NOOP: i32 = 1;
-// negative = a clean logical error from the plugin (the host logs it and treats it as no-op; not a panic).
-
-/// The C-ABI flattening of [`StageCtx`] (D2). The host fills the fn-ptrs over a concrete ctx (`ctx`) and passes them to the plugin,
-/// and the plugin calls only the fn-ptrs. Every fn-ptr dereferences a raw pointer, hence `unsafe`.
-///
-/// Constructed stack-local (per-plan-call) and passed by ptr — not `static` → no `Sync` required.
-#[repr(C)]
-pub struct StageCtxAbi {
-    /// An opaque thin pointer to the host's concrete `&dyn StageCtx` implementation (the first argument of the fn-ptrs below).
-    pub ctx: *const c_void,
-    /// [`StageCtx::current_pos`].
-    pub current_pos: unsafe extern "C" fn(*const c_void) -> usize,
-    /// [`StageCtx::target_len`].
-    pub target_len: unsafe extern "C" fn(*const c_void) -> usize,
-    /// [`StageCtx::layer_idx`].
-    pub layer_idx: unsafe extern "C" fn(*const c_void) -> usize,
-    /// [`StageCtx::n_kv_heads`].
-    pub n_kv_heads: unsafe extern "C" fn(*const c_void) -> usize,
-    /// [`StageCtx::head_dim`].
-    pub head_dim: unsafe extern "C" fn(*const c_void) -> usize,
-    /// [`StageCtx::importance`]. `Some` → `true` + fills `out_ptr`/`out_len` (the borrow lives for the ctx lifetime),
-    /// `None` → `false`.
-    pub importance:
-        unsafe extern "C" fn(*const c_void, out_ptr: *mut *const f32, out_len: *mut usize) -> bool,
-    /// Flattening of [`TensorHandle::read_row`]. `kind` ([`TensorKind`] u32) available + read → `true` (fills `out`,
-    /// `out_len == shape().cols` contract — verified by the host), unavailable → `false`.
-    pub tensor_read_row: unsafe extern "C" fn(
-        *const c_void,
-        kind: u32,
-        row: usize,
-        kv_head: usize,
-        out: *mut f32,
-        out_len: usize,
-    ) -> bool,
-    /// Flattening of [`TensorHandle::shape`]. `kind` available → `true` (fills `out`), unavailable → `false`.
-    pub tensor_shape: unsafe extern "C" fn(*const c_void, kind: u32, out: *mut TensorShape) -> bool,
-}
-
-/// C-ABI flattening of [`KVCachePlan`] (D5). Exposes the stable buffer owned by the plugin-arena as (ptr+len);
-/// after the host copies it immediately, the plugin reclaims its own arena via [`PluginVTableAbi::plan_free`]`(owner)`
-/// ("each side frees its own" — blocks cross-allocator UB).
-#[repr(C)]
-pub struct PlanAbi {
-    /// `0` = [`KeepSpec::LayerWide`], `1` = [`KeepSpec::PerHead`] (reserved for v1 — the host bails).
-    pub keep_kind: u32,
-    /// Kept positions, ascending. LayerWide = all heads, PerHead = concatenation of all heads.
-    pub keep_ptr: *const usize,
-    /// Length of `keep_ptr`.
-    pub keep_len: usize,
-    /// PerHead only: per-head keep length (LayerWide = null).
-    pub keep_outer_lens: *const usize,
-    /// Length of `keep_outer_lens` (= n_kv_heads, LayerWide = 0).
-    pub keep_outer_count: usize,
-    /// Array of weighted merges (len 0 if none).
-    pub merges_ptr: *const MergeAbi,
-    /// Length of `merges_ptr`.
-    pub merges_len: usize,
-    /// Plugin-arena-owned handle → `plan_free(owner)`. The host must never free it directly.
-    pub owner: *mut c_void,
-}
-
-impl PlanAbi {
-    /// Initial out-param value (all null/0). The host passes it to the plugin by `&mut`.
-    pub fn zeroed() -> Self {
-        PlanAbi {
-            keep_kind: 0,
-            keep_ptr: core::ptr::null(),
-            keep_len: 0,
-            keep_outer_lens: core::ptr::null(),
-            keep_outer_count: 0,
-            merges_ptr: core::ptr::null(),
-            merges_len: 0,
-            owner: core::ptr::null_mut(),
-        }
-    }
-}
-
-/// C-ABI flattening of [`WeightedMerge`] (D5). `from` becomes a separate [`FromPairAbi`] array.
-#[repr(C)]
-pub struct MergeAbi {
-    /// [`WeightedMerge::into`].
-    pub into: usize,
-    /// [`WeightedMerge::into_weight`].
-    pub into_weight: f32,
-    /// `(pos, weight)` array (plugin-arena-owned).
-    pub from_ptr: *const FromPairAbi,
-    /// Length of `from_ptr`.
-    pub from_len: usize,
-    /// Flattening of [`WeightedMerge::apply_to`] (Both=0 / KeyOnly=1 / ValueOnly=2). **Appended at the end** of the fields —
-    /// existing field offsets are unchanged; the region not filled by an old plugin `.so` is zero-init'd by the host to 0 (= Both).
-    pub apply_to: u32,
-}
-
-/// C-ABI POD for a `(pos, weight)` pair (D5).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct FromPairAbi {
-    /// Position of the evicted token.
-    pub pos: usize,
-    /// Merge weight.
-    pub weight: f32,
-}
-
-/// C-ABI vtable for a single stage (D2). In v2 the plugin accumulates these vtables into the [`PLUGIN_KV_STAGE_VTABLES`]
-/// slice, and `register_kv_stages_v2()` exposes them wrapped in a [`StageExportAbi`] envelope (one `.so` may host multiple
-/// stages). The vtable is a `static` in the plugin `.so`, so it is valid for the entire process lifetime.
-#[repr(C)]
-pub struct PluginVTableAbi {
-    /// Null-terminated canonical name (matched against the CLI `eviction plugin --name`). A `'static` str in the plugin `.so`.
-    /// (ABI gating is handled by the envelope's [`StageExportAbi::abi_version`] — no per-vtable version field.)
-    pub name: *const c_char,
-    /// `StageParams` → opaque plugin instance handle.
-    pub make: unsafe extern "C" fn(*const StageParams) -> *mut c_void,
-    /// handle + ctx → plan. Returns [`KV_PLAN_OK`]/[`KV_PLAN_NOOP`]/negative (err). Fills `out_plan`.
-    pub plan: unsafe extern "C" fn(*mut c_void, *const StageCtxAbi, *mut PlanAbi) -> i32,
-    /// Reclaims the [`PlanAbi::owner`] that `plan` filled (called by the host right after copying the plan).
-    pub plan_free: unsafe extern "C" fn(owner: *mut c_void),
-    /// Releases the plugin instance handle (called by the host when the stage is dropped).
-    pub drop: unsafe extern "C" fn(*mut c_void),
-}
-
-// SAFETY: the vtable is immutable and `name` points at a `'static` str in the plugin `.so`. fn-ptrs are inherently
-// Send+Sync. Therefore it is safe to share across threads — required for declaring the plugin's distributed_slice element static.
-unsafe impl Sync for PluginVTableAbi {}
-
-/// stage-axis envelope — declares all of a plugin `.so`'s stage vtables at once. `register_kv_stages_v2()`
-/// returns it **by value** (sret >16B; `count`/`vtables` are derived from the slice at runtime, so a const static is not possible).
-/// `vtables` is the [`PLUGIN_KV_STAGE_VTABLES`] base (a `.so` static) → valid for the `.so` lifetime; `count==0` is possible (empty axis).
-#[repr(C)]
-pub struct StageExportAbi {
-    /// [`KV_STAGE_ABI_VERSION`]. The host rejects the `.so` on mismatch (one ABI per `.so`).
-    pub abi_version: u32,
-    /// Length of the contiguous array pointed to by `vtables`.
-    pub count: usize,
-    /// A contiguous array of `count` [`PluginVTableAbi`] (a `.so` static). The loader accesses elements via `vtables.add(i)`.
-    pub vtables: *const PluginVTableAbi,
-}
-
-/// The slice that accumulates stage vtables inside the plugin `.so`. **Declared in exactly one place, argus-extension-api**
-/// (the linkme section name is determined by the declaring static's name — declaring it on the plugin side breaks cross-crate contribution). `register_kv_stage!`
-/// contributes via a const-block-isolated static under the plugin-cdylib gate (multiple calls = multiple stages). In a static build it stays empty and
-/// harmless (the engine reads only `KV_CACHE_STAGES`).
-#[distributed_slice]
-pub static PLUGIN_KV_STAGE_VTABLES: [PluginVTableAbi] = [..];
-
-/// Adapter that exposes one [`TensorKind`] of a [`StageCtxAbi`] as a [`TensorHandle`] (internal to [`AbiStageCtx`]).
-/// `abi` borrow is tied to the adapter's lifetime.
-pub struct AbiTensorHandle {
-    abi: *const StageCtxAbi,
-    kind: u32,
-    shape: TensorShape,
-}
-
-impl TensorHandle for AbiTensorHandle {
-    fn shape(&self) -> TensorShape {
-        self.shape
-    }
-    fn dtype(&self) -> TensorDtype {
-        // ABI reads always yield f32 (read_row outputs f32). The stored dtype is not carried by the v1 C-ABI
-        // (a diagnostic field — add a tensor_dtype fn-ptr in abi_version 2 if needed).
-        TensorDtype::F32
-    }
-    fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
-        // SAFETY: `abi` is valid for the AbiStageCtx lifetime (contract at construction). The out_len contract (== cols) is the caller's responsibility.
-        unsafe {
-            let a = &*self.abi;
-            (a.tensor_read_row)(a.ctx, self.kind, row, kv_head, out.as_mut_ptr(), out.len());
-        }
-    }
-}
-
-/// Adapter that re-implements [`StageCtx`] on top of [`StageCtxAbi`] (a C fn-ptr table) (D2 "write-once,
-/// link-either-way"). The plugin's plan thunk wraps the host's `StageCtxAbi` in this to call the same `impl
-/// KVCacheStage::plan(&dyn StageCtx)`.
-pub struct AbiStageCtx {
-    abi: *const StageCtxAbi,
-    // TensorKind (repr u32: Key=0/Value=1/AttnWeights=2/Scores=3/QueryStats=4/PrefillAttention=5)
-    // index. shape is probed at construction. Adding QueryStats (disc 4) / PrefillAttention (disc 5)
-    // is a C-ABI addition (MQ-5) — fn-ptr signatures unchanged, no effect on existing .so files.
-    // Array length MUST equal the TensorKind variant count (6); see the probe loop / `tensor()` index.
-    handles: [Option<AbiTensorHandle>; 6],
-}
-
-impl AbiStageCtx {
-    /// # Safety
-    /// `abi` must point at a valid [`StageCtxAbi`], and its `ctx` + all fn-ptrs must stay alive for this adapter's
-    /// lifetime (guaranteed by the host for the duration of the plan call).
-    pub unsafe fn new(abi: *const StageCtxAbi) -> Self {
-        let a = unsafe { &*abi };
-        let kinds = [
-            TensorKind::Key,
-            TensorKind::Value,
-            TensorKind::AttnWeights,
-            TensorKind::Scores,
-            TensorKind::QueryStats,
-            TensorKind::PrefillAttention,
-        ];
-        let mut handles: [Option<AbiTensorHandle>; 6] = [None, None, None, None, None, None];
-        for kind in kinds {
-            let mut shape = TensorShape {
-                rows: 0,
-                cols: 0,
-                per_head: false,
-            };
-            // SAFETY: per new's contract, the fn-ptrs and ctx are valid.
-            let ok = unsafe { (a.tensor_shape)(a.ctx, kind as u32, &mut shape) };
-            if ok {
-                handles[kind as u32 as usize] = Some(AbiTensorHandle {
-                    abi,
-                    kind: kind as u32,
-                    shape,
-                });
-            }
-        }
-        AbiStageCtx { abi, handles }
-    }
-}
-
-impl StageCtx for AbiStageCtx {
-    fn current_pos(&self) -> usize {
-        // SAFETY: new's contract.
-        unsafe {
-            let a = &*self.abi;
-            (a.current_pos)(a.ctx)
-        }
-    }
-    fn target_len(&self) -> usize {
-        unsafe {
-            let a = &*self.abi;
-            (a.target_len)(a.ctx)
-        }
-    }
-    fn layer_idx(&self) -> usize {
-        unsafe {
-            let a = &*self.abi;
-            (a.layer_idx)(a.ctx)
-        }
-    }
-    fn n_kv_heads(&self) -> usize {
-        unsafe {
-            let a = &*self.abi;
-            (a.n_kv_heads)(a.ctx)
-        }
-    }
-    fn head_dim(&self) -> usize {
-        unsafe {
-            let a = &*self.abi;
-            (a.head_dim)(a.ctx)
-        }
-    }
-    fn importance(&self) -> Option<&[f32]> {
-        // SAFETY: new's contract. The returned slice's borrow is tied to &self and valid within the ctx lifetime the host guarantees.
-        unsafe {
-            let a = &*self.abi;
-            let mut ptr: *const f32 = core::ptr::null();
-            let mut len: usize = 0;
-            if (a.importance)(a.ctx, &mut ptr, &mut len) && !ptr.is_null() {
-                Some(core::slice::from_raw_parts(ptr, len))
-            } else {
-                None
-            }
-        }
-    }
-    fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
-        self.handles[kind as u32 as usize]
-            .as_ref()
-            .map(|h| h as &dyn TensorHandle)
-    }
-}
-
-/// plugin-arena: the plan thunk flattens [`KVCachePlan`] and stores it in a stable buffer (D5). [`Self::into_abi`]
-/// leaks a Box that the host reclaims via [`Self::free`]. It is self-referential ([`MergeAbi::from_ptr`] points at
-/// `from_storage`), but it is safe because the Vec heap buffers never move.
-pub struct PlanArena {
-    keep: Vec<usize>,
-    keep_outer_lens: Vec<usize>,
-    keep_kind: u32,
-    // The backing buffer that `merges[i].from_ptr` points at. Since it is referenced only via a raw ptr (no direct reads),
-    // the compiler cannot see it, but the arena must own it so the ptr does not dangle on drop.
-    #[allow(dead_code)]
-    from_storage: Vec<Vec<FromPairAbi>>,
-    merges: Vec<MergeAbi>,
-}
-
-impl PlanArena {
-    fn from_plan(plan: KVCachePlan) -> Self {
-        let (keep_kind, keep, keep_outer_lens) = match plan.keep {
-            KeepSpec::LayerWide(k) => (0u32, k, Vec::new()),
-            KeepSpec::PerHead(heads) => {
-                let lens: Vec<usize> = heads.iter().map(|h| h.len()).collect();
-                let flat: Vec<usize> = heads.into_iter().flatten().collect();
-                (1u32, flat, lens)
-            }
-        };
-        // Fill from_storage first to secure stable addresses, then merges point at it.
-        let mut from_storage: Vec<Vec<FromPairAbi>> = Vec::with_capacity(plan.merges.len());
-        for m in &plan.merges {
-            from_storage.push(
-                m.from
-                    .iter()
-                    .map(|&(pos, weight)| FromPairAbi { pos, weight })
-                    .collect(),
-            );
-        }
-        let merges: Vec<MergeAbi> = plan
-            .merges
-            .iter()
-            .enumerate()
-            .map(|(i, m)| MergeAbi {
-                into: m.into,
-                into_weight: m.into_weight,
-                from_ptr: from_storage[i].as_ptr(),
-                from_len: from_storage[i].len(),
-                apply_to: m.apply_to as u32,
-            })
-            .collect();
-        PlanArena {
-            keep,
-            keep_outer_lens,
-            keep_kind,
-            from_storage,
-            merges,
-        }
-    }
-
-    /// Flattens and leaks the plan, then builds a [`PlanAbi`] pointing at it. Valid until the host releases it
-    /// via [`Self::free`]`(owner)`.
-    pub fn into_abi(plan: KVCachePlan) -> PlanAbi {
-        let arena = Box::new(Self::from_plan(plan));
-        let raw = Box::into_raw(arena);
-        // SAFETY: a valid pointer just leaked.
-        let a = unsafe { &*raw };
-        PlanAbi {
-            keep_kind: a.keep_kind,
-            keep_ptr: a.keep.as_ptr(),
-            keep_len: a.keep.len(),
-            keep_outer_lens: if a.keep_outer_lens.is_empty() {
-                core::ptr::null()
-            } else {
-                a.keep_outer_lens.as_ptr()
-            },
-            keep_outer_count: a.keep_outer_lens.len(),
-            merges_ptr: a.merges.as_ptr(),
-            merges_len: a.merges.len(),
-            owner: raw as *mut c_void,
-        }
-    }
-
-    /// # Safety
-    /// `owner` must be a `PlanArena` pointer created by [`Self::into_abi`], and this must be called exactly once.
-    pub unsafe fn free(owner: *mut c_void) {
-        if !owner.is_null() {
-            drop(unsafe { Box::from_raw(owner as *mut PlanArena) });
-        }
-    }
-}
-
-/// Dual-wiring macro (D2) that registers a stage plugin on both the static (rlib→linkme) and dynamic (cdylib→C-ABI) paths.
-///
-/// `$make` is the same `fn(StageParams) -> Box<dyn KVCacheStage>` as the existing [`KVCacheStageReg::make`]
-/// (closures allowed). The dynamic C-ABI export (`register_kv_stage_v1`) is gated behind the `plugin-cdylib` feature,
-/// which eliminates `#[no_mangle]` symbol collisions under static force-link (only `.so` builds use `--features plugin-cdylib`).
-///
-/// **Callable multiple times** within a single plugin crate (`.so`) for multiple stages. Every contributed static is
-/// isolated in an anonymous `const _: () = {}` scope so invocations do not collide (linkme does not rename a static element's ident,
-/// so scope isolation is the only workaround). The `.so` entry point (`register_kv_stages_v2`) is emitted once per `.so` by a separate [`export_plugin!`].
-///
-///
-/// ```ignore
-/// argus_extension_api::register_kv_stage!("example_keep_recent", |_p| Box::new(KeepRecent));
-/// argus_extension_api::export_plugin!();   // once per .so
-/// ```
-#[macro_export]
-macro_rules! register_kv_stage {
-    ($name:literal, $make:expr) => {
-        // ── Static path (rlib → linkme distributed_slice). const-block isolation = multiple invocations allowed (E2). ──
-        const _: () = {
-            #[$crate::distributed_slice($crate::KV_CACHE_STAGES)]
-            static __REG: $crate::KVCacheStageReg = $crate::KVCacheStageReg {
-                name: $name,
-                make: $make,
-                // args-ignoring shim: macro-registered stages take no technique-private args, so
-                // make_with_args drops the blob and delegates to `make` (keeps the macro surface unchanged).
-                make_with_args: {
-                    fn __mwa(
-                        p: $crate::StageParams,
-                        _args: $crate::StageArgs<'_>,
-                    ) -> ::std::boxed::Box<dyn $crate::KVCacheStage> {
-                        let f: fn(
-                            $crate::StageParams,
-                        ) -> ::std::boxed::Box<dyn $crate::KVCacheStage> = $make;
-                        f(p)
-                    }
-                    __mwa
-                },
-                // Macro-registered stages declare score-free defaults; a stage that needs scores or a
-                // non-default prefix registers via a direct-literal `KVCacheStageReg` with its own caps.
-                caps: $crate::StageCaps::SCORE_FREE,
-            };
-        };
-
-        // ── Dynamic path (cdylib → contributes to PLUGIN_KV_STAGE_VTABLES). plugin-cdylib gate keeps it un-emitted on static builds. ──
-        // The entry point (register_kv_stages_v2) is emitted by export_plugin!; here we only contribute the vtable to the slice (E2).
-        #[cfg(feature = "plugin-cdylib")]
-        const _: () = {
-            // Handle = Box<Box<dyn KVCacheStage>> (thin ptr). make/plan/drop share this representation.
-            type __Handle = ::std::boxed::Box<dyn $crate::KVCacheStage>;
-
-            unsafe extern "C" fn __make(p: *const $crate::StageParams) -> *mut ::core::ffi::c_void {
-                // SAFETY: the host passes a valid StageParams pointer (D2). StageParams is a Copy POD.
-                // $make (a Rust-ABI fn) is for internal calls here only — do not cast it directly to extern "C".
-                let params = unsafe { *p };
-                let make_fn: fn($crate::StageParams) -> __Handle = $make;
-                let stage: __Handle = make_fn(params);
-                ::std::boxed::Box::into_raw(::std::boxed::Box::new(stage))
-                    as *mut ::core::ffi::c_void
-            }
-
-            unsafe extern "C" fn __plan(
-                h: *mut ::core::ffi::c_void,
-                ctx: *const $crate::StageCtxAbi,
-                out: *mut $crate::PlanAbi,
-            ) -> i32 {
-                // SAFETY: h is the Box<Box<dyn>> created by __make, and ctx is a valid StageCtxAbi filled in by the host (D2).
-                let stage: &dyn $crate::KVCacheStage = unsafe { &**(h as *const __Handle) };
-                let abi_ctx = unsafe { $crate::AbiStageCtx::new(ctx) };
-                match stage.plan(&abi_ctx) {
-                    ::core::option::Option::None => $crate::KV_PLAN_NOOP,
-                    ::core::option::Option::Some(plan) => {
-                        let abi = $crate::PlanArena::into_abi(plan);
-                        // SAFETY: out is a valid &mut PlanAbi provided by the host.
-                        unsafe {
-                            *out = abi;
-                        }
-                        $crate::KV_PLAN_OK
-                    }
-                }
-            }
-
-            unsafe extern "C" fn __plan_free(owner: *mut ::core::ffi::c_void) {
-                // SAFETY: owner is the PlanArena created by into_abi, and the host calls this exactly once (D5).
-                unsafe { $crate::PlanArena::free(owner) };
-            }
-
-            unsafe extern "C" fn __drop(h: *mut ::core::ffi::c_void) {
-                // SAFETY: h is the Box<Box<dyn>> created by __make, and the host calls this exactly once.
-                drop(unsafe { ::std::boxed::Box::from_raw(h as *mut __Handle) });
-            }
-
-            // Contributes the vtable to PLUGIN_KV_STAGE_VTABLES (const-block isolation = accumulates across multiple invocations). Not an entry point.
-            #[$crate::distributed_slice($crate::PLUGIN_KV_STAGE_VTABLES)]
-            static __VTABLE: $crate::PluginVTableAbi = $crate::PluginVTableAbi {
-                name: ::core::concat!($name, "\0").as_ptr() as *const ::core::ffi::c_char,
-                make: __make,
-                plan: __plan,
-                plan_free: __plan_free,
-                drop: __drop,
-            };
-        };
-    };
-}
-
 // ── weight-axis dispatch types ──
 //
 // Surface types that express a weight stage plugin's dispatch decisions, isomorphic to KV's plan-returning.
@@ -1479,7 +912,7 @@ pub struct PartitionShare {
     pub hardware: DeviceTarget,
 }
 
-// ── weight stage plugin (isomorphic to KVCacheStage) ──
+// ── weight stage plugin (isomorphic to KVMutationStage) ──
 
 /// Kinds of per-layer metric a weight stage reads. The kind argument of `WeightStageCtx::layer_metric`
 /// (mirror of KV's `TensorKind`). `#[repr(u32)]` is for passing the discriminant directly across a future `.so` C-ABI.
@@ -1532,7 +965,7 @@ pub struct LayerDirective {
     pub precision: Option<TensorDtype>,
 }
 
-/// A weight stage's plan output (mirror of KV's `KVCachePlan`). Rust-native data holding decisions only
+/// A weight stage's plan output (mirror of the KV stage axis). Rust-native data holding decisions only
 /// (step/boundary-tier, no repr(C) needed). Mutation is performed by the engine executor (D3).
 #[derive(Debug, Clone, Default)]
 pub struct WeightDispatchPlan {
@@ -1540,7 +973,7 @@ pub struct WeightDispatchPlan {
     pub per_layer: Vec<LayerDirective>,
 }
 
-/// Plan-returning technique trait for the weight axis (mirror of KV's `KVCacheStage`).
+/// Plan-returning technique trait for the weight axis (mirror of KV's `KVMutationStage`).
 pub trait WeightStage: Send + Sync {
     /// Technique name (canonical stage name; unique within the slice).
     fn name(&self) -> &str;
@@ -1559,7 +992,7 @@ pub struct WeightStageParams {
     pub allow_boundary_layers: bool,
 }
 
-/// Registration entry for a single weight stage technique (mirror of KV's `KVCacheStageReg`).
+/// Registration entry for a single weight stage technique (mirror of KV's `MutationStageReg`).
 pub struct WeightStageReg {
     /// canonical stage name (matches the resilience `EngineCommand` → name normalization table, Seam C).
     pub name: &'static str,
@@ -1582,7 +1015,7 @@ pub fn registered_weight_names() -> Vec<&'static str> {
     WEIGHT_STAGES.iter().map(|r| r.name).collect()
 }
 
-// ── Format-axis plugin registry (isomorphic to KVCacheStage) ──
+// ── Format-axis plugin registry (isomorphic to KVMutationStage) ──
 
 /// How a quantization block stores its scale (block-quant family vocabulary).
 ///
@@ -1682,8 +1115,8 @@ impl KVLayoutDesc {
 /// M×N kernel cell, owned by the backend (D4). A format plugin is a pure descriptor (2 methods: name+layout).
 ///
 /// NOTE(phasing, S4-2 2026-06-07): step-tier `compact` is **not added** to this trait —
-/// superseded. The keep/merge decision belongs to the stage axis (`KVCacheStage::plan → KVCachePlan`),
-/// while mutation is owned exclusively by the engine executor `execute_kv_plan` (decision=plugin, mutation=engine). Pulling compact into the format axis
+/// superseded. The keep/merge decision belongs to the stage axis ([`KVMutationStage`]),
+/// while mutation is owned exclusively by the engine (decision=plugin, mutation=engine). Pulling compact into the format axis
 /// would blur the stage⊥format orthogonality at the decision layer and leak `Merge` (engine) into the api. Therefore
 /// `KVFormat`'s layer-tier contribution is only the `layout()` descriptor read (M-F2, the L1 repr(C) boundary).
 pub trait KVFormat: Send + Sync {
@@ -1694,7 +1127,7 @@ pub trait KVFormat: Send + Sync {
     fn layout(&self) -> KVLayoutDesc;
 }
 
-/// Registration entry for one format technique (mirror of KV `KVCacheStageReg`).
+/// Registration entry for one format technique (mirror of KV `MutationStageReg`).
 pub struct KVFormatReg {
     /// Canonical format name. Unique within the slice.
     pub name: &'static str,
@@ -1720,10 +1153,10 @@ pub fn registered_kv_format_names() -> Vec<&'static str> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// D3 — KVFormatPlan: the dual of KVCachePlan (format/precision assignment)
+// D3 — KVFormatPlan: the dual of the KV residency decision (format/precision assignment)
 // ════════════════════════════════════════════════════════════════════════════
 //
-// KVCachePlan answers "which tokens stay" (residency); KVFormatPlan answers "in what format is each
+// The stage axis answers "which tokens stay" (residency); KVFormatPlan answers "in what format is each
 // region stored" (precision/layout) — a near-uniform total function over layer x head x token x {K,V}.
 // Static-linkme only (no C-ABI yet; a repr(C) projection is a separate tail-append PR when a real
 // `.so` codec author appears). The executor (`apply_format_plan`) and its `FormatApplyError` live
@@ -1755,7 +1188,7 @@ pub struct FormatOverride {
     pub side: MergeAxis,
 }
 
-/// The dual of [`KVCachePlan`]: `base` + an ordered, last-wins `overrides` list encodes a
+/// The dual of the KV residency decision: `base` + an ordered, last-wins `overrides` list encodes a
 /// near-uniform total function over layer x head x token x {K,V}. Empty `overrides` <=> uniform
 /// `base` <=> today's behavior (Gate-0: byte-identical when `base` equals the current stored format).
 #[derive(Clone, Debug, PartialEq)]
@@ -1793,7 +1226,7 @@ fn region_contains(region: &KeepSpec, head: usize, token: usize) -> bool {
     }
 }
 
-/// The dynamic format-assignment producer — the third sibling of [`KVCacheStage::plan`] and
+/// The dynamic format-assignment producer — the third sibling of [`KVMutationStage::on_phase`] and
 /// `WeightStage::plan`, reusing the SAME [`StageCtx`] read seam. `assign` returns `None` for "no
 /// change" (uniform base kept), the safe default.
 pub trait KVFormatPolicy: Send + Sync {
@@ -1812,7 +1245,7 @@ pub trait KVFormatPolicy: Send + Sync {
 }
 
 /// Registration entry for one format policy — the 4th per-axis producer registry (mirror of
-/// [`KVCacheStageReg`] / [`KVFormatReg`]). Its register symbol is never unified with the others (D6).
+/// [`MutationStageReg`] / [`KVFormatReg`]). Its register symbol is never unified with the others (D6).
 pub struct KVFormatPolicyReg {
     /// Policy name. Unique within the slice.
     pub name: &'static str,
@@ -1841,7 +1274,7 @@ pub fn registered_format_policy_names() -> Vec<&'static str> {
 // ════════════════════════════════════════════════════════════════════════════
 //
 // Isomorphic to the stage axis (GATE-C above) but **overwhelmingly simpler**: [`KVFormat`] has zero callbacks (no ctx,
-// no plan — a pure descriptor, `name`+`layout`), so [`StageCtxAbi`]/[`PlanAbi`]/[`PlanArena`] are all
+// no plan — a pure descriptor, `name`+`layout`), so the stage axis ctx/plan marshalling is all
 // unnecessary. The vtable carries only `make` (opaque handle) + `layout` ([`KVLayoutDesc`] POD by-value) + `drop`.
 // `KVLayoutDesc`/`ScaleLayout`/`Packing` are already `#[repr(C)]`/`#[repr(u32)]`, so they pass through by value
 // as-is on the fn-ptr return (zero reshape). A plugin exports only the single `register_kv_format_v1() -> *const FormatVTableAbi`
@@ -1898,11 +1331,11 @@ pub static PLUGIN_KV_FORMAT_VTABLES: [FormatVTableAbi] = [..];
 /// `$make` is the same `fn() -> Box<dyn KVFormat>` as the existing [`KVFormatReg::make`] (a closure is allowed). The dynamic
 /// C-ABI export (`register_kv_format_v1`) is gated on the `plugin-cdylib` feature so that, under static force-link,
 /// `#[no_mangle]` symbol collisions are ruled out at the source (only the `.so` build uses `--features plugin-cdylib`). The format-axis
-/// counterpart of [`register_kv_stage!`].
+/// counterpart of [`register_kv_mutation_stage!`].
 ///
 /// **May be called multiple times** within one plugin crate (`.so`) (multiple formats = a quant family). All contributed
 /// statics are isolated in anonymous `const _: () = {}` scopes. The `.so` entry (`register_kv_formats_v2`) is emitted separately,
-/// once per `.so`, by [`export_plugin!`]. The format-axis counterpart of [`register_kv_stage!`].
+/// once per `.so`, by [`export_plugin!`]. The format-axis counterpart of [`register_kv_mutation_stage!`].
 ///
 /// ```ignore
 /// argus_extension_api::register_kv_format!("nf4",  || Box::new(Nf4));
@@ -1960,9 +1393,9 @@ macro_rules! register_kv_format {
 
 /// Called **once** per `.so` — emits this plugin's per-axis entry symbols. plugin-cdylib gate:
 /// not emitted in a static force-link build (prevents entry collisions across multiple force-linked plugins). Returns the
-/// [`PLUGIN_KV_STAGE_VTABLES`]/[`PLUGIN_KV_FORMAT_VTABLES`] slices accumulated by `register_kv_*!` as by-value envelopes.
+/// [`PLUGIN_KV_FORMAT_VTABLES`] / [`PLUGIN_BACKEND_CAP_VTABLES`] slices accumulated by the format/backend register macros as by-value envelopes.
 ///
-/// **Three-axis separate-symbol invariant**: `register_kv_stages_v2` ⊥ `register_kv_formats_v2` ⊥
+/// **Two-axis separate-symbol invariant** (the stage axis is static-linkme only): `register_kv_formats_v2` ⊥
 /// `register_backend_caps_v2` — separate entries + separate slices, not a unified symbol/registry (they are merely emitted
 /// together for the author's convenience). The backend axis (the third) was added by the D8 implementation.
 ///
@@ -1977,19 +1410,12 @@ macro_rules! export_plugin {
     () => {
         #[cfg(feature = "plugin-cdylib")]
         const _: () = {
-            /// Stage envelope entry — returns `PLUGIN_KV_STAGE_VTABLES` by-value (sret).
-            #[unsafe(no_mangle)] // Rust 2024: no_mangle is an unsafe attribute.
-            pub extern "C" fn register_kv_stages_v2() -> $crate::StageExportAbi {
-                // .len()/.as_ptr() are evaluated at runtime via linkme's Deref (static_slice) — the envelope is computed at call time.
-                $crate::StageExportAbi {
-                    abi_version: $crate::KV_STAGE_ABI_VERSION,
-                    count: $crate::PLUGIN_KV_STAGE_VTABLES.len(),
-                    vtables: $crate::PLUGIN_KV_STAGE_VTABLES.as_ptr(),
-                }
-            }
+            // The KV stage axis is static-linkme only (no `.so` C-ABI); a `.so` exports just the
+            // format and backend-cap axes. `.len()`/`.as_ptr()` are evaluated at runtime via linkme's
+            // Deref (static_slice) — each envelope is computed at call time.
 
             /// Format envelope entry — returns `PLUGIN_KV_FORMAT_VTABLES` by-value (sret).
-            #[unsafe(no_mangle)]
+            #[unsafe(no_mangle)] // Rust 2024: no_mangle is an unsafe attribute.
             pub extern "C" fn register_kv_formats_v2() -> $crate::FormatExportAbi {
                 $crate::FormatExportAbi {
                     abi_version: $crate::KV_FORMAT_ABI_VERSION,
@@ -2022,7 +1448,7 @@ pub trait BackendCapability: Send + Sync {
     fn name(&self) -> &str;
 }
 
-/// Registration entry for one backend capability (mirror of KV `KVCacheStageReg`).
+/// Registration entry for one backend capability (mirror of KV `MutationStageReg`).
 pub struct BackendCapReg {
     /// Canonical capability name. Unique within the slice.
     pub name: &'static str,
@@ -2047,7 +1473,7 @@ pub fn registered_backend_capability_names() -> Vec<&'static str> {
 // ── Backend-capability axis — ATTENTION (quantized fused attention, e.g. quant-window) category dynamic C-ABI ──
 //
 // D8 (single-trait): argus-extension-api owns the canonical [`QuantAttnBackend`]. The engine's static OpenCL
-// impl, the host dlopen adapter, and the plugin `.so` **all implement this one trait** (isomorphic to the stage `KVCacheStage`). The signatures take
+// impl, the host dlopen adapter, and the plugin `.so` **all implement this one trait** (isomorphic to the stage `KVMutationStage`). The signatures take
 // ABI structs (`QuantAttnArgs`/`QuantAttnGatherArgs`, cl_mem `*mut c_void`) rather than `&Tensor`, so the plugin does not reference engine
 // types (independent). The static `BACKEND_CAPABILITIES` above (keyed by name) stays as-is — for the fat-LTO name-survival smoke test.
 
@@ -2184,7 +1610,7 @@ pub trait QuantAttnBackend: Send + Sync {
     }
 }
 
-/// Static (force-link) quantized-attention capability registration entry — the backend-axis counterpart of the stage [`KVCacheStageReg`] (D8).
+/// Static (force-link) quantized-attention capability registration entry — the backend-axis counterpart of the stage [`MutationStageReg`] (D8).
 /// `make` is called only when the host has a GPU context (`QuantAttnMakeArgs`); the fat-LTO survival smoke test checks the name only.
 pub struct QuantAttnReg {
     /// Canonical capability name. Unique within the slice.
@@ -2278,7 +1704,7 @@ macro_rules! register_quant_attn_plugin {
     ($name:literal, $make:expr) => {
         // ── Static path (rlib → linkme QUANT_ATTN_REGS, name survives under force-link). Ungated (common to both builds). ──
         // Store `$make` in a live distributed_slice static → the static-lookup infrastructure, and even feature-OFF builds,
-        // keep `$make`/its associated types reachable (isomorphic to the Stage `register_kv_stage!`, no unused warnings).
+        // keep `$make`/its associated types reachable (isomorphic to the Stage `register_kv_mutation_stage!`, no unused warnings).
         const _: () = {
             #[$crate::distributed_slice($crate::QUANT_ATTN_REGS)]
             static __REG: $crate::QuantAttnReg = $crate::QuantAttnReg {
@@ -2697,7 +2123,7 @@ macro_rules! register_quant_cache_plugin {
 
 // ════════════════════════════════════════════════════════════════════════════
 // KV read-plan surface — the 4th plan-returning plugin surface, deciding "what to read".
-// A parallel mirror copy of KVCacheStage (eviction) / WeightStage (dispatch) / KVFormat.
+// A parallel mirror copy of KVMutationStage (eviction) / WeightStage (dispatch) / KVFormat.
 // ════════════════════════════════════════════════════════════════════════════
 
 /// The **granularity abstraction** for KV-cache reads.
@@ -2706,7 +2132,7 @@ macro_rules! register_quant_cache_plugin {
 /// `Page { page_size }` = `select` is a subset of page indices, and each page groups `page_size` tokens.
 ///
 /// NOTE: `Page { page_size }` is a variant with a field, so `#[repr(u32)]` cannot be applied directly. The C-ABI flattening
-/// (`KVReadPlanAbi`) is to be defined with separate `granularity: u32 + page_size: u32` fields.
+/// the future read-plan C-ABI is to be defined with separate `granularity: u32 + page_size: u32` fields.
 /// For now it stays a Rust-native enum (no .so conversion needed at the implementation stage — phased rollout).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadGranularity {
@@ -2765,7 +2191,7 @@ impl Default for ReadStageParams {
     }
 }
 
-/// The registration entry for one read stage technique (a mirror of `KVCacheStageReg`).
+/// The registration entry for one read stage technique (a mirror of `MutationStageReg`).
 pub struct KVReadStageReg {
     /// CLI `--read-stage` name. Must be unique within the slice.
     pub name: &'static str,
@@ -2853,7 +2279,7 @@ pub trait QcfEstimator: Send + Sync {
     fn o_after(&self, ctx: &dyn EstimatorCtx, kv_head: usize, out: &mut [f32]) -> bool;
 }
 
-/// Registration entry for one QCF estimator — a mirror of [`KVCacheStageReg`], static-linkme only.
+/// Registration entry for one QCF estimator — a mirror of [`MutationStageReg`], static-linkme only.
 /// `make` parses the same [`StageParams`] / [`StageArgs`] as the actuator stage so technique config
 /// (keep_ratio, merge_e, ...) has a single source.
 pub struct QcfEstimatorReg {
@@ -3485,32 +2911,6 @@ mod tests {
         assert_eq!(per_head.format_of(0, 2, MergeAxis::Both).0, "q8_0"); // head 0 falls to earlier
     }
 
-    /// (D1 proof) `ChannelKeep` constructs and rides `KVCachePlan.channels`. It is a dormant typed
-    /// surface — the engine executor rejects `Some(..)` cleanly (proven engine-side in `stage_registry`)
-    /// — so here we assert only that the interface value is constructible and `None` is the default.
-    #[test]
-    fn channel_keep_rides_kv_cache_plan() {
-        let token_only = KVCachePlan {
-            keep: KeepSpec::LayerWide(vec![0, 1, 2]),
-            merges: vec![],
-            channels: None,
-        };
-        assert!(token_only.channels.is_none());
-
-        let with_channels = KVCachePlan {
-            keep: KeepSpec::LayerWide(vec![0, 1, 2]),
-            merges: vec![],
-            channels: Some(ChannelKeep::PerHead(vec![vec![0, 2], vec![1, 3]])),
-        };
-        match with_channels.channels {
-            Some(ChannelKeep::PerHead(h)) => assert_eq!(h.len(), 2),
-            _ => panic!("ChannelKeep round-trip"),
-        }
-    }
-
-    /// (D2 ABI invariant) `TensorKind` discriminants ARE the C-ABI wire format (`kind as u32`), so
-    /// adding `Query` must keep 0–5 byte-identical and place `Query` at 6 (additive). Compile-time
-    /// `const _` asserts already pin these; this test surfaces the invariant in the test output too.
     #[test]
     fn tensor_kind_discriminants_are_additive() {
         assert_eq!(TensorKind::Key as u32, 0);
@@ -3586,75 +2986,6 @@ mod tests {
         assert_eq!(f16.bytes_for_elems(10), Some(20));
     }
 
-    /// No-op technique for verifying the registration/lookup round-trip.
-    struct Dummy;
-    impl KVCacheStage for Dummy {
-        fn name(&self) -> &str {
-            "dummy"
-        }
-        fn plan(&self, _ctx: &dyn StageCtx) -> Option<KVCachePlan> {
-            None
-        }
-    }
-
-    /// Minimal ctx stub to close the `plan` call path (all accessors trivial).
-    struct DummyCtx;
-    impl StageCtx for DummyCtx {
-        fn current_pos(&self) -> usize {
-            0
-        }
-        fn target_len(&self) -> usize {
-            0
-        }
-        fn layer_idx(&self) -> usize {
-            0
-        }
-        fn importance(&self) -> Option<&[f32]> {
-            None
-        }
-        fn n_kv_heads(&self) -> usize {
-            1
-        }
-        fn head_dim(&self) -> usize {
-            1
-        }
-        // Only tensor() is implemented — head_score/has_head_scores/dequant_k/dequant_v/attn_weight/
-        // has_attn_weights are satisfied by the default sugar (all None → trivial).
-        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
-            None
-        }
-    }
-
-    #[distributed_slice(KV_CACHE_STAGES)]
-    static DUMMY_REG: KVCacheStageReg = KVCacheStageReg {
-        name: "dummy",
-        make: |_params| Box::new(Dummy),
-        make_with_args: |_params, _args| Box::new(Dummy),
-        caps: StageCaps::SCORE_FREE,
-    };
-
-    #[test]
-    fn dummy_registers_into_slice() {
-        // Verify that linkme gathers registrations from the same crate into the slice.
-        let reg = find_stage("dummy").expect("dummy must be registered in the slice");
-        assert_eq!(reg.name, "dummy");
-        let params = StageParams {
-            eviction_window: 8,
-            protected_prefix: 4,
-            keep_ratio: 0.5,
-            sink_size: 4,
-            streaming_window: 0,
-        };
-        let stage = (reg.make)(params);
-        assert_eq!(stage.name(), "dummy");
-        assert!(stage.plan(&DummyCtx).is_none());
-    }
-
-    #[test]
-    fn registered_names_contains_dummy() {
-        assert!(registered_names().contains(&"dummy"));
-    }
-
     // ── v3 native registry (KV_MUTATION_STAGES) round-trip ──
 
     /// No-op imperative technique for verifying the mutation-stage registration/lookup round-trip.
@@ -3722,292 +3053,6 @@ mod tests {
         assert!(find_mutation_stage("not_a_stage").is_none());
     }
 
-    // ── GATE-C C-ABI round-trip (in-process verification without a `.so`) ──
-
-    /// Mock host concrete ctx — the StageCtxAbi fn-ptrs operate on top of this.
-    struct HostCtx {
-        cur: usize,
-        tgt: usize,
-        imp: Vec<f32>,
-        key: Vec<f32>, // when non-empty, tensor(Key) is Some(1 row × len); when empty, None
-        // For QueryStats (disc 4) probing — when non-empty, tensor(QueryStats) is Some(2 rows × qstats_cols); when empty, None.
-        // Layout [2 * qstats_cols]: row0=mean, row1=var.
-        qstats: Vec<f32>,
-        qstats_cols: usize,
-    }
-
-    unsafe extern "C" fn h_current_pos(c: *const c_void) -> usize {
-        unsafe { (*(c as *const HostCtx)).cur }
-    }
-    unsafe extern "C" fn h_target_len(c: *const c_void) -> usize {
-        unsafe { (*(c as *const HostCtx)).tgt }
-    }
-    unsafe extern "C" fn h_layer_idx(_c: *const c_void) -> usize {
-        0
-    }
-    unsafe extern "C" fn h_n_kv_heads(_c: *const c_void) -> usize {
-        1
-    }
-    unsafe extern "C" fn h_head_dim(c: *const c_void) -> usize {
-        unsafe { (*(c as *const HostCtx)).key.len().max(1) }
-    }
-    unsafe extern "C" fn h_importance(
-        c: *const c_void,
-        out_ptr: *mut *const f32,
-        out_len: *mut usize,
-    ) -> bool {
-        let h = unsafe { &*(c as *const HostCtx) };
-        if h.imp.is_empty() {
-            return false;
-        }
-        unsafe {
-            *out_ptr = h.imp.as_ptr();
-            *out_len = h.imp.len();
-        }
-        true
-    }
-    unsafe extern "C" fn h_tensor_shape(
-        c: *const c_void,
-        kind: u32,
-        out: *mut TensorShape,
-    ) -> bool {
-        let h = unsafe { &*(c as *const HostCtx) };
-        if kind == TensorKind::Key as u32 && !h.key.is_empty() {
-            unsafe {
-                *out = TensorShape {
-                    rows: 1,
-                    cols: h.key.len(),
-                    per_head: true,
-                };
-            }
-            true
-        } else if kind == TensorKind::QueryStats as u32 && !h.qstats.is_empty() {
-            unsafe {
-                *out = TensorShape {
-                    rows: 2,
-                    cols: h.qstats_cols,
-                    per_head: true,
-                };
-            }
-            true
-        } else {
-            false
-        }
-    }
-    unsafe extern "C" fn h_tensor_read_row(
-        c: *const c_void,
-        kind: u32,
-        _row: usize,
-        _kv_head: usize,
-        out: *mut f32,
-        out_len: usize,
-    ) -> bool {
-        let h = unsafe { &*(c as *const HostCtx) };
-        if kind == TensorKind::Key as u32 && out_len == h.key.len() {
-            unsafe { core::ptr::copy_nonoverlapping(h.key.as_ptr(), out, out_len) };
-            true
-        } else if kind == TensorKind::QueryStats as u32
-            && !h.qstats.is_empty()
-            && out_len == h.qstats_cols
-            && _row < 2
-        {
-            let base = _row * h.qstats_cols;
-            unsafe { core::ptr::copy_nonoverlapping(h.qstats.as_ptr().add(base), out, out_len) };
-            true
-        } else {
-            false
-        }
-    }
-
-    fn make_abi(host: &HostCtx) -> StageCtxAbi {
-        StageCtxAbi {
-            ctx: host as *const HostCtx as *const c_void,
-            current_pos: h_current_pos,
-            target_len: h_target_len,
-            layer_idx: h_layer_idx,
-            n_kv_heads: h_n_kv_heads,
-            head_dim: h_head_dim,
-            importance: h_importance,
-            tensor_read_row: h_tensor_read_row,
-            tensor_shape: h_tensor_shape,
-        }
-    }
-
-    #[test]
-    fn abi_stage_ctx_reproduces_scalars_and_importance() {
-        let host = HostCtx {
-            cur: 100,
-            tgt: 30,
-            imp: vec![1.0, 2.0, 3.0],
-            key: vec![],
-            qstats: vec![],
-            qstats_cols: 0,
-        };
-        let abi = make_abi(&host);
-        // SAFETY: abi (and host) outlive the ctx.
-        let ctx = unsafe { AbiStageCtx::new(&abi) };
-        assert_eq!(ctx.current_pos(), 100);
-        assert_eq!(ctx.target_len(), 30);
-        assert_eq!(ctx.layer_idx(), 0);
-        assert_eq!(ctx.n_kv_heads(), 1);
-        assert_eq!(ctx.importance(), Some(&[1.0f32, 2.0, 3.0][..]));
-        // key/qstats empty → tensor(Key)/Value/Scores/QueryStats all None (the default sugar is trivial too).
-        assert!(ctx.tensor(TensorKind::Key).is_none());
-        assert!(ctx.tensor(TensorKind::QueryStats).is_none());
-        assert!(!ctx.has_head_scores());
-    }
-
-    /// MQ-5: AbiStageCtx 5-kind probing — when the host supplies QueryStats (disc 4), the adapter builds a handle
-    /// (shape={2,cols,true}), and read_row(0)=mean / read_row(1)=var round-trip losslessly across the C-ABI fn-ptr.
-    /// Confirms the existing kinds 0~3 are unaffected (the C-ABI is additive).
-    #[test]
-    fn abi_stage_ctx_probes_query_stats_5kind() {
-        // head_dim=3: mean=[1,2,3], var=[0.5, 0.25, 0.125].
-        let host = HostCtx {
-            cur: 16,
-            tgt: 8,
-            imp: vec![],
-            key: vec![],
-            qstats: vec![1.0, 2.0, 3.0, 0.5, 0.25, 0.125],
-            qstats_cols: 3,
-        };
-        let abi = make_abi(&host);
-        let ctx = unsafe { AbiStageCtx::new(&abi) };
-        let h = ctx
-            .tensor(TensorKind::QueryStats)
-            .expect("QueryStats available (disc 4 probing)");
-        let sh = h.shape();
-        assert_eq!(sh.rows, 2, "rows=2 (mean/var)");
-        assert_eq!(sh.cols, 3, "cols=head_dim");
-        assert!(sh.per_head);
-        let mut mean = [0.0f32; 3];
-        let mut var = [0.0f32; 3];
-        h.read_row(0, 0, &mut mean);
-        h.read_row(1, 0, &mut var);
-        assert_eq!(mean, [1.0, 2.0, 3.0], "read_row(0)=mean");
-        assert_eq!(var, [0.5, 0.25, 0.125], "read_row(1)=var");
-        // Existing kinds unaffected.
-        assert!(ctx.tensor(TensorKind::Key).is_none());
-        assert!(ctx.tensor(TensorKind::Scores).is_none());
-    }
-
-    #[test]
-    fn abi_stage_ctx_prefill_attention_none_until_edit6() {
-        // R-P1-1 (design §2.7/§6.4): AbiStageCtx::new probes ALL of disc 0..=5 (incl.
-        // PrefillAttention). EDIT 6 (the host h_tensor_shape PFA branch) is deferred — PR1 is
-        // static-only — so disc 5 falls to `else { false }` and tensor(PrefillAttention) is None
-        // (documented-dead, not accidentally-dead). Because that probe indexes handles[5], this
-        // also guards the array length (6): a length-5 array would panic here (§2.2 OOB gotcha).
-        let host = HostCtx {
-            cur: 8,
-            tgt: 4,
-            imp: vec![],
-            key: vec![],
-            qstats: vec![],
-            qstats_cols: 0,
-        };
-        let abi = make_abi(&host);
-        // SAFETY: abi/host outlive the ctx; new() probes disc 0..=5 (handles[5] in-bounds).
-        let ctx = unsafe { AbiStageCtx::new(&abi) };
-        assert!(
-            ctx.tensor(TensorKind::PrefillAttention).is_none(),
-            "disc 5 must degrade to None on the .so path until EDIT 6 lands (R-P1-2)"
-        );
-        assert_eq!(TensorKind::PrefillAttention as u32, 5, "discriminant pin");
-    }
-
-    #[test]
-    fn abi_stage_ctx_reproduces_tensor_read() {
-        let host = HostCtx {
-            cur: 10,
-            tgt: 5,
-            imp: vec![],
-            key: vec![1.5, 2.5, 3.5, 4.5],
-            qstats: vec![],
-            qstats_cols: 0,
-        };
-        let abi = make_abi(&host);
-        let ctx = unsafe { AbiStageCtx::new(&abi) };
-        assert!(ctx.importance().is_none());
-        let kh = ctx.tensor(TensorKind::Key).expect("Key available");
-        assert_eq!(kh.shape().cols, 4);
-        let mut out = [0.0f32; 4];
-        // dequant_k is the default sugar over tensor(Key) — it fills the host key across the fn-ptr.
-        ctx.dequant_k(0, 0, &mut out);
-        assert_eq!(out, [1.5, 2.5, 3.5, 4.5]);
-    }
-
-    #[test]
-    fn plan_arena_layerwide_round_trip() {
-        let plan = KVCachePlan {
-            keep: KeepSpec::LayerWide(vec![70, 71, 72]),
-            merges: Vec::new(),
-            channels: None,
-        };
-        let abi = PlanArena::into_abi(plan.clone());
-        assert_eq!(abi.keep_kind, 0);
-        // SAFETY: read the valid arena leaked by into_abi until it is freed.
-        let keep = unsafe { core::slice::from_raw_parts(abi.keep_ptr, abi.keep_len) };
-        assert_eq!(keep, &[70usize, 71, 72]);
-        assert_eq!(abi.merges_len, 0);
-        assert!(abi.keep_outer_lens.is_null());
-        unsafe { PlanArena::free(abi.owner) };
-    }
-
-    #[test]
-    fn plan_arena_with_merges_round_trip() {
-        let plan = KVCachePlan {
-            keep: KeepSpec::LayerWide(vec![0, 1]),
-            merges: vec![WeightedMerge {
-                into: 0,
-                into_weight: 0.6,
-                from: vec![(5, 0.2), (6, 0.2)],
-                apply_to: MergeAxis::ValueOnly,
-            }],
-            channels: None,
-        };
-        let abi = PlanArena::into_abi(plan.clone());
-        // Host-side reconstruct mirror (C2 performs the identical logic).
-        let keep = unsafe { core::slice::from_raw_parts(abi.keep_ptr, abi.keep_len) }.to_vec();
-        let merges_abi = unsafe { core::slice::from_raw_parts(abi.merges_ptr, abi.merges_len) };
-        let merges: Vec<WeightedMerge> = merges_abi
-            .iter()
-            .map(|m| {
-                let from = unsafe { core::slice::from_raw_parts(m.from_ptr, m.from_len) };
-                WeightedMerge {
-                    into: m.into,
-                    into_weight: m.into_weight,
-                    from: from.iter().map(|p| (p.pos, p.weight)).collect(),
-                    apply_to: MergeAxis::from_u32(m.apply_to),
-                }
-            })
-            .collect();
-        let reconstructed = KVCachePlan {
-            keep: KeepSpec::LayerWide(keep),
-            merges,
-            channels: None,
-        };
-        assert_eq!(reconstructed, plan);
-        unsafe { PlanArena::free(abi.owner) };
-    }
-
-    #[test]
-    fn plan_arena_perhead_flattens_with_outer_lens() {
-        let plan = KVCachePlan {
-            keep: KeepSpec::PerHead(vec![vec![1, 2], vec![3, 4, 5]]),
-            merges: Vec::new(),
-            channels: None,
-        };
-        let abi = PlanArena::into_abi(plan);
-        assert_eq!(abi.keep_kind, 1);
-        let keep = unsafe { core::slice::from_raw_parts(abi.keep_ptr, abi.keep_len) };
-        assert_eq!(keep, &[1usize, 2, 3, 4, 5]); // all heads concatenated
-        let lens =
-            unsafe { core::slice::from_raw_parts(abi.keep_outer_lens, abi.keep_outer_count) };
-        assert_eq!(lens, &[2usize, 3]);
-        unsafe { PlanArena::free(abi.owner) };
-    }
-
     // ── GATE-C v2 Format C-ABI round-trip (in-process verification without a `.so`) ──
 
     /// Test format — a q4_0-like descriptor. It exposes a handle-lifecycle
@@ -4069,16 +3114,6 @@ mod tests {
 
     // ── envelope (ExportAbi) by-value sret round-trip + multi-call accumulation ──
 
-    // Stub vtable for the stage envelope round-trip (never called — only marshalling is verified).
-    unsafe extern "C" fn st_make(_p: *const StageParams) -> *mut c_void {
-        ::core::ptr::null_mut()
-    }
-    unsafe extern "C" fn st_plan(_h: *mut c_void, _c: *const StageCtxAbi, _o: *mut PlanAbi) -> i32 {
-        KV_PLAN_NOOP
-    }
-    unsafe extern "C" fn st_plan_free(_o: *mut c_void) {}
-    unsafe extern "C" fn st_drop(_h: *mut c_void) {}
-
     static FMT_EXPORT_VTS: [FormatVTableAbi; 2] = [
         FormatVTableAbi {
             name: b"rt_env_a\0".as_ptr() as *const c_char,
@@ -4094,36 +3129,12 @@ mod tests {
         },
     ];
 
-    static STAGE_EXPORT_VTS: [PluginVTableAbi; 2] = [
-        PluginVTableAbi {
-            name: b"rt_st_a\0".as_ptr() as *const c_char,
-            make: st_make,
-            plan: st_plan,
-            plan_free: st_plan_free,
-            drop: st_drop,
-        },
-        PluginVTableAbi {
-            name: b"rt_st_b\0".as_ptr() as *const c_char,
-            make: st_make,
-            plan: st_plan,
-            plan_free: st_plan_free,
-            drop: st_drop,
-        },
-    ];
-
     // Isomorphic to export_plugin!'s register_kv_formats_v2 — returns the envelope by-value (sret >16B).
     extern "C" fn mk_format_export() -> FormatExportAbi {
         FormatExportAbi {
             abi_version: KV_FORMAT_ABI_VERSION,
             count: FMT_EXPORT_VTS.len(),
             vtables: FMT_EXPORT_VTS.as_ptr(),
-        }
-    }
-    extern "C" fn mk_stage_export() -> StageExportAbi {
-        StageExportAbi {
-            abi_version: KV_STAGE_ABI_VERSION,
-            count: STAGE_EXPORT_VTS.len(),
-            vtables: STAGE_EXPORT_VTS.as_ptr(),
         }
     }
 
@@ -4361,23 +3372,6 @@ mod tests {
         );
     }
 
-    /// StageExportAbi isomorphic round-trip (symmetric across both axes).
-    #[test]
-    fn stage_export_abi_by_value_sret_round_trip() {
-        let env = mk_stage_export();
-        assert_eq!(env.abi_version, KV_STAGE_ABI_VERSION);
-        assert_eq!(env.count, 2);
-        for (i, expect) in ["rt_st_a", "rt_st_b"].iter().enumerate() {
-            // SAFETY: vtables is the base of STAGE_EXPORT_VTS (a 'static array), i < count.
-            let vt = unsafe { &*env.vtables.add(i) };
-            let name = unsafe { core::ffi::CStr::from_ptr(vt.name) }
-                .to_str()
-                .unwrap();
-            assert_eq!(&name, expect);
-        }
-    }
-
-    // Multiple invocations — register_kv_format! twice in one crate (impossible under the v1 single-symbol ABI due to the __REGISTER_KV_FORMAT_REG
     // E0428 name clash). Now possible thanks to const-block isolation.
     crate::register_kv_format!("v1_mc_a", || Box::new(DummyFormat));
     crate::register_kv_format!("v1_mc_b", || Box::new(DummyFormat));
