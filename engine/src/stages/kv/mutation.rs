@@ -30,10 +30,12 @@ use argus_extension_api::{
     CacheHandle, CacheOpError, KVCacheStage, KVMutationStage, KeepSpec, MutationPhase, StageCaps,
     StageCtx, TensorDtype, TensorHandle, TensorKind, TensorShape,
 };
+use argus_shared::Level;
 
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::kv::cache_handle::EngineCacheHandle;
 use crate::kv::dequant::{dequantize_k, dequantize_v};
+use crate::kv::eviction_handler::MIN_EVICT_TOKENS;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
 use crate::pipeline::{LifecyclePhase, PipelineStage, StageContext, StageLifecycle, StageOutcome};
@@ -297,6 +299,20 @@ pub struct KVMutationDriverStage {
     /// a score-free / importance-only stage pays nothing. Defaults to [`StageCaps::SCORE_FREE`] (no
     /// K/V reads); set via [`with_caps`](Self::with_caps) for value-aware (caote) / merge (d2o) stages.
     caps: StageCaps,
+    /// Pressure band gate for the **standard-loop eviction mode** (mirror of
+    /// [`EvictionStage::persistent`](super::eviction::EvictionStage)'s `min_band`). `Some(min)` makes
+    /// the driver a faithful drop-in for the pressure-driven `EvictionStage`: it fires only when
+    /// `ctx.step.pressure.band() >= min` (episode edge-triggered via [`armed`](Self::armed)) AND
+    /// applies the full CacheManager bookkeeping fold — the MIN_EVICT_TOKENS budget guard, per-cache
+    /// `release_unused_pages` (madvise), and `[CacheEvent]` logging. `None` (the bare [`new`](Self::new)
+    /// default, used by the eval/test path) fires every matching phase step with none of that — the
+    /// raw per-layer driver.
+    min_band: Option<Level>,
+    /// Episode edge-trigger for the pressure gate (mirror of `EvictionStage`'s `armed`): set on a
+    /// band-met fire, re-armed when the band falls back below `min_band`, so a sustained high-pressure
+    /// episode prunes once rather than spiralling the cache to the floor (per-step madvise/CacheEvent
+    /// churn). Unused when `min_band` is `None`.
+    armed: AtomicBool,
 }
 
 impl KVMutationDriverStage {
@@ -317,7 +333,22 @@ impl KVMutationDriverStage {
             score_cell: None,
             mutation_fired: None,
             caps: StageCaps::SCORE_FREE,
+            min_band: None,
+            armed: AtomicBool::new(true),
         }
+    }
+
+    /// Enable the **standard-loop eviction mode** — the driver becomes a faithful drop-in for the
+    /// pressure-driven [`EvictionStage::persistent`](super::eviction::EvictionStage), differing only in
+    /// that the keep-set is applied through the v3 [`CacheHandle`] (byte-identical to the v2
+    /// `execute_kv_plan` path, the Phase-1 gate) instead of `force_evict`. Sets the firing gate to
+    /// `ctx.step.pressure.band() >= min_band` (episode edge-triggered) and folds in the CacheManager
+    /// bookkeeping the v2 path owned: the `MIN_EVICT_TOKENS` budget guard, per-cache
+    /// `release_unused_pages` (madvise), and `[CacheEvent]` logging. Without this builder the driver
+    /// fires every matching phase step with no gate / guard / bookkeeping (the eval/test path).
+    pub fn with_pressure_gate(mut self, min_band: Level) -> Self {
+        self.min_band = Some(min_band);
+        self
     }
 
     /// Attach a score accumulator cell so score-based stages receive importance / per-head scores /
@@ -402,11 +433,47 @@ impl PipelineStage for KVMutationDriverStage {
     fn on_phase(
         &self,
         phase: &LifecyclePhase,
-        _ctx: &mut StageContext<'_>,
+        ctx: &mut StageContext<'_>,
     ) -> anyhow::Result<StageOutcome> {
         // self-filter: only the stage's registered phase (the single placement source of truth).
         if *phase != lifecycle_of(self.phase) {
             return Ok(StageOutcome::Continue);
+        }
+
+        // Pressure gate (standard-loop eviction mode, mirror of `EvictionStage::on_phase`): when a
+        // `min_band` is set, fire only on a pressure episode's rising edge. Below the band → no-op and
+        // re-arm; at/above but already fired this episode → no-op. `None` (eval/test) → always fire.
+        if let Some(min) = self.min_band {
+            if ctx.step.pressure.band() < min {
+                self.armed.store(true, Ordering::Relaxed);
+                return Ok(StageOutcome::Continue);
+            }
+            if !self.armed.swap(false, Ordering::Relaxed) {
+                return Ok(StageOutcome::Continue);
+            }
+        }
+
+        // MIN_EVICT_TOKENS budget guard (standard-loop mode, mirror of the v2 uniform path in
+        // `CacheManager::run_policy_eviction`): skip the whole eviction when the global budget delta is
+        // below the floor, so a near-full cache is not compacted for a handful of tokens (matches the
+        // v2 gate that ran BEFORE the per-layer plan). The per-layer `current_pos == 0` skip below still
+        // applies in every mode. Note the band edge-trigger above is consumed even when this skips —
+        // identical to v2, where `EvictionStage` disarms on band-met regardless of the inner guard.
+        if self.min_band.is_some() {
+            let current_pos = self
+                .handles
+                .iter()
+                .map(|f| f.with_cache_mut(|c| c.current_pos()))
+                .max()
+                .unwrap_or(0);
+            let target_len = self.budget_for(current_pos);
+            if current_pos <= target_len || current_pos - target_len < MIN_EVICT_TOKENS {
+                log::debug!(
+                    "[CacheManager] skip: stage='{}', current_pos={current_pos}, target_len={target_len} (< MIN_EVICT_TOKENS={MIN_EVICT_TOKENS})",
+                    self.stage.name(),
+                );
+                return Ok(StageOutcome::Continue);
+            }
         }
 
         // Extract score snapshots ONCE per fire (owned, so the per-layer read ctx borrows them without
@@ -510,6 +577,25 @@ impl PipelineStage for KVMutationDriverStage {
         result?;
         // Reset scores after a successful eviction (KV geometry changed → prior scores stale).
         self.reset_scores();
+        // CacheManager bookkeeping fold (standard-loop mode, mirror of `CacheManager::execute_dispatch`'s
+        // post-eviction tail): on an actual mutation, advise the OS to reclaim the now-unused KV pages
+        // (madvise MADV_DONTNEED, a host-buffer no-op on GPU/UMA) and emit the grep-able `[CacheEvent]`
+        // line. Runs AFTER the per-layer `commit` shrank `current_pos` (release_unused_pages keys off it)
+        // and only when `any_mutated`, so an idle/no-op fire does no madvise/log churn.
+        if self.min_band.is_some() && any_mutated {
+            let mut bytes_released = 0usize;
+            let mut new_pos = 0usize;
+            for f in self.handles.iter() {
+                f.with_cache_mut(|c| {
+                    bytes_released += c.release_unused_pages();
+                    new_pos = new_pos.max(c.current_pos());
+                });
+            }
+            log::info!(
+                "[CacheEvent] kv.mutation_driver eviction: stage='{}', new_pos={new_pos}, bytes_released={bytes_released}",
+                self.stage.name(),
+            );
+        }
         // T-6: a committed mutation invalidates the fused decode plan. Fire the shared cell so the
         // decode loop rebuilds it (covers position-PRESERVING reencode; a shrinking keep is also
         // covered by the loop's pos-shrink reflux).
@@ -1318,5 +1404,190 @@ mod tests {
         assert_eq!(cv2.kv_dtype(), DType::F32);
         assert_eq!(ch.kv_dtype(), DType::F32);
         assert_kv_byte_identical(&cv2, &ch);
+    }
+
+    // ── P0-5c: standard-loop eviction mode (pressure gate + MIN_EVICT guard + bookkeeping) ──
+
+    const BIG_MAX: usize = 256;
+
+    /// A large all-zero SeqMajor F32 cache — large enough that `current_pos - target_len` can clear the
+    /// MIN_EVICT_TOKENS(64) floor (the small `make_cache` can't). Byte content is irrelevant here; the
+    /// tests assert firing/positions, not buffer bytes (those are covered by the byte-identity gates).
+    fn make_big_cache(resident: usize) -> KVCache {
+        let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let sh = Shape::new(vec![1, BIG_MAX, KV_HEADS, HD]);
+        let total = BIG_MAX * KV_HEADS * HD;
+        let mut c = KVCache::new(
+            Tensor::new(
+                sh.clone(),
+                Arc::new(SharedBuffer::new(total * 4, DType::F32)),
+                be.clone(),
+            ),
+            Tensor::new(sh, Arc::new(SharedBuffer::new(total * 4, DType::F32)), be),
+            BIG_MAX,
+        );
+        c.set_current_pos(resident);
+        c
+    }
+
+    fn make_ctx_pressure(profiler: &mut OpProfiler, pressure: u8) -> StageContext<'_> {
+        StageContext {
+            step: StepInfo {
+                pos: 0,
+                decode_step: 0,
+                pressure: Pressure::new(pressure),
+                prev_token: 0,
+            },
+            profiler,
+        }
+    }
+
+    /// A minimal score-free mutation stage that evicts to the budget: keep the first `target_len`
+    /// positions. Always mutates when `current_pos > target_len`, so it deterministically drives the
+    /// gate/guard/bookkeeping under test.
+    struct KeepBudget;
+    impl KVMutationStage for KeepBudget {
+        fn name(&self) -> &str {
+            "keep_budget_test"
+        }
+        fn on_phase(
+            &self,
+            ctx: &dyn StageCtx,
+            cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            let keep: Vec<usize> = (0..ctx.target_len().min(ctx.current_pos())).collect();
+            if keep.is_empty() {
+                return Ok(());
+            }
+            cache.keep(&keep)
+        }
+    }
+
+    fn pressure_gated(handle: Arc<StandardFormat>, ratio: f32) -> KVMutationDriverStage {
+        KVMutationDriverStage::new(
+            vec![handle],
+            Box::new(KeepBudget),
+            MutationPhase::KvMutate,
+            ratio,
+        )
+        .with_pressure_gate(Level::Warning)
+    }
+
+    /// Band met (Warning) + budget delta ≥ MIN_EVICT → fires, evicting to the budget.
+    #[test]
+    fn pressure_gate_fires_on_band_met() {
+        let handle = Arc::new(StandardFormat::new(0, make_big_cache(200)));
+        // pos=200, ratio=0.3 → target_len=60, tokens_to_remove=140 ≥ 64.
+        let driver = pressure_gated(handle.clone(), 0.3);
+        let mut prof = OpProfiler::new();
+        let mut ctx = make_ctx_pressure(&mut prof, 50); // band() = Warning
+        let outcome = driver
+            .on_phase(&LifecyclePhase::KvMutate, &mut ctx)
+            .unwrap();
+        assert!(matches!(outcome, StageOutcome::Consumed));
+        assert_eq!(handle.take_inner().current_pos(), 60, "evicted to budget");
+    }
+
+    /// Band below `min_band` (Normal) → no-op, cache untouched.
+    #[test]
+    fn pressure_gate_skips_below_band() {
+        let handle = Arc::new(StandardFormat::new(0, make_big_cache(200)));
+        let driver = pressure_gated(handle.clone(), 0.3);
+        let mut prof = OpProfiler::new();
+        let mut ctx = make_ctx_pressure(&mut prof, 10); // band() = Normal < Warning
+        driver
+            .on_phase(&LifecyclePhase::KvMutate, &mut ctx)
+            .unwrap();
+        assert_eq!(handle.take_inner().current_pos(), 200, "below band → no-op");
+    }
+
+    /// Episode edge-trigger: fires once per pressure episode; re-arms after the band falls back.
+    /// Mirror of `EvictionStage::persistent_edge_trigger_once_per_episode`.
+    #[test]
+    fn pressure_gate_edge_trigger_once_per_episode() {
+        let handle = Arc::new(StandardFormat::new(0, make_big_cache(200)));
+        let driver = pressure_gated(handle.clone(), 0.3);
+        let mut prof = OpProfiler::new();
+
+        // episode 1: rising edge → fire.
+        let mut c = make_ctx_pressure(&mut prof, 50);
+        driver.on_phase(&LifecyclePhase::KvMutate, &mut c).unwrap();
+        assert_eq!(
+            handle.with_cache_mut(|c| c.current_pos()),
+            60,
+            "episode 1 fires"
+        );
+
+        // sustained pressure, cache regrown → same episode → no re-fire (armed consumed).
+        handle.with_cache_mut(|c| c.set_current_pos(200));
+        let mut c = make_ctx_pressure(&mut prof, 60);
+        driver.on_phase(&LifecyclePhase::KvMutate, &mut c).unwrap();
+        assert_eq!(
+            handle.with_cache_mut(|c| c.current_pos()),
+            200,
+            "same episode → no re-fire"
+        );
+
+        // band drops below min → re-arm (no-op).
+        let mut c = make_ctx_pressure(&mut prof, 10);
+        driver.on_phase(&LifecyclePhase::KvMutate, &mut c).unwrap();
+        assert_eq!(
+            handle.with_cache_mut(|c| c.current_pos()),
+            200,
+            "Normal → no-op"
+        );
+
+        // episode 2: rising edge again → re-fire.
+        let mut c = make_ctx_pressure(&mut prof, 80);
+        driver.on_phase(&LifecyclePhase::KvMutate, &mut c).unwrap();
+        assert_eq!(
+            handle.with_cache_mut(|c| c.current_pos()),
+            60,
+            "re-armed → fires again"
+        );
+    }
+
+    /// MIN_EVICT_TOKENS budget guard: band met but the budget delta is below the floor → skip (the
+    /// near-full cache is not compacted for a handful of tokens), mirror of the v2 uniform-path guard.
+    #[test]
+    fn min_evict_guard_skips_small_delta() {
+        let handle = Arc::new(StandardFormat::new(0, make_big_cache(80)));
+        // pos=80, ratio=0.75 → target_len=60, tokens_to_remove=20 < 64 → skip.
+        let driver = pressure_gated(handle.clone(), 0.75);
+        let mut prof = OpProfiler::new();
+        let mut ctx = make_ctx_pressure(&mut prof, 50); // Warning — band passes, guard skips.
+        driver
+            .on_phase(&LifecyclePhase::KvMutate, &mut ctx)
+            .unwrap();
+        assert_eq!(
+            handle.take_inner().current_pos(),
+            80,
+            "delta < MIN_EVICT → skip"
+        );
+    }
+
+    /// The bare `new()` (eval/test) mode has NO pressure gate and NO MIN_EVICT guard: it fires every
+    /// matching phase step regardless of pressure, and evicts even a sub-MIN_EVICT delta. This pins that
+    /// `with_pressure_gate` is strictly additive — the prior every-step behavior is unchanged.
+    #[test]
+    fn plain_mode_ignores_pressure_and_min_evict() {
+        let handle = Arc::new(StandardFormat::new(0, make_big_cache(80)));
+        // Same pos/ratio as the MIN_EVICT skip test (delta=20<64), but plain mode → still evicts.
+        let driver = KVMutationDriverStage::new(
+            vec![handle.clone()],
+            Box::new(KeepBudget),
+            MutationPhase::KvMutate,
+            0.75,
+        );
+        let mut prof = OpProfiler::new();
+        let mut ctx = make_ctx_pressure(&mut prof, 0); // Normal — plain mode ignores it.
+        driver
+            .on_phase(&LifecyclePhase::KvMutate, &mut ctx)
+            .unwrap();
+        assert_eq!(
+            handle.take_inner().current_pos(),
+            60,
+            "plain mode fires every step, no MIN_EVICT guard"
+        );
     }
 }
