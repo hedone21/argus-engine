@@ -6,8 +6,10 @@
 //!    from the cache without writing them anywhere. Use `SwapHandler::new(ratio)`
 //!    or `SwapHandler::default()`.
 //! 2. **Disk write-back** (lossless recall possible): dumps the prune-prefix
-//!    region of each layer's K/V buffer to `swap_dir/cache_L{layer}_{start}-{end}_{k,v}.bin`
-//!    before pruning, and can restore them via `recall_caches`. Enable with
+//!    region of each layer's K/V buffer to `swap_dir/cache_L{layer}_s{seq}_{start}-{end}_{k,v}.bin`
+//!    before pruning, and can restore them via `recall_caches`. The `s{seq}` segment is a monotonic
+//!    per-ledger counter that keeps repeated offloads of the same layer + count from clobbering each
+//!    other (see `SwapState::next_seq`). Enable with
 //!    `SwapHandler::with_disk(ratio, swap_dir)`.
 //!
 //! LRU strategy: always offloads the oldest tokens first.
@@ -43,6 +45,13 @@ pub struct SwapRecord {
 #[derive(Default)]
 pub struct SwapState {
     pub records: Vec<SwapRecord>,
+    /// Monotonic offload counter, appended to every backing-file name. Without it the name is keyed
+    /// only on `(layer_idx, offload_count)`, so a second offload of the same layer with the same count
+    /// (before its recall) would reuse the same path and clobber the first dump — leaving two records
+    /// pointing at one file, so the first recall reads the second dump's bytes (KV corruption). The
+    /// seq makes each dump's path unique. It lives in the shared ledger so handlers that share a
+    /// `state` (and thus a `swap_dir`) draw from one sequence.
+    next_seq: u64,
 }
 
 /// Offloads old KV cache tokens to disk (or just prunes them in lossy mode).
@@ -228,13 +237,21 @@ impl SwapHandler {
                 v_bytes[dst_base..dst_base + cp].copy_from_slice(&v_all[src_base..src_base + cp]);
             }
 
+            // Draw a unique sequence number so this dump's backing files never collide with an earlier
+            // (still-outstanding) dump of the same layer + count (see `SwapState::next_seq`).
+            let seq = {
+                let mut guard = self.state.lock().unwrap();
+                let s = guard.next_seq;
+                guard.next_seq += 1;
+                s
+            };
             let k_path = dir.join(format!(
-                "cache_L{}_{}-{}_k.bin",
-                layer_idx, 0, offload_count
+                "cache_L{}_s{}_{}-{}_k.bin",
+                layer_idx, seq, 0, offload_count
             ));
             let v_path = dir.join(format!(
-                "cache_L{}_{}-{}_v.bin",
-                layer_idx, 0, offload_count
+                "cache_L{}_s{}_{}-{}_v.bin",
+                layer_idx, seq, 0, offload_count
             ));
             if let Err(e) = fs::write(&k_path, &k_bytes) {
                 eprintln!(
@@ -721,6 +738,94 @@ mod tests {
             !kp.exists() && !vp.exists(),
             "backing files cleaned up on the recall error path (no leak)"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Per-head `[0..count]` K/V prefix snapshot in the live HeadMajor stride (`h*capacity*head_dim`),
+    /// the layout `offload_prefix` dumps and `recall_one` restores. Used to capture the exact bytes a
+    /// dump should round-trip.
+    fn prefix_kv(cache: &KVCache, count: usize) -> (Vec<f32>, Vec<f32>) {
+        let capacity = cache.capacity();
+        let head_dim = cache.head_dim();
+        let n_heads = cache.kv_heads();
+        let k: &[f32] = cache.k_buffer.as_slice();
+        let v: &[f32] = cache.v_buffer.as_slice();
+        let (mut ks, mut vs) = (Vec::new(), Vec::new());
+        for h in 0..n_heads {
+            let base = h * capacity * head_dim;
+            for pos in 0..count {
+                let off = base + pos * head_dim;
+                ks.extend_from_slice(&k[off..off + head_dim]);
+                vs.extend_from_slice(&v[off..off + head_dim]);
+            }
+        }
+        (ks, vs)
+    }
+
+    /// RES-1 regression: two offloads of the SAME layer with the SAME count (before recall) must NOT
+    /// share backing files. With the pre-fix `cache_L{layer}_{0}-{count}` naming the second dump
+    /// clobbers the first's file and both records point at it, so recalling the first record returns
+    /// the SECOND dump's bytes (KV corruption). The `s{seq}` segment gives each dump a unique path, so
+    /// each record round-trips its own bytes. Mutation-proof: dropping the seq makes the first recall
+    /// read pattern B and the `expected_a` assertion fails.
+    #[test]
+    fn test_repeat_offload_same_layer_count_no_clobber() {
+        let dir = unique_tmp_dir("repeat_offload");
+        let handler = SwapHandler::with_disk(0.5, dir.clone());
+        let (heads, dim, count) = (2usize, 4usize, 3usize);
+
+        // Dump #1: pattern A (the make_hm_cache_with_data fill: k[i]=i, v[i]=-i).
+        let mut cache = make_hm_cache_with_data(10, heads, dim);
+        let expected_a = prefix_kv(&cache, count);
+        let n1 = handler.offload_prefix(0, &mut cache, count).unwrap();
+        assert_eq!(n1, count);
+
+        // Overwrite the whole buffer with a DISTINCT pattern B and re-arm current_pos, then dump #2 of
+        // the same layer + count without an intervening recall.
+        {
+            let k_slice = cache.k_buffer.as_mut_slice::<f32>();
+            for (i, x) in k_slice.iter_mut().enumerate() {
+                *x = 7000.0 + i as f32;
+            }
+            let v_slice = cache.v_buffer.as_mut_slice::<f32>();
+            for (i, x) in v_slice.iter_mut().enumerate() {
+                *x = -(7000.0 + i as f32);
+            }
+        }
+        cache.current_pos = 10;
+        let expected_b = prefix_kv(&cache, count);
+        let n2 = handler.offload_prefix(0, &mut cache, count).unwrap();
+        assert_eq!(n2, count);
+
+        // Both dumps are outstanding, same (layer=0, count=3) — but on DISTINCT backing files.
+        let (a_kpath, b_kpath) = {
+            let g = handler.state.lock().unwrap();
+            assert_eq!(g.records.len(), 2, "both dumps recorded");
+            (g.records[0].k_path.clone(), g.records[1].k_path.clone())
+        };
+        assert_ne!(
+            a_kpath, b_kpath,
+            "the two same-(layer,count) dumps must not share a backing file"
+        );
+
+        // recall_layer pops layer-0 records in insertion order: first the A dump, then the B dump.
+        // Each must restore ITS OWN pattern into a fresh empty cache.
+        let mut fresh_a = make_hm_cache_with_data(0, heads, dim);
+        assert_eq!(handler.recall_layer(0, &mut fresh_a).unwrap(), count);
+        assert_eq!(
+            prefix_kv(&fresh_a, count),
+            expected_a,
+            "first record must restore dump A (not the clobbering dump B)"
+        );
+
+        let mut fresh_b = make_hm_cache_with_data(0, heads, dim);
+        assert_eq!(handler.recall_layer(0, &mut fresh_b).unwrap(), count);
+        assert_eq!(
+            prefix_kv(&fresh_b, count),
+            expected_b,
+            "second record must restore dump B"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
