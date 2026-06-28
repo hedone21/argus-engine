@@ -1988,16 +1988,17 @@ impl SelectiveRead for StandardFormat {
         // read stage 는 budget(target_len) 을 읽지 않는다(읽기 범위 결정 ≠ keep budget). importance/
         // scores 미공급(None) — read stage 는 `tensor(Key)`/`tensor(Value)` 로 자기 page 메타를
         // incremental 갱신한다(D5). query_stats 는 dormant fallback(현재 production producer 없음).
-        // Build owned K/V dequant snapshots over the (host-resident) cache_ref, then a read ctx that
-        // exposes them as `tensor(Key)`/`tensor(Value)` plus the optional faithful current-Q
-        // (`tensor(Query)`, Quest's 정본 current-Q; `None` on proxy/offload → `tensor(Query)==None`,
-        // byte-identical disabled path) and the dormant `tensor(QueryStats)` fallback.
+        // Build an owned K dequant snapshot over the (host-resident) cache_ref, then a read ctx that
+        // exposes it as `tensor(Key)` plus the optional faithful current-Q (`tensor(Query)`, Quest's
+        // 정본 current-Q; `None` on proxy/offload → `tensor(Query)==None`, byte-identical disabled path)
+        // and the dormant `tensor(QueryStats)` fallback. `tensor(Value)` is dequantized lazily from
+        // cache_ref by the ctx only if the read stage actually reads it (Quest does not — it reads only
+        // Key/Query — so the V dequant is skipped entirely on the production read path).
         let rows = cache_ref.current_pos();
         let n_kv_heads = cache_ref.kv_heads();
         let head_dim = cache_ref.head_dim();
         let key_snap = dequant_snapshot(cache_ref, rows, n_kv_heads, head_dim, true);
-        let value_snap = dequant_snapshot(cache_ref, rows, n_kv_heads, head_dim, false);
-        let ctx = SnapshotStageCtx::for_read(cache_ref, &key_snap, &value_snap, query, query_stats);
+        let ctx = SnapshotStageCtx::for_read(cache_ref, &key_snap, query, query_stats);
         rs.read_plan(&ctx)
     }
 }
