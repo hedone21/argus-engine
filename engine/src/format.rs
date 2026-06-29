@@ -29,7 +29,7 @@ pub use dtype_layout::{
 pub use format_policy_registry::{
     ensure_builtin_format_policies_registered, is_registered_kv_format_policy,
 };
-pub use kv_cache_format::{AttnDims, KVCacheFormat, Merge};
+pub use kv_cache_format::{AttnDims, KVCacheFormat, Merge, PerRowScores, PrefillScores};
 pub use kv_snapshot::SnapshotRestore;
 pub use selective_read::SelectiveRead;
 pub use weight_format::{LayerDispatch, PartitionShare, WeightFormat};

@@ -33,6 +33,40 @@ pub struct AttnDims {
     pub window: Option<usize>,
 }
 
+/// IMP-4 per-step (per-row) PFA target — the trailing `q_window` gold-answer rows written
+/// each to its **own step slot** (assign, not SUM-collapsed), recovering the per-output-step
+/// attention trajectory the [`PrefillScores::sum`] path destroys.
+///
+/// Same scalar dot / same op order as the SUM path (read from the same `scratch`/`denom`), so
+/// `Σ_step` of the per-head layout reproduces [`PrefillScores::sum`] exactly (un-summed, §6).
+pub struct PerRowScores<'a> {
+    /// Per-step output buffer, **caller pre-zeroed** (head-mean accumulates over heads; causal-/
+    /// SWA-masked key positions stay zero in both modes). Layout depends on
+    /// [`per_head`](Self::per_head), with `prefix_len == cache_seq_len`:
+    ///  - head-mean (`false`): `[step * prefix_len + key_pos]`, len `q_window * prefix_len`.
+    ///  - per-head (`true`): `[step * (n_heads_q * prefix_len) + h * prefix_len + key_pos]`,
+    ///    len `q_window * n_heads_q * prefix_len` (≈ `n_heads_q×` larger — power-user only).
+    pub out: &'a mut [f32],
+    /// `true` = keep every pre-GQA head; `false` = mean over heads (`(1/n_heads_q) Σ_h prob`).
+    pub per_head: bool,
+}
+
+/// Prefill-attention (PFA) side-channel targets for the trailing `q_window` gold-answer rows.
+///
+/// `sum` (IMP-2 `answer_attention`) SUM-accumulates the per-head post-softmax mass into one
+/// `[n_heads_q * prefix_len]` snapshot; `per_row` (IMP-4 `answer_attention_steps`) keeps the
+/// step axis. Either or both may be armed; `q_window` is shared. The whole `Option` is `None`
+/// everywhere except these dumps → byte-identical (one `is_some` branch per layer, INV-147).
+pub struct PrefillScores<'a> {
+    /// Number of trailing query rows captured (gold continuation length).
+    pub q_window: usize,
+    /// IMP-2 v1 per-head SUM-over-steps buffer `[n_heads_q * prefix_len]`, caller pre-zeroed.
+    /// `Some` for `answer_attention`; `None` for the steps-only dump.
+    pub sum: Option<&'a mut [f32]>,
+    /// IMP-4 per-step sibling; see [`PerRowScores`]. `None` for the v1-only dump.
+    pub per_row: Option<PerRowScores<'a>>,
+}
+
 /// 가중 병합(weighted-merge) 의미 기반의 compact merge 명세 (§4.1 `compact(keep, merges)`).
 ///
 /// "evicted 토큰들(`from`)을 retained(kept) 토큰(`into`)에 가중 병합" — 가중 merge plugin 의 cosine-nearest
@@ -93,10 +127,11 @@ pub trait KVCacheFormat: Send + Sync {
     /// quant-window AWQE 자기-need 는 impl 내부에서 자가 흡수한다(base trait 에 `needs_attn_scores` 없음,
     /// §4.1 R4 ③).
     ///
-    /// `prefill_scores` (R-P1-1): `Some((out_scores, q_window))` 면 prefill 시 trailing q_window 의
-    /// per-attention-head attention 확률을 `out_scores` 에 SUM-누적한다(side-channel, `out` 불변).
-    /// `None`(decode / producer 미무장) = 기존과 byte-identical. `StandardFormat` 만 실제 산출하고
-    /// 나머지 format 은 None pass-through(prefill arm 의 free fn 에 None 전달).
+    /// `prefill_scores` (R-P1-1 + IMP-4): `Some(PrefillScores { .. })` 면 prefill 시 trailing
+    /// q_window 의 per-attention-head attention 확률을 `sum`(SUM-누적) 그리고/또는 `per_row`(per-step
+    /// assign)에 기록한다(side-channel, `out` 불변). `None`(decode / producer 미무장) = 기존과
+    /// byte-identical. `StandardFormat` 만 실제 산출하고 나머지 format 은 None pass-through(prefill arm
+    /// 의 free fn 에 None 전달).
     fn attention_into(
         &self,
         q: &Tensor,
@@ -104,7 +139,7 @@ pub trait KVCacheFormat: Send + Sync {
         out: &mut Tensor,
         dims: AttnDims,
         scores: Option<&mut [f32]>,
-        prefill_scores: Option<(&mut [f32], usize)>,
+        prefill_scores: Option<PrefillScores<'_>>,
     ) -> Result<()>;
 
     // ── capability-handle (default) ──

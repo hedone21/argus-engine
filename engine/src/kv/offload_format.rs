@@ -178,8 +178,8 @@ impl KVCacheFormat for OffloadFormat {
         out: &mut Tensor,
         dims: AttnDims,
         scores: Option<&mut [f32]>,
-        // R-P1-1: offload format 은 PFA 미산출(None pass-through) — StandardFormat 만 producer.
-        _prefill_scores: Option<(&mut [f32], usize)>,
+        // R-P1-1 + IMP-4: offload format 은 PFA 미산출(None pass-through) — StandardFormat 만 producer.
+        _prefill_scores: Option<crate::format::PrefillScores<'_>>,
     ) -> Result<()> {
         let seq_len = q.shape().dims()[1];
 

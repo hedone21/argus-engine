@@ -586,6 +586,64 @@ mod tests {
         );
     }
 
+    /// Happy path: answer_attention_steps shares the generic dump guards (cpu + eval-ll +
+    /// dump-dir) and resolves its own `<dir>/answer_attention_steps.jsonl` path.
+    #[test]
+    fn accept_dump_answer_attention_steps_cpu_eval_ll() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention_steps",
+            "--dump-dir",
+            "/tmp/d",
+        ]);
+        assert!(reject_unsupported_modes_eval(&args).is_ok());
+        assert!(args.dump_enabled("answer_attention_steps"));
+        assert_eq!(
+            args.dump_path("answer_attention_steps").unwrap(),
+            std::path::PathBuf::from("/tmp/d/answer_attention_steps.jsonl")
+        );
+        // The per-head flag defaults off (head-mean).
+        assert!(!args.answer_attention_steps_per_head);
+    }
+
+    /// answer_attention_steps inherits the CPU-backend requirement (PFA is CPU-only).
+    #[test]
+    fn reject_dump_answer_attention_steps_requires_cpu_backend() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention_steps",
+            "--dump-dir",
+            "/tmp/d",
+            "--backend",
+            "opencl",
+        ]);
+        let err = reject_unsupported_modes_eval(&args).unwrap_err();
+        assert!(err.to_string().contains("cpu"), "{}", err);
+    }
+
+    /// The per-head flag parses and is independent of which dump is selected.
+    #[test]
+    fn answer_attention_steps_per_head_flag_parses() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention_steps",
+            "--dump-dir",
+            "/tmp/d",
+            "--answer-attention-steps-per-head",
+        ]);
+        assert!(reject_unsupported_modes_eval(&args).is_ok());
+        assert!(args.answer_attention_steps_per_head);
+    }
+
     /// No `--dump` → guard is a no-op and the accessors report nothing enabled
     /// (production path untouched — INV-147).
     #[test]

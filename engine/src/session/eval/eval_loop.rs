@@ -291,6 +291,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
                     layer_boundary_hook: None,
                     read_stage: None,
                     prefill_attn: None,
+                    prefill_attn_per_row: None,
                 })
             })?;
 
@@ -413,6 +414,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
                             layer_boundary_hook: None,
                             read_stage: None,
                             prefill_attn: None,
+                            prefill_attn_per_row: None,
                         })
                     })?;
 
@@ -634,6 +636,7 @@ fn run_importance_pass<C: EvalCacheKind>(
             layer_boundary_hook: None,
             read_stage: None,
             prefill_attn: None,
+            prefill_attn_per_row: None,
         })
     })?;
 
@@ -831,6 +834,7 @@ fn run_token_by_token_prefill<C: EvalCacheKind>(
                 layer_boundary_hook: None,
                 read_stage: None,
                 prefill_attn: None,
+                prefill_attn_per_row: None,
             })
         })?;
 
@@ -910,6 +914,7 @@ fn run_full_prefill<C: EvalCacheKind>(
             layer_boundary_hook: None,
             read_stage: None,
             prefill_attn: None,
+            prefill_attn_per_row: None,
         })
     })?;
 
@@ -1003,6 +1008,7 @@ fn run_chunked_prefill<C: EvalCacheKind>(
             layer_boundary_hook: None,
             read_stage: None,
             prefill_attn: None,
+            prefill_attn_per_row: None,
         })
     })?;
 
@@ -1062,6 +1068,7 @@ fn run_chunked_prefill<C: EvalCacheKind>(
                 layer_boundary_hook: None,
                 read_stage: None,
                 prefill_attn: None,
+                prefill_attn_per_row: None,
             })
         })?;
         start_pos += 1;
