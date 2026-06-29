@@ -26,6 +26,7 @@
 //! drop-in for the v2 `EvictionStage` (MUTUALLY EXCLUSIVE at KvMutate). The bare `new()` path stays the
 //! direct-construction surface the gates below exercise.
 
+use std::cell::OnceCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -110,6 +111,49 @@ impl TensorHandle for KvSnapHandle<'_> {
             out[..n].fill(0.0);
         }
     }
+}
+
+/// The owning twin of [`KvSnapHandle`] (`Vec` instead of `&[f32]`), for a snapshot materialized lazily
+/// inside the ctx (read seam: `tensor(Value)` on demand, see [`LazyValueSrc`]). Same `(kv_head*rows +
+/// row)*head_dim` layout and `read_row` semantics; it owns its buffer because there is no caller-frame
+/// slice to borrow — the snapshot is built on first access and cached in the ctx.
+struct OwnedKvSnapHandle {
+    data: Vec<f32>,
+    rows: usize,
+    head_dim: usize,
+}
+impl TensorHandle for OwnedKvSnapHandle {
+    fn shape(&self) -> TensorShape {
+        TensorShape {
+            rows: self.rows,
+            cols: self.head_dim,
+            per_head: true,
+        }
+    }
+    fn dtype(&self) -> TensorDtype {
+        TensorDtype::F32
+    }
+    fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
+        let base = (kv_head * self.rows + row) * self.head_dim;
+        let n = self.head_dim.min(out.len());
+        if base + n <= self.data.len() {
+            out[..n].copy_from_slice(&self.data[base..base + n]);
+        } else {
+            out[..n].fill(0.0);
+        }
+    }
+}
+
+/// A deferred source for a `tensor(Value)` dequant snapshot (read seam only — [`SnapshotStageCtx::
+/// for_read`]). Holds a host-resident cache ref + geometry; the V snapshot is materialized into the
+/// ctx's `value_cell` only on the first `tensor(Value)` access and skipped entirely when the read
+/// stage never reads Value (e.g. Quest reads only Key/Query). The materialized bytes are identical to
+/// an eager `dequant_snapshot(.., is_k = false)` — this only defers the work, it does not change it.
+struct LazyValueSrc<'a> {
+    cache: &'a KVCache,
+    rows: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
 }
 
 /// A per-q-head prefill-attention snapshot handle (`tensor(PrefillAttention)`), reading from an owned
@@ -228,13 +272,17 @@ pub(crate) fn dequant_snapshot(
     out
 }
 
-/// A read [`StageCtx`] backed by OWNED/borrowed snapshots — never the live cache — so it coexists with
-/// a `&mut` [`CacheHandle`] over the same cache (a v3 callback holds both at once). The scalars are
-/// copied from the entry frame; the signal slices are borrowed from driver-loop locals captured in
-/// that same pre-callback frame (T-3): `importance` (flat per-token) and the per-head `Scores` /
-/// `AttnWeights` from the score accumulator, plus raw `Key`/`Value` dequant snapshots for value-aware
-/// (caote) / merge (d2o) stages. A score-free stage gets all-`None` signals and reads only the
-/// scalars + budget.
+/// A read [`StageCtx`] backed by OWNED/borrowed snapshots — never the live cache on the MUTATION path,
+/// so it coexists with a `&mut` [`CacheHandle`] over the same cache (a v3 callback holds both at once).
+/// The scalars are copied from the entry frame; the signal slices are borrowed from driver-loop locals
+/// captured in that same pre-callback frame (T-3): `importance` (flat per-token) and the per-head
+/// `Scores` / `AttnWeights` from the score accumulator, plus raw `Key`/`Value` dequant snapshots for
+/// value-aware (caote) / merge (d2o) stages. A score-free stage gets all-`None` signals and reads only
+/// the scalars + budget.
+///
+/// The READ seam ([`Self::for_read`]) is the one exception to "never the live cache": it holds a
+/// host-resident cache ref in `value_lazy` to dequantize `tensor(Value)` on demand (no `&mut` handle
+/// exists on that path, so there is no aliasing to avoid). `value_cell` caches that lazy snapshot.
 pub struct SnapshotStageCtx<'a> {
     current_pos: usize,
     target_len: usize,
@@ -253,6 +301,11 @@ pub struct SnapshotStageCtx<'a> {
     query_handle: Option<QuerySnapHandle<'a>>,
     /// (read seam) dormant Q running mean/var (`tensor(QueryStats)`) — supplied only by [`Self::for_read`].
     query_stats_handle: Option<QueryStatsSnapHandle<'a>>,
+    /// (read seam) deferred `tensor(Value)` source — supplied only by [`Self::for_read`], `None` on the
+    /// mutation path (which uses the eager `value_handle`). Materialized lazily into `value_cell`.
+    value_lazy: Option<LazyValueSrc<'a>>,
+    /// Cache for the lazily-materialized `tensor(Value)` snapshot (see `value_lazy`). Built at most once.
+    value_cell: OnceCell<OwnedKvSnapHandle>,
 }
 
 impl<'a> SnapshotStageCtx<'a> {
@@ -280,6 +333,8 @@ impl<'a> SnapshotStageCtx<'a> {
             prefill_attn_handle: None,
             query_handle: None,
             query_stats_handle: None,
+            value_lazy: None,
+            value_cell: OnceCell::new(),
         }
     }
 
@@ -305,19 +360,21 @@ impl<'a> SnapshotStageCtx<'a> {
         }
     }
 
-    /// A read-stage ctx exposing `tensor(Key)`/`tensor(Value)` over owned dequant snapshots plus the
-    /// optional faithful current-Q (`tensor(Query)`) and dormant Q running-stats (`tensor(QueryStats)`).
-    /// Used by `StandardFormat::read_plan` (the W-DEVKV / Quest read seam). `cache` must be
-    /// host-resident; `key_snap`/`value_snap` are owned `[n_kv_heads * rows * head_dim]` dequant
-    /// snapshots the caller built from it via [`dequant_snapshot`] (same layout as [`KvSnapHandle`]).
+    /// A read-stage ctx exposing `tensor(Key)`/`tensor(Value)` plus the optional faithful current-Q
+    /// (`tensor(Query)`) and dormant Q running-stats (`tensor(QueryStats)`). Used by
+    /// `StandardFormat::read_plan` (the W-DEVKV / Quest read seam). `cache` must be host-resident.
+    /// `key_snap` is an owned `[n_kv_heads * rows * head_dim]` K dequant snapshot the caller built via
+    /// [`dequant_snapshot`] (same layout as [`KvSnapHandle`]). The V snapshot is **deferred**: it is
+    /// dequantized from `cache` only if the read stage actually reads `tensor(Value)` (Quest does not),
+    /// then cached — byte-identical to an eager `dequant_snapshot(cache, .., is_k = false)`, just lazy.
     pub fn for_read(
-        cache: &KVCache,
+        cache: &'a KVCache,
         key_snap: &'a [f32],
-        value_snap: &'a [f32],
         query: Option<&'a [f32]>,
         query_stats: Option<&'a [f32]>,
     ) -> Self {
         let rows = cache.current_pos();
+        let n_kv_heads = cache.kv_heads();
         let head_dim = cache.head_dim();
         Self {
             key_handle: Some(KvSnapHandle {
@@ -325,9 +382,10 @@ impl<'a> SnapshotStageCtx<'a> {
                 rows,
                 head_dim,
             }),
-            value_handle: Some(KvSnapHandle {
-                data: value_snap,
+            value_lazy: Some(LazyValueSrc {
+                cache,
                 rows,
+                n_kv_heads,
                 head_dim,
             }),
             query_handle: query.map(|data| QuerySnapHandle { data, head_dim }),
@@ -367,7 +425,29 @@ impl StageCtx for SnapshotStageCtx<'_> {
             TensorKind::Scores => self.score_handle.as_ref().map(|h| h as &dyn TensorHandle),
             TensorKind::AttnWeights => self.attn_handle.as_ref().map(|h| h as &dyn TensorHandle),
             TensorKind::Key => self.key_handle.as_ref().map(|h| h as &dyn TensorHandle),
-            TensorKind::Value => self.value_handle.as_ref().map(|h| h as &dyn TensorHandle),
+            TensorKind::Value => {
+                // Mutation path: eager `value_handle`. Read path: materialize the deferred V snapshot
+                // from `value_lazy` on first access (skipped entirely when the stage never reads Value)
+                // and cache it in `value_cell` — byte-identical to an eager dequant, just lazy.
+                if let Some(h) = self.value_handle.as_ref() {
+                    Some(h as &dyn TensorHandle)
+                } else if let Some(src) = self.value_lazy.as_ref() {
+                    let h = self.value_cell.get_or_init(|| OwnedKvSnapHandle {
+                        data: dequant_snapshot(
+                            src.cache,
+                            src.rows,
+                            src.n_kv_heads,
+                            src.head_dim,
+                            false,
+                        ),
+                        rows: src.rows,
+                        head_dim: src.head_dim,
+                    });
+                    Some(h as &dyn TensorHandle)
+                } else {
+                    None
+                }
+            }
             TensorKind::PrefillAttention => self
                 .prefill_attn_handle
                 .as_ref()
@@ -451,6 +531,8 @@ pub(crate) fn drive_mutation_layer(
         prefill_attn_handle: None,
         query_handle: None,
         query_stats_handle: None,
+        value_lazy: None,
+        value_cell: OnceCell::new(),
     };
     let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
     let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
@@ -937,6 +1019,54 @@ mod tests {
             }
         }
         c
+    }
+
+    /// Task ② (read seam): `for_read` must DEFER the `tensor(Value)` dequant — Quest reads only
+    /// Key/Query, so on the production read path V must never be dequantized. Proves: (a) the V cell is
+    /// empty right after construction (no eager dequant), (b) reading `tensor(Key)` does not materialize
+    /// it, and (c) the first `tensor(Value)` access materializes a snapshot byte-identical to an eager
+    /// `dequant_snapshot(.., is_k = false)`. Mutation-proof: making `for_read` eager (or skipping the
+    /// cell) fails (a)/(b); reading K instead of V in the lazy arm fails (c) (V carries a distinct salt).
+    #[test]
+    fn for_read_defers_value_dequant_until_first_access() {
+        let mut cache = make_int_cache(RESIDENT);
+        // Give V a pattern distinct from K (which is `pos`) so a lazy arm that mistakenly dequantized K
+        // would be caught by the byte-identity check below.
+        for pos in 0..RESIDENT {
+            for head in 0..KV_HEADS {
+                let off = cache.offset(pos, head);
+                let vb = cache.v_buffer.as_mut_slice::<f32>();
+                for d in 0..HD {
+                    vb[off + d] = pos as f32 + 100.0;
+                }
+            }
+        }
+        let key_snap = dequant_snapshot(&cache, RESIDENT, KV_HEADS, HD, true);
+        let ctx = SnapshotStageCtx::for_read(&cache, &key_snap, None, None);
+
+        // (a) V dequant is deferred — nothing materialized at construction.
+        assert!(
+            ctx.value_cell.get().is_none(),
+            "for_read must NOT dequantize V eagerly"
+        );
+        // (b) Reading Key (exactly what Quest does) must not trigger the V dequant.
+        assert!(ctx.tensor(TensorKind::Key).is_some());
+        assert!(
+            ctx.value_cell.get().is_none(),
+            "reading tensor(Key) must not materialize V"
+        );
+
+        // (c) First tensor(Value) access materializes the snapshot, byte-identical to an eager dequant.
+        assert!(ctx.tensor(TensorKind::Value).is_some());
+        let materialized = ctx
+            .value_cell
+            .get()
+            .expect("tensor(Value) materializes the cell");
+        let eager_v = dequant_snapshot(&cache, RESIDENT, KV_HEADS, HD, false);
+        assert_eq!(
+            materialized.data, eager_v,
+            "lazy V snapshot must equal the eager dequant"
+        );
     }
 
     /// A score-based stage that keeps the top-`target_len` positions by `importance()` (h2o shape).
