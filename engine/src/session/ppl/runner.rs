@@ -391,6 +391,7 @@ pub fn run_quant_window_ppl(
                 layer_boundary_hook: None,
                 read_stage: None,
                 prefill_attn: None,
+                prefill_attn_per_row: None,
             })
         })?;
 
@@ -477,6 +478,7 @@ pub fn run_quant_window_ppl(
                 layer_boundary_hook: None,
                 read_stage: None,
                 prefill_attn: None,
+                prefill_attn_per_row: None,
             })
         })?;
 
@@ -822,6 +824,7 @@ pub fn run_ppl(
                 layer_boundary_hook: None,
                 read_stage: None,
                 prefill_attn: None,
+                prefill_attn_per_row: None,
             })
         })?;
 
@@ -988,6 +991,7 @@ pub fn run_ppl(
                 layer_boundary_hook: None,
                 read_stage: None,
                 prefill_attn: None,
+                prefill_attn_per_row: None,
             })
         })?;
 

@@ -202,6 +202,7 @@ impl Forward for QuantWindowForward {
             layer_boundary_hook: None,
             read_stage: None,
             prefill_attn: None,
+            prefill_attn_per_row: None,
         });
 
         fwd_result?;
@@ -250,6 +251,7 @@ impl Forward for QuantWindowForward {
             layer_boundary_hook: None,
             read_stage: None,
             prefill_attn: None,
+            prefill_attn_per_row: None,
         });
 
         fwd_result?;

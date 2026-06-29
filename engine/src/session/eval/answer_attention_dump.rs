@@ -281,6 +281,7 @@ pub fn run_answer_attention_dump(
                 layer_boundary_hook: None,
                 read_stage: None,
                 prefill_attn: Some((&mut pfa_buf, q_window)),
+                prefill_attn_per_row: None,
             })
         })?;
 

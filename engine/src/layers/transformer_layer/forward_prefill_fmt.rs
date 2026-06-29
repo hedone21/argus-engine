@@ -52,6 +52,10 @@ pub(crate) struct ForwardPrefillFmtArgs<'a> {
     /// trailing q_window attention 확률을 `out_scores`(이 layer 슬라이스 `[n_heads_q * prefix_len]`,
     /// caller pre-zeroed)에 SUM-누적. `None`(decode-fallthrough / 미무장) = byte-identical.
     pub pfa_target: Option<(&'a mut [f32], usize)>,
+    /// IMP-4 per-step PFA target: `Some((out, q_window, per_head))` 면 prefill arm 이 trailing
+    /// q_window 의 각 row 를 자기 step 슬롯에 기록(per_head 면 head-keep, 아니면 head-mean) →
+    /// 이 layer 슬라이스 `out`(caller pre-zeroed). `None`(미무장) = byte-identical.
+    pub pfa_per_row_target: Option<(&'a mut [f32], usize, bool)>,
 }
 
 impl TransformerLayer {
@@ -150,14 +154,35 @@ impl TransformerLayer {
         } else {
             None
         };
+        // R-P1-1 + IMP-4: bundle the (optional) v1 SUM-over-steps target and the (optional)
+        // per-step sibling into one PFA side-channel. Both `None` (decode-fallthrough /
+        // production / no dump) → `None` → byte-identical (one `is_some` branch per layer).
+        let prefill_scores = match (args.pfa_target, args.pfa_per_row_target) {
+            (None, None) => None,
+            (sum, per_row) => {
+                // q_window is identical for both (same forward); take whichever is armed.
+                let q_window = sum
+                    .as_ref()
+                    .map(|(_, qw)| *qw)
+                    .or_else(|| per_row.as_ref().map(|(_, qw, _)| *qw))
+                    .expect("at least one PFA target armed");
+                Some(crate::format::PrefillScores {
+                    q_window,
+                    sum: sum.map(|(buf, _)| buf),
+                    per_row: per_row.map(|(buf, _, per_head)| crate::format::PerRowScores {
+                        out: buf,
+                        per_head,
+                    }),
+                })
+            }
+        };
         fmt.attention_into(
             &q_rope,
             backend.as_ref(),
             &mut ws.out_attn,
             AttnDims { n_heads_q, window },
             None,
-            // R-P1-1: 무장 시 이 layer 의 PFA target((out_scores, q_window)). None=byte-identical.
-            args.pfa_target,
+            prefill_scores,
         )?;
 
         // 6. Output projection.

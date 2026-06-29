@@ -17,7 +17,8 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::format::{
-    AttnDims, KVCacheFormat, SelectiveRead, SnapshotRestore, dequant_to_f32_tensor,
+    AttnDims, KVCacheFormat, PerRowScores, PrefillScores, SelectiveRead, SnapshotRestore,
+    dequant_to_f32_tensor,
 };
 use crate::kv::kv_cache::KVCache;
 use crate::memory::host::shared::SharedBuffer;
@@ -415,7 +416,7 @@ impl KVCacheFormat for StandardFormat {
         out: &mut Tensor,
         dims: AttnDims,
         scores: Option<&mut [f32]>,
-        prefill_scores: Option<(&mut [f32], usize)>,
+        prefill_scores: Option<PrefillScores<'_>>,
     ) -> Result<()> {
         let seq_len = q.shape().dims()[1];
 
@@ -1048,10 +1049,11 @@ pub(crate) fn prefill_attention(
     q_start_pos: usize,
     window: Option<usize>,
     backend: &dyn Backend,
-    // R-P1-1 PFA side-channel: `Some((out_scores, q_window))` 면 trailing q_window attention 확률을
-    // `out_scores`(caller pre-zeroed, `[n_heads_q * cache_seq_len]`)에 SUM-누적. GPU dispatch 시엔
-    // 아래에서 early-return 하므로 자연히 CPU-only. `None`=기존과 byte-identical(producer 미무장).
-    prefill_scores: Option<(&mut [f32], usize)>,
+    // R-P1-1 + IMP-4 PFA side-channel: `Some(PrefillScores { .. })` 면 trailing q_window attention
+    // 확률을 `sum`(caller pre-zeroed `[n_heads_q * cache_seq_len]`, SUM-누적) 그리고/또는 `per_row`
+    // (per-step assign)에 기록. GPU dispatch 시엔 아래에서 early-return 하므로 자연히 CPU-only.
+    // `None`=기존과 byte-identical(producer 미무장).
+    prefill_scores: Option<PrefillScores<'_>>,
 ) -> Result<()> {
     use crate::kv_cache_ops::KVLayout;
 
@@ -1265,10 +1267,10 @@ pub(crate) fn prefill_attention(
             );
         }
 
-        // R-P1-1: PFA side-channel — flash 가 쓰는 동일 dequant K/stride 로 batch 0(단일 시퀀스
-        // prefill)의 trailing q_window attention 확률 계산. `out`/`out_ptr` 미접촉(별도 버퍼).
+        // R-P1-1 + IMP-4: PFA side-channel — flash 가 쓰는 동일 dequant K/stride 로 batch 0(단일
+        // 시퀀스 prefill)의 trailing q_window attention 확률 계산. `out`/`out_ptr` 미접촉(별도 버퍼).
         // GPU dispatch 는 위에서 early-return 했으므로 여기는 CPU-only.
-        if let Some((pfa_out, q_window)) = prefill_scores {
+        if let Some(ps) = prefill_scores {
             let k_valid_len = if is_head_major_pf {
                 n_heads_kv * kv_capacity * head_dim
             } else {
@@ -1287,9 +1289,10 @@ pub(crate) fn prefill_attention(
                 k_pos_stride,
                 kv_head_stride,
                 q_start_pos,
-                q_window,
+                ps.q_window,
                 window,
-                pfa_out,
+                ps.sum,
+                ps.per_row,
             );
         }
     }
@@ -1334,15 +1337,20 @@ pub(crate) fn prefill_attention(
     Ok(())
 }
 
-/// R-P1-1 PFA side-channel: prefill 의 trailing query window(`q_window` rows)에서 전체 prefix key 로의
-/// per-ATTENTION-head(pre-GQA) softmax(q·Kᵀ/√head_dim) 확률을 q_window 에 SUM-accumulate 한다 →
-/// `out_scores[h * prefix_len + key_pos]`. flash `out` 은 미접촉(pure scalar CPU, no backend op).
-/// `q_data`/`k_data` 는 [`prefill_attention`] 의 CPU 분기가 이미 dequant 한 f32 슬라이스 + 동일 stride
-/// (= "모델이 본 attention" 충실). Gate-1 bit-exact 위해 **scalar dot**(SIMD 금지) + eager reference 와
-/// 동일 op order(dot→×scale→max→exp/denom→divide). `out_scores` 는 caller 가 pre-zero(SUM 누적, §4.7).
+/// R-P1-1 + IMP-4 PFA side-channel: prefill 의 trailing query window(`q_window` rows)에서 전체 prefix
+/// key 로의 per-ATTENTION-head(pre-GQA) softmax(q·Kᵀ/√head_dim) 확률을 두 sibling 출력에 기록한다.
+/// `sum_out`(IMP-2)은 q_window 에 SUM-accumulate → `sum_out[h * prefix_len + key_pos]`. `per_row`
+/// (IMP-4)은 각 row(`step = r - qwin_start`)를 자기 step 슬롯에 ASSIGN(per-head) / head-mean 누적
+/// → step 축 보존. 둘 다 같은 `scratch`/`denom`(동일 scalar dot, 동일 op order)에서 읽으므로 per-head
+/// `per_row` 의 `Σ_step` 은 `sum_out` 을 bit-exact 재현한다(un-summed, §6). flash `out` 은
+/// 미접촉(pure scalar CPU). `q_data`/`k_data` 는 [`prefill_attention`] 의 CPU 분기가 이미 dequant 한 f32
+/// 슬라이스 + 동일 stride(= "모델이 본 attention" 충실). Gate-1 bit-exact 위해 **scalar dot**(SIMD 금지),
+/// eager reference 와 동일 op order(dot→×scale→max→exp/denom→divide). 두 버퍼 모두 caller 가
+/// pre-zero(§4.7).
 ///
-/// 사전: `out_scores.len() == n_heads_q * cache_seq_len`; `n_heads_q % n_heads_kv == 0`. batch=0(단일
-/// 시퀀스 prefill)만 — KV eviction 은 per-sequence.
+/// 사전: `sum_out.len() == n_heads_q * cache_seq_len`(armed 시); `per_row.out.len()` 은 layout 종속
+/// (head-mean `q_window * prefix_len` / per-head `q_window * n_heads_q * prefix_len`);
+/// `n_heads_q % n_heads_kv == 0`. batch=0(단일 시퀀스 prefill)만 — KV eviction 은 per-sequence.
 // needless_range_loop: 명시적 `key_pos` 인덱스 루프는 Gate-1 bit-exact op-order 계약(§6.1)이다 —
 // eager reference(test `pfa_reference`)와 구조가 byte-for-byte 일치해야 bit-exact 비교가 성립한다.
 // 반복자 변환은 동일 값이나 계약상 인덱스 형태를 고정한다.
@@ -1360,14 +1368,30 @@ fn prefill_attention_scores(
     q_start_pos: usize,
     q_window: usize,
     window: Option<usize>,
-    out_scores: &mut [f32],
+    mut sum_out: Option<&mut [f32]>,
+    mut per_row: Option<PerRowScores<'_>>,
 ) {
     let prefix_len = cache_seq_len;
-    debug_assert_eq!(
-        out_scores.len(),
-        n_heads_q * prefix_len,
-        "PFA out_scores.len must == n_heads_q * prefix_len"
-    );
+    if let Some(s) = sum_out.as_deref() {
+        debug_assert_eq!(
+            s.len(),
+            n_heads_q * prefix_len,
+            "PFA sum_out.len must == n_heads_q * prefix_len"
+        );
+    }
+    if let Some(pr) = per_row.as_ref() {
+        let expect = if pr.per_head {
+            q_window * n_heads_q * prefix_len
+        } else {
+            q_window * prefix_len
+        };
+        debug_assert_eq!(
+            pr.out.len(),
+            expect,
+            "PFA per_row.out.len must == q_window * {} prefix_len",
+            if pr.per_head { "n_heads_q *" } else { "" }
+        );
+    }
     debug_assert_eq!(
         n_heads_q % n_heads_kv,
         0,
@@ -1379,6 +1403,7 @@ fn prefill_attention_scores(
     // trailing query window rows within this chunk: [seq_len - min(q_window, seq_len) .. seq_len).
     let qwin = q_window.min(seq_len);
     let qwin_start = seq_len - qwin;
+    let inv_heads = 1.0f32 / n_heads_q as f32;
     // per-(h,r) 재사용 scratch (logits → exp). len = prefix_len. prefill one-shot 라 alloc 1회.
     let mut scratch = vec![0.0f32; prefix_len];
 
@@ -1415,9 +1440,28 @@ fn prefill_attention_scores(
                 scratch[key_pos] = e;
                 denom += e;
             }
-            // 3) SUM-accumulate post-softmax prob over the q_window.
-            for key_pos in lo..=p {
-                out_scores[out_row_base + key_pos] += scratch[key_pos] / denom;
+            // 3a) IMP-2: SUM-accumulate post-softmax prob over the q_window (op-order unchanged).
+            if let Some(s) = sum_out.as_deref_mut() {
+                for key_pos in lo..=p {
+                    s[out_row_base + key_pos] += scratch[key_pos] / denom;
+                }
+            }
+            // 3b) IMP-4: per-step sibling — ASSIGN each row to its own step slot (head-keep) or
+            // head-mean accumulate. Reads the SAME `scratch[key_pos] / denom`, so summing the
+            // per-head slots over `step` reproduces 3a exactly (§6 cross-check).
+            if let Some(pr) = per_row.as_mut() {
+                let step = r - qwin_start;
+                if pr.per_head {
+                    let base = step * (n_heads_q * prefix_len) + out_row_base;
+                    for key_pos in lo..=p {
+                        pr.out[base + key_pos] = scratch[key_pos] / denom;
+                    }
+                } else {
+                    let base = step * prefix_len;
+                    for key_pos in lo..=p {
+                        pr.out[base + key_pos] += (scratch[key_pos] / denom) * inv_heads;
+                    }
+                }
             }
         }
     }
@@ -3141,7 +3185,8 @@ mod tests {
                     q_start_pos,
                     q_window,
                     window,
-                    &mut got,
+                    Some(&mut got),
+                    None,
                 );
                 let want = pfa_eager_reference(
                     &q,
@@ -3207,7 +3252,8 @@ mod tests {
                     q_start_pos,
                     q_window,
                     window,
-                    &mut got,
+                    Some(&mut got),
+                    None,
                 );
                 let want = pfa_reference(
                     &q,
@@ -3265,7 +3311,8 @@ mod tests {
                 0,
                 q_window,
                 None,
-                &mut out,
+                Some(&mut out),
+                None,
             );
             let qwin = q_window.min(seq_len) as f32;
             for h in 0..nq {
@@ -3275,6 +3322,243 @@ mod tests {
                     "head {h} q_window {q_window}: row-sum {sum} != qwin {qwin}"
                 );
             }
+        }
+    }
+
+    // ───────────── IMP-4 per-step (per-row) PFA producer ─────────────
+
+    /// Build the (q, k, strides) fixture used by the per-row tests, matching the
+    /// MHA/GQA × SeqMajor/HeadMajor matrix of the existing PFA tests.
+    fn pfa_fixture(
+        nq: usize,
+        nkv: usize,
+        layout: &str,
+        head_dim: usize,
+        seq_len: usize,
+        cache_seq_len: usize,
+        kv_capacity: usize,
+    ) -> (Vec<f32>, Vec<f32>, usize, usize) {
+        let q: Vec<f32> = (0..seq_len * nq * head_dim)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
+            .collect();
+        let (k_pos_stride, kv_head_stride, k_len) = if layout == "seq" {
+            (nkv * head_dim, head_dim, cache_seq_len * nkv * head_dim)
+        } else {
+            (
+                head_dim,
+                kv_capacity * head_dim,
+                nkv * kv_capacity * head_dim,
+            )
+        };
+        let k: Vec<f32> = (0..k_len).map(|i| ((i % 17) as f32 - 8.0) * 0.07).collect();
+        (q, k, k_pos_stride, kv_head_stride)
+    }
+
+    #[test]
+    fn pfa_per_row_per_head_sums_to_v1_bit_exact() {
+        // §6 cross-check: per-head per-row keeps each step in its own slot; summing the
+        // step slots reproduces the v1 SUM buffer BIT-EXACTLY — same `scratch/denom`, same
+        // accumulation order (qwin_start..seq_len). Arm both in ONE call so they share scratch.
+        let head_dim = 8;
+        let seq_len = 6;
+        let q_start_pos = 0;
+        let cache_seq_len = seq_len;
+        let q_window = 3;
+        let kv_capacity = 16;
+        let prefix_len = cache_seq_len;
+        for (nq, nkv, layout) in [(4, 4, "seq"), (4, 2, "seq"), (4, 4, "head"), (4, 2, "head")] {
+            for window in [None, Some(4usize)] {
+                let (q, k, k_pos_stride, kv_head_stride) = pfa_fixture(
+                    nq,
+                    nkv,
+                    layout,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    kv_capacity,
+                );
+
+                let mut sum_buf = vec![0.0f32; nq * prefix_len];
+                let mut per_row_buf = vec![0.0f32; q_window * nq * prefix_len];
+                prefill_attention_scores(
+                    &q,
+                    &k,
+                    nq,
+                    nkv,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    k_pos_stride,
+                    kv_head_stride,
+                    q_start_pos,
+                    q_window,
+                    window,
+                    Some(&mut sum_buf),
+                    Some(PerRowScores {
+                        out: &mut per_row_buf,
+                        per_head: true,
+                    }),
+                );
+
+                // Σ_step per_row[step][h][key] must equal sum_buf[h][key] bit-for-bit.
+                let qwin = q_window.min(seq_len);
+                for h in 0..nq {
+                    for key in 0..prefix_len {
+                        let mut acc = 0.0f32;
+                        for step in 0..qwin {
+                            acc += per_row_buf[step * (nq * prefix_len) + h * prefix_len + key];
+                        }
+                        let v1 = sum_buf[h * prefix_len + key];
+                        assert_eq!(
+                            acc, v1,
+                            "Σ_step per_row != v1 sum (nq={nq}, nkv={nkv}, layout={layout}, \
+                             window={window:?}, h={h}, key={key})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pfa_per_row_head_mean_matches_head_reduced_v1() {
+        // head-mean per-row, re-summed over steps, equals the head-mean of the v1 per-head
+        // sum — within fp tolerance (different summation order than the per-head path).
+        let head_dim = 8;
+        let seq_len = 6;
+        let q_start_pos = 0;
+        let cache_seq_len = seq_len;
+        let q_window = 3;
+        let kv_capacity = 16;
+        let prefix_len = cache_seq_len;
+        for (nq, nkv, layout) in [(4, 4, "seq"), (4, 2, "head")] {
+            for window in [None, Some(4usize)] {
+                let (q, k, k_pos_stride, kv_head_stride) = pfa_fixture(
+                    nq,
+                    nkv,
+                    layout,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    kv_capacity,
+                );
+
+                let mut sum_buf = vec![0.0f32; nq * prefix_len];
+                let mut per_row_buf = vec![0.0f32; q_window * prefix_len];
+                prefill_attention_scores(
+                    &q,
+                    &k,
+                    nq,
+                    nkv,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    k_pos_stride,
+                    kv_head_stride,
+                    q_start_pos,
+                    q_window,
+                    window,
+                    Some(&mut sum_buf),
+                    Some(PerRowScores {
+                        out: &mut per_row_buf,
+                        per_head: false,
+                    }),
+                );
+
+                let qwin = q_window.min(seq_len);
+                let inv = 1.0f32 / nq as f32;
+                for key in 0..prefix_len {
+                    let mut steps_sum = 0.0f32;
+                    for step in 0..qwin {
+                        steps_sum += per_row_buf[step * prefix_len + key];
+                    }
+                    let mut head_mean_v1 = 0.0f32;
+                    for h in 0..nq {
+                        head_mean_v1 += sum_buf[h * prefix_len + key];
+                    }
+                    head_mean_v1 *= inv;
+                    assert!(
+                        (steps_sum - head_mean_v1).abs() < 1e-5,
+                        "head-mean Σ_step {steps_sum} != head-mean v1 {head_mean_v1} \
+                         (nq={nq}, nkv={nkv}, layout={layout}, window={window:?}, key={key})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pfa_per_row_each_step_is_a_distribution() {
+        // Independent property (not a mirror): each step's post-softmax row normalizes to 1
+        // over its causal range. So per-head step rows sum to 1.0, and head-mean step rows
+        // (mean of nq unit-sum rows) also sum to 1.0. Catches step-slot indexing bugs.
+        let head_dim = 4;
+        let seq_len = 5;
+        let nq = 4;
+        let nkv = 2; // GQA.
+        let cache_seq_len = seq_len;
+        let q_window = 3;
+        let prefix_len = cache_seq_len;
+        let (q, k, k_pos_stride, kv_head_stride) =
+            pfa_fixture(nq, nkv, "seq", head_dim, seq_len, cache_seq_len, 16);
+
+        // per-head: each (step, h) row sums to ~1.
+        let mut ph = vec![0.0f32; q_window * nq * prefix_len];
+        prefill_attention_scores(
+            &q,
+            &k,
+            nq,
+            nkv,
+            head_dim,
+            seq_len,
+            cache_seq_len,
+            k_pos_stride,
+            kv_head_stride,
+            0,
+            q_window,
+            None,
+            None,
+            Some(PerRowScores {
+                out: &mut ph,
+                per_head: true,
+            }),
+        );
+        for step in 0..q_window {
+            for h in 0..nq {
+                let base = step * (nq * prefix_len) + h * prefix_len;
+                let s: f32 = ph[base..base + prefix_len].iter().sum();
+                assert!(
+                    (s - 1.0).abs() < 1e-4,
+                    "per-head step {step} head {h} sum {s} != 1"
+                );
+            }
+        }
+
+        // head-mean: each step row (mean over nq unit-sum rows) sums to ~1.
+        let mut hm = vec![0.0f32; q_window * prefix_len];
+        prefill_attention_scores(
+            &q,
+            &k,
+            nq,
+            nkv,
+            head_dim,
+            seq_len,
+            cache_seq_len,
+            k_pos_stride,
+            kv_head_stride,
+            0,
+            q_window,
+            None,
+            None,
+            Some(PerRowScores {
+                out: &mut hm,
+                per_head: false,
+            }),
+        );
+        for step in 0..q_window {
+            let base = step * prefix_len;
+            let s: f32 = hm[base..base + prefix_len].iter().sum();
+            assert!((s - 1.0).abs() < 1e-4, "head-mean step {step} sum {s} != 1");
         }
     }
 
@@ -3345,7 +3629,11 @@ mod tests {
                 window: None,
             },
             None,
-            Some((&mut pfa, 2)),
+            Some(PrefillScores {
+                q_window: 2,
+                sum: Some(&mut pfa),
+                per_row: None,
+            }),
         )
         .unwrap();
 

@@ -26,12 +26,20 @@ use serde::Serialize;
 /// IMP-2 — full-cache gold-answer attention (technique-independent ground truth).
 pub const DUMP_ANSWER_ATTENTION: &str = "answer_attention";
 
+/// IMP-4 — per-output-step gold-answer attention trajectory (`answer_attention` un-summed
+/// over the gold continuation's query rows: one record per `(question, step)`).
+pub const DUMP_ANSWER_ATTENTION_STEPS: &str = "answer_attention_steps";
+
 /// IMP-1 — compression-time per-(token × layer × KV-head) importance (technique-side).
 pub const DUMP_EVICT_IMPORTANCE: &str = "evict_importance";
 
 /// Dump kinds this build knows how to produce. Validated at runtime (NOT a clap
 /// closed value-set) so registering a new kind never touches the CLI surface.
-pub const KNOWN_DUMP_KINDS: &[&str] = &[DUMP_ANSWER_ATTENTION, DUMP_EVICT_IMPORTANCE];
+pub const KNOWN_DUMP_KINDS: &[&str] = &[
+    DUMP_ANSWER_ATTENTION,
+    DUMP_ANSWER_ATTENTION_STEPS,
+    DUMP_EVICT_IMPORTANCE,
+];
 
 /// True if `kind` is a dump this build can produce.
 pub fn is_known_dump_kind(kind: &str) -> bool {
@@ -371,6 +379,14 @@ mod tests {
     fn known_kinds_contains_answer_attention() {
         assert!(is_known_dump_kind(DUMP_ANSWER_ATTENTION));
         assert!(is_known_dump_kind("answer_attention"));
+    }
+
+    #[test]
+    fn known_kinds_contains_answer_attention_steps() {
+        assert!(is_known_dump_kind(DUMP_ANSWER_ATTENTION_STEPS));
+        assert!(is_known_dump_kind("answer_attention_steps"));
+        // The steps kind is distinct from v1 (its bytes/schema differ).
+        assert_ne!(DUMP_ANSWER_ATTENTION, DUMP_ANSWER_ATTENTION_STEPS);
     }
 
     #[test]

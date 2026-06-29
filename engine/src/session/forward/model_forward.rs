@@ -552,6 +552,7 @@ impl Forward for ModelForward {
                 read_stage: None,
                 // R-P1-1: 최종 청크 무장 시에만 Some — layer loop 가 buf[i] 슬라이스에 PFA 누적.
                 prefill_attn: pfa_buf.as_mut().map(|b| (b, q_window)),
+                prefill_attn_per_row: None,
             })?;
             // R-P1-1: forward 산출된 PFA buffer 를 공유 cell 에 적재(stage 가 PrefillEnd 에서 read).
             if let Some(buf) = pfa_buf {
@@ -702,6 +703,7 @@ impl Forward for ModelForward {
             read_stage: read_stage_slot,
             // R-P1-1: decode 는 PFA 미산출(prefill-only producer).
             prefill_attn: None,
+            prefill_attn_per_row: None,
         })?;
         drop(score_guard); // guard 명시 해제 (end_step 이미 완료)
         self.read_logits(&self.logits_decode)

@@ -346,6 +346,13 @@ pub struct TransformerModelForwardArgs<'a> {
     /// per-attention-head attention 확률을 SUM-누적. `None`(decode / 미무장 / production·eval·ppl 기본)
     /// = byte-identical(layer 당 `is_some` branch 1회).
     pub prefill_attn: Option<(&'a mut Vec<Vec<f32>>, usize)>,
+    /// IMP-4 per-step PFA target. `Some((bufs, q_window, per_head))` — like [`Self::prefill_attn`]
+    /// but each trailing query row is written to its **own step slot** (assign, not SUM-collapsed),
+    /// yielding the per-output-step attention trajectory. `bufs[i]` is layer `i`'s flat per-step
+    /// buffer (head-mean `[q_window * prefix_len]` or, when `per_head`, full
+    /// `[q_window * n_heads_q * prefix_len]`), caller pre-zeroed. `None` everywhere except the
+    /// `answer_attention_steps` dump = byte-identical (per-layer `as_mut` branch once, INV-147).
+    pub prefill_attn_per_row: Option<(&'a mut Vec<Vec<f32>>, usize, bool)>,
 }
 
 impl TransformerModel {
@@ -1478,6 +1485,8 @@ impl TransformerModel {
         // R-P1-1 PFA producer target (최종 prefill 청크에서만 Some). None=byte-identical(prefill arm
         // 이 layer 당 `as_mut` branch 1회). prefix_len 은 caller(ModelForward)가 buf 크기로 박음.
         let mut prefill_attn = args.prefill_attn;
+        // IMP-4 per-step PFA target (answer_attention_steps dump 에서만 Some). None=byte-identical.
+        let mut prefill_attn_per_row = args.prefill_attn_per_row;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -1621,6 +1630,7 @@ impl TransformerModel {
                         local_attn_window: self.config.sliding_window,
                         // R-P1-1: degenerate 1-token fall-through(warmup/qcf decode-X)는 PFA 미산출.
                         pfa_target: None,
+                        pfa_per_row_target: None,
                     },
                 )?;
             } else if is_decode {
@@ -1675,6 +1685,10 @@ impl TransformerModel {
                 let pfa_target = prefill_attn
                     .as_mut()
                     .map(|(buf, qw)| (buf[i].as_mut_slice(), *qw));
+                // IMP-4: 무장 시 이 layer 의 per-step target((buf[i] 슬라이스, q_window, per_head)).
+                let pfa_per_row_target = prefill_attn_per_row
+                    .as_mut()
+                    .map(|(buf, qw, ph)| (buf[i].as_mut_slice(), *qw, *ph));
                 layer.forward_prefill_fmt(
                     crate::layers::transformer_layer::ForwardPrefillFmtArgs {
                         x: &mut x,
@@ -1695,6 +1709,7 @@ impl TransformerModel {
                         is_local_attn: is_local,
                         local_attn_window: self.config.sliding_window,
                         pfa_target,
+                        pfa_per_row_target,
                     },
                 )?;
             }

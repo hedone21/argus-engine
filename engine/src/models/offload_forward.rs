@@ -325,6 +325,7 @@ impl TransformerModel {
                         local_attn_window: self.config.sliding_window,
                         // R-P1-1: offload forward 경로는 PFA 미산출(StandardFormat producer 전용).
                         pfa_target: None,
+                        pfa_per_row_target: None,
                     },
                 )?;
             }

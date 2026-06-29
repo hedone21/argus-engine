@@ -967,6 +967,13 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub dump: Vec<String>,
 
+    /// `--dump answer_attention_steps`: emit the full per-head trajectory
+    /// `[step][layer][head][token]` instead of the head-mean `[step][layer][token]` default.
+    /// Large (≈ `num_attention_heads ×` the head-mean dump) — the dump logs the size at startup.
+    /// No effect unless `answer_attention_steps` is requested.
+    #[arg(long)]
+    pub answer_attention_steps_per_head: bool,
+
     /// eval-LL KV eviction timing (when eviction fires and which importance drives
     /// it). `post_prefill_probe` (default) = today's behavior: full prefill, a
     /// post-question probe, one eviction — the importance is query-informed.

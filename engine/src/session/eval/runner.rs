@@ -72,6 +72,26 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         )?;
     }
 
+    // ── IMP-4: answer_attention_steps diagnostic dump (read-only; INV-147) ─
+    // Same standalone reference pass as answer_attention, but per-output-step (the trajectory):
+    // one JSONL record per (question, step). Decoupled from scoring → NLL/MC byte-identical.
+    if args.dump_enabled(crate::session::eval::dump::DUMP_ANSWER_ATTENTION_STEPS) {
+        let out_path = args
+            .dump_path(crate::session::eval::dump::DUMP_ANSWER_ATTENTION_STEPS)
+            .ok_or_else(|| anyhow::anyhow!("--dump <kind> requires --dump-dir"))?;
+        crate::session::eval::run_answer_attention_steps_dump(
+            &model,
+            &tokenizer,
+            &backend,
+            memory.clone(),
+            &questions,
+            max_seq_len,
+            vocab_size,
+            &out_path,
+            args.answer_attention_steps_per_head,
+        )?;
+    }
+
     // ── QCF-dump prelude: --eval-ll + --qcf-dump + --force-swap-ratio ────
     // When all three flags are active we run warmup prefill → ImportanceTable
     // → WeightSwapDecider → SwapExecutor before the eval loop.  This mirrors

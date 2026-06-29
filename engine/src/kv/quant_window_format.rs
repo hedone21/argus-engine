@@ -119,8 +119,8 @@ impl KVCacheFormat for QuantWindowFormat {
         out: &mut Tensor,
         dims: AttnDims,
         scores: Option<&mut [f32]>,
-        // R-P1-1: quant-window format 은 PFA 미산출(None pass-through) — StandardFormat 만 producer.
-        _prefill_scores: Option<(&mut [f32], usize)>,
+        // R-P1-1 + IMP-4: quant-window format 은 PFA 미산출(None pass-through) — StandardFormat 만 producer.
+        _prefill_scores: Option<crate::format::PrefillScores<'_>>,
     ) -> Result<()> {
         let mut cache = self.inner.lock().unwrap();
         let n_heads_q = dims.n_heads_q;
