@@ -20,6 +20,10 @@ pub struct EvalConfig {
     /// When eviction fires and which importance drives it (`--evict-timing`).
     /// Default [`EvictTiming::PostPrefillProbe`] = today's behavior (INV-147).
     pub evict_timing: EvictTiming,
+    /// Faithful-H2O `(c)`: set true when eviction == "h2o". The batched prefill then seeds the score
+    /// accumulator with prefill-attention column-sums and the query probe is suppressed (the seed IS
+    /// the importance source). Token-by-token prefill is rejected. Default false (INV-147).
+    pub faithful_h2o: bool,
 }
 
 /// A single evaluation question (grouped format).

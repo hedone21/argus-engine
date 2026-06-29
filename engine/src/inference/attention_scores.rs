@@ -214,10 +214,133 @@ impl AttentionScoreAccumulator {
     }
 }
 
+/// Seed the accumulator's cumulative importance with prefill-attention column-sums (faithful-H2O `(c)`).
+///
+/// `pfa[l]` is the per-layer PFA buffer in the producer layout `[n_heads_q * prefix_len]` — the
+/// SUM-pooled post-softmax column-sum produced by `prefill_attention_scores` (for each key `t`, the
+/// attention mass it received from the prefill query window). Folding it through the byte-tested
+/// [`AttentionScoreAccumulator::accumulate_layer_gqa`] path in ONE synthetic step makes
+/// `importance += layer-MAX of head-summed column-sums` and `head_importance += GQA-avg`, reusing the
+/// exact decode arithmetic (decode layer-combine MAX is preserved — divergence `(b)` is untouched).
+///
+/// Faithful-H2O sets `time_normalize=false` upstream so this large prefill base is not divided by the
+/// decode-only step count (divergence `(a)`). The caller must have `set_active(true)` already (every
+/// production score accumulator is active before prefill-end); on an inactive accumulator
+/// `should_track_layer` is false and this is a no-op.
+pub fn seed_prefill_importance(
+    acc: &mut AttentionScoreAccumulator,
+    pfa: &[Vec<f32>],
+    prefix_len: usize,
+    n_heads_q: usize,
+    n_kv_heads: usize,
+) {
+    if prefix_len == 0 || n_heads_q == 0 {
+        return;
+    }
+    acc.begin_step();
+    for (l, layer_scores) in pfa.iter().enumerate() {
+        if !acc.should_track_layer(l) {
+            continue;
+        }
+        // PFA layout [n_heads_q * prefix_len] → stride = cache_seq_len = prefix_len, score_offset = 0.
+        acc.set_current_layer(l);
+        acc.accumulate_layer_gqa(
+            layer_scores,
+            prefix_len,
+            prefix_len,
+            n_heads_q,
+            n_kv_heads,
+            0,
+        );
+    }
+    acc.end_step();
+}
+
+/// Seed the prefill column-sums into BOTH the CPU accumulator and (on an OpenCL backend with an active
+/// GPU score accumulator) the GPU cumulative buffers — the faithful-H2O `(c)` seed for GPU runs.
+///
+/// On a GPU backend the eviction policy ranks on importance that is `import_gpu_scores`'d FROM the GPU
+/// buffers (the pre-eviction `sync_gpu_scores_to_cpu` OVERWRITES the CPU side), so seeding only the CPU
+/// accumulator would be clobbered before the policy ever reads it. We fold on the CPU as usual (that is
+/// the byte-tested arithmetic and the source of the values) and then push the just-folded raw cumulative
+/// into the GPU buffers; the subsequent decode `end_step`s accumulate on top. On a CPU backend (or with
+/// the `opencl` feature off / GPU score path unarmed) this is exactly `seed_prefill_importance` — the
+/// host path stays byte-identical.
+pub fn seed_prefill_importance_dual(
+    acc: &mut AttentionScoreAccumulator,
+    backend: &dyn crate::backend::Backend,
+    pfa: &[Vec<f32>],
+    prefix_len: usize,
+    n_heads_q: usize,
+    n_kv_heads: usize,
+) {
+    seed_prefill_importance(acc, pfa, prefix_len, n_heads_q, n_kv_heads);
+    #[cfg(not(feature = "opencl"))]
+    let _ = backend; // GPU seed only exists on the OpenCL backend.
+    #[cfg(feature = "opencl")]
+    if let Some(ocl) = backend
+        .as_any()
+        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+        && let Some(gpu_acc) = ocl.gpu_score_acc_mut()
+        && gpu_acc.is_active()
+    {
+        // Raw cumulative (faithful sets time_normalize off, so raw == normalized here, but the GPU
+        // buffer holds the raw cumulative the reduce kernel accumulates onto — match it explicitly).
+        let flat = acc.raw_importance_scores().to_vec();
+        if let Some(head) = acc.head_importance_scores()
+            && let Err(e) = gpu_acc.seed_cumulative(ocl.queue.as_core(), &flat, head)
+        {
+            log::warn!("faithful-H2O GPU prefill seed skipped: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 mod tests {
     use super::*;
+
+    /// Faithful-H2O `(c)`: `seed_prefill_importance` folds per-layer PFA column-sums into the
+    /// cumulative importance via the byte-tested `accumulate_layer_gqa` path — flat importance ends up
+    /// as the layer-MAX of the head-summed column-sums, per-KV-head importance as the GQA group
+    /// average. `time_normalize` stays false so `importance_scores()` returns the raw cumulative.
+    #[test]
+    fn test_seed_prefill_importance_folds_column_sums() {
+        // 4 q-heads, 2 kv-heads (n_rep=2), 2 layers, prefix_len=3, max_seq=4.
+        let prefix_len = 3;
+        let n_heads_q = 4;
+        let n_kv_heads = 2;
+        let mut acc = AttentionScoreAccumulator::new_gqa(4, n_heads_q, n_kv_heads, 2, 0, 0.0);
+        acc.set_active(true);
+
+        // Layer 0 PFA buffer [n_heads_q * prefix_len], out_row_base = h*prefix_len + key.
+        // head-sum per token: tok0 = 0.1+0.2+0.3+0.4 = 1.0, tok1 = 0.5*4 = 2.0, tok2 = 0.0.
+        let l0 = vec![
+            0.1, 0.5, 0.0, // h0: key0,key1,key2
+            0.2, 0.5, 0.0, // h1
+            0.3, 0.5, 0.0, // h2
+            0.4, 0.5, 0.0, // h3
+        ];
+        // Layer 1 head-sum per token: tok0 = 0.0, tok1 = 0.0, tok2 = 0.25*4 = 1.0.
+        let l1 = vec![
+            0.0, 0.0, 0.25, // h0
+            0.0, 0.0, 0.25, // h1
+            0.0, 0.0, 0.25, // h2
+            0.0, 0.0, 0.25, // h3
+        ];
+        seed_prefill_importance(&mut acc, &[l0, l1], prefix_len, n_heads_q, n_kv_heads);
+
+        // step_importance[t] = MAX over layers of head-sum, end_step adds it to importance.
+        let imp = acc.importance_scores();
+        assert!((imp[0] - 1.0).abs() < 1e-6, "tok0 = {}", imp[0]); // MAX(1.0, 0.0)
+        assert!((imp[1] - 2.0).abs() < 1e-6, "tok1 = {}", imp[1]); // MAX(2.0, 0.0)
+        assert!((imp[2] - 1.0).abs() < 1e-6, "tok2 = {}", imp[2]); // MAX(0.0, 1.0)
+
+        // head_importance = GQA-avg per kv-head (n_rep=2). L0 tok1: kv0 = avg(0.5,0.5) = 0.5, kv1 = 0.5.
+        let head = acc.head_importance_scores().unwrap();
+        assert!((head[1] - 0.5).abs() < 1e-6, "kv0 tok1 = {}", head[1]); // idx 0*max_seq+1
+        assert!((head[5] - 0.5).abs() < 1e-6, "kv1 tok1 = {}", head[5]); // idx 1*max_seq+1
+    }
 
     #[test]
     fn test_accumulate_single_layer() {

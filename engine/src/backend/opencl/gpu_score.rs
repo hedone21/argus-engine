@@ -345,6 +345,60 @@ impl GpuScoreAccumulator {
         Ok((flat, head))
     }
 
+    /// Seed the cumulative importance buffers with a prefill-attention column-sum (faithful-H2O `(c)`).
+    ///
+    /// On GPU, the eviction policy ranks on importance that is `import_gpu_scores`'d FROM these buffers
+    /// (the pre-eviction sync OVERWRITES the CPU-side importance), so the prefill seed cannot live only
+    /// on the CPU accumulator — it would be clobbered. We write the just-folded cumulative directly into
+    /// the GPU buffers; the subsequent decode `end_step`s accumulate on top (the fused reduce reads the
+    /// existing value, applies decay, then adds — so with the default no-decay config the seed persists).
+    ///
+    /// Must be called AFTER `new`/`reset` (which zero the buffers) and BEFORE the first decode `end_step`.
+    /// `flat.len() == max_seq_len`, `head.len() == n_kv_heads * max_seq_len` (same layout `sync_to_cpu`
+    /// reads back and `import_gpu_scores` consumes).
+    pub fn seed_cumulative(
+        &self,
+        queue: &ocl::core::CommandQueue,
+        flat: &[f32],
+        head: &[f32],
+    ) -> Result<()> {
+        if flat.len() != self.max_seq_len {
+            anyhow::bail!(
+                "seed_cumulative: flat.len()={} != max_seq_len={}",
+                flat.len(),
+                self.max_seq_len
+            );
+        }
+        if head.len() != self.n_kv_heads * self.max_seq_len {
+            anyhow::bail!(
+                "seed_cumulative: head.len()={} != n_kv_heads*max_seq_len={}",
+                head.len(),
+                self.n_kv_heads * self.max_seq_len
+            );
+        }
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                queue,
+                &self.importance,
+                true,
+                0,
+                flat,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+            ocl::core::enqueue_write_buffer(
+                queue,
+                &self.head_importance,
+                true,
+                0,
+                head,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Reset cumulative importance (after eviction).
     pub fn reset(&mut self, queue: &ocl::core::CommandQueue) -> Result<()> {
         let flat_size = self.max_seq_len;

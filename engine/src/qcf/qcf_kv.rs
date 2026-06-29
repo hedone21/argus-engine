@@ -386,8 +386,8 @@ mod tests {
             target_len: usize,
         },
         H2o {
-            target_len: usize,
-            keep_ratio: f32,
+            hh_size: usize,
+            recent_size: usize,
             protected_prefix: usize,
         },
         Streaming {
@@ -418,20 +418,37 @@ mod tests {
         layout: KVLayout,
         beta: f32,
     ) -> (f32, Vec<f32>) {
-        let (name, sp, target_len) = match action {
-            TestAction::Sliding { target_len } => ("sliding", StageParams::default(), target_len),
+        // Faithful h2o takes ABSOLUTE budgets via the `--set` blob; other techniques use StageParams.
+        let (name, sp, target_len, args): (
+            &str,
+            StageParams,
+            usize,
+            Vec<argus_extension_api::PluginArg<'static>>,
+        ) = match action {
+            TestAction::Sliding { target_len } => {
+                ("sliding", StageParams::default(), target_len, vec![])
+            }
             TestAction::H2o {
-                target_len,
-                keep_ratio,
+                hh_size,
+                recent_size,
                 protected_prefix,
             } => (
                 "h2o",
                 StageParams {
-                    keep_ratio,
                     protected_prefix,
                     ..Default::default()
                 },
-                target_len,
+                hh_size + recent_size + protected_prefix,
+                vec![
+                    argus_extension_api::PluginArg {
+                        key: "hh_size",
+                        val: Box::leak(hh_size.to_string().into_boxed_str()),
+                    },
+                    argus_extension_api::PluginArg {
+                        key: "recent_size",
+                        val: Box::leak(recent_size.to_string().into_boxed_str()),
+                    },
+                ],
             ),
             TestAction::Streaming {
                 sink_size,
@@ -445,6 +462,7 @@ mod tests {
                 },
                 // streaming reads sink+window from its config, not target_len.
                 0,
+                vec![],
             ),
             TestAction::D2o {
                 target_len,
@@ -458,11 +476,12 @@ mod tests {
                     ..Default::default()
                 },
                 target_len,
+                vec![],
             ),
         };
         let est = (find_qcf_estimator(name)
             .unwrap_or_else(|| panic!("estimator '{name}' registered"))
-            .make)(sp, &[]);
+            .make)(sp, &args);
         let params = QcfKvParams {
             estimator: &*est,
             target_len,
@@ -711,8 +730,9 @@ mod tests {
         );
         let (qcf_h2o, _) = run(
             TestAction::H2o {
-                target_len,
-                keep_ratio: 0.5,
+                // faithful absolute budget reproducing the old keep_ratio=0.5 of target_len=8.
+                hh_size: 4,
+                recent_size: 4,
                 protected_prefix: 0,
             },
             VDataSource::F32(&v_data),
@@ -890,8 +910,9 @@ mod tests {
 
         let (qcf_h2o, ph_h2o) = run(
             TestAction::H2o {
-                target_len,
-                keep_ratio,
+                // faithful absolute budget reproducing the old keep_ratio=0.5 of target_len=2.
+                hh_size: 1,
+                recent_size: 1,
                 protected_prefix,
             },
             VDataSource::F32(&v_data),

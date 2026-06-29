@@ -95,6 +95,11 @@ pub struct ModelForward {
     prefill_attn_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
     wants_prefill_attn: bool,
     q_window: usize,
+    // Faithful-H2O `(c)`: when true, the final-prefill-chunk PFA column-sums are folded into the
+    // shared `score_cell` (via `seed_prefill_importance`) before the cell is published — so the
+    // importance the eviction stage ranks on reflects prefill attention, not just decode. Armed only
+    // on the faithful-h2o path (`arm_faithful_prefill_seed`); false → prefill byte-identical.
+    seed_prefill_scores: bool,
 
     decode_workspace: LayerWorkspace,
     // Phase 4-4.5: paradigm equivalence requires `prefill_workspace: None`
@@ -195,6 +200,7 @@ impl ModelForward {
             prefill_attn_cell: Arc::new(Mutex::new(None)),
             wants_prefill_attn: false,
             q_window: 0,
+            seed_prefill_scores: false,
             decode_workspace,
             prefill_workspace: None,
             max_seq_len,
@@ -250,6 +256,14 @@ impl ModelForward {
         self.prefill_attn_cell = cell;
         self.wants_prefill_attn = true;
         self.q_window = q_window;
+    }
+
+    /// Faithful-H2O `(c)`: arm the prefill-attention seed. After [`set_prefill_attn`] arms PFA with a
+    /// full-prompt `q_window`, this makes `prefill` fold the resulting per-key column-sums into the
+    /// shared `score_cell` (via `seed_prefill_importance`) at the final prefill chunk — so the
+    /// importance the eviction stage ranks on reflects prefill attention. No-op unless armed.
+    pub fn arm_faithful_prefill_seed(&mut self) {
+        self.seed_prefill_scores = true;
     }
 
     /// Phase 4-4.7 (A1): plan eligibility 검사 + build 시도.
@@ -556,6 +570,23 @@ impl Forward for ModelForward {
             })?;
             // R-P1-1: forward 산출된 PFA buffer 를 공유 cell 에 적재(stage 가 PrefillEnd 에서 read).
             if let Some(buf) = pfa_buf {
+                // Faithful-H2O (c): fold the prefill column-sums into the shared score accumulator
+                // BEFORE publishing the cell — so the importance the eviction stage ranks on reflects
+                // prefill attention, not just decode. Armed only on the faithful-h2o path
+                // (`arm_faithful_prefill_seed`); otherwise this branch is skipped (byte-identical).
+                if self.seed_prefill_scores
+                    && let Some(acc) = self.score_cell.lock().unwrap().as_mut()
+                {
+                    let cfg = &self.model.config;
+                    crate::inference::attention_scores::seed_prefill_importance_dual(
+                        acc,
+                        self.backend.as_ref(),
+                        &buf,
+                        start_pos + seq_len,
+                        cfg.num_attention_heads,
+                        cfg.num_key_value_heads,
+                    );
+                }
                 *self.prefill_attn_cell.lock().unwrap() = Some(buf);
             }
 

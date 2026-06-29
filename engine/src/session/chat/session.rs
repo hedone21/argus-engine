@@ -38,6 +38,21 @@ use crate::session::forward::{
 use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::resilience_adapter::ResilienceAdapter;
 
+/// Faithful-H2O `(c)` chat seed: the prefill column-sum cell shared with `ModelForward` plus the
+/// head geometry needed to fold it into the chat-local score accumulator. `Some` only when faithful
+/// (eviction == "h2o"). The cell is filled by `ModelForward::prefill` (PFA armed at build time) and
+/// drained per-turn by [`ChatSession::prefill`] — `ModelForward`'s own `score_cell` stays a dummy
+/// `None` so chat decode + the GPU plan fast path remain byte-identical.
+pub struct FaithfulPrefillSeed {
+    pub cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+    pub n_heads_q: usize,
+    pub n_kv_heads: usize,
+    /// The forward's backend handle — `ChatSession::prefill` needs it to push the prefill seed into the
+    /// GPU score accumulator (faithful-H2O `(c)` on OpenCL, where the pre-eviction sync would otherwise
+    /// clobber a CPU-only seed). On a CPU backend the dual-seed downcast is a no-op.
+    pub backend: Arc<dyn crate::backend::Backend>,
+}
+
 /// `ChatKvMode::Standard` variant inner payload.
 ///
 /// `CacheManager` + `AttentionScoreAccumulator`로 인해 ~376 bytes로 enum 전체가
@@ -50,6 +65,8 @@ pub struct ChatKvModeStandard {
     pub policy_name: String,
     pub target_ratio: f32,
     pub evicted_total: usize,
+    /// Faithful-H2O `(c)`: prefill column-sum seed; `Some` only when eviction == "h2o".
+    pub faithful_prefill: Option<FaithfulPrefillSeed>,
 }
 
 /// chat 모드의 KV-type 분기 (eviction-capable vs not).
@@ -209,6 +226,32 @@ impl ChatSession {
     /// turn 시작 시 prompt prefill. pos 갱신.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         let logits = self.decode_loop.prefill(tokens)?;
+        // Faithful-H2O (c): fold the prefill column-sums into the chat-local score accumulator. RESET
+        // per-turn first — the accumulator is absolute-position-indexed but the cache compacts on
+        // turn-boundary eviction, so each turn re-seeds from its own prefill (decode does NOT feed it).
+        if let ChatKvMode::Standard(s) = &mut self.kv_mode {
+            let seed = s.faithful_prefill.as_ref().and_then(|fp| {
+                fp.cell
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .map(|buf| (buf, fp.n_heads_q, fp.n_kv_heads, fp.backend.clone()))
+            });
+            if let Some((buf, n_heads_q, n_kv_heads, backend)) = seed
+                && let Some(acc) = s.score_accumulator.as_mut()
+            {
+                let prompt_len = buf.first().map(|l| l.len() / n_heads_q.max(1)).unwrap_or(0);
+                acc.reset();
+                crate::inference::attention_scores::seed_prefill_importance_dual(
+                    acc,
+                    backend.as_ref(),
+                    &buf,
+                    prompt_len,
+                    n_heads_q,
+                    n_kv_heads,
+                );
+            }
+        }
         self.pos = self.decode_loop.pos_snapshot();
         Ok(logits)
     }
@@ -585,7 +628,17 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
     let score_cell: Arc<
         Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>,
     > = Arc::new(Mutex::new(None));
-    let mf = ModelForward::new(
+    // Faithful-H2O (c): capture head geometry before `ctx.model` is moved into ModelForward.
+    let faithful_h2o = policy_name == "h2o";
+    let fp_n_heads_q = ctx.model.config.num_attention_heads;
+    let fp_n_kv_heads = ctx.model.config.num_key_value_heads;
+    // Clone the backend handle for the faithful-H2O GPU seed BEFORE `ctx.backend` is moved into mf.
+    let fp_backend = if faithful_h2o {
+        Some(ctx.backend.clone())
+    } else {
+        None
+    };
+    let mut mf = ModelForward::new(
         ctx.backend,
         ctx.memory,
         ctx.cpu_backend,
@@ -596,6 +649,21 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
         hook_cell,
         score_cell,
     )?;
+    // Faithful-H2O (c): arm a full-prompt-window PFA producer feeding a chat-local cell. ModelForward's
+    // OWN score_cell stays dummy None (decode + GPU plan fast path byte-identical); the cell is drained
+    // per-turn by ChatSession::prefill into the chat-local score accumulator.
+    let faithful_prefill = if faithful_h2o {
+        let cell = Arc::new(Mutex::new(None));
+        mf.set_prefill_attn(cell.clone(), usize::MAX);
+        Some(FaithfulPrefillSeed {
+            cell,
+            n_heads_q: fp_n_heads_q,
+            n_kv_heads: fp_n_kv_heads,
+            backend: fp_backend.expect("fp_backend is Some when faithful_h2o"),
+        })
+    } else {
+        None
+    };
 
     // Resilience: heartbeat KV handle (layer-0 StandardFormat) + dispatcher kv_handles.
     // `fmt_caches()` is populated by `ModelForward::new`. Read before `mf` is moved.
@@ -618,6 +686,7 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
             policy_name,
             target_ratio,
             evicted_total: 0,
+            faithful_prefill,
         })),
     })
 }
@@ -821,7 +890,7 @@ fn build_chat_eviction_internal(
             crate::kv::eviction::stage_registry::make_stage_backed_policy(name, &params, &extra)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>)",
+                        "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, d2o{} (or --load-plugin <.so>)",
                         name,
                         if cfg!(feature = "caote") { ", caote" } else { "" }
                     )
@@ -851,7 +920,10 @@ fn build_chat_eviction_internal(
         args.h2o_decay(),
     );
     acc.set_active(true);
-    acc.set_time_normalize(!args.h2o_raw_scores());
+    // Faithful-H2O (a): force time_normalize OFF for h2o so the prefill column-sum base is not
+    // divided by the decode-only step count. Non-h2o policies keep their behavior.
+    let faithful = eviction_policy == "h2o";
+    acc.set_time_normalize(!faithful && !args.h2o_raw_scores());
 
     // GPU-side accumulator init (OpenCL only). Caps-driven arming: only when the policy consumes
     // scores (`score_based`); a score-free policy still runs eviction but never reads importance, so
@@ -954,6 +1026,7 @@ mod tests {
                 policy_name: "none".to_string(),
                 target_ratio: 1.0,
                 evicted_total: 0,
+                faithful_prefill: None,
             })),
             pos: 0,
             max_seq_len,
@@ -1206,6 +1279,7 @@ mod tests {
                 policy_name: "sliding".to_string(),
                 target_ratio: 0.5,
                 evicted_total: 0,
+                faithful_prefill: None,
             })),
             pos: 0,
             max_seq_len: 10,
@@ -1311,6 +1385,7 @@ mod tests {
                 policy_name: "sliding".to_string(),
                 target_ratio: 0.5,
                 evicted_total: 0,
+                faithful_prefill: None,
             })),
             pos: 0,
             max_seq_len,

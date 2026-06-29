@@ -1016,6 +1016,56 @@ fn merge_row_weighted_opaque(
         .expect("opaque weighted-merge merge re-encode (q4_0 family descriptor)");
 }
 
+/// Read a (possibly device-resident, possibly quantized) tensor back to host f32, dequantizing
+/// Q4_0/F16 in place. Shared by the GPU device-only attention fallback and the faithful-H2O GPU
+/// host-mirror PFA path (both need the same float view the flash kernel computed over).
+fn read_tensor_to_f32(t: &Tensor, backend: &dyn Backend, vec: &mut Vec<f32>) -> Result<()> {
+    fn as_u8_mut(v: &mut [f32]) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
+    }
+    if t.dtype() == DType::Q4_0 {
+        use crate::quant::{BlockQ4_0, QK4_0};
+        let numel = t.numel();
+        let n_blocks = numel / QK4_0;
+        let byte_size = n_blocks * std::mem::size_of::<BlockQ4_0>();
+        let mut byte_vec = vec![0u8; byte_size];
+        backend.read_buffer(t, &mut byte_vec)?;
+        vec.resize(numel, 0.0);
+        let blocks =
+            unsafe { std::slice::from_raw_parts(byte_vec.as_ptr() as *const BlockQ4_0, n_blocks) };
+        for i in 0..n_blocks {
+            let mut tmp = [0.0f32; QK4_0];
+            blocks[i].dequantize(&mut tmp);
+            vec[i * QK4_0..(i + 1) * QK4_0].copy_from_slice(&tmp);
+        }
+    } else if t.dtype() == DType::F16 {
+        let numel = t.numel();
+        let byte_size = numel * 2;
+        let mut byte_vec = vec![0u8; byte_size];
+        backend.read_buffer(t, &mut byte_vec)?;
+        vec.resize(numel, 0.0);
+        unsafe {
+            crate::quant::f16_bulk::bulk_f16_to_f32(
+                byte_vec.as_ptr() as *const u16,
+                vec.as_mut_ptr(),
+                numel,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let f16_slice =
+                unsafe { std::slice::from_raw_parts(byte_vec.as_ptr() as *const half::f16, numel) };
+            for i in 0..numel {
+                vec[i] = f16_slice[i].to_f32();
+            }
+        }
+    } else {
+        vec.resize(t.numel(), 0.0);
+        backend.read_buffer(t, as_u8_mut(vec))?;
+    }
+    Ok(())
+}
+
 /// prefill multi-token causal attention (C-1, §9.1-BC1 / ①-b).
 ///
 /// `forward_prefill`(transformer_layer/forward.rs:259-585)의 attention 블록을 그대로 미러한다 —
@@ -1079,6 +1129,48 @@ pub(crate) fn prefill_attention(
         false
     };
     if gpu_dispatched {
+        // Faithful-H2O `(c)` host-mirror: the GPU flash kernel produced `out` but emits no per-key PFA.
+        // Read K (+ the query window) back to host and run the SAME scalar `prefill_attention_scores`
+        // the CPU path uses, so the prefill column-sum seed fires on GPU too. `out` is untouched (GPU
+        // already wrote the real attention). `None` (producer unarmed) → this whole branch is skipped
+        // and the dispatch stays byte-identical to before.
+        if let Some(ps) = prefill_scores {
+            let is_head_major = kv_layout == KVLayout::HeadMajor;
+            let mut q_host = Vec::new();
+            let mut k_host = Vec::new();
+            read_tensor_to_f32(q, backend, &mut q_host)?;
+            read_tensor_to_f32(k_cache, backend, &mut k_host)?;
+            let (k_pos_stride, kv_head_stride) = if is_head_major {
+                (head_dim, kv_capacity * head_dim)
+            } else {
+                (n_heads_kv * head_dim, head_dim)
+            };
+            let chunk_q_stride = seq_len * n_heads_q * head_dim;
+            let k_valid_len = if is_head_major {
+                n_heads_kv * kv_capacity * head_dim
+            } else {
+                cache_seq_len * n_heads_kv * head_dim
+            };
+            // Forward both the SUM (faithful-H2O (c) seed) and the per-row sibling (IMP-4
+            // answer_attention_steps) through the host-mirror, mirroring the CPU branch — so the
+            // GPU flash path supports either dump. `None` everywhere else → byte-identical.
+            prefill_attention_scores(
+                &q_host[0..chunk_q_stride],
+                &k_host[0..k_valid_len],
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                seq_len,
+                cache_seq_len,
+                k_pos_stride,
+                kv_head_stride,
+                q_start_pos,
+                ps.q_window,
+                window,
+                ps.sum,
+                ps.per_row,
+            );
+        }
         return Ok(());
     }
 
@@ -1086,64 +1178,14 @@ pub(crate) fn prefill_attention(
     let is_device_only = is_gpu && q.as_ptr().is_null();
     let mut out_vec: Vec<f32> = Vec::new();
     {
-        fn as_u8_mut(v: &mut [f32]) -> &mut [u8] {
-            unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
-        }
-
         let mut q_vec = Vec::new();
         let mut k_vec = Vec::new();
         let mut v_vec = Vec::new();
 
         let (q_data, k_data, v_data, out_ptr) = if is_device_only {
-            let read_to_f32 = |t: &Tensor, vec: &mut Vec<f32>| -> Result<()> {
-                if t.dtype() == DType::Q4_0 {
-                    use crate::quant::{BlockQ4_0, QK4_0};
-                    let numel = t.numel();
-                    let n_blocks = numel / QK4_0;
-                    let byte_size = n_blocks * std::mem::size_of::<BlockQ4_0>();
-                    let mut byte_vec = vec![0u8; byte_size];
-                    backend.read_buffer(t, &mut byte_vec)?;
-                    vec.resize(numel, 0.0);
-                    let blocks = unsafe {
-                        std::slice::from_raw_parts(byte_vec.as_ptr() as *const BlockQ4_0, n_blocks)
-                    };
-                    for i in 0..n_blocks {
-                        let mut tmp = [0.0f32; QK4_0];
-                        blocks[i].dequantize(&mut tmp);
-                        vec[i * QK4_0..(i + 1) * QK4_0].copy_from_slice(&tmp);
-                    }
-                } else if t.dtype() == DType::F16 {
-                    let numel = t.numel();
-                    let byte_size = numel * 2;
-                    let mut byte_vec = vec![0u8; byte_size];
-                    backend.read_buffer(t, &mut byte_vec)?;
-                    vec.resize(numel, 0.0);
-                    unsafe {
-                        crate::quant::f16_bulk::bulk_f16_to_f32(
-                            byte_vec.as_ptr() as *const u16,
-                            vec.as_mut_ptr(),
-                            numel,
-                        );
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        let f16_slice = unsafe {
-                            std::slice::from_raw_parts(byte_vec.as_ptr() as *const half::f16, numel)
-                        };
-                        for i in 0..numel {
-                            vec[i] = f16_slice[i].to_f32();
-                        }
-                    }
-                } else {
-                    vec.resize(t.numel(), 0.0);
-                    backend.read_buffer(t, as_u8_mut(vec))?;
-                }
-                Ok(())
-            };
-
-            read_to_f32(q, &mut q_vec)?;
-            read_to_f32(k_cache, &mut k_vec)?;
-            read_to_f32(v_cache, &mut v_vec)?;
+            read_tensor_to_f32(q, backend, &mut q_vec)?;
+            read_tensor_to_f32(k_cache, backend, &mut k_vec)?;
+            read_tensor_to_f32(v_cache, backend, &mut v_vec)?;
 
             out_vec.resize(out.numel(), 0.0);
 
@@ -1465,6 +1507,145 @@ fn prefill_attention_scores(
             }
         }
     }
+}
+
+/// On-device faithful-H2O `(c)` host-mirror self-check (device-test seam — `#[doc(hidden)]`, not API).
+///
+/// Builds a **device-resident** HeadMajor F16 KV view + device F32 query, then calls [`prefill_attention`]
+/// so the GPU flash kernel dispatches (`gpu_dispatched`) and the NEW host-mirror branch — the only code
+/// that fills the PFA side-channel under that early-return — produces the prefill column-sums. Runs the
+/// same call on the CPU backend over byte-identical data as a reference. Returns
+/// `(pfa_gpu, pfa_cpu, gpu_flash_confirmed)`:
+/// - `pfa_gpu == pfa_cpu` (byte-identical) proves the host-mirror computes exactly the CPU PFA on real
+///   hardware (both run the same scalar `prefill_attention_scores` over the same dequantized floats);
+/// - `gpu_flash_confirmed` is `out_gpu != out_cpu` — the GPU flash kernel and CPU flash share no rounding,
+///   so a byte difference in the attention OUTPUT independently confirms the GPU actually dispatched
+///   (hence the host-mirror branch ran, not the CPU `is_device_only` fallback).
+///
+/// The caller (`test_faithful_h2o_gpu_seed_device` bin) asserts `pfa_gpu == pfa_cpu`, `pfa_gpu` non-zero,
+/// and reports `gpu_flash_confirmed`.
+#[cfg(feature = "opencl")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn faithful_h2o_pfa_host_mirror_selfcheck(
+    gpu_backend: &std::sync::Arc<dyn Backend>,
+    gpu_memory: &std::sync::Arc<dyn crate::memory::Memory>,
+    cpu_backend: &std::sync::Arc<dyn Backend>,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    seq_len: usize,
+    q_window: usize,
+) -> Result<(Vec<f32>, Vec<f32>, bool)> {
+    use crate::buffer::{Buffer, DType};
+    use crate::kv_cache_ops::KVLayout;
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
+    use half::f16;
+    use std::sync::Arc;
+
+    let cache_seq_len = seq_len; // fresh prefill → q_start_pos = 0; no padding (capacity == seq_len).
+    let kv_capacity = seq_len;
+    let total_kv = n_heads_kv * kv_capacity * head_dim;
+    let total_q = seq_len * n_heads_q * head_dim;
+
+    // Deterministic known data — identical bytes on both backends.
+    let q_f32: Vec<f32> = (0..total_q)
+        .map(|i| ((i % 23) as f32 - 11.0) * 0.021)
+        .collect();
+    let q_bytes = unsafe { std::slice::from_raw_parts(q_f32.as_ptr() as *const u8, total_q * 4) };
+    let mut k_f16 = vec![0u8; total_kv * 2];
+    let mut v_f16 = vec![0u8; total_kv * 2];
+    {
+        let kk =
+            unsafe { std::slice::from_raw_parts_mut(k_f16.as_mut_ptr() as *mut f16, total_kv) };
+        let vv =
+            unsafe { std::slice::from_raw_parts_mut(v_f16.as_mut_ptr() as *mut f16, total_kv) };
+        for i in 0..total_kv {
+            kk[i] = f16::from_f32(((i % 29) as f32 - 14.0) * 0.013);
+            vv[i] = f16::from_f32(((i % 31) as f32 - 15.0) * 0.011);
+        }
+    }
+    let kv_shape = Shape::new(vec![1, n_heads_kv, kv_capacity, head_dim]);
+    let q_shape = Shape::new(vec![1, seq_len, n_heads_q, head_dim]);
+
+    let run = |backend: &std::sync::Arc<dyn Backend>,
+               k_t: &Tensor,
+               v_t: &Tensor,
+               q_t: &Tensor,
+               out_t: &mut Tensor|
+     -> Result<Vec<f32>> {
+        let mut pfa = vec![0.0f32; n_heads_q * cache_seq_len];
+        prefill_attention(
+            q_t,
+            out_t,
+            k_t,
+            v_t,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            seq_len,
+            cache_seq_len,
+            kv_capacity,
+            1,
+            KVLayout::HeadMajor,
+            0,
+            None,
+            backend.as_ref(),
+            Some(PrefillScores {
+                q_window,
+                sum: Some(&mut pfa),
+                per_row: None,
+            }),
+        )?;
+        Ok(pfa)
+    };
+
+    // ── GPU path: device-resident F16 KV + F32 Q/out → host-mirror PFA. ──
+    let (pfa_gpu, out_gpu) = {
+        let k_buf = gpu_memory.alloc_kv(total_kv * 2, DType::F16)?;
+        let v_buf = gpu_memory.alloc_kv(total_kv * 2, DType::F16)?;
+        let mut k_t = Tensor::new(kv_shape.clone(), k_buf, gpu_backend.clone());
+        let mut v_t = Tensor::new(kv_shape.clone(), v_buf, gpu_backend.clone());
+        gpu_backend.write_buffer(&mut k_t, &k_f16)?;
+        gpu_backend.write_buffer(&mut v_t, &v_f16)?;
+        anyhow::ensure!(
+            k_t.buffer().is_gpu_buffer(),
+            "GPU K must be device-resident (else flash never dispatches → host-mirror untested)"
+        );
+        let q_buf = gpu_memory.alloc_kv(total_q * 4, DType::F32)?;
+        let out_buf = gpu_memory.alloc_kv(total_q * 4, DType::F32)?;
+        let mut q_t = Tensor::new(q_shape.clone(), q_buf, gpu_backend.clone());
+        let mut out_t = Tensor::new(q_shape.clone(), out_buf, gpu_backend.clone());
+        gpu_backend.write_buffer(&mut q_t, q_bytes)?;
+        let pfa = run(gpu_backend, &k_t, &v_t, &q_t, &mut out_t)?;
+        let mut out_bytes = vec![0u8; total_q * 4];
+        gpu_backend.read_buffer(&out_t, &mut out_bytes)?;
+        (pfa, out_bytes)
+    };
+
+    // ── CPU reference: host F16 KV + F32 Q over identical bytes + identical HeadMajor strides. ──
+    let (pfa_cpu, out_cpu) = {
+        let k_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::new(total_kv * 2, DType::F16));
+        let v_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::new(total_kv * 2, DType::F16));
+        let mut k_t = Tensor::new(kv_shape.clone(), k_buf, cpu_backend.clone());
+        let mut v_t = Tensor::new(kv_shape.clone(), v_buf, cpu_backend.clone());
+        cpu_backend.write_buffer(&mut k_t, &k_f16)?;
+        cpu_backend.write_buffer(&mut v_t, &v_f16)?;
+        let q_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::new(total_q * 4, DType::F32));
+        let out_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::new(total_q * 4, DType::F32));
+        let mut q_t = Tensor::new(q_shape.clone(), q_buf, cpu_backend.clone());
+        let mut out_t = Tensor::new(q_shape.clone(), out_buf, cpu_backend.clone());
+        cpu_backend.write_buffer(&mut q_t, q_bytes)?;
+        let pfa = run(cpu_backend, &k_t, &v_t, &q_t, &mut out_t)?;
+        let mut out_bytes = vec![0u8; total_q * 4];
+        cpu_backend.read_buffer(&out_t, &mut out_bytes)?;
+        (pfa, out_bytes)
+    };
+
+    let gpu_flash_confirmed = out_gpu != out_cpu;
+    Ok((pfa_gpu, pfa_cpu, gpu_flash_confirmed))
 }
 
 // ── SnapshotRestore capability ────────────────────────────────────

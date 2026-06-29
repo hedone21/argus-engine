@@ -1,101 +1,156 @@
 //! H2O (Heavy-Hitter Oracle) technique crate — attention-score-based KV eviction (Zhang et al., 2023).
 //!
-//! Extracted from the engine core into a self-registering technique crate (the `caote`/`quest`
-//! precedent): depends only on `argus-extension-api` + `linkme`, implements [`KVMutationStage`], and
-//! registers under the name `"h2o"` via `register_kv_mutation_stage!`. The engine
-//! force-links it (`use h2o as _;`) so `eviction plugin --name h2o` resolves the out-of-tree plugin.
+//! Faithful to the reference `H2OKVCache_LayerWise` (FMInference/H2O): the cache keeps a FIXED budget
+//! of `hh_size` heavy hitters (highest cumulative attention) + `recent_size` most-recent tokens, with
+//! NO attention-sink prefix by default (`default_protected_prefix = 0`). The budgets are ABSOLUTE
+//! (`--set hh_size=… --set recent_size=…`), not a ratio of an engine-supplied `target_len` — the
+//! budget IS the policy, so the CLI requires both explicitly (`Args::require_h2o_budgets`).
 //!
-//! 3-partition model: `[Protected Prefix] [Heavy Hitters (score-ranked)] [Recent Window]`. After
-//! reserving the prefix, the remaining budget splits between HH and recent by `keep_ratio`
-//! (default 0.5 = the paper's 50:50). Heavy hitters are the highest-cumulative-attention tokens,
-//! read from [`StageCtx::importance`]. When no scores are supplied the stage degrades to recency
-//! (prefix + most-recent), matching the engine's score-free fallback.
+//! Per-head when the engine supplies per-(kv_head, pos) scores via `ctx.tensor(Scores)` (each KV head
+//! ranks its own heavy hitters, all heads keeping the same count so the single `current_pos`
+//! invariant holds — the original H2O granularity); otherwise the flat layer-wide importance, and
+//! score-free to recency.
 //!
-//! The stage only reads `current_pos`/`target_len`/`importance` and stages a layer-wide
-//! keep-set on the cache handle (imperative, v3).
+//! The faithful prefill-attention seed for the importance score (divergence `(c)`) is wired in the
+//! engine (`seed_prefill_importance`); this crate only consumes `ctx.importance()` / `tensor(Scores)`.
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, EstimatorCtx, KVMutationStage, KeepTopK, MutationPhase,
+    CacheHandle, CacheOpError, EstimatorCtx, KVMutationStage, KeepSpec, KeepTopK, MutationPhase,
     QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
     TensorKind, compile_keep_top_k, redistribute_value, register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
 
-/// The score-based caps for the v3 registration: H2O reads
-/// accumulated importance (Scores) and protects 4 sinks by default.
+/// The score-based caps for the v3 registration: H2O reads accumulated importance (Scores) and — to
+/// stay faithful to the reference, which has no attention sink — protects NO prefix by default.
 const H2O_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::Scores],
-    default_protected_prefix: 4,
+    default_protected_prefix: 0,
     produces_merge_plan: false,
 };
 
-/// H2O eviction stage. `keep_ratio` is clamped to `[0,1]` and `protected_prefix` to ≥4, matching
-/// the original engine policy constructor.
+/// Parse the absolute heavy-hitter / recent budgets from the technique-private `--set` blob.
+///
+/// EXPLICIT-REQUIRED: faithful H2O has no meaningful default budget (the budget IS the policy), so a
+/// run that omits `hh_size`/`recent_size` is rejected at the CLI layer ([`Args::require_h2o_budgets`])
+/// with a clean error — not here, since the `make` ABI is infallible. When absent here (e.g. the
+/// registration self-test's empty args) both default to 0: a degenerate keep-prefix-only stage that
+/// production never reaches.
+fn parse_h2o_budgets(args: StageArgs<'_>) -> (usize, usize) {
+    let mut hh_size = 0usize;
+    let mut recent_size = 0usize;
+    for a in args {
+        match a.key {
+            "hh_size" => {
+                if let Ok(v) = a.val.parse() {
+                    hh_size = v;
+                }
+            }
+            "recent_size" => {
+                if let Ok(v) = a.val.parse() {
+                    recent_size = v;
+                }
+            }
+            _ => {}
+        }
+    }
+    (hh_size, recent_size)
+}
+
+/// H2O eviction stage. Absolute `hh_size`/`recent_size` budgets (+ optional `protected_prefix`), with
+/// no clamps — faithful to `H2OKVCache_LayerWise(hh_size, recent_size)`.
 struct H2o {
-    keep_ratio: f32,
+    hh_size: usize,
+    recent_size: usize,
     protected_prefix: usize,
 }
 
-impl H2o {
-    fn new(keep_ratio: f32, protected_prefix: usize) -> Self {
-        Self {
-            keep_ratio: keep_ratio.clamp(0.0, 1.0),
-            protected_prefix: protected_prefix.max(4),
-        }
+/// The shared 3-partition budget (prefix / top-`hh_size` heavy / `recent_size` recent), computed once
+/// per plan. `None` from [`H2o::partition`] means already within budget (no-op).
+struct Partition {
+    prefix: usize,
+    hh_budget: usize,
+    recent: usize,
+    current: usize,
+}
+
+impl Partition {
+    /// One head's (or the layer-wide) ascending keep-list: prefix ∪ top-`hh_budget` scorers over the
+    /// evictable middle ∪ the `recent`-token recency window. Routed through the engine T1 compiler.
+    fn keep_list(&self, score: impl Fn(usize) -> f32) -> Vec<usize> {
+        compile_keep_top_k(
+            KeepTopK {
+                current: self.current,
+                prefix: self.prefix,
+                recent: self.recent,
+                heavy: self.hh_budget,
+            },
+            score,
+        )
+    }
+
+    /// Score-free fallback: give the full evictable budget (`hh_budget + recent`) to recency.
+    fn keep_list_recency(&self) -> Vec<usize> {
+        compile_keep_top_k(
+            KeepTopK {
+                current: self.current,
+                prefix: self.prefix,
+                recent: self.hh_budget + self.recent,
+                heavy: 0,
+            },
+            |_| 0.0,
+        )
     }
 }
 
 impl H2o {
-    /// The keep-list (`None` = no-op within budget / nothing to prune), ported verbatim from the
-    /// engine `H2OPolicy::plan_keep`. Drives the v3 `on_phase`. The 3-partition T1 shape is routed
-    /// through `compile_keep_top_k` (the policy supplies budgets + a score fn; the compiler owns the
-    /// recency window + STABLE top-k + ascending re-sort).
-    fn keep_list(
-        &self,
-        current: usize,
-        target: usize,
-        importance: Option<&[f32]>,
-    ) -> Option<Vec<usize>> {
-        let keep = target.max(self.protected_prefix + 2);
-        let prefix = self.protected_prefix;
-        if current <= keep {
+    fn from_args(p: StageParams, args: StageArgs<'_>) -> Self {
+        let (hh_size, recent_size) = parse_h2o_budgets(args);
+        Self {
+            hh_size,
+            recent_size,
+            protected_prefix: p.protected_prefix,
+        }
+    }
+
+    /// Partition by ABSOLUTE budget: keep `protected_prefix + hh_size + recent_size` tokens,
+    /// independent of the engine's `target_len`. `None` when the cache is already within that budget
+    /// (faithful to `H2OKVCache_LayerWise` evicting only past `hh_size + recent_size`).
+    fn partition(&self, current: usize) -> Option<Partition> {
+        let prefix = self.protected_prefix.min(current);
+        let keep_total = prefix + self.hh_size + self.recent_size;
+        if current <= keep_total {
             return None;
         }
-        match importance {
-            // score-free fallback: prefix + most-recent (heavy 0).
-            None => {
-                let available = keep.saturating_sub(prefix);
-                let actual_recent = available.min(current - prefix);
-                if current - prefix - actual_recent == 0 {
-                    return None; // nothing to prune — equivalent to the engine's full-keep plan.
-                }
-                Some(compile_keep_top_k(
-                    KeepTopK {
-                        current,
-                        prefix,
-                        recent: actual_recent,
-                        heavy: 0,
-                    },
-                    |_| 0.0,
-                ))
-            }
-            // score-based: prefix + heavy hitters (top score) + recent window.
-            Some(imp) => {
-                let available = keep.saturating_sub(prefix);
-                let hh_budget = (available as f32 * self.keep_ratio) as usize;
-                let recent_budget = available - hh_budget;
-                let actual_recent = recent_budget.min(current - prefix);
-                Some(compile_keep_top_k(
-                    KeepTopK {
-                        current,
-                        prefix,
-                        recent: actual_recent,
-                        heavy: hh_budget,
-                    },
-                    |pos| imp.get(pos).copied().unwrap_or(0.0),
-                ))
-            }
+        Some(Partition {
+            prefix,
+            hh_budget: self.hh_size,
+            recent: self.recent_size,
+            current,
+        })
+    }
+
+    /// The keep-set shape (`None` = no-op within budget). Per-head when per-(kv_head, pos) scores are
+    /// present (the reference granularity); otherwise layer-wide from the flat importance, and
+    /// score-free to recency.
+    fn keep_spec(&self, ctx: &dyn StageCtx) -> Option<KeepSpec> {
+        let p = self.partition(ctx.current_pos())?;
+
+        // (1) Per-head: each KV head ranks its own heavy hitters; all heads keep the same count.
+        if ctx.has_head_scores() {
+            let n_kv_heads = ctx.n_kv_heads().max(1);
+            let heads: Vec<Vec<usize>> = (0..n_kv_heads)
+                .map(|kv_h| p.keep_list(|pos| ctx.head_score(kv_h, pos)))
+                .collect();
+            return Some(KeepSpec::PerHead(heads));
         }
+
+        // (2) Flat fallback: heavy hitters from the layer-wide importance. (3) Score-free: recency.
+        let keep = match ctx.importance() {
+            Some(imp) => p.keep_list(|pos| imp.get(pos).copied().unwrap_or(0.0)),
+            None => p.keep_list_recency(),
+        };
+        Some(KeepSpec::LayerWide(keep))
     }
 }
 
@@ -106,63 +161,51 @@ impl KVMutationStage for H2o {
         "h2o"
     }
 
-    /// Stage the heavy-hitter keep-set (or no-op within budget). The driver supplies accumulated
-    /// importance through `ctx.importance()`; the keep-set is decided by the shared `keep_list`.
+    /// Stage the per-head (or layer-wide fallback) heavy-hitter keep-set, or no-op within budget.
     fn on_phase(
         &self,
         ctx: &dyn StageCtx,
         cache: &mut dyn CacheHandle,
     ) -> Result<(), CacheOpError> {
-        match self.keep_list(ctx.current_pos(), ctx.target_len(), ctx.importance()) {
-            Some(list) => cache.keep(&list),
+        match self.keep_spec(ctx) {
             None => Ok(()),
+            Some(KeepSpec::LayerWide(keep)) => cache.keep(&keep),
+            Some(KeepSpec::PerHead(heads)) => {
+                let refs: Vec<&[usize]> = heads.iter().map(|h| h.as_slice()).collect();
+                cache.keep_per_head(&refs)
+            }
         }
     }
 }
 
 register_kv_mutation_stage!(
     "h2o",
-    |p, _args| Box::new(H2o::new(p.keep_ratio, p.protected_prefix)),
+    |p, args| Box::new(H2o::from_args(p, args)),
     H2O_CAPS,
     MutationPhase::KvMutate
 );
 
 // ── QCF estimator (observer/score axis) ──────────────────────────
 
-/// Identify the H2O-retained token set for the QCF simulation: protected prefix + top-importance
-/// heavy hitters (by `keep_ratio`) + most-recent window. Ported verbatim from the engine's former
-/// `qcf_kv::identify_retained_h2o` so the estimate is bit-identical to the old engine path.
+/// Identify the H2O-retained token set for the QCF simulation: protected prefix + top-`hh_size` heavy
+/// hitters (by importance) + the `recent_size` recency window. Absolute budgets, faithful to the
+/// actuator's [`H2o::keep_spec`].
 fn identify_retained_h2o(
     importance: &[f32],
     current_pos: usize,
-    target_len: usize,
-    keep_ratio: f32,
+    hh_size: usize,
+    recent_size: usize,
     protected_prefix: usize,
 ) -> Vec<usize> {
-    let prefix = protected_prefix.min(current_pos).min(target_len);
-    let available = target_len.saturating_sub(prefix);
-    if available == 0 {
-        return (0..prefix).collect();
-    }
-    let hh_budget = (available as f32 * keep_ratio) as usize;
-    let recent_budget = available.saturating_sub(hh_budget);
-    let recent_start = current_pos.saturating_sub(recent_budget);
+    let prefix = protected_prefix.min(current_pos);
+    let recent_start = current_pos.saturating_sub(recent_size);
     let mut retained: Vec<usize> = (0..prefix).collect();
     if recent_start > prefix {
         let mut evictable: Vec<(usize, f32)> = (prefix..recent_start)
-            .map(|t| {
-                (
-                    t,
-                    if t < importance.len() {
-                        importance[t]
-                    } else {
-                        0.0
-                    },
-                )
-            })
+            .map(|t| (t, importance.get(t).copied().unwrap_or(0.0)))
             .collect();
         evictable.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        retained.extend(evictable.iter().take(hh_budget).map(|(t, _)| t));
+        retained.extend(evictable.iter().take(hh_size).map(|(t, _)| t));
     }
     retained.extend(recent_start..current_pos);
     retained.sort();
@@ -171,9 +214,10 @@ fn identify_retained_h2o(
 }
 
 /// H2O QCF estimator: prefix + heavy-hitter + recent retained set, then O_after redistribution over
-/// it. Ported verbatim from the engine's former `compute_qcf_kv` `EvictH2o` arm (bit-identical).
+/// it. Kept in lockstep with the faithful actuator (absolute `hh_size`/`recent_size` + prefix).
 struct H2oEstimator {
-    keep_ratio: f32,
+    hh_size: usize,
+    recent_size: usize,
     protected_prefix: usize,
 }
 
@@ -186,8 +230,7 @@ impl QcfEstimator for H2oEstimator {
     }
     fn o_after(&self, ctx: &dyn EstimatorCtx, kv_head: usize, out: &mut [f32]) -> bool {
         let current = ctx.current_pos();
-        let target = ctx.target_len();
-        if current <= target {
+        if current <= self.protected_prefix + self.hh_size + self.recent_size {
             return false;
         }
         let mut alpha = vec![0.0f32; current];
@@ -195,8 +238,8 @@ impl QcfEstimator for H2oEstimator {
         let retained = identify_retained_h2o(
             &alpha,
             current,
-            target,
-            self.keep_ratio,
+            self.hh_size,
+            self.recent_size,
             self.protected_prefix,
         );
         redistribute_value(ctx, kv_head, &alpha, &retained, ctx.beta(), out);
@@ -204,16 +247,17 @@ impl QcfEstimator for H2oEstimator {
     }
 }
 
-/// Registration — found via `find_qcf_estimator("h2o")`. `keep_ratio`/`protected_prefix` flow from
-/// the engine-supplied estimate `StageParams` with no actuator-style clamp, to stay bit-identical
-/// with the former engine estimate (which used the raw values). Score-based.
+/// Registration — found via `find_qcf_estimator("h2o")`. Parses the same absolute budgets as the
+/// actuator so the estimate ranks on the identical retained set. Score-based.
 #[distributed_slice(QCF_ESTIMATORS)]
 static H2O_QCF: QcfEstimatorReg = QcfEstimatorReg {
     name: "h2o",
     curve_key: "kv.evict_h2o",
-    make: |p: StageParams, _args: StageArgs<'_>| {
+    make: |p: StageParams, args: StageArgs<'_>| {
+        let (hh_size, recent_size) = parse_h2o_budgets(args);
         Box::new(H2oEstimator {
-            keep_ratio: p.keep_ratio,
+            hh_size,
+            recent_size,
             protected_prefix: p.protected_prefix,
         })
     },
@@ -224,52 +268,92 @@ static H2O_QCF: QcfEstimatorReg = QcfEstimatorReg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argus_extension_api::{TensorHandle, TensorKind};
+    use argus_extension_api::{
+        PluginArg, TensorDtype, TensorHandle, TensorShape, find_mutation_stage,
+    };
 
+    // ── per-head mock (carried over from the deleted h2o-plus crate) ──
+
+    /// Minimal ctx supplying optional per-(kv_head, pos) scores via `tensor(Scores)` and optional flat
+    /// importance. Faithful H2O ignores `target_len` (absolute budget), so it is a fixed 0 here.
     struct Ctx {
-        cur: usize,
-        tgt: usize,
-        imp: Option<Vec<f32>>,
+        current: usize,
+        n_kv_heads: usize,
+        stride: usize,
+        head_scores: Option<Vec<f32>>, // [n_kv_heads * stride]
+        importance: Option<Vec<f32>>,
+    }
+    struct ScoresHandle<'a> {
+        data: &'a [f32],
+        rows: usize,
+        stride: usize,
+    }
+    impl TensorHandle for ScoresHandle<'_> {
+        fn shape(&self) -> TensorShape {
+            TensorShape {
+                rows: self.rows,
+                cols: 1,
+                per_head: true,
+            }
+        }
+        fn dtype(&self) -> TensorDtype {
+            TensorDtype::F32
+        }
+        fn read_row(&self, row: usize, kv_head: usize, out: &mut [f32]) {
+            out[0] = self
+                .data
+                .get(kv_head * self.stride + row)
+                .copied()
+                .unwrap_or(0.0);
+        }
     }
     impl StageCtx for Ctx {
         fn current_pos(&self) -> usize {
-            self.cur
+            self.current
         }
         fn target_len(&self) -> usize {
-            self.tgt
+            0
         }
         fn layer_idx(&self) -> usize {
             0
         }
         fn importance(&self) -> Option<&[f32]> {
-            self.imp.as_deref()
+            self.importance.as_deref()
         }
         fn n_kv_heads(&self) -> usize {
-            1
+            self.n_kv_heads
         }
         fn head_dim(&self) -> usize {
             4
         }
-        fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
-            None
+        fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
+            match kind {
+                TensorKind::Scores => self.head_scores.as_ref().map(|d| {
+                    Box::leak(Box::new(ScoresHandle {
+                        data: d,
+                        rows: self.current,
+                        stride: self.stride,
+                    })) as &dyn TensorHandle
+                }),
+                _ => None,
+            }
         }
     }
 
-    fn keep_of(stage: &H2o, ctx: &Ctx) -> Option<Vec<usize>> {
-        stage.keep_list(ctx.current_pos(), ctx.target_len(), ctx.importance())
-    }
-
-    /// A mock [`CacheHandle`] capturing the keep staged by `keep`.
+    /// A mock [`CacheHandle`] capturing `keep` / `keep_per_head`.
+    #[derive(Default)]
     struct CaptureHandle {
         cur: usize,
+        n_kv: usize,
         kept: Option<Vec<usize>>,
+        kept_per_head: Option<Vec<Vec<usize>>>,
     }
     impl CacheHandle for CaptureHandle {
         fn current_pos(&self) -> usize {
             self.cur
         }
         fn n_kv_heads(&self) -> usize {
-            1
+            self.n_kv
         }
         fn head_dim(&self) -> usize {
             4
@@ -284,7 +368,8 @@ mod tests {
             self.kept = Some(keep.to_vec());
             Ok(())
         }
-        fn keep_per_head(&mut self, _keep: &[&[usize]]) -> Result<(), CacheOpError> {
+        fn keep_per_head(&mut self, keep: &[&[usize]]) -> Result<(), CacheOpError> {
+            self.kept_per_head = Some(keep.iter().map(|h| h.to_vec()).collect());
             Ok(())
         }
         fn merge(
@@ -307,101 +392,205 @@ mod tests {
         }
     }
 
-    /// v3 native registration + DECISION equivalence: the v3 `on_phase` stages the keep the shared
-    /// `keep_list` returns, for the score-free AND score-based (importance) cases, and within-budget
-    /// stages nothing.
+    fn budgets(hh: &'static str, recent: &'static str) -> [PluginArg<'static>; 2] {
+        [
+            PluginArg {
+                key: "hh_size",
+                val: hh,
+            },
+            PluginArg {
+                key: "recent_size",
+                val: recent,
+            },
+        ]
+    }
+
+    /// Faithful H2O has NO attention-sink prefix by default, and still reads accumulated Scores.
     #[test]
-    fn v3_native_matches_keep_list_decision() {
-        use argus_extension_api::find_mutation_stage;
+    fn caps_have_no_forced_prefix() {
+        assert_eq!(H2O_CAPS.default_protected_prefix, 0);
+        assert_eq!(H2O_CAPS.reads, &[TensorKind::Scores]);
+        // protected_prefix is passed through unclamped (no `.max(4)`).
+        let s = H2o::from_args(
+            StageParams {
+                protected_prefix: 0,
+                ..Default::default()
+            },
+            &budgets("4", "6"),
+        );
+        assert_eq!(s.protected_prefix, 0);
+        assert_eq!(s.hh_size, 4);
+        assert_eq!(s.recent_size, 6);
+    }
+
+    /// Within the absolute budget (`prefix + hh_size + recent_size`) → no-op.
+    #[test]
+    fn within_absolute_budget_is_noop() {
+        let s = H2o::from_args(StageParams::default(), &budgets("4", "6"));
+        // current=10 == 0+4+6 → within budget.
+        let ctx = Ctx {
+            current: 10,
+            n_kv_heads: 1,
+            stride: 0,
+            head_scores: None,
+            importance: None,
+        };
+        assert!(s.keep_spec(&ctx).is_none());
+    }
+
+    /// Score-free fallback gives the full evictable budget to recency (keep the last `hh+recent`).
+    #[test]
+    fn score_free_keeps_recency() {
+        let s = H2o::from_args(StageParams::default(), &budgets("4", "6"));
+        let ctx = Ctx {
+            current: 20,
+            n_kv_heads: 1,
+            stride: 0,
+            head_scores: None,
+            importance: None,
+        };
+        match s.keep_spec(&ctx) {
+            Some(KeepSpec::LayerWide(keep)) => assert_eq!(keep, (10..20).collect::<Vec<_>>()),
+            other => panic!("expected LayerWide recency, got {other:?}"),
+        }
+    }
+
+    /// Score-based: keep the top-`hh_size` heavy hitters (absolute) + the `recent_size` recency window.
+    #[test]
+    fn score_based_absolute_heavy_and_recent() {
+        // hh_size=2, recent_size=4, current=20 → recent [16,20); heavy top-2 over [0,16).
+        let s = H2o::from_args(StageParams::default(), &budgets("2", "4"));
+        let mut imp = vec![0.0f32; 20];
+        imp[5] = 10.0;
+        imp[9] = 9.0;
+        imp[2] = 1.0; // lower — must NOT be kept
+        let ctx = Ctx {
+            current: 20,
+            n_kv_heads: 1,
+            stride: 0,
+            head_scores: None,
+            importance: Some(imp),
+        };
+        match s.keep_spec(&ctx) {
+            Some(KeepSpec::LayerWide(keep)) => {
+                assert_eq!(keep, vec![5, 9, 16, 17, 18, 19]);
+            }
+            other => panic!("expected LayerWide, got {other:?}"),
+        }
+    }
+
+    /// Per-head: each KV head ranks its own heavy hitters (the reference granularity); `on_phase`
+    /// stages `keep_per_head`, not layer-wide.
+    #[test]
+    fn per_head_ranks_independently() {
+        let s = H2o::from_args(StageParams::default(), &budgets("3", "3"));
+        // head 0 prefers 5,6,7; head 1 prefers 10,11,12 (over the evictable [0, current-recent)).
+        let (n_kv_heads, stride) = (2usize, 100usize);
+        let mut hs = vec![0.0f32; n_kv_heads * stride];
+        for (i, &pos) in [5usize, 6, 7].iter().enumerate() {
+            hs[pos] = 10.0 - i as f32;
+        }
+        for (i, &pos) in [10usize, 11, 12].iter().enumerate() {
+            hs[stride + pos] = 10.0 - i as f32;
+        }
+        let ctx = Ctx {
+            current: 20,
+            n_kv_heads,
+            stride,
+            head_scores: Some(hs),
+            importance: None,
+        };
+        let expected = match s.keep_spec(&ctx).unwrap() {
+            KeepSpec::PerHead(h) => h,
+            KeepSpec::LayerWide(_) => panic!("expected PerHead"),
+        };
+        let mut h = CaptureHandle {
+            cur: 20,
+            n_kv: n_kv_heads,
+            ..Default::default()
+        };
+        <H2o as KVMutationStage>::on_phase(&s, &ctx, &mut h).unwrap();
+        assert_eq!(h.kept_per_head, Some(expected));
+        assert_eq!(h.kept, None, "per-head path must NOT use layer-wide keep");
+    }
+
+    /// v3 native registration + DECISION equivalence: `on_phase` stages exactly what `keep_spec`
+    /// decides, for the score-free, score-based, and per-head cases.
+    #[test]
+    fn v3_native_matches_keep_spec_decision() {
         let reg = find_mutation_stage("h2o").expect("h2o in KV_MUTATION_STAGES");
         assert_eq!(reg.name, "h2o");
         assert_eq!(reg.phase, MutationPhase::KvMutate);
         assert_eq!(reg.caps, H2O_CAPS);
-        assert_eq!((reg.make)(StageParams::default(), &[]).name(), "h2o");
+        assert_eq!(
+            (reg.make)(StageParams::default(), &budgets("2", "4")).name(),
+            "h2o"
+        );
 
-        let s = H2o::new(0.5, 4);
+        let s = H2o::from_args(StageParams::default(), &budgets("2", "4"));
         let imp: Vec<f32> = (0..20).map(|i| (i % 7) as f32).collect();
         let cases = [
             Ctx {
-                cur: 8,
-                tgt: 0,
-                imp: None,
+                current: 8,
+                n_kv_heads: 1,
+                stride: 0,
+                head_scores: None,
+                importance: None,
             }, // within budget -> no-op
             Ctx {
-                cur: 20,
-                tgt: 10,
-                imp: None,
-            }, // score-free prune
-            Ctx {
-                cur: 20,
-                tgt: 10,
-                imp: Some(imp.clone()),
-            }, // score-based heavy-hitter
+                current: 20,
+                n_kv_heads: 1,
+                stride: 0,
+                head_scores: None,
+                importance: Some(imp),
+            }, // score-based layer-wide
         ];
         for ctx in &cases {
             let mut h = CaptureHandle {
-                cur: ctx.cur,
-                kept: None,
+                cur: ctx.current,
+                n_kv: 1,
+                ..Default::default()
             };
             <H2o as KVMutationStage>::on_phase(&s, ctx, &mut h).unwrap();
-            assert_eq!(h.kept, keep_of(&s, ctx), "cur={} tgt={}", ctx.cur, ctx.tgt);
+            let expected = match s.keep_spec(ctx) {
+                None => None,
+                Some(KeepSpec::LayerWide(k)) => Some(k),
+                Some(KeepSpec::PerHead(_)) => unreachable!(),
+            };
+            assert_eq!(h.kept, expected, "current={}", ctx.current);
         }
     }
 
+    /// The QCF estimator's retained set matches the actuator's keep-set for a shared case (no silent
+    /// estimate/actuator skew).
     #[test]
-    fn prefix_clamped_to_four() {
-        // protected_prefix < 4 is clamped to 4.
-        let stage = H2o::new(0.5, 0);
-        // current=20, target=10, prefix=4 → keep=10. score-free: available=6, actual_recent=min(6,16)=6,
-        // prune_count = 16-6 = 10 → keep [0..4) ∪ [14..20)
-        let keep = keep_of(
-            &stage,
-            &Ctx {
-                cur: 20,
-                tgt: 10,
-                imp: None,
-            },
-        );
-        assert_eq!(keep, Some(vec![0, 1, 2, 3, 14, 15, 16, 17, 18, 19]));
-    }
+    fn qcf_estimator_matches_actuator_retained() {
+        let hh_size = 2;
+        let recent_size = 4;
+        let prefix = 0;
+        let current = 20;
+        let imp: Vec<f32> = (0..current)
+            .map(|i| if i == 5 { 10.0 } else { (i % 3) as f32 })
+            .collect();
 
-    #[test]
-    fn within_budget_is_noop() {
-        let stage = H2o::new(0.5, 4);
-        assert_eq!(
-            keep_of(
-                &stage,
-                &Ctx {
-                    cur: 5,
-                    tgt: 10,
-                    imp: None
-                }
-            ),
-            None
-        );
-    }
+        let retained = identify_retained_h2o(&imp, current, hh_size, recent_size, prefix);
 
-    #[test]
-    fn score_based_keeps_prefix_heavy_hitters_and_recent() {
-        // current=20, target=12, prefix=4, keep_ratio=0.5.
-        // keep=12, available=8, hh_budget=4, recent_budget=4, actual_recent=min(4,16)=4,
-        // recent_start=16, evictable=[4..16). Heavy hitters by score:
-        let stage = H2o::new(0.5, 4);
-        let mut imp = vec![0.0f32; 20];
-        // make positions 6,9,12,14 the highest scorers in [4..16)
-        imp[6] = 10.0;
-        imp[9] = 9.0;
-        imp[12] = 8.0;
-        imp[14] = 7.0;
-        let keep = keep_of(
-            &stage,
-            &Ctx {
-                cur: 20,
-                tgt: 12,
-                imp: Some(imp),
-            },
-        );
-        // keep = [0..4) ∪ {6,9,12,14} ∪ [16..20)
-        assert_eq!(keep, Some(vec![0, 1, 2, 3, 6, 9, 12, 14, 16, 17, 18, 19]));
+        let s = H2o {
+            hh_size,
+            recent_size,
+            protected_prefix: prefix,
+        };
+        let ctx = Ctx {
+            current,
+            n_kv_heads: 1,
+            stride: 0,
+            head_scores: None,
+            importance: Some(imp),
+        };
+        let actuator_keep = match s.keep_spec(&ctx).unwrap() {
+            KeepSpec::LayerWide(k) => k,
+            KeepSpec::PerHead(_) => unreachable!(),
+        };
+        assert_eq!(retained, actuator_keep);
     }
 }

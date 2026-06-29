@@ -161,7 +161,7 @@ pub fn build_resilience_cache_manager(
                 .collect();
             crate::kv::eviction::stage_registry::make_stage_backed_policy(&policy_name, &params, &extra).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o{} (or --load-plugin <.so>).",
+                    "argus-bench: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, d2o{} (or --load-plugin <.so>).",
                     policy_name,
                     if cfg!(feature = "caote") { ", caote" } else { "" }
                 )
@@ -239,6 +239,9 @@ pub fn build_bench_loop(
     // §5.9.1 Track A: score-based policy(h2o/h2o_plus/d2o) 시 호출자가 생성한 accumulator cell.
     // 비-score 조립처는 `Arc::new(Mutex::new(None))` 더미를 넘긴다.
     score_cell: Arc<Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>>,
+    // Faithful-H2O `(c)`: when true (eviction == "h2o"), arm a full-prompt-window PFA producer + the
+    // prefill seed so the score accumulator reflects prefill attention, not just decode.
+    faithful_h2o: bool,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고
@@ -264,7 +267,7 @@ pub fn build_bench_loop(
     // §5.9.1 Track A: score_cell 은 호출자(argus_bench 진입부)가 score-based policy 여부를 판단해
     // 생성 후 전달한다. 비-score 조립처는 `Arc::new(Mutex::new(None))` 더미를 넘긴다.
 
-    let mf = ModelForward::new(
+    let mut mf = ModelForward::new(
         backend,
         memory,
         cpu_backend,
@@ -275,6 +278,13 @@ pub fn build_bench_loop(
         Arc::clone(&hook_cell),
         Arc::clone(&score_cell),
     )?;
+    // Faithful-H2O (c): arm a full-prompt-window (`usize::MAX` clamps to seq_len) PFA producer + the
+    // prefill seed. The dummy cell is never consumed in the bench loop (no PrefillKeepSetStage); the
+    // PFA buffer is used only to fold prefill column-sums into `score_cell` at the final chunk.
+    if faithful_h2o {
+        mf.set_prefill_attn(Arc::new(Mutex::new(None)), usize::MAX);
+        mf.arm_faithful_prefill_seed();
+    }
 
     // β-3: pos-환류용 layer-0 fmt handle (§5.2.1 (가)). coercion: Arc<StandardFormat> →
     // Arc<dyn KVCacheFormat>.

@@ -138,6 +138,9 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         use std::sync::{Arc, Mutex};
         let policy = args.eviction_policy();
         if crate::kv::eviction::stage_registry::stage_is_score_based(policy) {
+            // EXPLICIT-REQUIRED: faithful h2o needs `--set hh_size/recent_size` (clean reject, no
+            // default budget). No-op for any non-h2o policy.
+            args.require_h2o_budgets()?;
             let n_layers = model.config.num_hidden_layers;
             let n_kv_heads = model.config.num_key_value_heads;
             crate::inference::attention_scores::ensure_score_producers_registered()?;
@@ -151,7 +154,10 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
                 args.h2o_decay(),
             );
             acc.set_active(true);
-            acc.set_time_normalize(!args.h2o_raw_scores());
+            // Faithful-H2O (a): force time_normalize OFF for h2o so the large prefill column-sum base
+            // is not divided by the decode-only step count. Non-h2o policies keep their behavior.
+            let faithful = args.eviction_policy() == "h2o";
+            acc.set_time_normalize(!faithful && !args.h2o_raw_scores());
             Arc::new(Mutex::new(Some(acc)))
         } else {
             Arc::new(Mutex::new(None))
@@ -194,6 +200,8 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
             phase_max_chunks_per_token: args.swap_phase_aware_max_chunks_per_token,
         },
         score_cell,
+        // Faithful-H2O (c): arm the prefill seed when eviction == "h2o".
+        args.eviction_policy() == "h2o",
     )?;
 
     run_decode_loop_experiment(
@@ -440,6 +448,9 @@ pub fn run_experiment_schedule_path(
         use std::sync::{Arc, Mutex};
         let policy = args.eviction_policy();
         if crate::kv::eviction::stage_registry::stage_is_score_based(policy) {
+            // EXPLICIT-REQUIRED: faithful h2o needs `--set hh_size/recent_size` (clean reject, no
+            // default budget). No-op for any non-h2o policy.
+            args.require_h2o_budgets()?;
             let n_layers = model.config.num_hidden_layers;
             let n_kv_heads = model.config.num_key_value_heads;
             crate::inference::attention_scores::ensure_score_producers_registered()?;
@@ -453,7 +464,10 @@ pub fn run_experiment_schedule_path(
                 args.h2o_decay(),
             );
             acc.set_active(true);
-            acc.set_time_normalize(!args.h2o_raw_scores());
+            // Faithful-H2O (a): force time_normalize OFF for h2o so the large prefill column-sum base
+            // is not divided by the decode-only step count. Non-h2o policies keep their behavior.
+            let faithful = args.eviction_policy() == "h2o";
+            acc.set_time_normalize(!faithful && !args.h2o_raw_scores());
             Arc::new(Mutex::new(Some(acc)))
         } else {
             Arc::new(Mutex::new(None))
@@ -484,6 +498,8 @@ pub fn run_experiment_schedule_path(
             phase_max_chunks_per_token: args.swap_phase_aware_max_chunks_per_token,
         },
         score_cell,
+        // Faithful-H2O (c): arm the prefill seed when eviction == "h2o".
+        args.eviction_policy() == "h2o",
     )?;
 
     let t_prefill = std::time::Instant::now();

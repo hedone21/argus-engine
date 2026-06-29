@@ -60,6 +60,7 @@ fn make_det_session(max_seq_len: usize) -> ChatSession {
             policy_name: "none".to_string(),
             target_ratio: 1.0,
             evicted_total: 0,
+            faithful_prefill: None,
         })),
         max_seq_len,
     )

@@ -821,7 +821,7 @@ mod tests {
 
         // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let cm = CacheManager::new(
-            h2o_backed_policy(0.3, 0), // prefix=4, keep_ratio=0.3
+            h2o_backed_policy(15, 15, 0), // keep hh=15 + recent=15 = 30 (faithful absolute budget)
             Box::new(MockMonitor {
                 available: 10 * 1024 * 1024,
             }),
@@ -876,7 +876,7 @@ mod tests {
         use crate::kv::eviction::stage_registry::h2o_backed_policy;
 
         let cm = CacheManager::new(
-            h2o_backed_policy(0.3, 0),
+            h2o_backed_policy(15, 15, 0),
             Box::new(MockMonitor {
                 available: 1024 * 1024 * 1024, // plenty of memory
             }),
@@ -902,7 +902,7 @@ mod tests {
         use crate::kv::eviction::stage_registry::h2o_backed_policy;
 
         let cm = CacheManager::new(
-            h2o_backed_policy(0.3, 0),
+            h2o_backed_policy(15, 15, 0),
             Box::new(MockMonitor {
                 available: 1024 * 1024 * 1024,
             }),
@@ -946,7 +946,7 @@ mod tests {
         use crate::kv::eviction::stage_registry::h2o_backed_policy;
 
         let cm = CacheManager::new(
-            h2o_backed_policy(0.5, 0),
+            h2o_backed_policy(15, 15, 0),
             Box::new(MockMonitor { available: 0 }),
             0,
             0.75,
@@ -1087,7 +1087,7 @@ mod tests {
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Emergency,
-            handler: Box::new(EvictionHandler::new(h2o_backed_policy(0.5, 0), 0.3)),
+            handler: Box::new(EvictionHandler::new(h2o_backed_policy(15, 15, 0), 0.3)),
         }]);
 
         let cm = CacheManager::with_pipeline(
@@ -1120,7 +1120,7 @@ mod tests {
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,
-            handler: Box::new(EvictionHandler::new(h2o_backed_policy(0.5, 0), 0.3)),
+            handler: Box::new(EvictionHandler::new(h2o_backed_policy(15, 15, 0), 0.3)),
         }]);
 
         let cm = CacheManager::with_pipeline(

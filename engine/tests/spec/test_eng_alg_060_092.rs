@@ -542,14 +542,23 @@ fn test_eng_alg_092_eviction_handler_wraps_h2o() {
     };
 
     // pos=100, ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
+    // Faithful H2O absolute budget: hh(15)+recent(15) = 30 = the old target (100 * 0.3).
     let h2o_policy = make_stage_backed_policy(
         "h2o",
         &StageParams {
-            keep_ratio: 0.5,
             protected_prefix: 0,
             ..Default::default()
         },
-        &[],
+        &[
+            argus_extension_api::PluginArg {
+                key: "hh_size",
+                val: "15",
+            },
+            argus_extension_api::PluginArg {
+                key: "recent_size",
+                val: "15",
+            },
+        ],
     )
     .expect("h2o v3 stage registered");
     let handler = EvictionHandler::new(h2o_policy, 0.3);
