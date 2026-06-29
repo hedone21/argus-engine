@@ -334,34 +334,47 @@ impl ChatSession {
                     unreachable!()
                 };
 
-                let (removed, new_pos) = {
-                    let scores_vec: Option<Vec<f32>> =
-                        if let ChatKvMode::Standard(s) = &self.kv_mode {
-                            if score_based {
-                                s.score_accumulator
-                                    .as_ref()
-                                    .filter(|a| a.is_active())
-                                    .map(|a| a.importance_scores().to_vec())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                    // value-aware a_i: last-layer last-step per-head attention (value-aware policies).
-                    let attn_vec: Option<Vec<f32>> = if let ChatKvMode::Standard(s) = &self.kv_mode
+                // GPU score sync before reading importance (faithful-H2O b/c on OpenCL): pull the
+                // on-device accumulated scores into the CPU accumulator so the turn-boundary
+                // eviction ranks on decode-time attention, not just the prefill seed. No-op on CPU
+                // backends. (Closes the chat-on-GPU sync gap — eval already does this.)
+                #[cfg(feature = "opencl")]
+                if score_based {
+                    let backend_ptr = self
+                        .decode_loop
+                        .forward_mut()
+                        .backend()
+                        .map(|b| b as *const dyn crate::backend::Backend);
+                    if let Some(bp) = backend_ptr
+                        && let ChatKvMode::Standard(s) = &mut self.kv_mode
+                        && let Some(acc) = s.score_accumulator.as_mut()
                     {
+                        // SAFETY: `bp` points at the backend owned by `decode_loop`; `acc` is in the
+                        // disjoint `kv_mode` field. The raw pointer is not retained past this call
+                        // and `decode_loop` is not mutated here.
+                        unsafe {
+                            crate::kv::eviction::score_fed::sync_gpu_scores_to_cpu(acc, &*bp);
+                        }
+                    }
+                }
+
+                let (removed, new_pos) = {
+                    // Shared score-fed extract (gated on score-based; per-layer FLAT = faithful-H2O b).
+                    let extracted = if let ChatKvMode::Standard(s) = &self.kv_mode {
                         if score_based {
                             s.score_accumulator
                                 .as_ref()
-                                .filter(|a| a.is_active())
-                                .and_then(|a| a.last_step_head_attn().map(|s| s.to_vec()))
+                                .and_then(crate::kv::eviction::score_fed::extract_scores)
                         } else {
                             None
                         }
                     } else {
                         None
                     };
+                    let (scores, attn, per_layer) = extracted
+                        .as_ref()
+                        .map(|e| e.as_args())
+                        .unwrap_or((None, None, None));
                     let cm = if let ChatKvMode::Standard(s) = &self.kv_mode {
                         let cm_ref = s.cache_manager.as_ref().expect("checked above");
                         // SAFETY: cm_ref는 self.kv_mode 안에 있고, forward_mut()은
@@ -375,8 +388,9 @@ impl ChatSession {
                     };
                     self.decode_loop.forward_mut().try_evict(
                         cm,
-                        scores_vec.as_deref(),
-                        attn_vec.as_deref(),
+                        scores,
+                        attn,
+                        per_layer,
                         true,
                         target_ratio,
                     )?
@@ -442,32 +456,44 @@ impl ChatSession {
             return Ok(());
         };
 
-        let scores_vec: Option<Vec<f32>> = if let ChatKvMode::Standard(s) = &self.kv_mode {
-            if score_based {
-                s.score_accumulator
-                    .as_ref()
-                    .filter(|a| a.is_active())
-                    .map(|a| a.importance_scores().to_vec())
-            } else {
-                None
+        // GPU score sync before reading importance (faithful-H2O b/c on OpenCL): pull the on-device
+        // accumulated scores into the CPU accumulator. No-op on CPU backends. (Closes the
+        // chat-on-GPU sync gap — eval already does this; mirrors `ensure_capacity`.)
+        #[cfg(feature = "opencl")]
+        if score_based {
+            let backend_ptr = self
+                .decode_loop
+                .forward_mut()
+                .backend()
+                .map(|b| b as *const dyn crate::backend::Backend);
+            if let Some(bp) = backend_ptr
+                && let ChatKvMode::Standard(s) = &mut self.kv_mode
+                && let Some(acc) = s.score_accumulator.as_mut()
+            {
+                // SAFETY: `bp` points at the backend owned by `decode_loop`; `acc` is in the
+                // disjoint `kv_mode` field. The raw pointer is not retained past this call.
+                unsafe {
+                    crate::kv::eviction::score_fed::sync_gpu_scores_to_cpu(acc, &*bp);
+                }
             }
-        } else {
-            None
-        };
+        }
 
-        // value-aware a_i: last-layer last-step per-head attention (value-aware policies).
-        let attn_vec: Option<Vec<f32>> = if let ChatKvMode::Standard(s) = &self.kv_mode {
+        // Shared score-fed extract (gated on score-based; per-layer FLAT = faithful-H2O b).
+        let extracted = if let ChatKvMode::Standard(s) = &self.kv_mode {
             if score_based {
                 s.score_accumulator
                     .as_ref()
-                    .filter(|a| a.is_active())
-                    .and_then(|a| a.last_step_head_attn().map(|s| s.to_vec()))
+                    .and_then(crate::kv::eviction::score_fed::extract_scores)
             } else {
                 None
             }
         } else {
             None
         };
+        let (scores, attn, per_layer) = extracted
+            .as_ref()
+            .map(|e| e.as_args())
+            .unwrap_or((None, None, None));
 
         let cm_ptr: *const CacheManager = if let ChatKvMode::Standard(s) = &self.kv_mode {
             match s.cache_manager.as_ref() {
@@ -484,8 +510,9 @@ impl ChatSession {
 
         let (removed, new_pos) = self.decode_loop.forward_mut().try_evict(
             cm,
-            scores_vec.as_deref(),
-            attn_vec.as_deref(),
+            scores,
+            attn,
+            per_layer,
             at_pressure,
             target_ratio,
         )?;
@@ -924,6 +951,11 @@ fn build_chat_eviction_internal(
     // divided by the decode-only step count. Non-h2o policies keep their behavior.
     let faithful = eviction_policy == "h2o";
     acc.set_time_normalize(!faithful && !args.h2o_raw_scores());
+    // Faithful-H2O (b): per-layer FLAT importance (no cross-layer MAX) so each layer evicts on its
+    // own heavy hitters. Opt-in (h2o only) → off elsewhere = byte-identical.
+    if faithful {
+        acc.enable_per_layer_flat();
+    }
 
     // GPU-side accumulator init (OpenCL only). Caps-driven arming: only when the policy consumes
     // scores (`score_based`); a score-free policy still runs eviction but never reads importance, so
@@ -1247,6 +1279,7 @@ mod tests {
                 _cm: &CacheManager,
                 _scores: Option<&[f32]>,
                 _last_attn: Option<&[f32]>,
+                _per_layer: Option<(&[f32], usize)>,
                 _force: bool,
                 _target_ratio: f32,
             ) -> anyhow::Result<(usize, usize)> {
@@ -1344,6 +1377,7 @@ mod tests {
             _cm: &crate::kv::cache_manager::CacheManager,
             _scores: Option<&[f32]>,
             _last_attn: Option<&[f32]>,
+            _per_layer: Option<(&[f32], usize)>,
             _force: bool,
             _target_ratio: f32,
         ) -> anyhow::Result<(usize, usize)> {

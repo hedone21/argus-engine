@@ -782,11 +782,16 @@ impl Forward for ModelForward {
         Ok(())
     }
 
+    fn backend(&self) -> Option<&dyn Backend> {
+        Some(self.backend.as_ref())
+    }
+
     fn try_evict(
         &mut self,
         cache_manager: &crate::kv::cache_manager::CacheManager,
         scores: Option<&[f32]>,
         last_attn: Option<&[f32]>,
+        per_layer: Option<(&[f32], usize)>,
         force: bool,
         target_ratio: f32,
     ) -> anyhow::Result<(usize, usize)> {
@@ -805,22 +810,16 @@ impl Forward for ModelForward {
             let mut temp: Vec<crate::kv::kv_cache::KVCache> =
                 fmts.iter().map(|f| f.take_inner()).collect();
             // evict 결과를 캡처 → `?` 전파를 rewrap 이후로 미뤄 placeholder 잔존 방지(잔여위험 1).
-            let evict_result = if force {
-                match scores {
-                    Some(sc) => cache_manager.force_evict_with_scores(
-                        &mut temp,
-                        target_ratio,
-                        sc,
-                        last_attn,
-                    ),
-                    None => cache_manager.force_evict(&mut temp, target_ratio),
-                }
-            } else {
-                match scores {
-                    Some(sc) => cache_manager.maybe_evict_with_scores(&mut temp, sc, last_attn),
-                    None => cache_manager.maybe_evict(&mut temp),
-                }
-            };
+            // Shared score-fed routing (per-layer FLAT > collapsed scores > recency; force/maybe).
+            let evict_result = crate::kv::eviction::score_fed::route_evict(
+                cache_manager,
+                &mut temp,
+                scores,
+                last_attn,
+                per_layer,
+                force,
+                target_ratio,
+            );
             // rewrap: 항상 실행(Err/Ok 무관) — inner 복귀, placeholder 폐기.
             for (f, c) in fmts.iter().zip(temp) {
                 f.put_inner(c);
@@ -835,24 +834,16 @@ impl Forward for ModelForward {
 
         let before_pos = self.kv_caches.first().map(|c| c.current_pos).unwrap_or(0);
 
-        let result = if force {
-            match scores {
-                Some(sc) => cache_manager.force_evict_with_scores(
-                    &mut self.kv_caches,
-                    target_ratio,
-                    sc,
-                    last_attn,
-                )?,
-                None => cache_manager.force_evict(&mut self.kv_caches, target_ratio)?,
-            }
-        } else {
-            match scores {
-                Some(sc) => {
-                    cache_manager.maybe_evict_with_scores(&mut self.kv_caches, sc, last_attn)?
-                }
-                None => cache_manager.maybe_evict(&mut self.kv_caches)?,
-            }
-        };
+        // Shared score-fed routing (per-layer FLAT > collapsed scores > recency; force/maybe).
+        let result = crate::kv::eviction::score_fed::route_evict(
+            cache_manager,
+            &mut self.kv_caches,
+            scores,
+            last_attn,
+            per_layer,
+            force,
+            target_ratio,
+        )?;
 
         if result.evicted {
             let removed = before_pos.saturating_sub(result.new_pos);

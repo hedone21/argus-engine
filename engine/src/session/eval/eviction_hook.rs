@@ -337,18 +337,21 @@ impl EvictionHook {
     /// eviction reads them. No-op on CPU backends / without the `opencl` feature, so
     /// the host path is unchanged. Shared by `post_prefill` and the streaming path.
     fn sync_gpu_scores_to_cpu(&mut self) {
-        #[cfg(feature = "opencl")]
-        if let Some(ref mut acc) = self.score_accumulator
-            && acc.is_active()
-            && let Some(ocl_be) = self
-                .backend
-                .as_any()
-                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            && let Some(gpu_acc) = ocl_be.gpu_score_acc()
-            && gpu_acc.is_active()
-            && let Ok((flat, head)) = gpu_acc.sync_to_cpu(ocl_be.queue.as_core())
-        {
-            acc.import_gpu_scores(&flat, &head);
+        // Shared score-fed body (disjoint field borrows: `score_accumulator` mut, `backend` shared).
+        if let Some(acc) = self.score_accumulator.as_mut() {
+            crate::kv::eviction::score_fed::sync_gpu_scores_to_cpu(acc, self.backend.as_ref());
+        }
+    }
+
+    /// Reset the GPU per-`(layer, token)` FLAT cumulative buffer at an eviction boundary, in lockstep
+    /// with the CPU `acc.reset()` (faithful-H2O `(b)`). The GPU per-layer reduce accumulates on-device
+    /// and is otherwise never reset, so without this a 2nd eviction would rank GPU per-layer importance
+    /// monotonically accumulated since prefill (misaligned with the compacted cache) while the CPU twin
+    /// starts fresh — they would diverge. No-op on CPU backends / when per-layer is not armed; touches
+    /// ONLY the per-layer buffer (the collapsed GPU buffers keep their existing behavior).
+    fn reset_gpu_layer_flat(&self) {
+        if let Some(acc) = self.score_accumulator.as_ref() {
+            crate::kv::eviction::score_fed::reset_gpu_layer_flat(acc, self.backend.as_ref());
         }
     }
 
@@ -377,22 +380,29 @@ impl EvictionHook {
         // GPU score sync before a score-based eviction reads importance (no-op on CPU).
         self.sync_gpu_scores_to_cpu();
 
-        let result = if self.score_based_eviction {
-            let active = self
-                .score_accumulator
+        // Shared score-fed body: extract (only when score-based + active) → route (force, ratio).
+        use crate::kv::eviction::score_fed;
+        let extracted = if self.score_based_eviction {
+            self.score_accumulator
                 .as_ref()
-                .is_some_and(|acc| acc.is_active());
-            if active {
-                let acc = self.score_accumulator.as_ref().unwrap();
-                let scores = acc.importance_scores().to_vec();
-                let attn = acc.last_step_head_attn().map(|s| s.to_vec());
-                self.cache_manager
-                    .force_evict_with_scores(caches, ratio, &scores, attn.as_deref())
-            } else {
-                self.cache_manager.force_evict(caches, ratio)
-            }
+                .and_then(score_fed::extract_scores)
         } else {
-            self.cache_manager.force_evict(caches, ratio)
+            None
+        };
+        let result = {
+            let (scores, last_attn, per_layer) = extracted
+                .as_ref()
+                .map(|e| e.as_args())
+                .unwrap_or((None, None, None));
+            score_fed::route_evict(
+                &self.cache_manager,
+                caches,
+                scores,
+                last_attn,
+                per_layer,
+                true,
+                ratio,
+            )
         };
 
         if let Ok(evict_result) = result
@@ -421,6 +431,9 @@ impl EvictionHook {
             if let Some(acc) = self.score_accumulator.as_mut() {
                 acc.reset();
             }
+            // Faithful-H2O (b): reset the GPU per-layer buffer in lockstep (CPU acc.reset above zeroed
+            // the CPU twin; the GPU reduce accumulates on-device and is otherwise never reset).
+            self.reset_gpu_layer_flat();
         } else if self.dump_evict_importance {
             // No eviction fired — drop the armed capture so it can't leak forward.
             crate::kv::eviction::keepset_dump::disarm_capture();
@@ -736,24 +749,29 @@ impl StepHook<KVCache> for EvictionHook {
             crate::kv::eviction::keepset_dump::arm_capture();
         }
 
-        // Perform eviction
-        let result = if self.score_based_eviction {
-            let active = self
-                .score_accumulator
+        // Perform eviction — shared score-fed body: extract (score-based + active) → route.
+        use crate::kv::eviction::score_fed;
+        let extracted = if self.score_based_eviction {
+            self.score_accumulator
                 .as_ref()
-                .is_some_and(|acc| acc.is_active());
-            if active {
-                let acc = self.score_accumulator.as_ref().unwrap();
-                let scores = acc.importance_scores().to_vec();
-                // a_i: last-layer last-step per-head attention (value-aware policies).
-                let attn = acc.last_step_head_attn().map(|s| s.to_vec());
-                self.cache_manager
-                    .force_evict_with_scores(caches, ratio, &scores, attn.as_deref())
-            } else {
-                self.cache_manager.force_evict(caches, ratio)
-            }
+                .and_then(score_fed::extract_scores)
         } else {
-            self.cache_manager.force_evict(caches, ratio)
+            None
+        };
+        let result = {
+            let (scores, last_attn, per_layer) = extracted
+                .as_ref()
+                .map(|e| e.as_args())
+                .unwrap_or((None, None, None));
+            score_fed::route_evict(
+                &self.cache_manager,
+                caches,
+                scores,
+                last_attn,
+                per_layer,
+                true,
+                ratio,
+            )
         };
 
         if let Ok(evict_result) = result
@@ -771,6 +789,8 @@ impl StepHook<KVCache> for EvictionHook {
             if let Some(acc) = self.score_accumulator.as_mut() {
                 acc.reset();
             }
+            // Faithful-H2O (b): reset the GPU per-layer buffer in lockstep with the CPU reset above.
+            self.reset_gpu_layer_flat();
 
             // Store QCF result for extra_question_fields
             self.eviction_qcf = Some(EvictionQcfResult {
@@ -793,6 +813,8 @@ impl StepHook<KVCache> for EvictionHook {
         if let Some(acc) = self.score_accumulator.as_mut() {
             acc.reset();
         }
+        // Faithful-H2O (b): reset the GPU per-layer buffer in lockstep with the CPU reset above.
+        self.reset_gpu_layer_flat();
         self.eviction_count = 0;
         self.evicted_total = 0;
         self.eviction_qcf = None;

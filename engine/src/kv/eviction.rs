@@ -83,4 +83,5 @@ pub trait EvictionPolicy: Send + Sync {
 // `h2o` → `h2o`, `d2o` → `d2o`, `sliding` → `sliding-window`, `none` → `no-eviction`,
 // `rkv` → `rkv` (feature-gated). The engine retains only the generic plumbing here.
 pub(crate) mod keepset_dump;
+pub mod score_fed;
 pub mod stage_registry;

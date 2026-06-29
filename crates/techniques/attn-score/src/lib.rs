@@ -77,6 +77,21 @@ struct AttnScoreProducer {
     /// token-by-token prefill it is the query-agnostic context importance the
     /// policy actually ranked on. Empty unless `dump_layer_head`.
     layer_head_cum: Vec<f32>,
+    /// Whether the per-`(layer, token)` FLAT importance is kept (faithful-H2O LayerWise,
+    /// divergence `(b)`). Off by default → no buffer, the collapsed `importance` path is
+    /// byte-identical (the `dump_layer_head` INV-147 precedent for the flat axis).
+    per_layer_flat: bool,
+    /// Per-`(layer, token)` FLAT **step-local** scratch: `[total_layers * max_seq_len]`,
+    /// row-major `layer * max_seq_len + pos`. Cleared each `begin_step`, written (NOT
+    /// MAX-collapsed across layers) during `accumulate_layer*`, flushed into
+    /// `layer_flat_cum` by `end_step`. Empty unless `per_layer_flat`.
+    layer_flat: Vec<f32>,
+    /// Cumulative per-`(layer, token)` FLAT importance summed across steps — the
+    /// layer-resolved twin of the collapsed `importance`, with NO cross-layer MAX, so
+    /// each layer ranks heavy hitters on its OWN accumulated attention (faithful
+    /// `H2OKVCache_LayerWise`). What `layer_flat_importance()` reports. Empty unless
+    /// `per_layer_flat`.
+    layer_flat_cum: Vec<f32>,
 }
 
 impl AttnScoreProducer {
@@ -120,6 +135,9 @@ impl AttnScoreProducer {
             dump_layer_head: false,
             layer_head: Vec::new(),
             layer_head_cum: Vec::new(),
+            per_layer_flat: false,
+            layer_flat: Vec::new(),
+            layer_flat_cum: Vec::new(),
         }
     }
 }
@@ -167,6 +185,11 @@ impl ScoreProducer for AttnScoreProducer {
             for v in self.layer_head_cum.iter_mut() {
                 *v *= factor;
             }
+            // Decay the per-(layer, token) FLAT cumulative in lockstep with the collapsed
+            // `importance` (faithful-H2O `(b)`). No-op when per-layer is off (buffer empty).
+            for v in self.layer_flat_cum.iter_mut() {
+                *v *= factor;
+            }
         }
         self.step_importance.fill(0.0);
         self.head_step_importance.fill(0.0);
@@ -174,6 +197,9 @@ impl ScoreProducer for AttnScoreProducer {
         // Per-(layer, KV-head) dump buffer is a most-recent-step snapshot (like
         // last_layer_head_attn). No-op when the dump is off (buffer is empty).
         self.layer_head.fill(0.0);
+        // Per-(layer, token) FLAT step scratch — cleared so each layer writes its own
+        // slot this step. No-op when per-layer is off (buffer empty).
+        self.layer_flat.fill(0.0);
     }
 
     fn accumulate_layer(
@@ -196,6 +222,17 @@ impl ScoreProducer for AttnScoreProducer {
                 layer_score += scores[h * stride + t];
             }
             self.step_importance[pos] = self.step_importance[pos].max(layer_score);
+
+            // Per-(layer, token) FLAT step scratch (faithful-H2O `(b)`): record THIS layer's
+            // head-summed score in its own slot — NO cross-layer MAX, so each layer keeps its
+            // own heavy hitters. Guarded so the production path (per-layer off → buffer empty)
+            // does no work (INV-147 for the flat axis).
+            if self.per_layer_flat {
+                let l_idx = self.current_layer * self.max_seq_len + pos;
+                if l_idx < self.layer_flat.len() {
+                    self.layer_flat[l_idx] = layer_score;
+                }
+            }
         }
     }
 
@@ -224,6 +261,16 @@ impl ScoreProducer for AttnScoreProducer {
                 layer_score += scores[h * stride + t];
             }
             self.step_importance[pos] = self.step_importance[pos].max(layer_score);
+
+            // Per-(layer, token) FLAT step scratch (faithful-H2O `(b)`): THIS layer's
+            // head-summed score in its own slot, no cross-layer MAX. Guarded (INV-147,
+            // flat axis) — production path (per-layer off) does no work.
+            if self.per_layer_flat {
+                let l_idx = self.current_layer * self.max_seq_len + pos;
+                if l_idx < self.layer_flat.len() {
+                    self.layer_flat[l_idx] = layer_score;
+                }
+            }
 
             // Per-KV-head: average Q-heads within each GQA group
             for kv_h in 0..n_kv_heads {
@@ -296,6 +343,14 @@ impl ScoreProducer for AttnScoreProducer {
                 *cum += step;
             }
         }
+        // Sum this step's per-(layer, token) FLAT scratch into its cumulative (faithful-H2O
+        // `(b)`, the same SUM-across-steps flush as the collapsed `importance`, with the
+        // layer axis kept). Guarded so per-layer off → no work.
+        if self.per_layer_flat {
+            for (cum, &step) in self.layer_flat_cum.iter_mut().zip(self.layer_flat.iter()) {
+                *cum += step;
+            }
+        }
     }
 
     fn import_gpu_scores(&mut self, flat: &[f32], head: &[f32]) {
@@ -334,6 +389,8 @@ impl ScoreProducer for AttnScoreProducer {
         self.normalized.fill(0.0);
         self.layer_head.fill(0.0);
         self.layer_head_cum.fill(0.0);
+        self.layer_flat.fill(0.0);
+        self.layer_flat_cum.fill(0.0);
     }
 
     fn importance_scores(&self) -> &[f32] {
@@ -396,6 +453,41 @@ impl ScoreProducer for AttnScoreProducer {
         } else {
             None
         }
+    }
+
+    fn enable_per_layer_flat(&mut self) {
+        // Works in both flat and GQA mode — the flat `layer_score` (sum over Q-heads) exists
+        // in both `accumulate_layer` and `accumulate_layer_gqa`, so (unlike the per-head dump)
+        // there is no n_kv_heads guard.
+        let size = self.total_layers * self.max_seq_len;
+        if self.layer_flat.len() != size {
+            self.layer_flat = vec![0.0; size];
+        }
+        if self.layer_flat_cum.len() != size {
+            self.layer_flat_cum = vec![0.0; size];
+        }
+        self.per_layer_flat = true;
+    }
+
+    fn layer_flat_importance(&self) -> Option<&[f32]> {
+        if self.per_layer_flat {
+            // The cumulative per-(layer, token) FLAT importance — each layer's own
+            // accumulated attention with no cross-layer MAX (faithful `H2OKVCache_LayerWise`).
+            Some(&self.layer_flat_cum)
+        } else {
+            None
+        }
+    }
+
+    fn import_gpu_layer_flat(&mut self, layer_flat: &[f32]) {
+        // GPU twin of `import_gpu_scores` for the per-(layer, token) FLAT axis: on a GPU backend the
+        // per-layer reduce accumulates on-device, so at eviction the synced buffer OVERWRITES the CPU
+        // `layer_flat_cum` (the CPU side held only the prefill seed). No-op when per-layer is off.
+        if !self.per_layer_flat {
+            return;
+        }
+        let n = layer_flat.len().min(self.layer_flat_cum.len());
+        self.layer_flat_cum[..n].copy_from_slice(&layer_flat[..n]);
     }
 }
 

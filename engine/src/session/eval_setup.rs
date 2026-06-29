@@ -281,6 +281,12 @@ fn build_eval_score_accumulator(
     // divided by the decode-only step count. Non-h2o policies keep their behavior.
     let faithful = args.eviction_policy() == "h2o";
     acc.set_time_normalize(!faithful && !args.h2o_raw_scores());
+    // Faithful-H2O (b): keep each layer's OWN accumulated attention (no cross-layer MAX) so the
+    // eviction ranks heavy hitters per-layer (`H2OKVCache_LayerWise`). Opt-in (h2o only) → off
+    // elsewhere keeps the collapsed `importance` path byte-identical.
+    if faithful {
+        acc.enable_per_layer_flat();
+    }
 
     // IMP-1: arm the non-collapsed per-(layer, KV-head) importance buffer when the
     // `evict_importance` dump is requested. No-op in flat mode; eviction policies use

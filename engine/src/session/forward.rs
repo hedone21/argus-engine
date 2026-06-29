@@ -70,6 +70,9 @@ pub trait Forward {
     /// - `last_attn`: value-aware policy (a_i)용 last-layer last-step per-head
     ///   attention slice. `None`이면 importance 폴백. score accumulator 의
     ///   `last_step_head_attn()` 에서 공급.
+    /// - `per_layer`: faithful-H2O `(b)` per-`(layer, token)` FLAT importance `(layer_flat, max_seq)`
+    ///   — when `Some`, each layer evicts on its OWN heavy hitters (no cross-layer MAX), taking
+    ///   priority over `scores`. `None` everywhere except the opt-in faithful-H2O path.
     /// - `force`: true이면 `force_evict*`, false이면 `maybe_evict*`.
     /// - `target_ratio`: `force=true` 시 eviction 목표 비율.
     ///
@@ -79,11 +82,29 @@ pub trait Forward {
         cache_manager: &crate::kv::cache_manager::CacheManager,
         scores: Option<&[f32]>,
         last_attn: Option<&[f32]>,
+        per_layer: Option<(&[f32], usize)>,
         force: bool,
         target_ratio: f32,
     ) -> anyhow::Result<(usize, usize)> {
-        let _ = (cache_manager, scores, last_attn, force, target_ratio);
+        let _ = (
+            cache_manager,
+            scores,
+            last_attn,
+            per_layer,
+            force,
+            target_ratio,
+        );
         Ok((0, 0))
+    }
+
+    /// Backend handle for the GPU score sync at a chat eviction boundary (faithful-H2O `(b)`/`(c)`).
+    ///
+    /// Default `None`. Only [`model_forward::ModelForward`] (the score-bearing path) exposes its
+    /// backend, so `ChatSession`'s turn-boundary eviction can sync GPU-accumulated scores into the
+    /// CPU accumulator before reading them — closing the chat-on-GPU sync gap. No-op Forwards
+    /// (`QuantWindowForward`/`OffloadForward`, test mocks) keep the default `None`.
+    fn backend(&self) -> Option<&dyn crate::backend::Backend> {
+        None
     }
 
     /// prefix cache save (ENG-085, INV-189). prefill 완료 직후 호출.

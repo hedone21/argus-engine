@@ -212,6 +212,25 @@ impl AttentionScoreAccumulator {
     pub fn layer_head_importance(&self) -> Option<&[f32]> {
         self.producer.layer_head_importance()
     }
+
+    /// Enable the per-`(layer, token)` FLAT importance buffer (faithful-H2O LayerWise, divergence
+    /// `(b)`). See [`ScoreProducer::enable_per_layer_flat`].
+    pub fn enable_per_layer_flat(&mut self) {
+        self.producer.enable_per_layer_flat();
+    }
+
+    /// Per-`(layer, token)` FLAT cumulative importance (no cross-layer MAX), if enabled.
+    /// `[n_layers * max_seq_len]`, indexed `layer * max_seq_len + pos`. See
+    /// [`ScoreProducer::layer_flat_importance`].
+    pub fn layer_flat_importance(&self) -> Option<&[f32]> {
+        self.producer.layer_flat_importance()
+    }
+
+    /// Overwrite the per-`(layer, token)` FLAT cumulative from GPU-computed values (eviction-time
+    /// readback of the GPU per-layer reduce). See [`ScoreProducer::import_gpu_layer_flat`].
+    pub fn import_gpu_layer_flat(&mut self, layer_flat: &[f32]) {
+        self.producer.import_gpu_layer_flat(layer_flat);
+    }
 }
 
 /// Seed the accumulator's cumulative importance with prefill-attention column-sums (faithful-H2O `(c)`).
@@ -291,6 +310,18 @@ pub fn seed_prefill_importance_dual(
             && let Err(e) = gpu_acc.seed_cumulative(ocl.queue.as_core(), &flat, head)
         {
             log::warn!("faithful-H2O GPU prefill seed skipped: {e}");
+        }
+        // Faithful-H2O `(b)`: when per-layer FLAT is armed on the CPU acc, mirror it onto the GPU —
+        // arm the GPU per-layer reduce (so each decode `end_step` accumulates per-layer on-device) and
+        // seed its cumulative buffer with the CPU `layer_flat_cum` (the prefill seed populated it). The
+        // GPU per-layer reduce then accumulates on top; the eviction syncs it back via
+        // `import_gpu_layer_flat`.
+        if let Some(layer_flat) = acc.layer_flat_importance() {
+            let layer_flat = layer_flat.to_vec();
+            gpu_acc.enable_per_layer_flat();
+            if let Err(e) = gpu_acc.seed_layer_flat_cumulative(ocl.queue.as_core(), &layer_flat) {
+                log::warn!("faithful-H2O GPU per-layer prefill seed skipped: {e}");
+            }
         }
     }
 }

@@ -53,13 +53,20 @@ impl CachePressureHandler for EvictionHandler {
         // α-K 2b: guard + per-policy dispatch + 결과 조립은 registry 경로와 공유하는
         // 단일 코어(CacheManager::run_policy_eviction)에 위임한다. EHH 는 target_len(≥1)을
         // 미리 해소해 넘기므로 코어의 `target_len > 0` 한정 guard 가 기존 거동과 동일하다.
-        let scores = match (ctx.importance, ctx.head_importance) {
-            (Some(flat), Some(head)) if ctx.n_kv_heads > 0 => ScoreContext::PerHead {
+        let scores = match (ctx.importance, ctx.head_importance, ctx.per_layer_flat) {
+            // Faithful-H2O `(b)`: per-(layer, token) FLAT importance takes priority — each layer
+            // ranks its own heavy hitters (no cross-layer MAX). Opt-in (faithful-H2O only).
+            (_, _, Some((layer_flat, max_seq))) => ScoreContext::PerLayerFlat {
+                layer_flat,
+                max_seq,
+                last_attn: ctx.last_attn,
+            },
+            (Some(flat), Some(head), _) if ctx.n_kv_heads > 0 => ScoreContext::PerHead {
                 flat,
                 head,
                 n_kv_heads: ctx.n_kv_heads,
             },
-            (Some(flat), _) => ScoreContext::Flat {
+            (Some(flat), _, _) => ScoreContext::Flat {
                 importance: flat,
                 last_attn: ctx.last_attn,
             },
@@ -146,6 +153,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
@@ -202,6 +210,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
@@ -236,6 +245,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Warning,
             mem_available: 0,
             target_ratio: None,
@@ -258,6 +268,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
@@ -293,6 +304,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
@@ -324,6 +336,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
@@ -352,6 +365,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
@@ -380,6 +394,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,

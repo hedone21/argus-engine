@@ -143,22 +143,17 @@ impl EvictionStage {
     /// force_evict_with_scores 로 heavy-hitter/weighted-merge 정밀 token 선택(eval EvictionHook 동형).
     /// eviction 성공 직후 acc.reset() — KV geometry 변경 후 stale score 방지(§5.9.1 landmine 해소).
     fn run_eviction(&self) -> anyhow::Result<()> {
-        // §5.9.1 Track A: score (+ value-aware a_i) 추출 (lock 짧게 — 복사 후 즉시 해제).
-        let (scores_opt, attn_opt): (Option<Vec<f32>>, Option<Vec<f32>>) =
-            if let Some(cell) = self.score_cell.as_ref() {
-                let guard = cell
-                    .lock()
-                    .expect("EvictionStage score_cell Mutex poisoned");
-                match guard.as_ref().filter(|acc| acc.is_active()) {
-                    Some(acc) => (
-                        Some(acc.importance_scores().to_vec()),
-                        acc.last_step_head_attn().map(|s| s.to_vec()),
-                    ),
-                    None => (None, None),
-                }
-            } else {
-                (None, None)
-            };
+        use crate::kv::eviction::score_fed;
+        // §5.9.1 Track A: shared score-fed body (extract → route). Extract under the lock and
+        // release before routing. `bench` uses the CPU accumulate path on GPU backends, so there is
+        // no GPU score buffer to sync (unlike eval/chat) — the `score_fed::sync_gpu_scores_to_cpu`
+        // step is skipped here.
+        let extracted = self.score_cell.as_ref().and_then(|cell| {
+            let guard = cell
+                .lock()
+                .expect("EvictionStage score_cell Mutex poisoned");
+            guard.as_ref().and_then(score_fed::extract_scores)
+        });
 
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
         let result = {
@@ -166,16 +161,21 @@ impl EvictionStage {
                 .cache_manager
                 .lock()
                 .expect("EvictionStage CacheManager Mutex poisoned");
-            if let Some(ref scores) = scores_opt {
-                cm.force_evict_with_scores(
-                    &mut temp,
-                    self.target_ratio,
-                    scores,
-                    attn_opt.as_deref(),
-                )
-            } else {
-                cm.force_evict(&mut temp, self.target_ratio)
-            }
+            let (scores, last_attn, per_layer) = extracted
+                .as_ref()
+                .map(|e| e.as_args())
+                .unwrap_or((None, None, None));
+            // §5.9.1 force-evict (target_ratio): per-layer FLAT (faithful-H2O b) over collapsed
+            // scores over recency.
+            score_fed::route_evict(
+                &cm,
+                &mut temp,
+                scores,
+                last_attn,
+                per_layer,
+                true,
+                self.target_ratio,
+            )
         };
         for (f, c) in self.handles.iter().zip(temp) {
             f.put_inner(c);

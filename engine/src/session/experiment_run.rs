@@ -158,6 +158,11 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
             // is not divided by the decode-only step count. Non-h2o policies keep their behavior.
             let faithful = args.eviction_policy() == "h2o";
             acc.set_time_normalize(!faithful && !args.h2o_raw_scores());
+            // Faithful-H2O (b): per-layer FLAT importance (no cross-layer MAX) so each layer evicts
+            // on its own heavy hitters. Opt-in (h2o only) → off elsewhere = byte-identical.
+            if faithful {
+                acc.enable_per_layer_flat();
+            }
             Arc::new(Mutex::new(Some(acc)))
         } else {
             Arc::new(Mutex::new(None))
@@ -468,6 +473,11 @@ pub fn run_experiment_schedule_path(
             // is not divided by the decode-only step count. Non-h2o policies keep their behavior.
             let faithful = args.eviction_policy() == "h2o";
             acc.set_time_normalize(!faithful && !args.h2o_raw_scores());
+            // Faithful-H2O (b): per-layer FLAT importance (no cross-layer MAX) so each layer evicts
+            // on its own heavy hitters. Opt-in (h2o only) → off elsewhere = byte-identical.
+            if faithful {
+                acc.enable_per_layer_flat();
+            }
             Arc::new(Mutex::new(Some(acc)))
         } else {
             Arc::new(Mutex::new(None))
