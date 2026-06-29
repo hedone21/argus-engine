@@ -89,6 +89,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
             vocab_size,
             &out_path,
             args.answer_attention_steps_per_head,
+            args.answer_attention_steps_full(),
         )?;
     }
 

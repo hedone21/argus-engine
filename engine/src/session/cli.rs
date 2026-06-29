@@ -970,9 +970,23 @@ pub struct Args {
     /// `--dump answer_attention_steps`: emit the full per-head trajectory
     /// `[step][layer][head][token]` instead of the head-mean `[step][layer][token]` default.
     /// Large (≈ `num_attention_heads ×` the head-mean dump) — the dump logs the size at startup.
-    /// No effect unless `answer_attention_steps` is requested.
+    /// No effect unless `answer_attention_steps` is requested. Composes with `--..-scope`.
     #[arg(long)]
     pub answer_attention_steps_per_head: bool,
+
+    /// `--dump answer_attention_steps` capture scope. `decode` (default) keeps the trailing
+    /// gold-answer rows over the context columns `[0, prompt_len)` (schema 1). `full` keeps EVERY
+    /// forward row (prefill then decode) over the full key axis `[0, seq_len)` — the whole
+    /// lower-triangular causal matrix (schema 2; per-record `row` / `phase` / `n_valid_keys`).
+    /// `full` is quadratic in seq_len (the dump logs the size at startup), intended for short
+    /// diagnostic benches. No effect unless `answer_attention_steps` is requested; composes with
+    /// `--answer-attention-steps-per-head`.
+    #[arg(
+        long,
+        default_value = "decode",
+        value_parser = clap::builder::PossibleValuesParser::new(["decode", "full"])
+    )]
+    pub answer_attention_steps_scope: String,
 
     /// eval-LL KV eviction timing (when eviction fires and which importance drives
     /// it). `post_prefill_probe` (default) = today's behavior: full prefill, a
@@ -1543,6 +1557,13 @@ impl Args {
         self.dump_dir
             .as_ref()
             .map(|dir| dir.join(format!("{kind}.jsonl")))
+    }
+
+    /// Whether `--dump answer_attention_steps` should capture the full lower-triangular matrix
+    /// (`--answer-attention-steps-scope full`) instead of the decode-only default. Centralizes
+    /// the `"full"` scope string (clap validates the value set).
+    pub fn answer_attention_steps_full(&self) -> bool {
+        self.answer_attention_steps_scope == "full"
     }
 
     /// Engine 내부 dispatch default mode 결정.

@@ -3563,6 +3563,106 @@ mod tests {
     }
 
     #[test]
+    fn pfa_per_row_full_window_matches_decode_window_and_is_causal() {
+        // FULL-mode acceptance (§5): the producer's per-row output for query row r depends only on
+        // (q, k, r, window), NOT on the capture window q_window. So a `full` capture (q_window =
+        // seq_len, rows 0..seq_len) gives, for row = prompt_len + s restricted to columns
+        // [0, prompt_len), the SAME bytes as a `decode` capture (q_window = gold_len) at step s.
+        // Also pins causality: a full row r has zero mass on keys k > r (above the diagonal).
+        let head_dim = 8;
+        let seq_len = 7;
+        let cache_seq_len = seq_len;
+        let prompt_len = 4; // context boundary (prefill→decode)
+        let gold_len = seq_len - prompt_len; // 3 decode rows
+        let kv_capacity = 16;
+        let prefix_len = cache_seq_len;
+        for (nq, nkv, layout) in [(4, 4, "seq"), (4, 2, "seq"), (4, 4, "head"), (4, 2, "head")] {
+            for window in [None, Some(5usize)] {
+                let (q, k, k_pos_stride, kv_head_stride) = pfa_fixture(
+                    nq,
+                    nkv,
+                    layout,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    kv_capacity,
+                );
+
+                // decode capture: trailing gold_len rows → step s in 0..gold_len (qwin_start=prompt_len).
+                let mut decode = vec![0.0f32; gold_len * nq * prefix_len];
+                prefill_attention_scores(
+                    &q,
+                    &k,
+                    nq,
+                    nkv,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    k_pos_stride,
+                    kv_head_stride,
+                    0,
+                    gold_len,
+                    window,
+                    None,
+                    Some(PerRowScores {
+                        out: &mut decode,
+                        per_head: true,
+                    }),
+                );
+                // full capture: every row → row r in 0..seq_len (qwin_start=0).
+                let mut full = vec![0.0f32; seq_len * nq * prefix_len];
+                prefill_attention_scores(
+                    &q,
+                    &k,
+                    nq,
+                    nkv,
+                    head_dim,
+                    seq_len,
+                    cache_seq_len,
+                    k_pos_stride,
+                    kv_head_stride,
+                    0,
+                    seq_len,
+                    window,
+                    None,
+                    Some(PerRowScores {
+                        out: &mut full,
+                        per_head: true,
+                    }),
+                );
+
+                // sub-slice cross-check: full[row=prompt_len+s][h][key<prompt_len] == decode[s][h][key].
+                for s in 0..gold_len {
+                    let r = prompt_len + s;
+                    for h in 0..nq {
+                        for key in 0..prompt_len {
+                            let f = full[r * (nq * prefix_len) + h * prefix_len + key];
+                            let d = decode[s * (nq * prefix_len) + h * prefix_len + key];
+                            assert_eq!(
+                                f, d,
+                                "full vs decode mismatch (nq={nq}, nkv={nkv}, layout={layout}, \
+                                 window={window:?}, s={s}, h={h}, key={key})"
+                            );
+                        }
+                    }
+                }
+                // causality: full row r has zero mass on keys above its own position r.
+                for r in 0..seq_len {
+                    for h in 0..nq {
+                        for key in (r + 1)..prefix_len {
+                            let v = full[r * (nq * prefix_len) + h * prefix_len + key];
+                            assert_eq!(
+                                v, 0.0,
+                                "full not causal at r={r}, h={h}, key={key} (window={window:?})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pfa_side_channel_does_not_touch_out() {
         // Gate-0 armed-identity(§6.2 ii): producer 무장(prefill_scores=Some) 시에도 flash `out` 은
         // 미무장(None)과 byte-identical. 동시에 PFA buffer 는 채워진다(producer 가 실제 발화).

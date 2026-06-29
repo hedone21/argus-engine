@@ -49,8 +49,12 @@ use super::dump::{DUMP_ANSWER_ATTENTION_STEPS, JsonlDumpWriter};
 use super::fmt_bridge::EvalCacheKind;
 use super::output::EvalQuestion;
 
-/// Schema version of the `answer_attention_steps` record (bump on breaking changes).
+/// Schema version of the decode-default `answer_attention_steps` record (trailing gold rows over
+/// the context columns).
 pub const ANSWER_ATTENTION_STEPS_SCHEMA_VERSION: u32 = 1;
+
+/// Schema version of the `full`-scope record (every forward row over the full key axis).
+pub const ANSWER_ATTENTION_STEPS_SCHEMA_VERSION_FULL: u32 = 2;
 
 /// One JSONL record (per `(question, step)`) for the head-mean default.
 ///
@@ -89,6 +93,48 @@ struct AnswerAttentionStepRecordPerHead<'a> {
     attn_by_layer_head: Vec<Vec<Vec<f32>>>,
 }
 
+/// One JSONL record (per `(question, row)`) for the `full` scope, head-mean.
+///
+/// `row` is the forward query position (`0..seq_len`): rows `< prompt_len` are prefill, the rest
+/// are decode. `attn_by_layer[l][k]` is the head-mean post-softmax mass row `row` places on key
+/// `k` over the FULL key axis `[0, seq_len)`; columns `k > row` are `0` (causal), so
+/// `n_valid_keys == row + 1` marks the causal fill boundary.
+#[derive(Debug, Serialize)]
+struct AnswerAttentionStepFullRecord<'a> {
+    kind: &'static str,
+    schema_version: u32,
+    question_id: &'a str,
+    /// Prompt/context length = the gold continuation's `cont_start` (prefill→decode boundary).
+    prompt_len: usize,
+    /// Full forward length (`prompt + gold`).
+    seq_len: usize,
+    gold_index: usize,
+    /// Forward step = query position (`0..seq_len`).
+    row: usize,
+    /// `"prefill"` if `row < prompt_len`, else `"decode"`.
+    phase: &'static str,
+    /// Causal fill boundary: keys `[0, n_valid_keys)` are attended, `>=` are `0` (`= row + 1`).
+    n_valid_keys: usize,
+    /// `[num_hidden_layers][seq_len]` — head-mean post-softmax over the full key axis.
+    attn_by_layer: Vec<Vec<f32>>,
+}
+
+/// One JSONL record (per `(question, row)`) for the `full` scope, `--answer-attention-steps-per-head`.
+#[derive(Debug, Serialize)]
+struct AnswerAttentionStepFullRecordPerHead<'a> {
+    kind: &'static str,
+    schema_version: u32,
+    question_id: &'a str,
+    prompt_len: usize,
+    seq_len: usize,
+    gold_index: usize,
+    row: usize,
+    phase: &'static str,
+    n_valid_keys: usize,
+    /// `[num_hidden_layers][num_attention_heads][seq_len]` — per-head over the full key axis.
+    attn_by_layer_head: Vec<Vec<Vec<f32>>>,
+}
+
 /// The gold-choice index to forward for a question (mirrors v1).
 ///
 /// Uses the host-supplied `gold_index` when present; for a single-choice question the gold is
@@ -101,27 +147,30 @@ fn effective_gold_index(gold_index: Option<usize>, n_choices: usize) -> Option<u
     }
 }
 
-/// Slice step `step`'s head-mean per-layer buffer into `[layer][context-token]`.
+/// Slice step `step`'s head-mean per-layer buffer into `[layer][key]`, keeping the first
+/// `keep_cols` key columns (`keep_cols <= prefix_len`).
 ///
-/// `per_row_buf[l]` is laid out `[step * prefix_len + key_pos]`; we keep the context prefix
-/// `[0, prompt_len)` (`prompt_len <= prefix_len`) for the given `step`.
+/// `per_row_buf[l]` is laid out `[step * prefix_len + key_pos]`. The decode dump keeps the context
+/// prefix (`keep_cols = prompt_len`); the `full` dump keeps the whole key axis
+/// (`keep_cols = prefix_len = seq_len`, with causal zeros above the diagonal).
 fn build_step_attn_by_layer(
     per_row_buf: &[Vec<f32>],
     step: usize,
     prefix_len: usize,
-    prompt_len: usize,
+    keep_cols: usize,
 ) -> Vec<Vec<f32>> {
-    debug_assert!(prompt_len <= prefix_len);
+    debug_assert!(keep_cols <= prefix_len);
     per_row_buf
         .iter()
         .map(|layer| {
             let base = step * prefix_len;
-            layer[base..base + prompt_len].to_vec()
+            layer[base..base + keep_cols].to_vec()
         })
         .collect()
 }
 
-/// Slice step `step`'s per-head per-layer buffer into `[layer][head][context-token]`.
+/// Slice step `step`'s per-head per-layer buffer into `[layer][head][key]`, keeping the first
+/// `keep_cols` key columns.
 ///
 /// `per_row_buf[l]` is laid out `[step * (n_heads_q * prefix_len) + h * prefix_len + key_pos]`.
 fn build_step_attn_by_layer_head(
@@ -129,16 +178,16 @@ fn build_step_attn_by_layer_head(
     step: usize,
     n_heads_q: usize,
     prefix_len: usize,
-    prompt_len: usize,
+    keep_cols: usize,
 ) -> Vec<Vec<Vec<f32>>> {
-    debug_assert!(prompt_len <= prefix_len);
+    debug_assert!(keep_cols <= prefix_len);
     per_row_buf
         .iter()
         .map(|layer| {
             (0..n_heads_q)
                 .map(|h| {
                     let base = step * (n_heads_q * prefix_len) + h * prefix_len;
-                    layer[base..base + prompt_len].to_vec()
+                    layer[base..base + keep_cols].to_vec()
                 })
                 .collect()
         })
@@ -146,10 +195,16 @@ fn build_step_attn_by_layer_head(
 }
 
 /// Run the `answer_attention_steps` (IMP-4) dump over `questions`, writing one JSONL record per
-/// `(question, step)` whose gold choice is known. `per_head` = full per-head dump (default
-/// head-mean). The skip rules (ambiguous gold / out-of-range / empty continuation / too long)
-/// mirror v1.
+/// captured row whose gold choice is known. `per_head` = full per-head dump (default head-mean).
 ///
+/// `full` selects the capture scope:
+/// - `false` (decode default, schema 1): the trailing gold-answer rows over the context columns
+///   `[0, prompt_len)` — one record per `(question, step in 0..q_window)`.
+/// - `true` (full, schema 2): EVERY forward row (prefill `0..prompt_len` then decode
+///   `prompt_len..seq_len`) over the FULL key axis `[0, seq_len)` (causal → zeros above the
+///   diagonal) — one record per `(question, row in 0..seq_len)`. Quadratic in `seq_len`.
+///
+/// The skip rules (ambiguous gold / out-of-range / empty continuation / too long) mirror v1.
 /// `out_path` is created (with parent dirs); `vocab_size` sizes the throwaway logits buffer.
 #[allow(clippy::too_many_arguments)]
 pub fn run_answer_attention_steps_dump(
@@ -162,6 +217,7 @@ pub fn run_answer_attention_steps_dump(
     vocab_size: usize,
     out_path: &Path,
     per_head: bool,
+    full: bool,
 ) -> Result<()> {
     if backend.is_gpu() {
         // PFA is CPU-only (the GPU flash kernel short-circuits before it). The caller already
@@ -176,20 +232,25 @@ pub fn run_answer_attention_steps_dump(
     let n_kv_heads = model.config.num_key_value_heads;
     let head_dim = model.config.head_dim;
 
-    if per_head {
-        // Full per-head dump is ≈ n_heads_q × the head-mean size — call it out up front so a
-        // many-GB run on a long batch is a conscious choice, not a surprise.
-        let approx_bytes_per_q = (max_seq_len as u128)
-            * (n_layers as u128)
-            * (n_heads_q as u128)
-            * (max_seq_len as u128)
-            * 4;
+    if per_head || full {
+        // per-head is ≈ n_heads_q × head-mean; `full` is quadratic in seq_len (every row × full
+        // key axis). Call the upper-bound size out up front so a many-GB run is a conscious choice.
+        // (Upper bound: decode rows ≤ max_seq_len, full rows = seq_len ≤ max_seq_len.)
+        let heads = if per_head { n_heads_q as u128 } else { 1 };
+        let approx_bytes_per_q =
+            (max_seq_len as u128) * (n_layers as u128) * heads * (max_seq_len as u128) * 4;
         eprintln!(
-            "[dump:answer_attention_steps] per-head mode: full [step][layer][head][token] — up to \
-             ~{} MB per question at max_seq_len={} (head-mean default is ~{}× smaller)",
+            "[dump:answer_attention_steps] scope={}, {} — up to ~{} MB per question at \
+             max_seq_len={}{}",
+            if full { "full" } else { "decode" },
+            if per_head { "per-head" } else { "head-mean" },
             approx_bytes_per_q / (1024 * 1024),
             max_seq_len,
-            n_heads_q
+            if full {
+                " (quadratic in seq_len; intended for short diagnostic benches)"
+            } else {
+                ""
+            },
         );
     }
 
@@ -296,13 +357,17 @@ pub fn run_answer_attention_steps_dump(
         );
 
         // Per-step PFA target: per-layer flat buffer, prefix_len == seq_len (start_pos 0).
-        // head-mean accumulates over heads → pre-zero; per-head assigns each (step,h) slot but
+        // head-mean accumulates over heads → pre-zero; per-head assigns each (row,h) slot but
         // masked key positions stay zero → pre-zero too.
         let prefix_len = seq_len;
+        // Capture window: `full` = every forward row (0..seq_len); decode = trailing gold rows.
+        let cap = if full { seq_len } else { q_window };
+        // Kept key columns: `full` = whole key axis [0, seq_len); decode = context [0, prompt_len).
+        let keep_cols = if full { prefix_len } else { prompt_len };
         let per_layer_len = if per_head {
-            q_window * n_heads_q * prefix_len
+            cap * n_heads_q * prefix_len
         } else {
-            q_window * prefix_len
+            cap * prefix_len
         };
         let mut per_row_buf: Vec<Vec<f32>> =
             (0..n_layers).map(|_| vec![0.0f32; per_layer_len]).collect();
@@ -326,46 +391,94 @@ pub fn run_answer_attention_steps_dump(
                 layer_boundary_hook: None,
                 read_stage: None,
                 prefill_attn: None,
-                prefill_attn_per_row: Some((&mut per_row_buf, q_window, per_head)),
+                prefill_attn_per_row: Some((&mut per_row_buf, cap, per_head)),
             })
         })?;
 
-        // Stream one record per (question, step) so peak per-record RAM is one step's slice.
-        for step in 0..q_window {
-            let gold_token_position = prompt_len + step;
-            if per_head {
-                let attn_by_layer_head = build_step_attn_by_layer_head(
-                    &per_row_buf,
-                    step,
-                    n_heads_q,
-                    prefix_len,
-                    prompt_len,
-                );
-                writer.write_record(&AnswerAttentionStepRecordPerHead {
-                    kind: DUMP_ANSWER_ATTENTION_STEPS,
-                    schema_version: ANSWER_ATTENTION_STEPS_SCHEMA_VERSION,
-                    question_id: &question.id,
-                    prompt_len,
-                    q_window,
-                    gold_index,
-                    step,
-                    gold_token_position,
-                    attn_by_layer_head,
-                })?;
+        // Stream one record per captured row so peak per-record RAM is one row's slice.
+        for row in 0..cap {
+            if full {
+                // `full`: every forward row over the full key axis (schema 2).
+                let phase = if row < prompt_len {
+                    "prefill"
+                } else {
+                    "decode"
+                };
+                let n_valid_keys = row + 1; // causal: keys [0, row] attended, > row are 0.
+                if per_head {
+                    let attn_by_layer_head = build_step_attn_by_layer_head(
+                        &per_row_buf,
+                        row,
+                        n_heads_q,
+                        prefix_len,
+                        keep_cols,
+                    );
+                    writer.write_record(&AnswerAttentionStepFullRecordPerHead {
+                        kind: DUMP_ANSWER_ATTENTION_STEPS,
+                        schema_version: ANSWER_ATTENTION_STEPS_SCHEMA_VERSION_FULL,
+                        question_id: &question.id,
+                        prompt_len,
+                        seq_len,
+                        gold_index,
+                        row,
+                        phase,
+                        n_valid_keys,
+                        attn_by_layer_head,
+                    })?;
+                } else {
+                    let attn_by_layer =
+                        build_step_attn_by_layer(&per_row_buf, row, prefix_len, keep_cols);
+                    writer.write_record(&AnswerAttentionStepFullRecord {
+                        kind: DUMP_ANSWER_ATTENTION_STEPS,
+                        schema_version: ANSWER_ATTENTION_STEPS_SCHEMA_VERSION_FULL,
+                        question_id: &question.id,
+                        prompt_len,
+                        seq_len,
+                        gold_index,
+                        row,
+                        phase,
+                        n_valid_keys,
+                        attn_by_layer,
+                    })?;
+                }
             } else {
-                let attn_by_layer =
-                    build_step_attn_by_layer(&per_row_buf, step, prefix_len, prompt_len);
-                writer.write_record(&AnswerAttentionStepRecord {
-                    kind: DUMP_ANSWER_ATTENTION_STEPS,
-                    schema_version: ANSWER_ATTENTION_STEPS_SCHEMA_VERSION,
-                    question_id: &question.id,
-                    prompt_len,
-                    q_window,
-                    gold_index,
-                    step,
-                    gold_token_position,
-                    attn_by_layer,
-                })?;
+                // decode default: trailing gold rows over context columns (schema 1, unchanged).
+                let step = row;
+                let gold_token_position = prompt_len + step;
+                if per_head {
+                    let attn_by_layer_head = build_step_attn_by_layer_head(
+                        &per_row_buf,
+                        step,
+                        n_heads_q,
+                        prefix_len,
+                        keep_cols,
+                    );
+                    writer.write_record(&AnswerAttentionStepRecordPerHead {
+                        kind: DUMP_ANSWER_ATTENTION_STEPS,
+                        schema_version: ANSWER_ATTENTION_STEPS_SCHEMA_VERSION,
+                        question_id: &question.id,
+                        prompt_len,
+                        q_window,
+                        gold_index,
+                        step,
+                        gold_token_position,
+                        attn_by_layer_head,
+                    })?;
+                } else {
+                    let attn_by_layer =
+                        build_step_attn_by_layer(&per_row_buf, step, prefix_len, keep_cols);
+                    writer.write_record(&AnswerAttentionStepRecord {
+                        kind: DUMP_ANSWER_ATTENTION_STEPS,
+                        schema_version: ANSWER_ATTENTION_STEPS_SCHEMA_VERSION,
+                        question_id: &question.id,
+                        prompt_len,
+                        q_window,
+                        gold_index,
+                        step,
+                        gold_token_position,
+                        attn_by_layer,
+                    })?;
+                }
             }
         }
     }
@@ -419,6 +532,43 @@ mod tests {
         assert_eq!(out[1], vec![1200.0, 1201.0]);
         // Context slice excludes positions >= prompt_len (the answer tokens).
         assert_eq!(out[0], vec![200.0, 201.0]);
+    }
+
+    #[test]
+    fn full_axis_slice_keeps_all_columns() {
+        // `full` mode slices keep_cols = prefix_len → the WHOLE key axis (incl. columns the decode
+        // dump drops). Same buffer/layout as the decode test; only keep_cols differs.
+        let n_layers = 2;
+        let prefix_len = 4; // = seq_len in full mode
+        let cap = 3; // = seq_len rows in full mode
+        let per_row_buf: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| {
+                let mut row = vec![0.0f32; cap * prefix_len];
+                for step in 0..cap {
+                    for k in 0..prefix_len {
+                        row[step * prefix_len + k] = (l * 1000 + step * 100 + k) as f32;
+                    }
+                }
+                row
+            })
+            .collect();
+
+        // Row 1, full key axis (keep_cols = prefix_len) → all 4 columns kept.
+        let out = build_step_attn_by_layer(&per_row_buf, 1, prefix_len, prefix_len);
+        assert_eq!(out[0].len(), prefix_len, "full key-axis width");
+        // Layer 0, row 1 → 0*1000 + 1*100 + {0,1,2,3}.
+        assert_eq!(out[0], vec![100.0, 101.0, 102.0, 103.0]);
+        // Per-head full axis keeps all columns too.
+        let n_heads_q = 1;
+        let ph: Vec<Vec<f32>> = vec![{
+            let mut row = vec![0.0f32; cap * n_heads_q * prefix_len];
+            for k in 0..prefix_len {
+                row[2 * prefix_len + k] = (200 + k) as f32; // row 2
+            }
+            row
+        }];
+        let outh = build_step_attn_by_layer_head(&ph, 2, n_heads_q, prefix_len, prefix_len);
+        assert_eq!(outh[0][0], vec![200.0, 201.0, 202.0, 203.0]);
     }
 
     #[test]

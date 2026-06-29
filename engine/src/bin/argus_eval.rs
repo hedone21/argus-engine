@@ -644,6 +644,50 @@ mod tests {
         assert!(args.answer_attention_steps_per_head);
     }
 
+    /// The capture scope defaults to decode and accepts `full`; both compose with the dump guards.
+    #[test]
+    fn answer_attention_steps_scope_parses_and_defaults_to_decode() {
+        let decode = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention_steps",
+            "--dump-dir",
+            "/tmp/d",
+        ]);
+        assert!(reject_unsupported_modes_eval(&decode).is_ok());
+        assert_eq!(decode.answer_attention_steps_scope, "decode");
+        assert!(!decode.answer_attention_steps_full());
+
+        let full = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention_steps",
+            "--dump-dir",
+            "/tmp/d",
+            "--answer-attention-steps-scope",
+            "full",
+        ]);
+        assert!(reject_unsupported_modes_eval(&full).is_ok());
+        assert!(full.answer_attention_steps_full());
+    }
+
+    /// An out-of-set scope value is rejected by clap (closed value set).
+    #[test]
+    fn answer_attention_steps_scope_rejects_unknown_value() {
+        let res = Args::try_parse_from([
+            "argus-eval",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--answer-attention-steps-scope",
+            "everything",
+        ]);
+        assert!(res.is_err(), "unknown scope value must be rejected by clap");
+    }
+
     /// No `--dump` → guard is a no-op and the accessors report nothing enabled
     /// (production path untouched — INV-147).
     #[test]
