@@ -79,6 +79,15 @@ pub struct GpuScoreAccumulator {
     /// Cumulative per-KV-head importance: `[n_kv_heads * max_seq_len]`.
     head_importance: ocl::core::Mem,
 
+    /// Cumulative per-`(layer, token)` FLAT importance: `[n_layers * max_seq_len]` (faithful-H2O
+    /// `H2OKVCache_LayerWise`, divergence `(b)`). Updated by the per-layer reduce kernel with NO
+    /// cross-layer MAX, so each layer ranks heavy hitters on its OWN attention — the GPU twin of the
+    /// CPU producer's `layer_flat_cum`. Always allocated (tiny vs `score_buf`); dispatched/synced only
+    /// when `per_layer_flat` is armed.
+    layer_flat_importance: ocl::core::Mem,
+    /// Whether the per-layer FLAT reduce runs each `end_step` + is synced/seeded (faithful-H2O only).
+    per_layer_flat: bool,
+
     // --- Reduce policy (the GPU score POLICY — per-layer MAX + GQA averaging + forgetting-factor decay —
     // owned by the `attn-score` plugin; the engine core holds no GPU scoring arithmetic). ---
     reducer: Box<dyn ScoreReduceBackend>,
@@ -156,6 +165,17 @@ impl GpuScoreAccumulator {
             ocl::core::create_buffer::<_, f32>(context, ocl::core::MEM_READ_WRITE, head_size, None)?
         };
 
+        // Per-(layer, token) FLAT cumulative buffer (faithful-H2O (b)): [n_layers * max_seq_len].
+        let layer_flat_size = n_layers * max_seq_len;
+        let layer_flat_importance = unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                context,
+                ocl::core::MEM_READ_WRITE,
+                layer_flat_size,
+                None,
+            )?
+        };
+
         // Zero-initialize cumulative buffers and score buffer (score_buf zero is
         // important because the fused reduce reads every layer; any layer that
         // didn't write for some reason would otherwise contribute stale data
@@ -191,12 +211,23 @@ impl GpuScoreAccumulator {
                 None::<ocl::core::Event>,
                 None::<&mut ocl::core::Event>,
             )?;
+            ocl::core::enqueue_write_buffer(
+                queue,
+                &layer_flat_importance,
+                true,
+                0,
+                &vec![0.0f32; layer_flat_size],
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
         }
 
         Ok(Self {
             score_buf,
             importance,
             head_importance,
+            layer_flat_importance,
+            per_layer_flat: false,
             reducer,
             n_layers,
             n_heads_q,
@@ -296,10 +327,21 @@ impl GpuScoreAccumulator {
             cache_seq_len,
             score_stride: self.score_stride,
             max_seq_len: self.max_seq_len,
+            layer_flat_importance: self.layer_flat_importance.as_ptr(),
         };
         let ret = self.reducer.reduce(&args);
         if ret != 0 {
             anyhow::bail!("attn_score GPU reduce failed: code {ret}");
+        }
+        // Faithful-H2O (b): ALSO fold this step into the per-(layer, token) FLAT cumulative (no
+        // cross-layer MAX), so each layer ranks its own heavy hitters. The collapsed reduce above is
+        // left running (harmless, keeps the non-faithful path available); only this extra dispatch is
+        // gated. The kernel reads `args.layer_flat_importance`.
+        if self.per_layer_flat {
+            let ret = self.reducer.reduce_per_layer(&args);
+            if ret != 0 {
+                anyhow::bail!("attn_score GPU per-layer reduce failed: code {ret}");
+            }
         }
 
         self.steps_accumulated += 1;
@@ -345,6 +387,140 @@ impl GpuScoreAccumulator {
         Ok((flat, head))
     }
 
+    /// Seed the cumulative importance buffers with a prefill-attention column-sum (faithful-H2O `(c)`).
+    ///
+    /// On GPU, the eviction policy ranks on importance that is `import_gpu_scores`'d FROM these buffers
+    /// (the pre-eviction sync OVERWRITES the CPU-side importance), so the prefill seed cannot live only
+    /// on the CPU accumulator — it would be clobbered. We write the just-folded cumulative directly into
+    /// the GPU buffers; the subsequent decode `end_step`s accumulate on top (the fused reduce reads the
+    /// existing value, applies decay, then adds — so with the default no-decay config the seed persists).
+    ///
+    /// Must be called AFTER `new`/`reset` (which zero the buffers) and BEFORE the first decode `end_step`.
+    /// `flat.len() == max_seq_len`, `head.len() == n_kv_heads * max_seq_len` (same layout `sync_to_cpu`
+    /// reads back and `import_gpu_scores` consumes).
+    pub fn seed_cumulative(
+        &self,
+        queue: &ocl::core::CommandQueue,
+        flat: &[f32],
+        head: &[f32],
+    ) -> Result<()> {
+        if flat.len() != self.max_seq_len {
+            anyhow::bail!(
+                "seed_cumulative: flat.len()={} != max_seq_len={}",
+                flat.len(),
+                self.max_seq_len
+            );
+        }
+        if head.len() != self.n_kv_heads * self.max_seq_len {
+            anyhow::bail!(
+                "seed_cumulative: head.len()={} != n_kv_heads*max_seq_len={}",
+                head.len(),
+                self.n_kv_heads * self.max_seq_len
+            );
+        }
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                queue,
+                &self.importance,
+                true,
+                0,
+                flat,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+            ocl::core::enqueue_write_buffer(
+                queue,
+                &self.head_importance,
+                true,
+                0,
+                head,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Arm the per-`(layer, token)` FLAT reduce (faithful-H2O `(b)`): from now on each `end_step`
+    /// also folds the step into `layer_flat_importance` (no cross-layer MAX), and the seed/sync paths
+    /// below become active. Must be called before the first decode `end_step` / seed (mirror of the
+    /// CPU `enable_per_layer_flat`).
+    pub fn enable_per_layer_flat(&mut self) {
+        self.per_layer_flat = true;
+    }
+
+    /// Read the cumulative per-`(layer, token)` FLAT importance back to CPU (`[n_layers * max_seq_len]`,
+    /// row-major `layer * max_seq_len + pos`) — the GPU twin of the CPU producer's `layer_flat_cum`.
+    /// Blocking; called only at eviction time alongside [`sync_to_cpu`](Self::sync_to_cpu).
+    pub fn sync_layer_flat_to_cpu(&self, queue: &ocl::core::CommandQueue) -> Result<Vec<f32>> {
+        let mut out = vec![0.0f32; self.n_layers * self.max_seq_len];
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                queue,
+                &self.layer_flat_importance,
+                true,
+                0,
+                &mut out,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(out)
+    }
+
+    /// Seed the per-`(layer, token)` FLAT cumulative buffer with the prefill column-sums (faithful-H2O
+    /// `(b)` + `(c)`): the GPU per-layer twin of [`seed_cumulative`](Self::seed_cumulative). The
+    /// subsequent decode per-layer reduces accumulate on top (decay=1.0 default → the seed persists).
+    /// `layer_flat.len() == n_layers * max_seq_len` (same layout `sync_layer_flat_to_cpu` reads back).
+    pub fn seed_layer_flat_cumulative(
+        &self,
+        queue: &ocl::core::CommandQueue,
+        layer_flat: &[f32],
+    ) -> Result<()> {
+        let want = self.n_layers * self.max_seq_len;
+        if layer_flat.len() != want {
+            anyhow::bail!(
+                "seed_layer_flat_cumulative: layer_flat.len()={} != n_layers*max_seq_len={}",
+                layer_flat.len(),
+                want
+            );
+        }
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                queue,
+                &self.layer_flat_importance,
+                true,
+                0,
+                layer_flat,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reset ONLY the per-`(layer, token)` FLAT cumulative buffer (faithful-H2O `(b)`), in lockstep
+    /// with the CPU accumulator's post-eviction `reset()`. The GPU per-layer reduce accumulates
+    /// on-device across decode steps; without this the buffer would monotonically grow since prefill
+    /// at physical slots that compaction has shifted, so a 2nd eviction would rank GPU per-layer
+    /// importance misaligned with the compacted cache (and diverge from the freshly-reset CPU twin).
+    /// Touches NEITHER the collapsed `importance`/`head_importance` (their existing GPU behavior is
+    /// unchanged — only the new per-layer buffer is reset) NOR `steps_accumulated`/`current_layer_idx`.
+    pub fn reset_layer_flat(&self, queue: &ocl::core::CommandQueue) -> Result<()> {
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                queue,
+                &self.layer_flat_importance,
+                true,
+                0,
+                &vec![0.0f32; self.n_layers * self.max_seq_len],
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Reset cumulative importance (after eviction).
     pub fn reset(&mut self, queue: &ocl::core::CommandQueue) -> Result<()> {
         let flat_size = self.max_seq_len;
@@ -367,6 +543,16 @@ impl GpuScoreAccumulator {
                 true,
                 0,
                 &zeros_head,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+            // Per-layer FLAT cumulative — cleared in lockstep (faithful-H2O (b)).
+            ocl::core::enqueue_write_buffer(
+                queue,
+                &self.layer_flat_importance,
+                true,
+                0,
+                &vec![0.0f32; self.n_layers * self.max_seq_len],
                 None::<ocl::core::Event>,
                 None::<&mut ocl::core::Event>,
             )?;

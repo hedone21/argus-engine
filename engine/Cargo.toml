@@ -60,6 +60,10 @@ path = "src/bin/test_q4_soa_byte_equal.rs"
 name = "test_kv_reencode_device"
 path = "src/bin/test_kv_reencode_device.rs"
 
+[[bin]]
+name = "test_faithful_h2o_gpu_seed_device"
+path = "src/bin/test_faithful_h2o_gpu_seed_device.rs"
+
 [dependencies]
 # Shared IPC protocol types (manager <-> engine). Separate repo.
 argus-shared = { git = "https://github.com/hedone21/argus-shared.git", branch = "main" }
@@ -101,9 +105,6 @@ pyramidkv = { path = "../crates/techniques/pyramidkv", optional = true }
 # H2O (Heavy-Hitter Oracle, score-based KVCacheStage). Extracted from the engine core;
 # non-optional, force-linked so `eviction h2o` resolves the out-of-tree plugin.
 h2o = { path = "../crates/techniques/h2o" }
-# H2O+ (GQA-aware per-head heavy-hitter KVCacheStage — the first PerHead-plan plugin). Extracted
-# from the engine core; non-optional, force-linked so `eviction h2o_plus` resolves the plugin.
-h2o-plus = { path = "../crates/techniques/h2o-plus" }
 # D2O (Dynamic Discriminative Operations, WeightedMerge-producing KVCacheStage). Extracted from
 # the engine core; non-optional, force-linked. Production builds `d2o::D2OStage` directly with the
 # full CLI config; the linkme registration backs `make_stage("d2o")` + the registry self-test.

@@ -82,6 +82,12 @@ pub struct HandlerContext<'a> {
     /// Layout: `[n_kv_heads * max_seq_len]`, row-major. `None` when no AttnWeights producer
     /// is active; the value-aware stage then falls back to flat `importance`.
     pub last_attn: Option<&'a [f32]>,
+    /// Optional per-`(layer, token)` FLAT importance buffer + its `max_seq` stride (faithful-H2O
+    /// `H2OKVCache_LayerWise`, divergence `(b)`): `(layer_flat[n_layers * max_seq], max_seq)`. When
+    /// `Some`, the per-layer eviction loop ranks each layer's heavy hitters on its OWN window
+    /// (`&layer_flat[layer * max_seq ..][.. max_seq]`) with no cross-layer MAX. `None` everywhere
+    /// except the opt-in faithful-H2O path → byte-identical to the collapsed behavior.
+    pub per_layer_flat: Option<(&'a [f32], usize)>,
     /// Current pressure level determined by the pipeline.
     pub pressure_level: PressureLevel,
     /// Available system memory in bytes.
@@ -345,6 +351,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
@@ -383,6 +390,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Normal,
             mem_available: 1024 * 1024 * 1024,
             target_ratio: None,
@@ -445,6 +453,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
@@ -468,6 +477,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
@@ -501,6 +511,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
@@ -591,6 +602,7 @@ mod tests {
             head_importance: None,
             n_kv_heads: 0,
             last_attn: None,
+            per_layer_flat: None,
             pressure_level: PressureLevel::Warning,
             mem_available: 0,
             target_ratio: None,

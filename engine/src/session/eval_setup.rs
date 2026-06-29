@@ -149,13 +149,18 @@ pub fn is_score_based_eviction(args: &Args) -> bool {
 /// - sliding/none → prompt 전체 보호(legacy 동작).
 pub fn eval_protected_prefix(args: &Args, prompt_len: usize) -> usize {
     args.protected_prefix().unwrap_or_else(|| {
-        // Score-based stages declare a protected-prefix (4 attention sinks); score-free stages
-        // declare 0 → the engine protects the whole prompt (legacy sliding/none default). Streaming
+        // Score-FREE stages declare 0 → the engine protects the whole prompt (legacy sliding/none
+        // default). A SCORE-BASED stage that declares 0 (faithful H2O — no attention sink) means
+        // protect 0, NOT the whole prompt — otherwise the prompt would never be evicted. Streaming
         // derives its own sink and ignores StageParams.protected_prefix, so no per-name branch is
         // needed.
-        match stage_default_protected_prefix(args.eviction_policy()) {
-            0 => prompt_len,
-            cap => cap,
+        let cap = stage_default_protected_prefix(args.eviction_policy());
+        if cap == 0
+            && !crate::kv::eviction::stage_registry::stage_is_score_based(args.eviction_policy())
+        {
+            prompt_len
+        } else {
+            cap
         }
     })
 }
@@ -206,7 +211,7 @@ fn build_eval_cache_manager(
             crate::kv::eviction::stage_registry::make_stage_backed_policy(name, &params, &extra)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "argus-eval: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o (or --load-plugin <.so>).",
+                        "argus-eval: unknown eviction policy '{}'. Use: none, sliding, streaming, h2o, d2o (or --load-plugin <.so>).",
                         name
                     )
                 })?
@@ -272,7 +277,16 @@ fn build_eval_score_accumulator(
         )
     };
     acc.set_active(true);
-    acc.set_time_normalize(!args.h2o_raw_scores());
+    // Faithful-H2O (a): force time_normalize OFF for h2o so the prefill column-sum base is not
+    // divided by the decode-only step count. Non-h2o policies keep their behavior.
+    let faithful = args.eviction_policy() == "h2o";
+    acc.set_time_normalize(!faithful && !args.h2o_raw_scores());
+    // Faithful-H2O (b): keep each layer's OWN accumulated attention (no cross-layer MAX) so the
+    // eviction ranks heavy hitters per-layer (`H2OKVCache_LayerWise`). Opt-in (h2o only) → off
+    // elsewhere keeps the collapsed `importance` path byte-identical.
+    if faithful {
+        acc.enable_per_layer_flat();
+    }
 
     // IMP-1: arm the non-collapsed per-(layer, KV-head) importance buffer when the
     // `evict_importance` dump is requested. No-op in flat mode; eviction policies use
@@ -653,6 +667,7 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
         hidden_size,
         // The quant-window path does not evict; eviction timing does not apply.
         evict_timing: crate::session::eval::EvictTiming::default(),
+        faithful_h2o: false,
     };
     let qcf_config = crate::qcf_types::QcfConfig::default();
     let quant_window_bits = args.effective_quant_window_bits();
@@ -789,11 +804,19 @@ mod tests {
         assert_eq!(eval_protected_prefix(&args, 50), 50);
     }
 
-    /// h2o/h2o_plus/d2o + 미지정 → 4 (attention sinks only).
+    /// Faithful h2o → 0 (no attention sink); h2o_plus/d2o + 미지정 → 4 (attention sinks only).
     #[test]
-    fn protected_prefix_score_based_defaults_to_4() {
-        // Stages are now selected generically by registry name (snake_case `h2o_plus`).
-        for policy in ["h2o", "h2o_plus", "d2o"] {
+    fn protected_prefix_score_based_defaults() {
+        // Faithful H2O has NO sink prefix (`H2O_CAPS.default_protected_prefix == 0`).
+        let args = parse_args(&["--eval-ll", "eviction", "plugin", "--name", "h2o"]);
+        assert_eq!(args.eviction_policy(), "h2o");
+        assert_eq!(
+            eval_protected_prefix(&args, 100),
+            0,
+            "faithful h2o should default protected_prefix to 0"
+        );
+        // The D2O lineage still protects 4 attention sinks by default.
+        for policy in ["d2o"] {
             let args = parse_args(&["--eval-ll", "eviction", "plugin", "--name", policy]);
             assert_eq!(args.eviction_policy(), policy);
             assert_eq!(

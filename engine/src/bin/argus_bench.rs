@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
     if !bench_supported(&args) {
         bail!(
             "argus-bench AB-1: this combination of args is not yet supported. \
-             supported: eviction <none|sliding|streaming|h2o|h2o_plus> + resilience. \
+             supported: eviction <none|sliding|streaming|h2o> + resilience. \
              blocked: qcf_dump, skip_ratio, d2o_layer_alloc, profile, profile_events, \
              tensor_partition, weight-swap (→ AB-3)."
         );

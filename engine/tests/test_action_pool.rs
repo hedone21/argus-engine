@@ -207,6 +207,7 @@ fn test_swap_then_continue() {
         head_importance: None,
         n_kv_heads: 0,
         last_attn: None,
+        per_layer_flat: None,
         pressure_level: PressureLevel::Warning,
         mem_available: 0,
         target_ratio: None,

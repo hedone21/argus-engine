@@ -94,3 +94,40 @@ __kernel void kernel_score_fused_reduce(
         head_importance[idx] = head_importance[idx] * decay_factor + step_head_local[kv];
     }
 }
+
+// Per-layer FLAT reduce (faithful-H2O H2OKVCache_LayerWise, divergence (b)).
+//
+// The same per-(layer, token) head-sum as the fused kernel above, but with NO cross-layer MAX:
+// each layer's head-summed score is accumulated into its OWN slot of a
+// [n_layers, max_seq_len] cumulative buffer (decay applied once before adding, exactly like the
+// collapsed `importance`). So every layer ranks heavy hitters on its own attention — the GPU twin
+// of the CPU producer's `layer_flat_cum`. The collapsed kernel above is left byte-unchanged.
+//
+// layer_flat: [n_layers, max_seq_len] - cumulative per-(layer, token) flat importance (in-place).
+//   slot(layer, t) = layer * max_seq_len + t
+// Each work-item processes one token position t (across all layers).
+__kernel void kernel_score_fused_reduce_per_layer(
+    __global const float * scores,
+    __global float * layer_flat,
+    float decay_factor,
+    int n_layers,
+    int n_heads_q,
+    int cache_seq_len,
+    int score_stride,
+    int max_seq_len
+) {
+    int t = get_global_id(0);
+    if (t >= cache_seq_len) return;
+
+    int layer_stride = n_heads_q * score_stride;
+    for (int l = 0; l < n_layers; l++) {
+        int layer_base = l * layer_stride;
+        // Head-sum for this layer (identical order to the CPU producer's flat layer_score).
+        float layer_sum = 0.0f;
+        for (int h = 0; h < n_heads_q; h++) {
+            layer_sum += scores[layer_base + h * score_stride + t];
+        }
+        int idx = l * max_seq_len + t;
+        layer_flat[idx] = layer_flat[idx] * decay_factor + layer_sum;
+    }
+}

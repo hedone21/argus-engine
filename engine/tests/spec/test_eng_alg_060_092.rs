@@ -209,6 +209,7 @@ fn test_eng_alg_091_pipeline_executes_matching_stages() {
         head_importance: None,
         n_kv_heads: 0,
         last_attn: None,
+        per_layer_flat: None,
         pressure_level: PressureLevel::Critical,
         mem_available: 0,
         target_ratio: None,
@@ -278,6 +279,7 @@ fn test_eng_alg_091_pipeline_skips_all_at_normal() {
         head_importance: None,
         n_kv_heads: 0,
         last_attn: None,
+        per_layer_flat: None,
         pressure_level: PressureLevel::Normal,
         mem_available: 1024 * 1024 * 1024,
         target_ratio: None,
@@ -387,6 +389,7 @@ fn test_eng_alg_092_swap_warning_offloads() {
         head_importance: None,
         n_kv_heads: 0,
         last_attn: None,
+        per_layer_flat: None,
         pressure_level: PressureLevel::Warning,
         mem_available: 0,
         target_ratio: None,
@@ -432,6 +435,7 @@ fn test_eng_alg_092_swap_emergency_offloads() {
         head_importance: None,
         n_kv_heads: 0,
         last_attn: None,
+        per_layer_flat: None,
         pressure_level: PressureLevel::Emergency,
         mem_available: 0,
         target_ratio: None,
@@ -488,6 +492,7 @@ fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
         head_importance: None,
         n_kv_heads: 0,
         last_attn: None,
+        per_layer_flat: None,
         pressure_level: PressureLevel::Critical,
         mem_available: 0,
         target_ratio: None,
@@ -542,14 +547,23 @@ fn test_eng_alg_092_eviction_handler_wraps_h2o() {
     };
 
     // pos=100, ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
+    // Faithful H2O absolute budget: hh(15)+recent(15) = 30 = the old target (100 * 0.3).
     let h2o_policy = make_stage_backed_policy(
         "h2o",
         &StageParams {
-            keep_ratio: 0.5,
             protected_prefix: 0,
             ..Default::default()
         },
-        &[],
+        &[
+            argus_extension_api::PluginArg {
+                key: "hh_size",
+                val: "15",
+            },
+            argus_extension_api::PluginArg {
+                key: "recent_size",
+                val: "15",
+            },
+        ],
     )
     .expect("h2o v3 stage registered");
     let handler = EvictionHandler::new(h2o_policy, 0.3);
@@ -567,6 +581,7 @@ fn test_eng_alg_092_eviction_handler_wraps_h2o() {
         head_importance: None,
         n_kv_heads: 0,
         last_attn: None,
+        per_layer_flat: None,
         pressure_level: PressureLevel::Critical,
         mem_available: 0,
         target_ratio: None,
@@ -663,6 +678,7 @@ fn test_eng_alg_091_c08_context_updated_after_eviction() {
         head_importance: None,
         n_kv_heads: 0,
         last_attn: None,
+        per_layer_flat: None,
         pressure_level: PressureLevel::Critical,
         mem_available: 0,
         target_ratio: None,

@@ -2614,6 +2614,31 @@ pub trait ScoreProducer: Send + Sync {
     fn layer_head_importance(&self) -> Option<&[f32]> {
         None
     }
+
+    // ── per-(layer, token) FLAT importance (faithful-H2O LayerWise, divergence `(b)`; opt-in) ──
+    //
+    // The eviction-decision twin of the per-head dump above: when enabled, the producer keeps each
+    // layer's OWN head-summed cumulative attention with NO cross-layer MAX, so a per-layer eviction
+    // path can rank each layer's heavy hitters independently (faithful `H2OKVCache_LayerWise`).
+    // Default no-op / `None` → purely additive, and the collapsed `importance` stays byte-identical
+    // unless `enable_per_layer_flat` is explicitly called (the `INV-147` precedent for the flat axis).
+
+    /// Enable capture of a per-`(layer, token)` FLAT importance buffer (no cross-layer MAX). Default
+    /// no-op; the built-in producer lazily allocates an `[n_layers * max_seq_len]` buffer. Works in
+    /// both flat and GQA mode (the flat layer score exists in both accumulate paths).
+    fn enable_per_layer_flat(&mut self) {}
+
+    /// The per-`(layer, token)` FLAT cumulative importance, if [`Self::enable_per_layer_flat`] was
+    /// called. Row-major `[n_layers * max_seq_len]`, indexed `layer * max_seq_len + pos`. Each layer's
+    /// own accumulated attention (no cross-layer MAX) — the faithful LayerWise score. Default `None`.
+    fn layer_flat_importance(&self) -> Option<&[f32]> {
+        None
+    }
+
+    /// Overwrite the per-`(layer, token)` FLAT cumulative with GPU-computed values `[n_layers *
+    /// max_seq_len]` (the GPU per-layer reduce accumulates on-device; this is its eviction-time
+    /// readback, the per-layer twin of [`Self::import_gpu_scores`]). Default no-op.
+    fn import_gpu_layer_flat(&mut self, _layer_flat: &[f32]) {}
 }
 
 /// Registration entry for one score producer — a mirror of [`LayerScorerReg`], static-linkme only.
@@ -2708,6 +2733,11 @@ pub struct ScoreReduceArgs {
     pub score_stride: usize,
     /// Capacity stride of the cumulative buffers (`== max_seq_len`).
     pub max_seq_len: usize,
+    /// `cl_mem` of the per-`(layer, token)` FLAT cumulative buffer `[n_layers * max_seq_len]`
+    /// (faithful-H2O `H2OKVCache_LayerWise`, divergence `(b)`), updated in place by
+    /// [`reduce_per_layer`](ScoreReduceBackend::reduce_per_layer). `null` on the collapsed-only path
+    /// (the `reduce` method never reads it). Appended last so the prior field layout is unchanged.
+    pub layer_flat_importance: *mut c_void,
 }
 
 /// A GPU attention-score reducer: owns a compiled reduce kernel and folds one decode step's per-layer
@@ -2723,6 +2753,15 @@ pub trait ScoreReduceBackend: Send + Sync {
     /// on failure (the engine logs and continues — cumulative importance is unchanged for the step).
     /// Must not panic across the call (panic = abort discipline).
     fn reduce(&self, args: &ScoreReduceArgs) -> i32;
+
+    /// Dispatch the per-`(layer, token)` FLAT reduce (faithful-H2O `H2OKVCache_LayerWise`, divergence
+    /// `(b)`) into `args.layer_flat_importance` — each layer's head-sum accumulated into its own slot
+    /// with NO cross-layer MAX. Same return contract as [`reduce`](Self::reduce). Default `-1`
+    /// (unsupported): a reducer without a per-layer kernel leaves the GPU per-layer buffer untouched,
+    /// and the engine logs + falls back. Additive — existing reducers compile unchanged.
+    fn reduce_per_layer(&self, _args: &ScoreReduceArgs) -> i32 {
+        -1
+    }
 }
 
 /// Registration entry for one GPU score reducer — a mirror of [`ScoreProducerReg`], static-linkme

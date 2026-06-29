@@ -39,10 +39,6 @@ use streaming_llm as _;
 // makes `find_mutation_stage("h2o")` visible (same force-link rationale as streaming above).
 use ::h2o as _;
 
-// heavy-hitter+ production force-link. Extracted from the engine core into the `h2o-plus` technique crate
-// (the first PerHead-plan stage); makes `find_mutation_stage("h2o_plus")` visible.
-use h2o_plus as _;
-
 // weighted-merge production force-link. Extracted from the engine core into the `d2o` technique crate
 // (registers "d2o", a WeightedMerge-producing stage); makes `find_mutation_stage("d2o")` visible.
 // Production resolves it via `make_stage_backed_policy("d2o", &params, &blob)`
@@ -280,15 +276,29 @@ pub fn make_stage_backed_policy(
 /// to the `h2o` plugin crate — production resolves "h2o" the same way (`make_stage_backed_policy`).
 #[cfg(test)]
 pub(crate) fn h2o_backed_policy(
-    keep_ratio: f32,
+    hh_size: usize,
+    recent_size: usize,
     protected_prefix: usize,
 ) -> Box<dyn EvictionPolicy> {
+    // Faithful H2O takes ABSOLUTE budgets via the `--set` blob (hh_size/recent_size), not a ratio.
+    // Test-only: leak the formatted values for the 'static StageArgs lifetime.
     let p = StageParams {
-        keep_ratio,
         protected_prefix,
         ..Default::default()
     };
-    make_stage_backed_policy("h2o", &p, &[])
+    let hh: &'static str = Box::leak(hh_size.to_string().into_boxed_str());
+    let recent: &'static str = Box::leak(recent_size.to_string().into_boxed_str());
+    let args = [
+        argus_extension_api::PluginArg {
+            key: "hh_size",
+            val: hh,
+        },
+        argus_extension_api::PluginArg {
+            key: "recent_size",
+            val: recent,
+        },
+    ];
+    make_stage_backed_policy("h2o", &p, &args)
         .expect("h2o v3 stage registered (force-linked h2o plugin)")
 }
 
@@ -358,7 +368,7 @@ pub fn ensure_builtin_stages_registered() -> Result<()> {
     // owned solely by the plugin). Mirrors `ensure_score_producers_registered` /
     // `ensure_layer_scorers_registered`, which likewise keep a hardcoded name list + assert only
     // resolution.
-    for name in ["sliding", "streaming", "h2o", "h2o_plus", "d2o"] {
+    for name in ["sliding", "streaming", "h2o", "d2o"] {
         if mutation_stage_caps(name).is_none() {
             anyhow::bail!(
                 "built-in KV mutation stage '{name}' not registered — suspect linkme fat-LTO \

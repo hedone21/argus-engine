@@ -63,6 +63,9 @@ struct AttnScoreReducer {
     _program: Program,
     /// `kernel_score_fused_reduce` — re-dispatched once per decode step.
     kernel: Kernel,
+    /// `kernel_score_fused_reduce_per_layer` — the faithful-H2O `(b)` per-`(layer, token)` FLAT reduce
+    /// (no cross-layer MAX). Dispatched in addition to `kernel` only when per-layer is armed.
+    kernel_per_layer: Kernel,
 }
 
 // SAFETY: the reducer is only used from the single inference thread, exactly like the engine's
@@ -80,6 +83,16 @@ impl ScoreReduceBackend for AttnScoreReducer {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("[attn_score reducer] reduce failed: {e}");
+                -1
+            }
+        }
+    }
+
+    fn reduce_per_layer(&self, args: &ScoreReduceArgs) -> i32 {
+        match self.reduce_per_layer_inner(args) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("[attn_score reducer] per-layer reduce failed: {e}");
                 -1
             }
         }
@@ -142,6 +155,63 @@ impl AttnScoreReducer {
         .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    /// Faithful-H2O `(b)` per-`(layer, token)` FLAT reduce — dispatches
+    /// `kernel_score_fused_reduce_per_layer` over `args.layer_flat_importance` (no cross-layer MAX).
+    fn reduce_per_layer_inner(&self, args: &ScoreReduceArgs) -> Result<(), String> {
+        if args.layer_flat_importance.is_null() {
+            return Err("null layer_flat_importance".to_string());
+        }
+        let queue = reconstruct_queue(args.cl_queue).ok_or("null cl_queue")?;
+        // SAFETY: borrow-only cl_mem (host retains ownership; never dropped).
+        let score_buf = unsafe { borrow_mem(args.score_buf) };
+        let layer_flat = unsafe { borrow_mem(args.layer_flat_importance) };
+
+        let decay_factor = args.decay_factor;
+        let (n_layers, n_heads_q, cache_seq_len, score_stride, max_seq_len) = (
+            args.n_layers as i32,
+            args.n_heads_q as i32,
+            args.cache_seq_len as i32,
+            args.score_stride as i32,
+            args.max_seq_len as i32,
+        );
+
+        // Arg order mirrors `kernel_score_fused_reduce_per_layer(scores, layer_flat, decay_factor,
+        // n_layers, n_heads_q, cache_seq_len, score_stride, max_seq_len)`.
+        for (i, a) in [
+            ArgVal::mem(&score_buf),
+            ArgVal::mem(&layer_flat),
+            ArgVal::scalar(&decay_factor),
+            ArgVal::scalar(&n_layers),
+            ArgVal::scalar(&n_heads_q),
+            ArgVal::scalar(&cache_seq_len),
+            ArgVal::scalar(&score_stride),
+            ArgVal::scalar(&max_seq_len),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            core::set_kernel_arg(&self.kernel_per_layer, i as u32, a).map_err(|e| e.to_string())?;
+        }
+
+        let gws = [round_up(args.cache_seq_len, 64), 1, 1];
+        let lws = [64usize, 1, 1];
+        // SAFETY: validated handles; single-threaded; borrowed mems live until the call returns.
+        unsafe {
+            core::enqueue_kernel(
+                &queue,
+                &self.kernel_per_layer,
+                1,
+                None,
+                &gws,
+                Some(lws),
+                None::<&Event>,
+                None::<&mut Event>,
+            )
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
 }
 
 /// make factory — compiles `score_reduce.cl` from the borrowed host context using the host's
@@ -174,11 +244,14 @@ fn make_attn_score_reducer(
         .map_err(|e| format!("score_reduce.cl build failed: {e}"))?;
     let kernel =
         core::create_kernel(&program, "kernel_score_fused_reduce").map_err(|e| e.to_string())?;
+    let kernel_per_layer = core::create_kernel(&program, "kernel_score_fused_reduce_per_layer")
+        .map_err(|e| e.to_string())?;
 
     Ok(Box::new(AttnScoreReducer {
         _ctx: ctx,
         _program: program,
         kernel,
+        kernel_per_layer,
     }))
 }
 

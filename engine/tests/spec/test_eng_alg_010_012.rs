@@ -59,16 +59,27 @@ fn make_cache_with_data(num_tokens: usize) -> KVCache {
 
 /// H2O was extracted to the `h2o` plugin crate; build the stage by registry name and wrap it as
 /// a legacy EvictionPolicy (StageBackedPolicy) — the same seam production uses to resolve "h2o".
-fn h2o_policy(keep_ratio: f32, protected_prefix: usize) -> StageBackedPolicy {
+fn h2o_policy(hh_size: usize, recent_size: usize, protected_prefix: usize) -> StageBackedPolicy {
     let reg = argus_extension_api::find_mutation_stage("h2o").expect("h2o v3 stage registered");
+    // Faithful H2O takes ABSOLUTE budgets via the `--set` blob; leak the values for 'static StageArgs.
+    let hh: &'static str = Box::leak(hh_size.to_string().into_boxed_str());
+    let recent: &'static str = Box::leak(recent_size.to_string().into_boxed_str());
     StageBackedPolicy::new(
         (reg.make)(
             StageParams {
-                keep_ratio,
                 protected_prefix,
                 ..Default::default()
             },
-            &[],
+            &[
+                argus_extension_api::PluginArg {
+                    key: "hh_size",
+                    val: hh,
+                },
+                argus_extension_api::PluginArg {
+                    key: "recent_size",
+                    val: recent,
+                },
+            ],
         ),
         reg.caps,
     )
@@ -76,7 +87,8 @@ fn h2o_policy(keep_ratio: f32, protected_prefix: usize) -> StageBackedPolicy {
 
 #[test]
 fn test_eng_alg_010_h2o_no_eviction_when_below_target() {
-    let policy = h2o_policy(0.5, 4);
+    // budget = hh(8)+recent(8)+prefix(4) = 20 ≥ current(10) → no eviction (absolute budget).
+    let policy = h2o_policy(8, 8, 4);
     let mut cache = make_cache_with_data(10);
     // target_len이 current_pos 이상이면 eviction 발생하지 않음
     policy.evict(&mut cache, 20).unwrap();
@@ -85,7 +97,8 @@ fn test_eng_alg_010_h2o_no_eviction_when_below_target() {
 
 #[test]
 fn test_eng_alg_010_h2o_evict_preserves_prefix() {
-    let policy = h2o_policy(0.5, 4);
+    // budget = hh(5)+recent(6)+prefix(4) = 15 < current(30) → evict to 15 (prefix 0..4 preserved).
+    let policy = h2o_policy(5, 6, 4);
     let mut cache = make_cache_with_data(30);
 
     // target_len=15: prefix 4개는 보호되어야 함
@@ -109,7 +122,8 @@ fn test_eng_alg_010_h2o_evict_preserves_prefix() {
 
 #[test]
 fn test_eng_alg_010_c01_h2o_evict_with_scores_preserves_important() {
-    let policy = h2o_policy(0.5, 4);
+    // budget = hh(5)+recent(6)+prefix(4) = 15 < current(30) → evict to 15 (prefix 0..4 preserved).
+    let policy = h2o_policy(5, 6, 4);
     let mut cache = make_cache_with_data(30);
 
     // importance scores: position 10, 20에 높은 중요도

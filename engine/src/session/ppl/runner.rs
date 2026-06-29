@@ -1062,27 +1062,30 @@ pub fn run_ppl(
                     && !kv_caches.is_empty()
                     && (v_cpu_data.is_some() || !kv_caches[0].v_buffer.buffer().as_ptr().is_null());
 
-                // Perform eviction
-                let result = if score_based_eviction {
-                    if let Some(acc) = score_accumulator.as_ref() {
-                        if acc.is_active() {
-                            let scores = acc.importance_scores().to_vec();
-                            // value-aware a_i: last-layer last-step per-head attention (value-aware policies).
-                            let attn = acc.last_step_head_attn().map(|s| s.to_vec());
-                            cache_manager.force_evict_with_scores(
-                                kv_caches,
-                                ratio,
-                                &scores,
-                                attn.as_deref(),
-                            )?
-                        } else {
-                            cache_manager.force_evict(kv_caches, ratio)?
-                        }
-                    } else {
-                        cache_manager.force_evict(kv_caches, ratio)?
-                    }
+                // Perform eviction — shared score-fed body (extract → route; force, ratio).
+                // ppl uses the CPU accumulate path (no GPU score sync here).
+                use crate::kv::eviction::score_fed;
+                let extracted = if score_based_eviction {
+                    score_accumulator
+                        .as_ref()
+                        .and_then(score_fed::extract_scores)
                 } else {
-                    cache_manager.force_evict(kv_caches, ratio)?
+                    None
+                };
+                let result = {
+                    let (scores, last_attn, per_layer) = extracted
+                        .as_ref()
+                        .map(|e| e.as_args())
+                        .unwrap_or((None, None, None));
+                    score_fed::route_evict(
+                        cache_manager,
+                        kv_caches,
+                        scores,
+                        last_attn,
+                        per_layer,
+                        true,
+                        ratio,
+                    )?
                 };
 
                 if result.evicted {

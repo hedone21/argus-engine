@@ -241,6 +241,8 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         vocab_size,
         hidden_size,
         evict_timing: args.evict_timing(),
+        // Faithful-H2O (c): AUTO-on for the h2o policy.
+        faithful_h2o: args.eviction_policy() == "h2o",
     };
 
     // For ratio mode, hook starts with budget=0; eval_loop updates it per-question.
@@ -505,7 +507,12 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         "kv_type": args.kv_type,
         "h2o_keep_ratio": args.keep_ratio(),
         "h2o_decay": args.h2o_decay(),
-        "time_normalized": !args.h2o_raw_scores(),
+        // Faithful-H2O: time_normalize is forced OFF for h2o, and the budget is absolute
+        // (hh_size/recent_size, not keep_ratio) — surface the effective values honestly.
+        "faithful_h2o": args.eviction_policy() == "h2o",
+        "h2o_hh_size": args.h2o_hh_size(),
+        "h2o_recent_size": args.h2o_recent_size(),
+        "time_normalized": args.eviction_policy() != "h2o" && !args.h2o_raw_scores(),
         "skip_layers": args.skip_layers,
         "skip_ratio": args.skip_ratio,
     });

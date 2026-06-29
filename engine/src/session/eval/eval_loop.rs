@@ -250,8 +250,11 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
         // produces is query-informed. `--evict-timing prefill_end` suppresses it
         // (`runs_query_probe()` = false) and instead ranks on the context importance
         // accumulated by the token-by-token prefill above — a query-agnostic decision.
+        // Faithful-H2O (c): the prefill column-sum seed (in run_full_prefill) IS the importance
+        // source, so suppress the query probe to avoid double-counting on top of the seed.
         if effective_eval_config.evict_timing.runs_query_probe()
             && hook.needs_score_probe(kv_caches)
+            && !effective_eval_config.faithful_h2o
         {
             // Save current_pos before probe (will be prompt_len)
             let saved_positions: Vec<usize> = kv_caches.iter().map(|c| c.cur_pos()).collect();
@@ -730,13 +733,24 @@ fn run_prefill<C: EvalCacheKind>(
     // prefill so each quant-window flush has scores from the previous step.
     let needs_scores = !kv_caches.is_empty() && kv_caches[0].needs_scores();
 
-    if prefill_runs_token_by_token(
+    let token_by_token = prefill_runs_token_by_token(
         needs_scores,
         eval_config.evict_timing,
         hook.ranks_on_scores(),
         eval_config.effective_budget,
         prompt_ids.len(),
-    ) {
+    );
+    // Faithful-H2O (c) needs the BATCHED prefill (the PFA column-sum seam in `run_full_prefill`);
+    // token-by-token prefill (quant-window cache / --evict-timing prefill_end|prefill_streaming)
+    // cannot produce it. Reject cleanly rather than silently skip the seed.
+    if eval_config.faithful_h2o && token_by_token {
+        anyhow::bail!(
+            "faithful h2o requires batched prefill for the (c) prefill-attention seed; \
+             token-by-token prefill (quant-window cache or \
+             --evict-timing prefill_end/prefill_streaming) is unsupported with faithful h2o."
+        );
+    }
+    if token_by_token {
         return run_token_by_token_prefill(
             model,
             backend,
@@ -867,7 +881,7 @@ fn run_full_prefill<C: EvalCacheKind>(
     hook: &mut dyn StepHook<C>,
     prompt_ids: &[u32],
     vocab_size: usize,
-    _eval_config: &EvalConfig,
+    eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
     _prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
@@ -895,6 +909,15 @@ fn run_full_prefill<C: EvalCacheKind>(
     );
 
     let fp_need = kv_caches.first().is_some_and(|c| c.needs_scores());
+    // Faithful-H2O (c): arm a full-prompt-window PFA producer so the batched prefill emits per-key
+    // column-sums (CPU prefill only; GPU early-returns → buffer stays zero, harmless). `usize::MAX`
+    // clamps to the prompt length.
+    let mut pfa_buf: Option<Vec<Vec<f32>>> = eval_config.faithful_h2o.then(|| {
+        let c = &model.config;
+        (0..c.num_hidden_layers)
+            .map(|_| vec![0.0f32; c.num_attention_heads * prompt_len])
+            .collect()
+    });
     C::forward_fmt_roundtrip(kv_caches, |fmts| {
         model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
@@ -913,10 +936,26 @@ fn run_full_prefill<C: EvalCacheKind>(
             cache_self_need_scores: fp_need,
             layer_boundary_hook: None,
             read_stage: None,
-            prefill_attn: None,
+            prefill_attn: pfa_buf.as_mut().map(|b| (b, usize::MAX)),
             prefill_attn_per_row: None,
         })
     })?;
+
+    // Faithful-H2O (c): fold the prefill column-sums into the eval score accumulator (the same one
+    // h2o eviction ranks on). Replaces the query probe under faithful (suppressed in the caller).
+    if let Some(buf) = pfa_buf
+        && let Some(acc) = hook.score_accumulator()
+    {
+        let c = &model.config;
+        crate::inference::attention_scores::seed_prefill_importance_dual(
+            acc,
+            backend.as_ref(),
+            &buf,
+            prompt_len,
+            c.num_attention_heads,
+            c.num_key_value_heads,
+        );
+    }
 
     // Read logits (only last position — much smaller than full prompt × vocab)
     let mut prompt_logits_cpu = vec![0.0f32; vocab_size];
@@ -1187,6 +1226,7 @@ mod tests {
             vocab_size: 32000,
             hidden_size: 2048,
             evict_timing: crate::session::eval::EvictTiming::default(),
+            faithful_h2o: false,
         }
     }
 

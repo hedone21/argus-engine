@@ -1722,6 +1722,32 @@ impl Args {
         matches!(self.plugin_set("raw_scores"), Some("true") | Some("1"))
     }
 
+    /// The absolute heavy-hitter budget for faithful H2O (`--set hh_size=`). `None` if unset.
+    pub fn h2o_hh_size(&self) -> Option<usize> {
+        self.plugin_set("hh_size").and_then(|v| v.parse().ok())
+    }
+
+    /// The absolute recency budget for faithful H2O (`--set recent_size=`). `None` if unset.
+    pub fn h2o_recent_size(&self) -> Option<usize> {
+        self.plugin_set("recent_size").and_then(|v| v.parse().ok())
+    }
+
+    /// EXPLICIT-REQUIRED guard for faithful H2O: both `hh_size` and `recent_size` must be supplied via
+    /// `--set` (the budget IS the policy — there is no default). Returns a clean error instead of a
+    /// deep panic at stage construction. No-op for any non-`h2o` policy. Call once at session setup.
+    pub fn require_h2o_budgets(&self) -> anyhow::Result<()> {
+        if self.eviction_policy() == "h2o"
+            && (self.h2o_hh_size().is_none() || self.h2o_recent_size().is_none())
+        {
+            anyhow::bail!(
+                "eviction policy 'h2o' requires explicit budgets: pass \
+                 `--set hh_size=<N> --set recent_size=<M>` (faithful H2O keeps hh_size heavy hitters \
+                 + recent_size recent tokens; there is no default)."
+            );
+        }
+        Ok(())
+    }
+
     /// heavy-hitter verbose debug output — moved to env var `LLMRS_H2O_DEBUG`
     /// (no longer a CLI flag).
     pub fn h2o_debug(&self) -> bool {

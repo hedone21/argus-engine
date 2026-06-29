@@ -41,6 +41,16 @@ pub enum ScoreContext<'a> {
         head: &'a [f32],
         n_kv_heads: usize,
     },
+    /// Per-`(layer, token)` FLAT importance (faithful-H2O `H2OKVCache_LayerWise`, divergence `(b)`):
+    /// `layer_flat` is `[n_layers * max_seq]`, row-major `layer * max_seq + pos`. The per-layer
+    /// eviction loop slices each layer's own `max_seq` window and ranks that layer's heavy hitters
+    /// independently — NO cross-layer MAX collapse. `last_attn` carries the value-aware `a_i` as in
+    /// `Flat`. Opt-in (faithful-H2O only); every other path uses the collapsed variants above.
+    PerLayerFlat {
+        layer_flat: &'a [f32],
+        max_seq: usize,
+        last_attn: Option<&'a [f32]>,
+    },
 }
 
 /// Orchestrates KV cache management based on memory pressure and policy decisions.
@@ -260,17 +270,22 @@ impl CacheManager {
             );
         }
 
-        let (importance, head_importance, n_kv_heads, last_attn) = match scores {
-            ScoreContext::None => (None, None, 0, None),
+        let (importance, head_importance, n_kv_heads, last_attn, per_layer_flat) = match scores {
+            ScoreContext::None => (None, None, 0, None, None),
             ScoreContext::Flat {
                 importance,
                 last_attn,
-            } => (Some(importance), None, 0, last_attn),
+            } => (Some(importance), None, 0, last_attn, None),
             ScoreContext::PerHead {
                 flat,
                 head,
                 n_kv_heads,
-            } => (Some(flat), Some(head), n_kv_heads, None),
+            } => (Some(flat), Some(head), n_kv_heads, None, None),
+            ScoreContext::PerLayerFlat {
+                layer_flat,
+                max_seq,
+                last_attn,
+            } => (None, None, 0, last_attn, Some((layer_flat, max_seq))),
         };
 
         let mut ctx = HandlerContext {
@@ -279,6 +294,7 @@ impl CacheManager {
             head_importance,
             n_kv_heads,
             last_attn,
+            per_layer_flat,
             pressure_level: pressure,
             mem_available,
             target_ratio: force_target_ratio,
@@ -416,6 +432,52 @@ impl CacheManager {
         )
     }
 
+    /// Force eviction with per-`(layer, token)` FLAT importance (faithful-H2O `H2OKVCache_LayerWise`,
+    /// divergence `(b)`). `layer_flat` is `[n_layers * max_seq]`, row-major `layer * max_seq + pos`;
+    /// each layer ranks its own heavy hitters on its `max_seq` window with no cross-layer MAX. Opt-in
+    /// (faithful-H2O only); other paths use the collapsed `force_evict_with_scores`.
+    pub fn force_evict_with_per_layer_scores(
+        &self,
+        caches: &mut [KVCache],
+        target_ratio: f32,
+        layer_flat: &[f32],
+        max_seq: usize,
+        last_attn: Option<&[f32]>,
+    ) -> Result<EvictionResult> {
+        self.execute_dispatch(
+            caches,
+            ScoreContext::PerLayerFlat {
+                layer_flat,
+                max_seq,
+                last_attn,
+            },
+            true,
+            Some(target_ratio),
+        )
+    }
+
+    /// Pressure-checked variant of [`force_evict_with_per_layer_scores`](Self::force_evict_with_per_layer_scores)
+    /// (mirror of [`maybe_evict_with_scores`](Self::maybe_evict_with_scores)) — evicts only if memory
+    /// pressure warrants it, ranking each layer on its own FLAT importance window.
+    pub fn maybe_evict_with_per_layer_scores(
+        &self,
+        caches: &mut [KVCache],
+        layer_flat: &[f32],
+        max_seq: usize,
+        last_attn: Option<&[f32]>,
+    ) -> Result<EvictionResult> {
+        self.execute_dispatch(
+            caches,
+            ScoreContext::PerLayerFlat {
+                layer_flat,
+                max_seq,
+                last_attn,
+            },
+            false,
+            None,
+        )
+    }
+
     /// Returns the name of the active policy or pipeline.
     ///
     /// This is the **logging** descriptor — each stage is decorated with the
@@ -496,17 +558,22 @@ impl CacheManager {
             target_len,
         );
 
-        let (importance, head_importance, n_kv_heads, last_attn) = match &scores {
-            ScoreContext::None => (None, None, 0, None),
+        let (importance, head_importance, n_kv_heads, last_attn, per_layer_flat) = match &scores {
+            ScoreContext::None => (None, None, 0, None, None),
             ScoreContext::Flat {
                 importance,
                 last_attn,
-            } => (Some(*importance), None, 0, *last_attn),
+            } => (Some(*importance), None, 0, *last_attn, None),
             ScoreContext::PerHead {
                 flat,
                 head,
                 n_kv_heads,
-            } => (Some(*flat), Some(*head), *n_kv_heads, None),
+            } => (Some(*flat), Some(*head), *n_kv_heads, None, None),
+            ScoreContext::PerLayerFlat {
+                layer_flat,
+                max_seq,
+                last_attn,
+            } => (None, None, 0, *last_attn, Some((*layer_flat, *max_seq))),
         };
 
         let n_layers = caches.len();
@@ -528,7 +595,30 @@ impl CacheManager {
                 }
             }
 
-            if let (Some(flat), Some(head_imp)) = (importance, head_importance) {
+            // Faithful-H2O `(b)` — per-`(layer, token)` FLAT importance: rank THIS layer's heavy
+            // hitters on its own `max_seq` window (`&layer_flat[layer * max_seq ..][.. max_seq]`),
+            // with no cross-layer MAX. Takes priority over the collapsed paths. On a malformed buffer
+            // (slice out of range) degrade to the score-free recency fallback (`None`) — NOT the whole
+            // multi-layer buffer, which would silently mis-rank this layer on the wrong window. The
+            // invariant `layer_flat.len() == n_layers * max_seq` holds by construction (the producer
+            // sizes it `total_layers * max_seq_len`), so the fallback is defensive, not a live path.
+            if let Some((layer_flat, max_seq)) = per_layer_flat {
+                let base = layer_idx * max_seq;
+                let layer_imp = layer_flat.get(base..base + max_seq);
+                debug_assert!(
+                    layer_imp.is_some(),
+                    "per-layer FLAT slice out of range: layer={layer_idx} max_seq={max_seq} len={}",
+                    layer_flat.len()
+                );
+                policy.evict_layer(
+                    cache,
+                    layer_target_len,
+                    layer_imp,
+                    last_attn,
+                    layer_idx,
+                    n_layers,
+                )?;
+            } else if let (Some(flat), Some(head_imp)) = (importance, head_importance) {
                 if n_kv_heads > 0 {
                     // Per-head (h2o_plus) — not a layer-aware stage, but the real (layer_idx,
                     // n_layers) is threaded through so the keep-set dump (R-P0-2) keys by layer.
@@ -821,7 +911,7 @@ mod tests {
 
         // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let cm = CacheManager::new(
-            h2o_backed_policy(0.3, 0), // prefix=4, keep_ratio=0.3
+            h2o_backed_policy(15, 15, 0), // keep hh=15 + recent=15 = 30 (faithful absolute budget)
             Box::new(MockMonitor {
                 available: 10 * 1024 * 1024,
             }),
@@ -845,6 +935,130 @@ mod tests {
         for cache in &caches {
             assert_eq!(cache.current_pos, pos);
         }
+    }
+
+    /// Build `n_layers` F32 caches of `max_seq` capacity with `pos` resident tokens where every
+    /// element of position `p` equals `p` (so a survivor's ORIGINAL position is read directly off
+    /// `k_buffer` after compaction). kv_heads=1, head_dim=4.
+    fn make_pos_caches(n_layers: usize, pos: usize, max_seq: usize) -> Vec<KVCache> {
+        let backend = Arc::new(CpuBackend::new());
+        (0..n_layers)
+            .map(|_| {
+                let buf = max_seq * 4 * 4;
+                let k = Tensor::new(
+                    Shape::new(vec![1, max_seq, 1, 4]),
+                    Arc::new(SharedBuffer::new(buf, DType::F32)),
+                    backend.clone(),
+                );
+                let v = Tensor::new(
+                    Shape::new(vec![1, max_seq, 1, 4]),
+                    Arc::new(SharedBuffer::new(buf, DType::F32)),
+                    backend.clone(),
+                );
+                let mut cache = KVCache::new(k, v, max_seq);
+                cache.current_pos = pos;
+                for p in 0..pos {
+                    let off = cache.offset(p, 0);
+                    let kb = cache.k_buffer.as_mut_slice::<f32>();
+                    for d in 0..4 {
+                        kb[off + d] = p as f32;
+                    }
+                }
+                cache
+            })
+            .collect()
+    }
+
+    /// Faithful-H2O `(b)` — per-`(layer, token)` FLAT importance makes each layer evict on its OWN
+    /// heavy hitters (no cross-layer MAX), so layer 0 and layer 1 keep DIFFERENT tokens. A token that
+    /// is the heavy hitter only in layer 0 survives in layer 0's cache but is evicted from layer 1's
+    /// cache, and vice-versa. The collapsed (MAX-combined) path gives every layer the SAME keep-set —
+    /// the mutation-proof contrast asserted at the end.
+    #[test]
+    fn faithful_h2o_per_layer_evicts_divergent_keepsets() {
+        use crate::kv::eviction::stage_registry::h2o_backed_policy;
+
+        // hh_size=1 + recent_size=2 + prefix=0 → keep exactly 3 tokens: the single heavy hitter over
+        // the evictable middle [0, pos-recent) plus the 2 recent. pos=100 so removed=97 ≥ MIN_EVICT(64).
+        let (n_layers, pos, max_seq) = (2usize, 100usize, 200usize);
+        let make_cm = || {
+            CacheManager::new(
+                h2o_backed_policy(1, 2, 0),
+                Box::new(MockMonitor { available: 0 }),
+                256 * 1024 * 1024,
+                0.03, // target_len = (100*0.03).max(1) = 3 (h2o ignores it; abs budget = 3)
+            )
+        };
+
+        // Per-(layer, token) FLAT importance: layer 0 ranks token 30 highest, layer 1 ranks token 60
+        // highest — divergent heavy hitters (both in the evictable middle [0, 98)).
+        let mut layer_flat = vec![0.0f32; n_layers * max_seq];
+        layer_flat[0 * max_seq + 30] = 10.0; // layer 0 heavy hitter
+        layer_flat[1 * max_seq + 60] = 20.0; // layer 1 heavy hitter
+
+        // ── Faithful per-layer path ──
+        let mut caches = make_pos_caches(n_layers, pos, max_seq);
+        let res = make_cm()
+            .force_evict_with_per_layer_scores(&mut caches, 0.03, &layer_flat, max_seq, None)
+            .unwrap();
+        assert!(res.evicted, "per-layer eviction must fire");
+
+        // Read each layer's survivor original positions (K[p]==p, compacted to the front, h2o keeps
+        // an ascending list so order is prefix∪heavy∪recent sorted).
+        let survivors = |c: &KVCache| -> Vec<usize> {
+            let n = c.current_pos;
+            let kb = c.k_buffer.as_slice::<f32>();
+            (0..n).map(|s| kb[c.offset(s, 0)] as usize).collect()
+        };
+        let l0 = survivors(&caches[0]);
+        let l1 = survivors(&caches[1]);
+
+        assert_eq!(
+            l0,
+            vec![30, 98, 99],
+            "layer 0 keeps its own heavy hitter 30"
+        );
+        assert_eq!(
+            l1,
+            vec![60, 98, 99],
+            "layer 1 keeps its own heavy hitter 60"
+        );
+        // The defining property: the two layers' kept-sets DIFFER (token 30 survives only in layer 0,
+        // token 60 only in layer 1) — impossible under a single cross-layer-MAX-collapsed importance.
+        assert_ne!(l0, l1, "faithful (b): per-layer kept-sets must diverge");
+        assert!(
+            l0.contains(&30) && !l1.contains(&30),
+            "30 kept only in layer 0"
+        );
+        assert!(
+            l1.contains(&60) && !l0.contains(&60),
+            "60 kept only in layer 1"
+        );
+
+        // ── Mutation-proof: the collapsed (MAX-combined) flat gives EVERY layer the SAME keep-set. ──
+        // Element-wise MAX over layers → token 60 (20.0) outranks token 30 (10.0) everywhere, so both
+        // layers keep {60, 98, 99} and token 30 (layer-0-critical) is lost. This is exactly what (b)
+        // fixes; if the per-layer routing silently collapsed, the first block would equal this one.
+        let mut collapsed = vec![0.0f32; max_seq];
+        for t in 0..max_seq {
+            collapsed[t] = layer_flat[t].max(layer_flat[max_seq + t]);
+        }
+        let mut caches_c = make_pos_caches(n_layers, pos, max_seq);
+        make_cm()
+            .force_evict_with_scores(&mut caches_c, 0.03, &collapsed, None)
+            .unwrap();
+        let c0 = survivors(&caches_c[0]);
+        let c1 = survivors(&caches_c[1]);
+        assert_eq!(c0, c1, "collapsed path: all layers share one keep-set");
+        assert_eq!(
+            c0,
+            vec![60, 98, 99],
+            "collapsed keeps the global MAX hitter 60"
+        );
+        assert!(
+            !c0.contains(&30),
+            "collapsed loses layer-0-critical token 30"
+        );
     }
 
     #[test]
@@ -876,7 +1090,7 @@ mod tests {
         use crate::kv::eviction::stage_registry::h2o_backed_policy;
 
         let cm = CacheManager::new(
-            h2o_backed_policy(0.3, 0),
+            h2o_backed_policy(15, 15, 0),
             Box::new(MockMonitor {
                 available: 1024 * 1024 * 1024, // plenty of memory
             }),
@@ -902,7 +1116,7 @@ mod tests {
         use crate::kv::eviction::stage_registry::h2o_backed_policy;
 
         let cm = CacheManager::new(
-            h2o_backed_policy(0.3, 0),
+            h2o_backed_policy(15, 15, 0),
             Box::new(MockMonitor {
                 available: 1024 * 1024 * 1024,
             }),
@@ -946,7 +1160,7 @@ mod tests {
         use crate::kv::eviction::stage_registry::h2o_backed_policy;
 
         let cm = CacheManager::new(
-            h2o_backed_policy(0.5, 0),
+            h2o_backed_policy(15, 15, 0),
             Box::new(MockMonitor { available: 0 }),
             0,
             0.75,
@@ -1087,7 +1301,7 @@ mod tests {
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Emergency,
-            handler: Box::new(EvictionHandler::new(h2o_backed_policy(0.5, 0), 0.3)),
+            handler: Box::new(EvictionHandler::new(h2o_backed_policy(15, 15, 0), 0.3)),
         }]);
 
         let cm = CacheManager::with_pipeline(
@@ -1120,7 +1334,7 @@ mod tests {
 
         let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
             min_level: PressureLevel::Warning,
-            handler: Box::new(EvictionHandler::new(h2o_backed_policy(0.5, 0), 0.3)),
+            handler: Box::new(EvictionHandler::new(h2o_backed_policy(15, 15, 0), 0.3)),
         }]);
 
         let cm = CacheManager::with_pipeline(

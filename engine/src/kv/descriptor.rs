@@ -10,7 +10,7 @@
 //! same regardless of which feature-gated crates (caote / rkv) are force-linked — the coordinate map
 //! is a fixed matrix, not a build-dependent one.
 //!
-//! What is VALIDATED today: CARDINALITY (exactly 7, const-assert), OCCUPANCY ([`validate_occupancy`] —
+//! What is VALIDATED today: CARDINALITY (exactly 6, const-assert), OCCUPANCY ([`validate_occupancy`] —
 //! no technique reads a signal nothing produces, where the engine supplies [`ENGINE_INTRINSIC`]), and
 //! name↔registry resolution (the tests). `axis` and `phase` are DESCRIPTIVE coordinates beyond the
 //! name-resolution cross-check — not otherwise validated. Only the stage / score / read cells are
@@ -29,7 +29,7 @@ pub type SignalSet = &'static [TensorKind];
 /// today (`Format` / `Hardware` have no built-in entry — their producers live in separate registries).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvAxis {
-    /// Resident-token adjustment (eviction / merge): sliding / streaming / h2o / h2o_plus / d2o.
+    /// Resident-token adjustment (eviction / merge): sliding / streaming / h2o / d2o.
     Stage,
     /// Storage precision / layout (the format axis). No built-in descriptor yet (see `KV_FORMAT_POLICIES`).
     Format,
@@ -103,13 +103,6 @@ pub static KV_TECHNIQUE_DESCRIPTORS: &[KvTechniqueDescriptor] = &[
         produces: &[],
     },
     KvTechniqueDescriptor {
-        name: "h2o_plus",
-        axis: KvAxis::Stage,
-        phase: MutationPhase::KvMutate,
-        reads: &[TensorKind::Scores],
-        produces: &[],
-    },
-    KvTechniqueDescriptor {
         name: "d2o",
         axis: KvAxis::Stage,
         phase: MutationPhase::KvMutate,
@@ -118,7 +111,7 @@ pub static KV_TECHNIQUE_DESCRIPTORS: &[KvTechniqueDescriptor] = &[
     },
     // ── observer/score + read producer axes ──
     // attn_score accumulates the forward-internal attention into the per-token Scores signal that the
-    // score-based stage techniques (h2o / h2o_plus / d2o) read — the producer that closes their reads.
+    // score-based stage techniques (h2o / d2o) read — the producer that closes their reads.
     KvTechniqueDescriptor {
         name: "attn_score",
         axis: KvAxis::Score,
@@ -173,10 +166,10 @@ pub fn validate_occupancy(
     Ok(())
 }
 
-/// CARDINALITY invariant: the built-in coordinate map is exactly 7 techniques, regardless of which
+/// CARDINALITY invariant: the built-in coordinate map is exactly 6 techniques, regardless of which
 /// feature-gated crates are linked (a fixed matrix). A compile-time assert — adding/removing a
 /// descriptor without updating this fails the build.
-const _: () = assert!(KV_TECHNIQUE_DESCRIPTORS.len() == 7);
+const _: () = assert!(KV_TECHNIQUE_DESCRIPTORS.len() == 6);
 
 /// Boot self-test: the live coordinate map satisfies OCCUPANCY over the engine-intrinsic producer
 /// set. Panics with the offending orphan on violation. Callable at engine startup; exercised by the
@@ -191,22 +184,14 @@ pub fn descriptor_self_test() {
 mod tests {
     use super::*;
 
-    /// The coordinate map is exactly the 7-technique matrix, regardless of feature-gated crates.
+    /// The coordinate map is exactly the 6-technique matrix, regardless of feature-gated crates.
     /// Mutation-proof: adding/removing a descriptor changes this set (and breaks the CARDINALITY
     /// const-assert).
     #[test]
-    fn descriptor_names_match_the_seven_technique_matrix() {
+    fn descriptor_names_match_the_six_technique_matrix() {
         let mut got = descriptor_names();
         got.sort_unstable();
-        let mut want = vec![
-            "attn_score",
-            "d2o",
-            "h2o",
-            "h2o_plus",
-            "quest",
-            "sliding",
-            "streaming",
-        ];
+        let mut want = vec!["attn_score", "d2o", "h2o", "quest", "sliding", "streaming"];
         want.sort_unstable();
         assert_eq!(got, want);
     }
