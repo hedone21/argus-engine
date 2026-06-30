@@ -246,9 +246,35 @@ impl TensorHandle for QueryStatsSnapHandle<'_> {
     }
 }
 
+/// Dequantize the resident K of `cache` into an owned `[n_kv_heads * rows * head_dim]` f32 snapshot
+/// (the [`OwnedKvSnapHandle`]/[`KvSnapHandle`] layout), DEVICE-AWARE. This is the whole-model analogue of
+/// the `!on_device` gate in [`drive_mutation_layer`]/[`StandardFormat::read_plan`](super::super::kv::standard_format):
+/// a device-resident K has no host pointer to `dequant_snapshot` from, so it is first flushed
+/// (`synchronize`) and downloaded device→host ([`KVCache::host_snapshot`] = `read_buffer`, INV-191), then
+/// dequantized off that host mirror. A host-resident cache dequantizes directly (no readback, cost 0).
+/// The dequant bytes are byte-identical either way — `host_snapshot` preserves geometry/dtype/layout
+/// verbatim, so `offset()`/`dequantize_k` produce the same floats. This byte-identity is exactly what the
+/// P0 self-check (`cross_layer_host_mirror_byte_identical`) pins on host and the device bin pins on Adreno.
+fn dequant_key_host_mirrored(
+    cache: &KVCache,
+    rows: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> anyhow::Result<Vec<f32>> {
+    if cache.k_buffer.buffer().is_gpu_buffer() {
+        // Flush pending device writes so the readback observes this round's K (host_snapshot precondition).
+        cache.k_buffer.backend().synchronize()?;
+        let host = cache.host_snapshot()?;
+        Ok(dequant_snapshot(&host, rows, n_kv_heads, head_dim, true))
+    } else {
+        Ok(dequant_snapshot(cache, rows, n_kv_heads, head_dim, true))
+    }
+}
+
 /// Dequantize the resident region of `cache`'s K (or V) into an owned `[n_kv_heads * rows * head_dim]`
 /// f32 snapshot (layout matching [`KvSnapHandle`]). Host-only — the caller must gate on
-/// `!kv_on_device()` (a device buffer has no host pointer to dequantize from).
+/// `!kv_on_device()` (a device buffer has no host pointer to dequantize from), or host-mirror first via
+/// [`dequant_key_host_mirrored`].
 pub(crate) fn dequant_snapshot(
     cache: &KVCache,
     rows: usize,
@@ -580,23 +606,30 @@ impl<'a> EngineCrossLayerStageCtx<'a> {
     /// `caches` must be NON-EMPTY and uniform (every layer the same `current_pos`/geometry — the
     /// caller's precondition); the geometry is read from the first layer.
     ///
-    /// HOST-ONLY: [`dequant_snapshot`] reads through the host pointer, so on a device-resident cache the
-    /// caller must host-mirror (read the device buffer back) before constructing this ctx — mirroring
-    /// the `!kv_on_device()` gate in [`drive_mutation_layer`].
-    pub fn new(caches: &[KVCache], target_len: usize, positions: &'a [usize]) -> Self {
+    /// DEVICE-AWARE: each layer's Key is dequantized via [`dequant_key_host_mirrored`], which host-mirrors
+    /// (flush + `read_buffer` device→host) a device-resident cache before dequantizing — so this ctx is
+    /// faithful on Adreno/CUDA, not host-only. Fallible because the device readback can fail (`Err`
+    /// propagates out of [`drive_cross_layer`] rather than silently producing a zero/garbage keep-set).
+    pub fn new(
+        caches: &[KVCache],
+        target_len: usize,
+        positions: &'a [usize],
+    ) -> anyhow::Result<Self> {
         let c0 = &caches[0];
         let current_pos = c0.current_pos();
         let n_kv_heads = c0.kv_heads();
         let head_dim = c0.head_dim();
         let key_handles = caches
             .iter()
-            .map(|cache| OwnedKvSnapHandle {
-                data: dequant_snapshot(cache, current_pos, n_kv_heads, head_dim, true),
-                rows: current_pos,
-                head_dim,
+            .map(|cache| {
+                Ok(OwnedKvSnapHandle {
+                    data: dequant_key_host_mirrored(cache, current_pos, n_kv_heads, head_dim)?,
+                    rows: current_pos,
+                    head_dim,
+                })
             })
-            .collect();
-        Self {
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
             n_layers: caches.len(),
             current_pos,
             target_len,
@@ -604,7 +637,7 @@ impl<'a> EngineCrossLayerStageCtx<'a> {
             head_dim,
             positions,
             key_handles,
-        }
+        })
     }
 }
 
@@ -656,7 +689,7 @@ pub(crate) fn drive_cross_layer(
     }
     // Entry-frame host-mirrored read ctx (owned snapshots — the immutable borrow of `caches` is
     // released here, before the `&mut` model handle below).
-    let sctx = EngineCrossLayerStageCtx::new(caches, target_len, positions);
+    let sctx = EngineCrossLayerStageCtx::new(caches, target_len, positions)?;
     let handle = EngineModelCacheHandle::new(caches);
     let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         move || -> anyhow::Result<bool> {
@@ -674,6 +707,114 @@ pub(crate) fn drive_cross_layer(
             stage.name()
         )),
     }
+}
+
+/// On-device (Adreno/CUDA) self-check for the whole-model GPU **host-mirror K readback** (P0/P4): builds
+/// `n_layers` DEVICE-resident KV caches with deterministic F32 keys, then constructs an
+/// [`EngineCrossLayerStageCtx`] over them — which host-mirrors each device K (flush + `read_buffer`
+/// device→host via [`KVCache::host_snapshot`]) and dequantizes off the mirror. Returns the keys read
+/// back through the device ctx (`gpu_mirror`) alongside the keys read through a CPU ctx over byte-identical
+/// host caches (`cpu_ref`); the caller (the `test_cross_layer_host_mirror_device` bin) asserts they are
+/// **bit-identical** — the on-device proof that the host-mirror readback is faithful (the device→host DMA
+/// preserves the exact bytes the CPU path sees). `gpu_confirmed` reports the K was truly device-resident
+/// (`is_gpu_buffer()`), so the mirror branch — not the host-direct path — actually ran.
+///
+/// Mirrors [`faithful_h2o_pfa_host_mirror_selfcheck`](crate::kv::standard_format::faithful_h2o_pfa_host_mirror_selfcheck):
+/// a thin device harness around the production seam, callable only with a real GPU backend.
+#[cfg(feature = "opencl")]
+#[doc(hidden)]
+pub fn cross_layer_host_mirror_selfcheck(
+    gpu_backend: &Arc<dyn crate::backend::Backend>,
+    gpu_memory: &Arc<dyn crate::memory::Memory>,
+    n_layers: usize,
+    n_kv: usize,
+    head_dim: usize,
+    resident: usize,
+) -> anyhow::Result<(Vec<f32>, Vec<f32>, bool)> {
+    use crate::backend::cpu::CpuBackend;
+    use crate::buffer::{Buffer, DType};
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
+
+    let capacity = resident; // fresh prefill frame: capacity == resident (no padding).
+    let per_layer = n_kv * capacity * head_dim;
+    let shape = Shape::new(vec![1, capacity, n_kv, head_dim]); // SeqMajor [1, cap, n_kv, head_dim]
+
+    // Deterministic known K (F32) for a layer, distinct per (layer, slot, head, channel).
+    let make_bytes = |layer: usize| -> Vec<u8> {
+        let mut k = vec![0.0f32; per_layer];
+        for slot in 0..capacity {
+            for head in 0..n_kv {
+                for d in 0..head_dim {
+                    let idx = (slot * n_kv + head) * head_dim + d;
+                    k[idx] = ((slot + layer * 5 + head) as f32 * 0.05 + d as f32 * 0.01).sin();
+                }
+            }
+        }
+        let mut b = vec![0u8; per_layer * 4];
+        // SAFETY: copying `per_layer` f32 (== b.len() bytes) into the byte buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(k.as_ptr() as *const u8, b.as_mut_ptr(), b.len());
+        }
+        b
+    };
+
+    // DEVICE-resident caches (K + V on the GPU; V unused by TriAttention but `host_snapshot` reads both).
+    let mut device_caches: Vec<KVCache> = Vec::with_capacity(n_layers);
+    for layer in 0..n_layers {
+        let bytes = make_bytes(layer);
+        let k_buf = gpu_memory.alloc_kv(per_layer * 4, DType::F32)?;
+        let v_buf = gpu_memory.alloc_kv(per_layer * 4, DType::F32)?;
+        let mut k_t = Tensor::new(shape.clone(), k_buf, gpu_backend.clone());
+        let mut v_t = Tensor::new(shape.clone(), v_buf, gpu_backend.clone());
+        gpu_backend.write_buffer(&mut k_t, &bytes)?;
+        gpu_backend.write_buffer(&mut v_t, &bytes)?;
+        anyhow::ensure!(
+            k_t.buffer().is_gpu_buffer(),
+            "K must be device-resident (else the host-mirror branch never runs → readback untested)"
+        );
+        let mut c = KVCache::new(k_t, v_t, capacity);
+        c.set_current_pos(resident);
+        device_caches.push(c);
+    }
+
+    // HOST caches with byte-identical K (the CPU reference the device path must match).
+    let cpu: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
+    let mut host_caches: Vec<KVCache> = Vec::with_capacity(n_layers);
+    for layer in 0..n_layers {
+        let bytes = make_bytes(layer);
+        let k_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::from_vec(bytes.clone(), DType::F32));
+        let v_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::from_vec(bytes, DType::F32));
+        let mut c = KVCache::new(
+            Tensor::new(shape.clone(), k_buf, cpu.clone()),
+            Tensor::new(shape.clone(), v_buf, cpu.clone()),
+            capacity,
+        );
+        c.set_current_pos(resident);
+        host_caches.push(c);
+    }
+
+    let positions: Vec<usize> = (0..resident).collect();
+    let gpu_confirmed = device_caches[0].k_buffer.buffer().is_gpu_buffer();
+    // Device ctx host-mirrors; host ctx dequants directly. Both expose K via `read_key`.
+    let ctx_dev = EngineCrossLayerStageCtx::new(&device_caches, resident, &positions)?;
+    let ctx_host = EngineCrossLayerStageCtx::new(&host_caches, resident, &positions)?;
+
+    let mut gpu_mirror = Vec::with_capacity(n_layers * per_layer);
+    let mut cpu_ref = Vec::with_capacity(n_layers * per_layer);
+    let mut buf = vec![0.0f32; head_dim];
+    for layer in 0..n_layers {
+        for head in 0..n_kv {
+            for slot in 0..resident {
+                ctx_dev.read_key(layer, head, slot, &mut buf);
+                gpu_mirror.extend_from_slice(&buf);
+                ctx_host.read_key(layer, head, slot, &mut buf);
+                cpu_ref.extend_from_slice(&buf);
+            }
+        }
+    }
+    Ok((gpu_mirror, cpu_ref, gpu_confirmed))
 }
 
 /// A pipeline stage that runs a [`KVMutationStage`] callback over a set of per-layer caches, mirroring
@@ -1190,6 +1331,71 @@ mod tests {
             materialized.data, eager_v,
             "lazy V snapshot must equal the eager dequant"
         );
+    }
+
+    /// P0 (GPU host-mirror K readback) host self-check. The whole-model read ctx dequantizes each layer's
+    /// K through [`dequant_key_host_mirrored`], which — on a device-resident cache — host-mirrors (flush +
+    /// `read_buffer` device→host via [`KVCache::host_snapshot`]) before dequantizing. This pins the
+    /// BYTE-IDENTITY property that makes that device path faithful: dequantizing off a `host_snapshot`
+    /// round-trip equals dequantizing the cache directly, for EVERY layer, AND the bytes the ctx exposes
+    /// via `read_key` equal that direct dequant. On host (no GPU) the readback branch is a CpuBackend
+    /// `read_buffer` memcpy, so this exercises the round-trip plumbing; the Adreno bin
+    /// (`test_cross_layer_host_mirror_device`) pins the same equality across a real device→host DMA.
+    /// Mutation-proof: a readback that garbled/reordered bytes (wrong geometry in `host_snapshot`) breaks
+    /// assert (1); a layer-index mixup in the ctx (the per-layer K is salted by layer) breaks assert (2).
+    #[test]
+    fn cross_layer_host_mirror_byte_identical() {
+        const N_LAYERS: usize = 3;
+        // Distinct K per layer (base `pos`, salted by layer + channel) so a layer-index mixup is caught.
+        let caches: Vec<KVCache> = (0..N_LAYERS)
+            .map(|l| {
+                let mut c = make_int_cache(RESIDENT);
+                for pos in 0..RESIDENT {
+                    for head in 0..KV_HEADS {
+                        let off = c.offset(pos, head);
+                        let kb = c.k_buffer.as_mut_slice::<f32>();
+                        for d in 0..HD {
+                            kb[off + d] = (pos as f32) + (l as f32) * 1000.0 + (d as f32) * 0.5;
+                        }
+                    }
+                }
+                c
+            })
+            .collect();
+        let positions: Vec<usize> = (0..RESIDENT).collect();
+        let ctx = EngineCrossLayerStageCtx::new(&caches, RESIDENT, &positions)
+            .expect("host-mirror cross-layer ctx build");
+
+        let mut buf = vec![0.0f32; HD];
+        for (l, cache) in caches.iter().enumerate() {
+            // Reference: direct dequant of this (host-resident) cache's K.
+            let direct = dequant_snapshot(cache, RESIDENT, KV_HEADS, HD, true);
+            // (1) host-mirror round-trip byte-identity — the device path's exact transform (read_buffer
+            //     → rebuild geometry-verbatim → dequant), here over a CpuBackend memcpy.
+            let mirror = dequant_snapshot(
+                &cache.host_snapshot().expect("host_snapshot round-trip"),
+                RESIDENT,
+                KV_HEADS,
+                HD,
+                true,
+            );
+            assert_eq!(
+                mirror, direct,
+                "layer {l}: host-mirror (read_buffer round-trip) K must be byte-identical to direct dequant"
+            );
+            // (2) the ctx exposes exactly those bytes per (kv_head, slot) via read_key.
+            for kv_head in 0..KV_HEADS {
+                for slot in 0..RESIDENT {
+                    ctx.read_key(l, kv_head, slot, &mut buf);
+                    let base = (kv_head * RESIDENT + slot) * HD;
+                    assert_eq!(
+                        &buf[..],
+                        &direct[base..base + HD],
+                        "layer {l} kv_head {kv_head} slot {slot}: ctx.read_key must match direct dequant"
+                    );
+                }
+            }
+        }
     }
 
     /// A score-based stage that keeps the top-`target_len` positions by `importance()` (h2o shape).

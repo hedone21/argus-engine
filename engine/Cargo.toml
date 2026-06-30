@@ -64,6 +64,10 @@ path = "src/bin/test_kv_reencode_device.rs"
 name = "test_faithful_h2o_gpu_seed_device"
 path = "src/bin/test_faithful_h2o_gpu_seed_device.rs"
 
+[[bin]]
+name = "test_cross_layer_host_mirror_device"
+path = "src/bin/test_cross_layer_host_mirror_device.rs"
+
 [dependencies]
 # Shared IPC protocol types (manager <-> engine). Separate repo.
 argus-shared = { git = "https://github.com/hedone21/argus-shared.git", branch = "main" }

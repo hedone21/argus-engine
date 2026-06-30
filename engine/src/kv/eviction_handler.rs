@@ -82,6 +82,11 @@ impl CachePressureHandler for EvictionHandler {
             // mechanism lives in `run_policy_eviction`; production arming (CLI + warmup compute)
             // is a follow-up. `None` keeps this path byte-identical to the uniform behavior.
             None,
+            // Whole-model positions: the pressure handler fires a single-shot eviction (round-1, where
+            // slot index == absolute position), so the identity frame is correct here. A multi-round
+            // caller that tracks survivors' absolute positions (prefill-producer-arming-unification)
+            // would supply them; `None` keeps the round-1 path byte-identical.
+            None,
         )?;
 
         if result.evicted {
