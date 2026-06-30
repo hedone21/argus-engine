@@ -6,8 +6,11 @@
 //!   are integers and the `f64` arithmetic + round-half-to-even match Python exactly).
 //! * `select_fixture.txt` — per-kv-head keep sets from the SnapKV score→topk pipeline on integer
 //!   (LCG) attention; the Rust test regenerates the identical attention via the same LCG and
-//!   asserts the keep sets. Integer pooled-sums make the ranking f32/f64-agnostic and ties are
-//!   broken lower-index-first on both sides.
+//!   asserts the keep sets. Integer pooled-sums make the ranking f32/f64-agnostic, and BOTH sides
+//!   break ties lower-index-first — a deterministic parity check of the *score pipeline*, NOT of
+//!   torch.topk's exact tie order (which is implementation-defined, not lower-index-first; see the
+//!   residuals in `lib.rs`). Every case uses `n_kept ≥ window_size` (window fully resident); the
+//!   sub-window budget path (`lib.rs` D3) is covered by `sub_window_budget_keeps_raw_count`.
 
 use super::*;
 use argus_extension_api::{TensorDtype, TensorHandle, TensorKind, TensorShape};
@@ -166,6 +169,41 @@ fn budget_pyramid_endpoints_average_to_uniform() {
     assert_eq!(first, 960);
     assert_eq!(last, 64); // == window_size (min_num floor)
     assert_eq!((first + last) / 2, (q as f64 * (1.0 - cr)) as usize); // 512
+}
+
+// ── 2b. D3: budget below / at the observation window keeps the RAW count ──────
+
+#[test]
+fn sub_window_budget_keeps_raw_count() {
+    // High-CR degenerate case (SnapKV-uniform fallback) — get_layer_budget rounds BELOW the window.
+    // kvpress keeps EXACTLY n_kept positions; the former floor-to-window kept `window` instead (the
+    // D3 over-compression divergence). q=128, cr=0.9, window=64, beta=20, 32 layers → raw budget 13.
+    let current = 128usize;
+    let window = 64usize;
+    let raw = get_layer_budget(current, 0.9, window, 20, 32, 0);
+    assert_eq!(raw, 13, "ground-truth kvpress budget for this config");
+    assert!(raw < window, "must exercise the sub-window branch");
+
+    let ctx = Ctx {
+        current,
+        n_layers: 32,
+        ..Ctx::default()
+    };
+    match keep_spec_for(&cr_args("0.9", window, 5, 20), &ctx) {
+        Some(KeepSpec::LayerWide(keep)) => {
+            assert_eq!(
+                keep.len(),
+                raw,
+                "keeps the raw budget (13), NOT the window floor (64)"
+            );
+            assert_eq!(
+                keep,
+                (current - raw..current).collect::<Vec<usize>>(),
+                "the n_kept most-recent positions"
+            );
+        }
+        _ => panic!("expected LayerWide of the 13 most-recent positions"),
+    }
 }
 
 // ── 3. per-head SnapKV selection == kvpress (fixture oracle) ──────────────────
@@ -518,11 +556,12 @@ fn recency_fallback_without_any_scores() {
 // ── 6. adversarial-review regression tests ───────────────────────────────────
 
 #[test]
-fn degenerate_cr_floors_to_window_never_empty() {
-    // Adversarial finding: a degenerate compression_ratio could make the uniform fallback budget
-    // round to 0, yielding an EMPTY keep-list that empties the cache. The window floor must keep at
-    // least the recent window. current=64, window=8, cr≈1 ⇒ raw budget round(64*1e-6)=0 → floored
-    // to window=8 → keep the last 8 (non-empty), NOT [].
+fn degenerate_cr_floors_to_one_never_empty() {
+    // Adversarial finding: a degenerate compression_ratio makes the uniform fallback budget round to
+    // 0. kvpress's `topk(0)` would EMPTY the cache; we floor to 1 — the minimal safe non-empty keep
+    // — and keep the single most-recent token, NOT the window (the old floor-to-window was the D3
+    // over-compression divergence). current=64, window=8, cr≈1 ⇒ raw budget round(64·1e-6)=0 →
+    // floored to 1 → keep [63] (non-empty).
     let ctx = Ctx {
         current: 64,
         n_layers: 1,
@@ -538,15 +577,27 @@ fn degenerate_cr_floors_to_window_never_empty() {
         .expect("keep Some (must evict, not empty)");
     match keep {
         KeepSpec::LayerWide(k) => {
-            assert_eq!(
-                k,
-                (56..64).collect::<Vec<_>>(),
-                "floored to the recent window"
-            );
+            assert_eq!(k, vec![63], "floored to 1 — the single most-recent token");
             assert!(!k.is_empty(), "must never produce an empty keep-list");
         }
-        KeepSpec::PerHead(_) => panic!("window-only keep is LayerWide"),
+        KeepSpec::PerHead(_) => panic!("sub-window keep is LayerWide"),
     }
+}
+
+#[test]
+fn empty_cache_is_noop_no_panic() {
+    // Adversarial finding (D3-A): `raw_budget.clamp(1, current)` panics when current==0 (min>max).
+    // An empty cache (current==0) with cr>0 must be a SAFE no-op (None), not a panic.
+    let ctx = Ctx {
+        current: 0,
+        n_layers: 32,
+        ..Ctx::default()
+    };
+    assert_eq!(
+        keep_spec_for(&cr_args("0.9", 64, 5, 20), &ctx),
+        None,
+        "empty cache must be a no-op, never a panic"
+    );
 }
 
 #[test]
