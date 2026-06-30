@@ -8,6 +8,8 @@ use crate::kv::{
     ActionResult, CachePressurePipeline, EvictionHandler, HandlerContext, MIN_EVICT_TOKENS,
     PressureLevel, PressureStageConfig, SwapHandler,
 };
+use crate::stages::kv::mutation::drive_cross_layer;
+use argus_extension_api::KVMutationStage;
 // LAYER-EXEMPT: cross_cutting_trait_usage — §13.8-N SystemMonitor trait
 use crate::resilience::sys_monitor::SystemMonitor;
 use std::path::PathBuf;
@@ -496,6 +498,58 @@ impl CacheManager {
         self.pipeline.policy_id()
     }
 
+    /// WHOLE-MODEL cross-layer keepset eviction (TriAttention's global mode) — the cross-layer sibling
+    /// of [`run_policy_eviction`]. BYPASSES the per-layer `EvictionPolicy`/`StageBackedPolicy` loop:
+    /// it asserts uniform geometry across layers, then drives the stage's
+    /// [`KVMutationStage::on_whole_model`] ONCE over all caches (via
+    /// [`drive_cross_layer`](crate::stages::kv::mutation::drive_cross_layer) — an owned host-mirrored
+    /// `CrossLayerStageCtx` + an `EngineModelCacheHandle` whose keep fans out to every layer). One
+    /// keep-set, applied identically to all layers.
+    ///
+    /// `positions` are the engine's absolute positions of the resident slots (len == current_pos;
+    /// identity `0..current` before any eviction, survivors' original positions after — the source of
+    /// `round_start` in TriAttention). The caller supplies them (e.g. the eval loop's `saved_positions`),
+    /// or `0..current` for the single-prefill / first-eviction frame.
+    pub(crate) fn run_cross_layer_keepset_eviction(
+        stage: &dyn KVMutationStage,
+        caches: &mut [KVCache],
+        target_len: usize,
+        positions: &[usize],
+    ) -> Result<EvictionResult> {
+        if caches.is_empty() {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: 0,
+            });
+        }
+        // Uniform-geometry precondition: every layer shares the same resident length (the whole-model
+        // keep-set is applied identically to all layers). Bail cleanly rather than mis-evict on a
+        // ragged (per-layer-budgeted) cache.
+        let current_pos = caches[0].current_pos();
+        if !caches.iter().all(|c| c.current_pos() == current_pos) {
+            anyhow::bail!(
+                "cross-layer keepset eviction requires a uniform resident length across layers \
+                 (found mixed current_pos); whole-model stages are incompatible with per-layer budgets"
+            );
+        }
+        // Global guard (the uniform path): nothing to remove.
+        if target_len > 0 && current_pos <= target_len {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: current_pos,
+            });
+        }
+        let mutated = drive_cross_layer(stage, caches, target_len, positions)?;
+        let new_pos = max_cache_pos(caches);
+        Ok(EvictionResult {
+            evicted: mutated && new_pos < current_pos,
+            tokens_removed: current_pos.saturating_sub(new_pos),
+            new_pos,
+        })
+    }
+
     /// Shared eviction core: guard on `target_len`, dispatch to policy methods,
     /// assemble result. `target_len == 0` means "policy decides" (guards skipped).
     ///
@@ -516,6 +570,18 @@ impl CacheManager {
                 tokens_removed: 0,
                 new_pos: 0,
             });
+        }
+
+        // WHOLE-MODEL routing: a stage that decides over all layers at once (caps `whole_model`, e.g.
+        // TriAttention's global mode) bypasses the per-layer loop below. Per-layer policies (the common
+        // case) return `None` here → the loop runs unchanged (byte-identical). Positions are the
+        // single-prefill identity frame (`0..current`); a multi-round production caller that has the
+        // engine's `saved_positions` should call `run_cross_layer_keepset_eviction` directly with them
+        // (the per-layer-budget path is incompatible — asserted inside).
+        if let Some((stage, _caps)) = policy.as_whole_model_stage() {
+            let current = max_cache_pos(caches);
+            let positions: Vec<usize> = (0..current).collect();
+            return Self::run_cross_layer_keepset_eviction(stage, caches, target_len, &positions);
         }
 
         let current_pos = max_cache_pos(caches);
@@ -1502,5 +1568,229 @@ mod tests {
         let result = cm.maybe_evict(&mut caches).unwrap();
         assert!(!result.evicted);
         assert_eq!(result.new_pos, 40);
+    }
+}
+
+#[cfg(all(test, feature = "triattention"))]
+mod cross_layer_parity_tests {
+    //! LIVE-ENGINE parity for the cross-layer (whole-model) keepset seam. Drives the real engine
+    //! [`CacheManager::run_cross_layer_keepset_eviction`] over KVCaches populated from the TriAttention
+    //! reference oracle dump, and asserts the resulting keep-set is byte-identical
+    //! (`symmetric_diff == 0`) to the reference Path-1 oracle — round 1 (identity positions) AND round
+    //! 2 (non-identity survivors + new tokens). The decision flows through the ENGINE path
+    //! (`EngineCrossLayerStageCtx` + `EngineModelCacheHandle` + `TriAttention::on_whole_model`), NOT the
+    //! plugin's `compute_keepset_global` harness. Env-gated on `TRIATTN_FIXTURE_DIR` (no fixture → SKIP,
+    //! so the default `cargo test` stays green); the fixture is the same one the plugin's `parity.rs`
+    //! consumes.
+
+    use super::*;
+    use crate::backend::cpu::CpuBackend;
+    use crate::buffer::DType;
+    use crate::kv::eviction::keepset_dump::{arm_capture, capture_test_lock, drain_capture};
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
+    use std::collections::{BTreeMap, HashSet};
+    use std::path::Path;
+    use std::sync::Arc;
+    use triattention::{Calib, TriAttention};
+
+    fn parse_params(path: &Path) -> BTreeMap<String, String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect()
+    }
+    fn read_ints(path: &Path) -> Vec<usize> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .split_whitespace()
+            .map(|t| t.parse().unwrap())
+            .collect()
+    }
+    fn read_keys_flat(path: &Path) -> Vec<f32> {
+        std::fs::read(path)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect()
+    }
+    fn symmetric_diff(a: &[usize], b: &[usize]) -> usize {
+        let sa: HashSet<usize> = a.iter().copied().collect();
+        let sb: HashSet<usize> = b.iter().copied().collect();
+        sa.symmetric_difference(&sb).count()
+    }
+
+    /// Build one layer's F32 SeqMajor KVCache, populating K so `dequant_snapshot` reproduces the
+    /// fixture `[kv_head][slot][head_dim]` (`layer_keys[(kv*l_total + slot)*head_dim ..]`). V is left
+    /// zeroed (TriAttention reads only Key).
+    fn build_layer_cache(
+        layer_keys: &[f32],
+        n_kv: usize,
+        l_total: usize,
+        head_dim: usize,
+    ) -> KVCache {
+        let backend = Arc::new(CpuBackend::new());
+        let bytes = l_total * n_kv * head_dim * std::mem::size_of::<f32>();
+        let shape = Shape::new(vec![1, l_total, n_kv, head_dim]);
+        let mut c = KVCache::new(
+            Tensor::new(
+                shape.clone(),
+                Arc::new(SharedBuffer::new(bytes, DType::F32)),
+                backend.clone(),
+            ),
+            Tensor::new(
+                shape,
+                Arc::new(SharedBuffer::new(bytes, DType::F32)),
+                backend,
+            ),
+            l_total,
+        );
+        c.set_current_pos(l_total);
+        for kv in 0..n_kv {
+            for slot in 0..l_total {
+                let src = ((kv * l_total) + slot) * head_dim;
+                let off = c.offset(slot, kv);
+                let k = c.k_buffer.as_mut_slice::<f32>();
+                k[off..off + head_dim].copy_from_slice(&layer_keys[src..src + head_dim]);
+            }
+        }
+        c
+    }
+
+    fn run_round(
+        dir: &Path,
+        round: &str,
+        params_file: &str,
+        keys_file: &str,
+        keepset_file: &str,
+        positions_file: Option<&str>,
+    ) {
+        let p = parse_params(&dir.join(params_file));
+        let g = |k: &str| p[k].parse::<usize>().unwrap();
+        let (l_total, prefix_length, budget) = (g("L"), g("prefix_length"), g("budget"));
+        let (num_layers, num_kv_heads, head_dim) =
+            (g("num_layers"), g("num_kv_heads"), g("head_dim"));
+        let theta: f32 = p["rope_theta"].parse().unwrap();
+        let offset_max_length = g("offset_max_length");
+        let normalize = g("normalize_scores") != 0;
+
+        let calib = Calib::from_path(dir.join("qwen25_calib.bin").to_str().unwrap()).unwrap();
+        let keys = read_keys_flat(&dir.join(keys_file));
+        assert_eq!(
+            keys.len(),
+            num_layers * num_kv_heads * l_total * head_dim,
+            "[{round}] keys size mismatch"
+        );
+        let oracle = read_ints(&dir.join(keepset_file));
+        let positions: Vec<usize> = match positions_file {
+            Some(f) => read_ints(&dir.join(f)),
+            None => (0..l_total).collect(),
+        };
+        assert_eq!(positions.len(), l_total, "[{round}] positions length == L");
+
+        // One KVCache per transformer layer, populated from the fixture's post-RoPE keys.
+        let layer_stride = num_kv_heads * l_total * head_dim;
+        let mut caches: Vec<KVCache> = (0..num_layers)
+            .map(|layer| {
+                build_layer_cache(
+                    &keys[layer * layer_stride..(layer + 1) * layer_stride],
+                    num_kv_heads,
+                    l_total,
+                    head_dim,
+                )
+            })
+            .collect();
+
+        let stage =
+            TriAttention::with_calib(calib, prefix_length, offset_max_length, normalize, theta);
+
+        // Drive the LIVE engine whole-model path and capture the applied keep-set (the model handle
+        // records into the keepset dump exactly as the per-layer path does).
+        let _guard = capture_test_lock();
+        arm_capture();
+        let result =
+            CacheManager::run_cross_layer_keepset_eviction(&stage, &mut caches, budget, &positions)
+                .unwrap();
+        let captured = drain_capture();
+
+        // The committed keep-set (LayerWide → per-head replication; take head 0 of a layer recorded at
+        // this round's pre-eviction fingerprint seq_len == L).
+        let mine: Vec<_> = captured.iter().filter(|c| c.seq_len == l_total).collect();
+        assert!(
+            !mine.is_empty(),
+            "[{round}] whole-model commit recorded no keep-set at seq_len={l_total}"
+        );
+        let engine_keep: Vec<usize> = mine[0].keep[0].clone();
+
+        let sd = symmetric_diff(&engine_keep, &oracle);
+        println!(
+            "[live-parity {round}] oracle_keep={} engine_keep={} symmetric_diff={} \
+             (new_pos={}, removed={})",
+            oracle.len(),
+            engine_keep.len(),
+            sd,
+            result.new_pos,
+            result.tokens_removed
+        );
+        assert_eq!(
+            sd, 0,
+            "[{round}] live engine whole-model keep-set must match the reference Path-1 oracle exactly"
+        );
+        assert_eq!(
+            result.new_pos, budget,
+            "[{round}] resident count after eviction == budget"
+        );
+        assert_eq!(
+            caches[0].current_pos(),
+            budget,
+            "[{round}] layer 0 compacted to budget"
+        );
+    }
+
+    fn fixture_dir() -> Option<String> {
+        match std::env::var("TRIATTN_FIXTURE_DIR") {
+            Ok(d) => Some(d),
+            Err(_) => {
+                eprintln!("[live-parity] TRIATTN_FIXTURE_DIR unset → SKIP");
+                None
+            }
+        }
+    }
+
+    /// Round 1: identity coordinates (single-prefill faithful frame), via the live engine path.
+    #[test]
+    fn live_engine_round1_keepset_parity() {
+        let Some(dir) = fixture_dir() else { return };
+        run_round(
+            Path::new(&dir),
+            "round1",
+            "oracle_params.txt",
+            "oracle_keys.f32",
+            "oracle_keepset.txt",
+            None,
+        );
+    }
+
+    /// Round 2: NON-IDENTITY coordinates (survivors at original positions + new decode tokens), via the
+    /// live engine path — `round_start` is derived from the engine's absolute positions.
+    #[test]
+    fn live_engine_round2_keepset_parity() {
+        let Some(dir) = fixture_dir() else { return };
+        let dir = Path::new(&dir);
+        if !dir.join("oracle_params_r2.txt").exists() {
+            eprintln!("[live-parity round2] no round-2 fixture → SKIP");
+            return;
+        }
+        run_round(
+            dir,
+            "round2",
+            "oracle_params_r2.txt",
+            "oracle_keys_r2.f32",
+            "oracle_keepset_r2.txt",
+            Some("oracle_positions_r2.txt"),
+        );
     }
 }

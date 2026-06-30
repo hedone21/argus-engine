@@ -1,0 +1,17 @@
+[package]
+name = "triattention"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# TriAttention (Mao et al., 2026) — trigonometric frequency-domain KV eviction technique crate.
+# Faithful to the reference Path-1 (WeianMao/triattention, methods/pruning_utils.py +
+# methods/triattention.py), default config. A stage-axis extension depending only on
+# `argus-extension-api` + `linkme`: reads POST-RoPE `TensorKind::Key`, inverts RoPE in-plugin (Route A,
+# no engine forward-core edit), scores keys against calibrated query centers, and stages a keep-set.
+# Force-linked via `use triattention as _;` under the `triattention` engine feature.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

@@ -387,17 +387,39 @@ pub struct StageCaps {
     /// instead of a pure-drop estimator. Replaces the engine-side `eviction_policy() == "d2o"` name
     /// match (the last STAGE-axis technique-name leak in eval).
     pub produces_merge_plan: bool,
+    /// `true` ⟺ this stage decides over the WHOLE model at once: the engine invokes
+    /// [`KVMutationStage::on_whole_model`] ONCE with a [`CrossLayerStageCtx`] spanning every layer and
+    /// a model-scoped [`CacheHandle`] (verbs fan out to all layers), instead of the per-layer
+    /// `on_phase` loop. A cross-layer global keep-set technique (TriAttention's default mode, which
+    /// aggregates all layers' resident keys into ONE keep-set) sets this. Mirrors
+    /// [`produces_merge_plan`](Self::produces_merge_plan): a per-stage declaration the engine reads
+    /// pre-`make`, `false` for all but the relevant stage (default `false` → the per-layer path,
+    /// byte-identical to before).
+    pub whole_model: bool,
+    /// The trailing query window the prefill-attention (PFA) producer should SUM over for this stage,
+    /// or `None` (no preference — the engine arms its own default). A stage that reads
+    /// [`TensorKind::PrefillAttention`] and scores like SnapKV (PyramidKV) declares its scoring
+    /// `window_size` here so the engine observes EXACTLY that many trailing queries (a different
+    /// window sums a different, differently-scaled query set and ranks different heavy hitters — the
+    /// D1 divergence). A **declaration** the engine reads pre-`make` (off the [`MutationStageReg`]),
+    /// not a runtime behavior — so it lives on the caps, not on a trait method (the engine no longer
+    /// instantiates a throwaway default stage just to read this constant). `None` for the ~11
+    /// score-free / non-PFA stages.
+    pub prefill_attn_window: Option<usize>,
 }
 
 impl StageCaps {
-    /// Score-free defaults — no reads, no stage-declared prefix, drop-only (`{ &[], 0, false }`).
-    /// Used by the `register_kv_mutation_stage!` macro so macro-registered (and example) plugins compile
-    /// unchanged: a score-free drop-only LayerWide technique is the common case, and any stage that
-    /// needs scores / emits merges declares them via a direct-literal [`MutationStageReg`].
+    /// Score-free defaults — no reads, no stage-declared prefix, drop-only, per-layer, no PFA window
+    /// (`{ &[], 0, false, false, None }`). Used by the `register_kv_mutation_stage!` macro so
+    /// macro-registered (and example) plugins compile unchanged: a score-free drop-only LayerWide
+    /// per-layer technique is the common case, and any stage that needs scores / emits merges / decides
+    /// whole-model / declares a PFA window declares it via a direct-literal [`MutationStageReg`].
     pub const SCORE_FREE: StageCaps = StageCaps {
         reads: &[],
         default_protected_prefix: 0,
         produces_merge_plan: false,
+        whole_model: false,
+        prefill_attn_window: None,
     };
 }
 
@@ -530,8 +552,12 @@ impl core::fmt::Display for CacheOpError {
     }
 }
 
-/// A rule-respecting, transactional mutation surface over **one layer's** KV cache, handed to a
-/// [`KVMutationStage`] callback as `&mut dyn CacheHandle`.
+/// A rule-respecting, transactional mutation surface over **the scope handed to the stage** — one
+/// layer's KV cache in the per-layer [`on_phase`](KVMutationStage::on_phase) path, ALL layers' caches
+/// in the whole-model [`on_whole_model`](KVMutationStage::on_whole_model) path (where each verb fans
+/// out to every layer). Handed to a [`KVMutationStage`] callback as `&mut dyn CacheHandle`. The verbs
+/// are identical across both scopes; only the breadth they apply to differs (the engine supplies a
+/// one-layer `EngineCacheHandle` or a model-scoped `EngineModelCacheHandle`).
 ///
 /// **dyn-safe is mandatory** (the callback takes a `&mut dyn CacheHandle`): every method is free of
 /// generic parameters / `Self` by value / associated types / `impl Trait` arguments. Like
@@ -651,6 +677,50 @@ pub trait CacheHandle {
     }
 }
 
+/// The whole-model read view handed to [`KVMutationStage::on_whole_model`] — the cross-layer sibling
+/// of [`StageCtx`]. Where `StageCtx` is a single-layer view, this spans EVERY layer at once, so a
+/// technique that must decide over all layers' resident keys together (TriAttention's global mode)
+/// can read them through one ctx. dyn-safe (the callback takes `&dyn CrossLayerStageCtx`): every
+/// method is free of generic params / `Self` by value / associated types / `impl Trait` args, and
+/// tensor reads use the same [`TensorHandle`] out-param convention as `StageCtx`.
+///
+/// **Uniform-geometry precondition.** The whole-model path is defined only when every layer shares the
+/// same resident length and the same per-slot absolute positions (the common single-prefill / uniform
+/// decode case). The engine asserts this before building the ctx; `current_pos` / `abs_position` are
+/// therefore model-wide, not per-layer.
+pub trait CrossLayerStageCtx {
+    /// Total number of transformer layers (caches) spanned.
+    fn n_layers(&self) -> usize;
+    /// The uniform resident token count (every layer equal — the precondition above).
+    fn current_pos(&self) -> usize;
+    /// The resolved budget — the absolute number of tokens to retain (the engine's ratio→len
+    /// conversion already applied; the mirror of [`StageCtx::target_len`]).
+    fn target_len(&self) -> usize;
+    /// Number of KV heads (uniform across layers).
+    fn n_kv_heads(&self) -> usize;
+    /// Dimension per head.
+    fn head_dim(&self) -> usize;
+    /// The absolute RoPE position of cache slot `slot` — the engine source-of-truth (derived from its
+    /// RoPE-continuation `saved_positions`), so the plugin's position frame never drifts from the
+    /// engine's. Identity (`slot`) before any eviction; survivors carry their original positions after.
+    fn abs_position(&self, slot: usize) -> usize;
+    /// The `kind` tensor handle for `layer` (`StageCtx::tensor` with a layer argument; `TensorKind`
+    /// reused). `None` when the kind is unavailable for this call (e.g. a device-only cache with no
+    /// host mirror, or a kind the engine did not snapshot).
+    fn layer_tensor(&self, layer: usize, kind: TensorKind) -> Option<&dyn TensorHandle>;
+
+    // ── default sugar (delegates to `layer_tensor`; the engine need not override) ──
+
+    /// Fills the post-RoPE key at `(layer, kv_head, slot)` into `out` as f32. Sugar over
+    /// `layer_tensor(layer, Key)` (the `StageCtx::dequant_k` pattern). `out.len() == head_dim`;
+    /// no-op if the Key kind is unavailable for `layer`.
+    fn read_key(&self, layer: usize, kv_head: usize, slot: usize, out: &mut [f32]) {
+        if let Some(h) = self.layer_tensor(layer, TensorKind::Key) {
+            h.read_row(slot, kv_head, out);
+        }
+    }
+}
+
 /// The imperative sibling of [`KVMutationStage`] — a callback that drives a transactional
 /// [`CacheHandle`] at a [`MutationPhase`]. Additive: a technique implements EITHER this or the
 /// plan-returning [`KVMutationStage`], whichever its mutation shape fits.
@@ -670,15 +740,23 @@ pub trait KVMutationStage: Send + Sync {
     fn on_phase(&self, ctx: &dyn StageCtx, cache: &mut dyn CacheHandle)
     -> Result<(), CacheOpError>;
 
-    /// The trailing query window the PFA producer should SUM over for this stage, or `None` (no
-    /// preference — the engine arms its own default). A stage that reads
-    /// [`TensorKind::PrefillAttention`] and scores like SnapKV (PyramidKV) MUST return its scoring
-    /// `window_size` here: kvpress observes EXACTLY the last `window_size` queries, so an
-    /// engine-observed window of a different size sums a different (and differently-scaled) query
-    /// set and ranks different heavy hitters. ABI-additive default method (the static-linkme
-    /// [`KVMutationStage`] surface has no C-ABI to break); the ~11 score-free stages keep `None`.
-    fn prefill_attn_window(&self) -> Option<usize> {
-        None
+    /// Drive a WHOLE-MODEL mutation: read every layer's resident KV through [`CrossLayerStageCtx`] and
+    /// mutate through a model-scoped [`CacheHandle`] whose verbs fan out to all layers. The SAME shape
+    /// as [`on_phase`](Self::on_phase) — only the READ scope differs (all layers vs one); the write
+    /// generality is identical (the full [`CacheHandle`] verb set, not keep-only). The engine invokes
+    /// this ONCE per eviction round for a stage that declares [`StageCaps::whole_model`], instead of
+    /// the per-layer `on_phase` loop. The cross-layer global keep-set class (TriAttention's default
+    /// mode — score all layers' keys, aggregate, apply ONE keep-set to every layer) lives here.
+    ///
+    /// Default no-op: the ~11 per-layer stages do not implement it (they declare `whole_model = false`
+    /// and the engine never calls this on them). Reads observe the pre-callback frame and staged
+    /// mutations commit once on `Ok`, exactly like `on_phase` (the same transaction invariants T-1..T-10).
+    fn on_whole_model(
+        &self,
+        _ctx: &dyn CrossLayerStageCtx,
+        _cache: &mut dyn CacheHandle,
+    ) -> Result<(), CacheOpError> {
+        Ok(())
     }
 }
 

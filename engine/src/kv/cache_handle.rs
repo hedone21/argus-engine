@@ -363,6 +363,207 @@ impl CacheHandle for EngineCacheHandle<'_> {
     }
 }
 
+/// Engine-side [`CacheHandle`] over the WHOLE MODEL — `&mut [KVCache]`, one entry per layer. The
+/// whole-model sibling of [`EngineCacheHandle`], handed to [`KVMutationStage::on_whole_model`]
+/// (`StageCaps::whole_model`). Its mutation verbs apply the SAME staged intent to EVERY layer (the
+/// "verbs fan out" of the design): a `keep` is the cross-layer global keep-set applied identically to
+/// all layers. Uniform geometry is a precondition — every layer must share `current_pos` (and
+/// kv_heads/head_dim); the caller (`run_cross_layer_keepset_eviction`) asserts it before building this
+/// handle, and the entry frame is read from the first layer.
+///
+/// Today it is a compaction-only surface (keep / keep_per_head — what the cross-layer global keep-set
+/// class needs). The format (reencode/transition) and residency (offload/recall) and merge verbs stay
+/// DORMANT for the whole-model scope until a fan-out consumer exists (the per-layer
+/// [`EngineCacheHandle`] carries those today) — mirroring the dormant geometry-wall precedent. Reads
+/// flow through the companion [`argus_extension_api::CrossLayerStageCtx`], not this handle (`tensor`
+/// returns `None`, like the per-layer handle).
+pub struct EngineModelCacheHandle<'a> {
+    caches: &'a mut [KVCache],
+    /// Uniform entry-frame token count (every layer equal — the caller's precondition). Every read +
+    /// keep validation observes this (T-3).
+    entry_pos: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    on_device: bool,
+    /// The single staged compaction (T-2), applied to every layer at commit (the fan-out).
+    compaction: Option<Compaction>,
+    /// Whether `commit` mutated any bytes.
+    mutated: bool,
+}
+
+impl<'a> EngineModelCacheHandle<'a> {
+    /// Build a whole-model handle over all layers' caches. `caches` must be NON-EMPTY and uniform
+    /// (every layer the same `current_pos`/geometry — the caller's precondition); the entry frame is
+    /// read from the first layer. Panics on an empty slice (a programming error — the caller guards).
+    pub fn new(caches: &'a mut [KVCache]) -> Self {
+        let (entry_pos, n_kv_heads, head_dim, on_device) = {
+            let c0 = &caches[0];
+            (
+                c0.current_pos(),
+                c0.kv_heads(),
+                c0.head_dim(),
+                c0.k_buffer.buffer().is_gpu_buffer(),
+            )
+        };
+        Self {
+            caches,
+            entry_pos,
+            n_kv_heads,
+            head_dim,
+            on_device,
+            compaction: None,
+            mutated: false,
+        }
+    }
+
+    /// Validate a keep-list against the uniform entry frame: ascending + unique + in `[0, entry_pos)`
+    /// (T-10) — checked ONCE (every layer shares the frame), before any layer mutates (T-8 atomicity
+    /// across the fan-out).
+    fn validate_keep(&self, keep: &[usize]) -> Result<(), CacheOpError> {
+        let mut prev: Option<usize> = None;
+        for &k in keep {
+            if k >= self.entry_pos {
+                return Err(CacheOpError::InvalidKeep);
+            }
+            if let Some(p) = prev
+                && k <= p
+            {
+                return Err(CacheOpError::InvalidKeep);
+            }
+            prev = Some(k);
+        }
+        Ok(())
+    }
+
+    /// Stage the single compaction, rejecting a second one (T-2).
+    fn set_compaction(&mut self, c: Compaction) -> Result<(), CacheOpError> {
+        if self.compaction.is_some() {
+            return Err(CacheOpError::MultipleCompactions);
+        }
+        self.compaction = Some(c);
+        Ok(())
+    }
+
+    /// Apply the staged compaction to EVERY layer (the fan-out commit) and return whether any bytes
+    /// changed. Each layer routes through the SAME executor (`compact_keep_positions[_for_head]`) the
+    /// per-layer handle uses, so a whole-model keep is byte-identical to applying that keep to each
+    /// layer individually. The keep-set is recorded per layer into the keepset dump (when active), so
+    /// a whole-model eviction appears in dumps exactly as the per-layer path does.
+    pub fn commit(mut self) -> Result<bool> {
+        let n_layers = self.caches.len();
+        match self.compaction.take() {
+            Some(Compaction::Keep(keep)) => {
+                for (layer_idx, cache) in self.caches.iter_mut().enumerate() {
+                    if crate::kv::eviction::keepset_dump::is_active() {
+                        crate::kv::eviction::keepset_dump::record(
+                            cache,
+                            &KeepSpec::LayerWide(keep.clone()),
+                            layer_idx,
+                            n_layers,
+                        );
+                    }
+                    cache.compact_keep_positions(&keep, 0)?;
+                    cache.set_current_pos(keep.len());
+                }
+                self.mutated = true;
+            }
+            Some(Compaction::KeepPerHead(heads)) => {
+                let new_pos = heads.first().map_or(0, |h| h.len());
+                for (layer_idx, cache) in self.caches.iter_mut().enumerate() {
+                    if crate::kv::eviction::keepset_dump::is_active() {
+                        crate::kv::eviction::keepset_dump::record(
+                            cache,
+                            &KeepSpec::PerHead(heads.clone()),
+                            layer_idx,
+                            n_layers,
+                        );
+                    }
+                    for (kv_head, keep) in heads.iter().enumerate() {
+                        cache.compact_keep_positions_for_head(kv_head, keep, 0)?;
+                    }
+                    cache.set_current_pos(new_pos);
+                }
+                self.mutated = true;
+            }
+            // offload/recall reject at call time on this surface (NoResidencyBackend), so they never
+            // stage — these arms are unreachable, handled as no-ops for exhaustiveness.
+            Some(Compaction::Offload(_)) | Some(Compaction::Recall) | None => {}
+        }
+        Ok(self.mutated)
+    }
+}
+
+impl CacheHandle for EngineModelCacheHandle<'_> {
+    fn current_pos(&self) -> usize {
+        self.entry_pos
+    }
+    fn n_kv_heads(&self) -> usize {
+        self.n_kv_heads
+    }
+    fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+    fn kv_on_device(&self) -> bool {
+        self.on_device
+    }
+    fn tensor(&self, _kind: TensorKind) -> Option<&dyn TensorHandle> {
+        // Reads flow through the companion CrossLayerStageCtx (the on_whole_model ctx argument), not
+        // this mutation surface — mirror of EngineCacheHandle.
+        None
+    }
+
+    fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
+        self.validate_keep(keep)?;
+        self.set_compaction(Compaction::Keep(keep.to_vec()))
+    }
+
+    fn keep_per_head(&mut self, keep: &[&[usize]]) -> Result<(), CacheOpError> {
+        if keep.len() != self.n_kv_heads {
+            return Err(CacheOpError::InvalidKeep);
+        }
+        // All heads keep the same NUMBER of tokens (single shared current_pos), each ascending +
+        // unique + in-range. Validate ALL (across heads) before staging (T-8).
+        let new_pos = keep.first().map_or(0, |h| h.len());
+        for head in keep {
+            if head.len() != new_pos {
+                return Err(CacheOpError::InvalidKeep);
+            }
+            self.validate_keep(head)?;
+        }
+        // Per-head compaction requires HeadMajor layout in EVERY layer; reject the whole fan-out if any
+        // layer is SeqMajor (atomicity — never half-apply).
+        if self
+            .caches
+            .iter()
+            .any(|c| c.layout() != KVLayout::HeadMajor)
+        {
+            return Err(CacheOpError::WrongContainer);
+        }
+        self.set_compaction(Compaction::KeepPerHead(
+            keep.iter().map(|h| h.to_vec()).collect(),
+        ))
+    }
+
+    // ── dormant for the whole-model scope (no cross-layer consumer yet; the per-layer
+    //    EngineCacheHandle carries these) ──
+
+    fn merge(&mut self, _merges: &[WeightedMerge]) -> Result<(), CacheOpError> {
+        Err(CacheOpError::WrongContainer)
+    }
+    fn reencode(&mut self, _target: FormatId) -> Result<(), CacheOpError> {
+        Err(CacheOpError::WrongContainer)
+    }
+    fn transition_quant_bits(&mut self, _bits: u8) -> Result<(), CacheOpError> {
+        Err(CacheOpError::WrongContainer)
+    }
+    fn offload(&mut self, _prefix_len: usize) -> Result<(), CacheOpError> {
+        Err(CacheOpError::NoResidencyBackend)
+    }
+    fn recall(&mut self) -> Result<(), CacheOpError> {
+        Err(CacheOpError::NoResidencyBackend)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
