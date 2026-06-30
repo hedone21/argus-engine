@@ -39,6 +39,8 @@ const RKV_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::Key, TensorKind::Scores],
     default_protected_prefix: 4,
     produces_merge_plan: false,
+    whole_model: false,
+    prefill_attn_window: None,
 };
 
 /// 1단 측정 덤프 게이트 env var. set 시 plan() 마다 per-kv_head `[RkvStats]` 마커 라인을 stderr 로

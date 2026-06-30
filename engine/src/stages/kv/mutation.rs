@@ -31,13 +31,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use argus_extension_api::{
-    KVMutationStage, MutationPhase, StageCaps, StageCtx, TensorDtype, TensorHandle, TensorKind,
-    TensorShape,
+    CrossLayerStageCtx, KVMutationStage, MutationPhase, StageCaps, StageCtx, TensorDtype,
+    TensorHandle, TensorKind, TensorShape,
 };
 use argus_shared::Level;
 
 use crate::inference::attention_scores::AttentionScoreAccumulator;
-use crate::kv::cache_handle::EngineCacheHandle;
+use crate::kv::cache_handle::{EngineCacheHandle, EngineModelCacheHandle};
 use crate::kv::dequant::{dequantize_k, dequantize_v};
 use crate::kv::eviction_handler::MIN_EVICT_TOKENS;
 use crate::kv::kv_cache::KVCache;
@@ -548,6 +548,129 @@ pub(crate) fn drive_mutation_layer(
         Ok(r) => r,
         Err(_) => Err(anyhow::anyhow!(
             "mutation stage '{}' panicked during on_phase/commit",
+            stage.name()
+        )),
+    }
+}
+
+/// A whole-model read view ([`CrossLayerStageCtx`]) over ALL layers' caches. Holds an owned,
+/// host-mirrored Key snapshot per layer (built via [`dequant_snapshot`] — the same bytes the per-layer
+/// [`SnapshotStageCtx`] exposes through [`KvSnapHandle`]), plus the engine's absolute positions. The
+/// snapshots are OWNED (no cache borrow retained), so this read ctx coexists with the `&mut`
+/// [`EngineModelCacheHandle`] over the same caches (the whole-model twin of the per-layer
+/// read/mutate-aliasing split). Built in the entry frame (T-3).
+pub struct EngineCrossLayerStageCtx<'a> {
+    n_layers: usize,
+    current_pos: usize,
+    target_len: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    /// The engine's absolute position of each resident slot (len == current_pos; identity before any
+    /// eviction, survivors' original positions after). The plugin reads it via `abs_position`.
+    positions: &'a [usize],
+    /// One host-mirrored Key snapshot per layer (index == layer), `[kv_head][slot][head_dim]` layout
+    /// (the [`OwnedKvSnapHandle`] convention) — `layer_tensor(layer, Key)` returns `&key_handles[layer]`.
+    key_handles: Vec<OwnedKvSnapHandle>,
+}
+
+impl<'a> EngineCrossLayerStageCtx<'a> {
+    /// Build the whole-model read ctx from all layers' (host-resident) caches + the engine's absolute
+    /// `positions`. Each layer's Key is dequantized into an owned host-mirror snapshot here, so the
+    /// `on_whole_model` closure can stream `(layer, kv_head, slot)` keys without holding a cache borrow.
+    /// `caches` must be NON-EMPTY and uniform (every layer the same `current_pos`/geometry — the
+    /// caller's precondition); the geometry is read from the first layer.
+    ///
+    /// HOST-ONLY: [`dequant_snapshot`] reads through the host pointer, so on a device-resident cache the
+    /// caller must host-mirror (read the device buffer back) before constructing this ctx — mirroring
+    /// the `!kv_on_device()` gate in [`drive_mutation_layer`].
+    pub fn new(caches: &[KVCache], target_len: usize, positions: &'a [usize]) -> Self {
+        let c0 = &caches[0];
+        let current_pos = c0.current_pos();
+        let n_kv_heads = c0.kv_heads();
+        let head_dim = c0.head_dim();
+        let key_handles = caches
+            .iter()
+            .map(|cache| OwnedKvSnapHandle {
+                data: dequant_snapshot(cache, current_pos, n_kv_heads, head_dim, true),
+                rows: current_pos,
+                head_dim,
+            })
+            .collect();
+        Self {
+            n_layers: caches.len(),
+            current_pos,
+            target_len,
+            n_kv_heads,
+            head_dim,
+            positions,
+            key_handles,
+        }
+    }
+}
+
+impl CrossLayerStageCtx for EngineCrossLayerStageCtx<'_> {
+    fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+    fn current_pos(&self) -> usize {
+        self.current_pos
+    }
+    fn target_len(&self) -> usize {
+        self.target_len
+    }
+    fn n_kv_heads(&self) -> usize {
+        self.n_kv_heads
+    }
+    fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+    fn abs_position(&self, slot: usize) -> usize {
+        // Identity fallback for an out-of-range slot (defensive; positions.len() == current_pos holds
+        // by construction).
+        self.positions.get(slot).copied().unwrap_or(slot)
+    }
+    fn layer_tensor(&self, layer: usize, kind: TensorKind) -> Option<&dyn TensorHandle> {
+        match kind {
+            TensorKind::Key => self.key_handles.get(layer).map(|h| h as &dyn TensorHandle),
+            _ => None,
+        }
+    }
+}
+
+/// Drive a WHOLE-MODEL [`KVMutationStage::on_whole_model`] callback over all layers' caches through an
+/// [`EngineModelCacheHandle`] and commit it, returning whether the commit mutated any bytes. The
+/// cross-layer sibling of [`drive_mutation_layer`]: it builds an owned, host-mirrored
+/// [`EngineCrossLayerStageCtx`] (so the read view never aliases the `&mut` model handle), runs the
+/// stage once over all layers, and commits the fanned-out keep-set. `positions` are the engine's
+/// absolute positions (len == current_pos; identity before any eviction). `caches` must be non-empty +
+/// uniform (the caller asserts uniform geometry). A panic in the (untrusted) stage is caught (mirror of
+/// `drive_mutation_layer`).
+pub(crate) fn drive_cross_layer(
+    stage: &dyn KVMutationStage,
+    caches: &mut [KVCache],
+    target_len: usize,
+    positions: &[usize],
+) -> anyhow::Result<bool> {
+    if caches.is_empty() || caches[0].current_pos() == 0 {
+        return Ok(false);
+    }
+    // Entry-frame host-mirrored read ctx (owned snapshots — the immutable borrow of `caches` is
+    // released here, before the `&mut` model handle below).
+    let sctx = EngineCrossLayerStageCtx::new(caches, target_len, positions);
+    let handle = EngineModelCacheHandle::new(caches);
+    let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        move || -> anyhow::Result<bool> {
+            let mut handle = handle;
+            stage
+                .on_whole_model(&sctx, &mut handle)
+                .map_err(|e| anyhow::anyhow!("whole-model stage '{}' failed: {e}", stage.name()))?;
+            handle.commit()
+        },
+    ));
+    match driven {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "whole-model stage '{}' panicked during on_whole_model/commit",
             stage.name()
         )),
     }
@@ -1189,6 +1312,8 @@ mod tests {
             reads: &[TensorKind::Value],
             default_protected_prefix: 0,
             produces_merge_plan: false,
+            whole_model: false,
+            prefill_attn_window: None,
         };
         let driver = KVMutationDriverStage::new(
             vec![handle.clone()],

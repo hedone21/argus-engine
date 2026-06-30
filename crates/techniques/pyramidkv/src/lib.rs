@@ -30,8 +30,8 @@
 //!    q-heads of each kv-head, then keep the budget's worth of highest-scored positions **plus the
 //!    always-kept recent window** — i.e. `topk` with the window forced in. Routed through the
 //!    engine's [`compile_keep_top_k`] (prefix `0`, recent = `window`, heavy = `budget − window`).
-//!    The engine must observe EXACTLY `window_size` trailing queries: that width is plumbed from
-//!    [`KVMutationStage::prefill_attn_window`] (a producer of a different width sums a different
+//!    The engine must observe EXACTLY `window_size` trailing queries: that width is declared on
+//!    [`StageCaps::prefill_attn_window`] (a producer of a different width sums a different
 //!    query set and ranks different heavy hitters — the former D1 divergence).
 //!
 //! ## Residuals (not byte-identical)
@@ -79,6 +79,15 @@ const PYRAMIDKV_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::PrefillAttention],
     default_protected_prefix: 0,
     produces_merge_plan: false,
+    whole_model: false,
+    // The PFA producer must observe EXACTLY `window_size` trailing queries (kvpress's SnapKV scores
+    // the mean of the last `window_size` queries' attention). This MIRRORS `PyramidConfig::default().
+    // window_size` (64): the engine reads this off the caps pre-`make`, and the standard loop builds
+    // the consuming stage from default config too, so producer and consumer windows agree. (`--set
+    // window_size` is not threaded into the standard loop, so the const default is what both use; a
+    // non-default `--set window_size` would diverge from this declaration — a documented limitation
+    // of the caps-as-declaration move, same as before when the engine read a default-config instance.)
+    prefill_attn_window: Some(64),
 };
 
 // ── KVPress-parity arithmetic ────────────────────────────────────────────────
@@ -407,15 +416,9 @@ impl KVMutationStage for PyramidKv {
         "pyramidkv"
     }
 
-    /// The PFA producer must observe EXACTLY `window_size` trailing queries — kvpress's SnapKV score
-    /// is the mean of the last `window_size` queries' attention (`attentions[..., -window:, :-window]`),
-    /// and the engine divides the producer's SUM by `window_size` to recover that mean. A mismatched
-    /// observation window sums a different query set and ranks different heavy hitters (the D1
-    /// divergence). Returning `Some(window_size)` plumbs it (`build_standard_loop` arms the producer
-    /// at this width instead of its hardcoded default).
-    fn prefill_attn_window(&self) -> Option<usize> {
-        Some(self.cfg.window_size)
-    }
+    // NOTE: the PFA observation window (the SnapKV `window_size`) is declared statically on
+    // `PYRAMIDKV_CAPS.prefill_attn_window = Some(64)` (the engine reads it pre-`make`), not via a
+    // trait method — see the caps doc for the producer/consumer-window agreement.
 
     /// Stage the SnapKV per-head (or layer-wide fallback) keep-set at prefill end, or no-op. The
     /// driver supplies PrefillAttention via `ctx.tensor(PrefillAttention)`. Byte-identical to the v2

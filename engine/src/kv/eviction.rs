@@ -1,5 +1,6 @@
 use crate::kv::kv_cache::KVCache;
 use anyhow::Result;
+use argus_extension_api::{KVMutationStage, StageCaps};
 
 /// Trait for KV cache eviction strategies.
 ///
@@ -75,6 +76,16 @@ pub trait EvictionPolicy: Send + Sync {
             Some(imp) => self.evict_with_scores(cache, target_len, imp),
             None => self.evict(cache, target_len),
         }
+    }
+
+    /// If this policy is backed by a WHOLE-MODEL [`KVMutationStage`] (one whose [`StageCaps::whole_model`]
+    /// is set), expose the raw stage + its caps so the engine drives it through the cross-layer keepset
+    /// path (`run_cross_layer_keepset_eviction`) — one decision over ALL layers — instead of the
+    /// per-layer `evict*` loop. `None` (default) ⇒ a per-layer policy → the engine uses the per-layer
+    /// loop, byte-identical to before. Only `StageBackedPolicy` overrides it (returning `Some` exactly
+    /// when its caps' `whole_model` is set); `StageCaps` is `Copy`, so it is returned by value.
+    fn as_whole_model_stage(&self) -> Option<(&dyn KVMutationStage, StageCaps)> {
+        None
     }
 }
 

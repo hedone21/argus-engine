@@ -79,6 +79,12 @@ use rkv as _;
 #[cfg(feature = "pyramidkv")]
 use pyramidkv as _;
 
+// TriAttention force-link (feature `triattention`). Registers "triattention" with `caps.reads ∋ Key`
+// (reads POST-RoPE keys, inverts RoPE in-plugin, scores via calibrated query centers). Feature OFF =
+// unlinked = `find_mutation_stage("triattention")` returns None (byte-identical to before).
+#[cfg(feature = "triattention")]
+use triattention as _;
+
 /// (dormant) Pre-make compatibility check: reject a stage whose declared capabilities the current
 /// container cannot execute, BEFORE instantiation — surfacing the expressible-vs-executable boundary
 /// at make time instead of as a runtime executor reject (the channel-axis honest-reject precedent).
@@ -125,6 +131,8 @@ mod constraint_validator_tests {
             reads: &[TensorKind::Scores],
             default_protected_prefix: 4,
             produces_merge_plan: true,
+            whole_model: false,
+            prefill_attn_window: None,
         };
         assert!(validate_stage_constraints(&merge_caps, false).is_err()); // device → reject
         assert!(validate_stage_constraints(&merge_caps, true).is_ok()); // host → ok
@@ -251,6 +259,17 @@ impl EvictionPolicy for StageBackedPolicy {
 
     fn name(&self) -> &str {
         self.stage.name()
+    }
+
+    /// Expose the backing stage for the cross-layer keepset path when it declares `whole_model`
+    /// (TriAttention's global mode). `None` for the per-layer stages (the common case) → the engine
+    /// keeps the per-layer `evict*` loop (byte-identical).
+    fn as_whole_model_stage(&self) -> Option<(&dyn KVMutationStage, StageCaps)> {
+        if self.caps.whole_model {
+            Some((self.stage.as_ref(), self.caps))
+        } else {
+            None
+        }
     }
 }
 
@@ -418,21 +437,64 @@ pub fn find_prefill_attn_stage_name() -> Option<String> {
 }
 
 /// R-P1-2: the PFA observation window the registered prefill-attn stage wants — its scoring
-/// `window_size` ([`KVMutationStage::prefill_attn_window`]), so the producer SUMs over exactly the
-/// queries the stage scores on (SnapKV/PyramidKV: the engine-observed mean must match kvpress's last
-/// `window_size` queries). `None` when no such stage is registered or it declares no preference
-/// (the caller falls back to the engine default). Caps-driven and plugin-name agnostic: the twin of
+/// `window_size` ([`StageCaps::prefill_attn_window`]), so the producer SUMs over exactly the queries
+/// the stage scores on (SnapKV/PyramidKV: the engine-observed mean must match kvpress's last
+/// `window_size` queries). `None` when no such stage is registered or it declares no preference (the
+/// caller falls back to the engine default). Caps-driven and plugin-name agnostic: the twin of
 /// [`find_prefill_attn_stage_name`].
 ///
-/// Reads the window from a **default-config** stage instance (`StageParams::default()`, no args) —
-/// the SAME config `build_standard_loop` builds its PrefillKeepSetStage CONSUMER from, so producer and
-/// consumer windows are guaranteed equal there. (`--set window_size` is not threaded into the standard
-/// loop, so the default is what both use; the knob lives in the stage config, not the const
-/// [`StageCaps`].)
+/// Reads the window straight off the registered stage's `caps.prefill_attn_window` — a DECLARATION the
+/// engine consults pre-`make`, with no throwaway default instance. The standard loop builds the
+/// consuming PrefillKeepSetStage from the same default config, so producer and consumer windows agree
+/// (`--set window_size` is not threaded into the standard loop, so the const declaration is what both
+/// use).
 pub fn find_prefill_attn_window() -> Option<usize> {
     let name = find_prefill_attn_stage_name()?;
     let reg = find_mutation_stage(&name)?;
-    (reg.make)(StageParams::default(), &[]).prefill_attn_window()
+    reg.caps.prefill_attn_window
+}
+
+/// The engine fallback PFA observation window (kvpress convention) for a registered prefill-keepset
+/// stage that declares no preference via [`StageCaps::prefill_attn_window`]
+/// (`prefill_attn_window: None`). PyramidKV declares 64; a stage that declares none (a hypothetical
+/// bare SnapKV) uses this.
+pub const PFA_Q_WINDOW_DEFAULT: usize = 32;
+
+/// The caps-driven prefill-keepset producer-arming decision — the SINGLE place all four loops
+/// (cli/chat/eval/bench) consult to decide whether to arm a [`TensorKind::PrefillAttention`] producer
+/// and at what observation window. `Some` iff a PFA-reading keep-set stage (e.g. pyramidkv) is
+/// registered; `None` (no such stage linked) leaves every loop's PFA arming dormant → byte-identical.
+///
+/// This is the direction-B root-cause fix: previously only `build_standard_loop` (argus-cli) made this
+/// decision inline, so a per-head SnapKV/PyramidKV ran faithfully ONLY there; bench/eval special-cased
+/// the faithful-H2O full-window seed and never armed the keep-set producer. Extracting the decision here
+/// lets each loop arm its forward mechanism from one source (the producer-arming/eviction-trigger
+/// separation: the trigger stays loop-specific, the arming is shared).
+pub struct PrefillKeepsetArming {
+    /// The registered PFA-reading stage's name (e.g. `"pyramidkv"`) — the consumer to build.
+    pub stage_name: String,
+    /// The observation window the producer must SUM over (the stage's `window_size`, else
+    /// [`PFA_Q_WINDOW_DEFAULT`]). A mismatched window ranks different heavy hitters (the D1 divergence).
+    pub q_window: usize,
+}
+
+/// Resolve the caps-driven prefill-keepset arming (see [`PrefillKeepsetArming`]). `None` when no
+/// PFA-reading stage is registered.
+pub fn resolve_prefill_keepset_arming() -> Option<PrefillKeepsetArming> {
+    let stage_name = find_prefill_attn_stage_name()?;
+    let q_window = find_prefill_attn_window().unwrap_or(PFA_Q_WINDOW_DEFAULT);
+    Some(PrefillKeepsetArming {
+        stage_name,
+        q_window,
+    })
+}
+
+/// Build the registered prefill-keepset stage instance (default config, no `--set` args — the SAME
+/// config the producer window was read from in [`resolve_prefill_keepset_arming`], so producer and
+/// consumer windows agree). `None` for an unknown name.
+pub fn make_prefill_keepset_stage(name: &str) -> Option<Box<dyn KVMutationStage>> {
+    let reg = find_mutation_stage(name)?;
+    Some((reg.make)(StageParams::default(), &[]))
 }
 
 #[cfg(test)]
@@ -493,6 +555,27 @@ mod tests {
             find_prefill_attn_window(),
             Some(64),
             "producer window must plumb to pyramidkv's window_size (64), not the 32 fallback"
+        );
+    }
+
+    #[cfg(feature = "pyramidkv")]
+    #[test]
+    fn shared_arming_resolves_pyramidkv_at_window_64() {
+        // Direction-B root-cause fix: the SINGLE caps-driven arming decision all four loops
+        // (cli/chat/eval/bench) consult. It must resolve to pyramidkv at its window_size (64) — the
+        // same value `build_standard_loop`, `build_bench_loop`, and the eval loop all arm the PFA
+        // producer at, so a per-head SnapKV/PyramidKV runs identically everywhere (not cli-only).
+        let arming = resolve_prefill_keepset_arming()
+            .expect("a PFA-reading stage is registered (pyramidkv)");
+        assert_eq!(arming.stage_name, "pyramidkv");
+        assert_eq!(
+            arming.q_window, 64,
+            "all loops must arm at pyramidkv's window_size (64), not the {PFA_Q_WINDOW_DEFAULT} fallback"
+        );
+        // The consumer the loops build must resolve from the same name.
+        assert!(
+            make_prefill_keepset_stage(&arming.stage_name).is_some(),
+            "the arming stage_name must build a keep-set stage"
         );
     }
 

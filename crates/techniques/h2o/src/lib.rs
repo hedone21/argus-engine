@@ -27,6 +27,8 @@ const H2O_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::Scores],
     default_protected_prefix: 0,
     produces_merge_plan: false,
+    whole_model: false,
+    prefill_attn_window: None,
 };
 
 /// Parse the absolute heavy-hitter / recent budgets from the technique-private `--set` blob.

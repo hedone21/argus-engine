@@ -102,6 +102,10 @@ rkv = { path = "../crates/techniques/rkv", optional = true }
 # (build_standard_loop). Default OFF — registering it activates the PFA keep-set path, so it is a
 # build-time opt-in (the caote/rkv precedent). cr is taken from --eviction-target-ratio.
 pyramidkv = { path = "../crates/techniques/pyramidkv", optional = true }
+# TriAttention (trigonometric frequency-domain KV eviction, Mao et al. 2026). Gated by the
+# `triattention` feature, force-linked so its `caps.reads ∋ Key` registration is visible to
+# `find_mutation_stage("triattention")`. Default OFF (the caote/rkv/pyramidkv precedent).
+triattention = { path = "../crates/techniques/triattention", optional = true }
 # H2O (Heavy-Hitter Oracle, score-based KVCacheStage). Extracted from the engine core;
 # non-optional, force-linked so `eviction h2o` resolves the out-of-tree plugin.
 h2o = { path = "../crates/techniques/h2o" }
@@ -204,6 +208,9 @@ rkv = ["dep:rkv"]
 # prefill-keepset path so PyramidKV runs at prefill end (per-layer pyramid budget + per-head SnapKV
 # selection). Default OFF (registering a PFA stage auto-arms it; opt in at build time).
 pyramidkv = ["dep:pyramidkv"]
+# Links + force-links the `triattention` technique crate (trigonometric frequency-domain KV
+# eviction). Registers "triattention" with `caps.reads ∋ Key`. Default OFF (build-time opt-in).
+triattention = ["dep:triattention"]
 cuda = ["cudarc"]               # PC / discrete GPU
 cuda-embedded = ["cudarc"]      # Embedded UMA, e.g. Jetson Xavier
 resilience = ["zbus"]

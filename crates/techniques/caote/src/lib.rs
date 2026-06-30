@@ -25,6 +25,8 @@ const CAOTE_CAPS: StageCaps = StageCaps {
     ],
     default_protected_prefix: 4,
     produces_merge_plan: false,
+    whole_model: false,
+    prefill_attn_window: None,
 };
 
 /// CAOTE eviction stage — value-aware criticality.

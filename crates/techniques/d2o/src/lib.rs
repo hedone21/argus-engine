@@ -40,6 +40,8 @@ const D2O_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::Scores, TensorKind::Key],
     default_protected_prefix: 4,
     produces_merge_plan: true,
+    whole_model: false,
+    prefill_attn_window: None,
 };
 
 // ── Configuration ────────────────────────────────────────────────
