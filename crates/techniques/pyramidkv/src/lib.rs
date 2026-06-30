@@ -9,9 +9,12 @@
 //!
 //! ## Matched against NVIDIA kvpress `PyramidKVPress`
 //!
-//! Two pieces, ported to be byte-identical to
+//! Two pieces, ported from
 //! <https://github.com/NVIDIA/kvpress/blob/main/kvpress/presses/pyramidkv_press.py> (which in turn
-//! ports the official authors' arithmetic, KVCache-Factory `pyramidkv_utils.py#L197`):
+//! ports the official authors' arithmetic, KVCache-Factory `pyramidkv_utils.py#L197`). The
+//! per-layer budget is **byte-identical**; the keep-SET matches kvpress for the dominant
+//! `n_kept ≥ window_size` regime under f32 scores, with three small residuals called out inline
+//! (sub-window budgets, exact score ties, f32-vs-f16 rounding):
 //!
 //! 1. **Per-layer budget** ([`get_layer_budget`]) — a verbatim port of
 //!    `PyramidKVPress.get_layer_budget`. `max_capacity = window + q_len·(1−cr)`; the layer budgets
@@ -26,8 +29,37 @@
 //!    `avg_pool1d(kernel, pad=kernel/2, stride=1, count_include_pad=True)`, GQA group-mean over the
 //!    q-heads of each kv-head, then keep the budget's worth of highest-scored positions **plus the
 //!    always-kept recent window** — i.e. `topk` with the window forced in. Routed through the
-//!    engine's [`compile_keep_top_k`] (prefix `0`, recent = `window`, heavy = `budget − window`),
-//!    whose STABLE-desc/ascending-resort tie-break matches `torch.topk`'s lower-index-first order.
+//!    engine's [`compile_keep_top_k`] (prefix `0`, recent = `window`, heavy = `budget − window`).
+//!    The engine must observe EXACTLY `window_size` trailing queries: that width is plumbed from
+//!    [`KVMutationStage::prefill_attn_window`] (a producer of a different width sums a different
+//!    query set and ranks different heavy hitters — the former D1 divergence).
+//!
+//! ## Residuals (not byte-identical)
+//!
+//! * **Sub-window budgets** (`n_kept < window_size`, only the degenerate SnapKV-uniform fallback at
+//!   very high compression): only the kept COUNT is faithful. kvpress keeps `n_kept` of the max-tied
+//!   window positions in torch.topk's non-deterministic tie order (arbitrary mid-window indices); we
+//!   keep the `n_kept` most-recent, so the kept SET is near-disjoint from kvpress's (measured ~0
+//!   overlap). No canonical target set exists — the tie order is platform/dtype/version-dependent —
+//!   so recency is the principled choice. See [`PyramidKv::keep_spec`].
+//! * **Exact score ties** (n_kept ≥ window): [`compile_keep_top_k`] breaks ties STABLE-desc/
+//!   ascending-resort, which is NOT torch.topk's tie order (torch.topk's is implementation-defined,
+//!   *not* lower-index-first — verified live). Real f32 attention scores tie with measure zero, so
+//!   this residual alone is essentially never observed.
+//! * **f32 vs f16**: the engine accumulates the PFA in f32; kvpress softmaxes in f32 then casts to
+//!   the model dtype (f16) before pooling. This is an INDEPENDENT finite-precision divergence, not a
+//!   sub-case of exact ties: f16's ~3-digit mantissa can flip the rank of CLOSE-but-distinct heavy
+//!   hitters at the topk boundary even in the dominant `n_kept ≥ window` regime (measured a kept-set
+//!   difference in ~3/40 random configs). The budget and the score pipeline are otherwise identical.
+//!
+//! ## Where the faithful path runs
+//!
+//! The faithful per-head SnapKV selection needs a [`TensorKind::PrefillAttention`] producer, which is
+//! armed only on the **standard generate/chat loop** (`build_standard_loop`, e.g. `argus-cli`) — there
+//! the producer's observation window and this stage's `window_size` are BOTH the kvpress default 64
+//! (the standard loop builds the stage from default config; `--set window_size` is not threaded into
+//! that path), so they always agree and the per-head keep-set is faithful. Eval/bench paths that do
+//! not arm a PFA producer take the degraded layer-wide fallback below (not byte-identical to kvpress).
 //!
 //! Each kv-head keeps the SAME NUMBER of tokens (the per-layer budget) at DIFFERENT positions, so a
 //! [`KeepSpec::PerHead`] plan satisfies the engine's single-`current_pos` invariant (equal-length
@@ -214,7 +246,10 @@ impl PyramidKvConfig {
                 }
                 "window_size" => {
                     if let Ok(v) = a.val.parse::<usize>() {
-                        c.window_size = v;
+                        // Clamp ≥ 1 (like kernel_size/beta below): window_size==0 would make
+                        // `inv_window = 1/window` infinite in per_head_keep. kvpress requires a
+                        // positive window; 0 is meaningless (no observation window).
+                        c.window_size = v.max(1);
                     }
                 }
                 "kernel_size" => {
@@ -268,6 +303,9 @@ impl PyramidKv {
     /// is usable; otherwise a layer-wide pyramid budget (window-only or score-ranked fallback).
     fn keep_spec(&self, ctx: &dyn StageCtx) -> Option<KeepSpec> {
         let current = ctx.current_pos();
+        if current == 0 {
+            return None; // empty cache — nothing to evict (also: `clamp(1, 0)` below would panic).
+        }
         let cr = self.cfg.effective_cr(current, ctx.target_len());
         if cr <= 0.0 {
             return None; // kvpress: compression_ratio == 0 ⇒ no compression (no-op).
@@ -282,23 +320,31 @@ impl PyramidKv {
             ctx.layer_idx(),
         );
 
-        // Floor the budget to the observation window. kvpress's pyramid branch already guarantees
-        // every layer budget ≥ window_size (the `min_num ≥ window_size` admission check), so this is
-        // a NO-OP for the faithful path. It only bites the degenerate SnapKV-uniform fallback (very
-        // high compression / tiny prompt), where `round(q·(1−cr))` can fall below the window or to 0
-        // — which would evict the always-kept recent window and could empty the cache entirely
-        // (`(current-0..current)` is an empty range). PyramidKV/SnapKV always retain the recent
-        // window, so flooring to it is the correct, safe boundary.
+        // Respect the raw per-layer budget — kvpress keeps EXACTLY `n_kept` positions, even below the
+        // observation window. kvpress's `score` max-fills the window so `topk(n_kept)` keeps:
+        //   * `n_kept >= window`: the whole window + `n_kept − window` heavy hitters (per-head path);
+        //   * `n_kept < window`: `n_kept` of the window positions (they all tie at the max score, so
+        //     torch.topk's tie order is non-deterministic — we keep the `n_kept` MOST RECENT. Only the
+        //     COUNT is faithful: torch.topk picks arbitrary mid-window indices, so the kept SET is
+        //     near-disjoint from kvpress's (measured ~0 overlap) — but no canonical target set exists
+        //     (the tie order is platform/dtype/version-dependent), so recency is the principled choice.
+        // (The pyramid branch already guarantees budget ≥ window via the `min_num ≥ window_size`
+        // admission check, so the sub-window case only arises in the degenerate SnapKV-uniform
+        // fallback — very high compression / tiny prompt.) Floor to 1, NOT to the window: flooring to
+        // the window kept `window` tokens where kvpress keeps `n_kept` (the D3 over-compression
+        // divergence). 1 is the minimal safe floor — `round(q·(1−cr))` can hit 0, and a 0-length keep
+        // empties the cache.
         let window = self.cfg.window_size.min(current);
-        let n_kept = raw_budget.clamp(window, current);
+        let n_kept = raw_budget.clamp(1, current);
         if n_kept >= current {
             return None; // budget covers everything (incl. window == current) — nothing to evict.
         }
-        if n_kept == window {
-            // Exactly the window: keep the recent window only (== kvpress's window-forced set when
-            // the budget equals the window). Layer-wide (identical across heads) — valid on any
-            // cache layout, no HeadMajor requirement.
-            let keep: Vec<usize> = (current - window..current).collect();
+        if n_kept <= window {
+            // At or below the observation window: keep the `n_kept` most-recent. At `n_kept == window`
+            // this is kvpress's window-forced set (faithful); below it, only the COUNT is faithful —
+            // the SET is the recency resolution of the max-score tie (see the comment above). Layer-wide
+            // (identical across heads) — valid on any cache layout.
+            let keep: Vec<usize> = (current - n_kept..current).collect();
             return Some(KeepSpec::LayerWide(keep));
         }
         let heavy = n_kept - window;
@@ -359,6 +405,16 @@ impl PyramidKv {
 impl KVMutationStage for PyramidKv {
     fn name(&self) -> &str {
         "pyramidkv"
+    }
+
+    /// The PFA producer must observe EXACTLY `window_size` trailing queries — kvpress's SnapKV score
+    /// is the mean of the last `window_size` queries' attention (`attentions[..., -window:, :-window]`),
+    /// and the engine divides the producer's SUM by `window_size` to recover that mean. A mismatched
+    /// observation window sums a different query set and ranks different heavy hitters (the D1
+    /// divergence). Returning `Some(window_size)` plumbs it (`build_standard_loop` arms the producer
+    /// at this width instead of its hardcoded default).
+    fn prefill_attn_window(&self) -> Option<usize> {
+        Some(self.cfg.window_size)
     }
 
     /// Stage the SnapKV per-head (or layer-wide fallback) keep-set at prefill end, or no-op. The

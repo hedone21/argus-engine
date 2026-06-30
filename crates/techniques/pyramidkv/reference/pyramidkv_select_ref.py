@@ -14,9 +14,12 @@ INPUT = TensorKind::PrefillAttention: attn[q_head][key_pos] = window-summed soft
 attention to each prefix key, per ATTENTION head (pre-GQA). INTEGER-valued (a shared LCG,
 mirrored exactly by the Rust test) so the per-position ranking is decided by integer
 pooled-sums — identical in f32 (Rust) and f64 (here), with ties broken lower-index-first
-in BOTH compile_keep_top_k (STABLE-desc) and topk_indices below (matches torch.topk's
-stable order). The fixture therefore stores only case params + the expected per-kv-head
-keep sets; the Rust test regenerates the attn via the same LCG.
+in BOTH compile_keep_top_k (STABLE-desc) and topk_indices below. NOTE: lower-index-first is
+NOT torch.topk's tie order (torch.topk's is implementation-defined, not lower-index-first);
+this oracle is a deterministic parity check of the SCORE pipeline, and every case uses
+n_kept >= window_size so the always-kept window is fully resident and no torch-tie residual
+arises. The fixture stores only case params + expected per-kv-head keep sets; the Rust test
+regenerates the attn via the same LCG.
 
 Regenerate:
     python3 pyramidkv_select_ref.py > ../tests/fixtures/select_fixture.txt
@@ -58,8 +61,9 @@ def avg_pool1d(x, kernel_size, padding):
 
 
 def topk_indices(scores, k):
-    """Indices of the k largest scores; ties → lower index first (torch.topk stable order).
-    Returned ascending (the kept SET; cache order is irrelevant to attention)."""
+    """Indices of the k largest scores; ties → lower index first (mirrors compile_keep_top_k's
+    STABLE-desc, NOT torch.topk — torch.topk's tie order is implementation-defined). Returned
+    ascending (the kept SET; cache order is irrelevant to attention)."""
     order = sorted(range(len(scores)), key=lambda i: (-scores[i], i))
     return sorted(order[:k])
 

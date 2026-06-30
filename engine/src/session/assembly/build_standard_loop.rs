@@ -216,7 +216,22 @@ pub fn build_standard_loop(
     // 주입. 미무장(PR1)이면 미진입 → ModelForward 의 prefill PFA 경로는 wants_prefill_attn=false 로
     // byte-identical.
     if arm_prefill_keepset {
-        mf.set_prefill_attn(pfa_cell.clone(), PFA_Q_WINDOW_DEFAULT);
+        // R-P1-2: plumb the producer's observation window from the consuming stage's declared
+        // `prefill_attn_window` (its scoring `window_size`). SnapKV/PyramidKV need the SUM over
+        // EXACTLY `window_size` trailing queries — a mismatched window ranks different heavy hitters
+        // (the D1 divergence). Falls back to the engine default for a stage that declares none.
+        let q_window = crate::kv::eviction::stage_registry::find_prefill_attn_window()
+            .unwrap_or(PFA_Q_WINDOW_DEFAULT);
+        mf.set_prefill_attn(pfa_cell.clone(), q_window);
+        // Arming log, consistent with the [read-stage] / [format-reencode] sites below — the PFA
+        // producer was previously silent. Surfaces the plumbed observation window (q_window) so a
+        // run can confirm SnapKV/PyramidKV observe their `window_size` (not the 32 fallback).
+        if let Some(name) = prefill_attn_stage_name.as_ref() {
+            eprintln!(
+                "[prefill-keepset] '{name}' active — PFA producer arms q_window={q_window} \
+                 (SnapKV per-head keep-set staged at PrefillEnd)"
+            );
+        }
     }
 
     // KV format handles — eviction stage prune 대상 + resilience heartbeat + eviction 후

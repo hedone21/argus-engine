@@ -417,6 +417,24 @@ pub fn find_prefill_attn_stage_name() -> Option<String> {
         .map(|r| r.name.to_string())
 }
 
+/// R-P1-2: the PFA observation window the registered prefill-attn stage wants — its scoring
+/// `window_size` ([`KVMutationStage::prefill_attn_window`]), so the producer SUMs over exactly the
+/// queries the stage scores on (SnapKV/PyramidKV: the engine-observed mean must match kvpress's last
+/// `window_size` queries). `None` when no such stage is registered or it declares no preference
+/// (the caller falls back to the engine default). Caps-driven and plugin-name agnostic: the twin of
+/// [`find_prefill_attn_stage_name`].
+///
+/// Reads the window from a **default-config** stage instance (`StageParams::default()`, no args) —
+/// the SAME config `build_standard_loop` builds its PrefillKeepSetStage CONSUMER from, so producer and
+/// consumer windows are guaranteed equal there. (`--set window_size` is not threaded into the standard
+/// loop, so the default is what both use; the knob lives in the stage config, not the const
+/// [`StageCaps`].)
+pub fn find_prefill_attn_window() -> Option<usize> {
+    let name = find_prefill_attn_stage_name()?;
+    let reg = find_mutation_stage(&name)?;
+    (reg.make)(StageParams::default(), &[]).prefill_attn_window()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +474,26 @@ mod tests {
         };
         let stage = (reg.make)(params, &[]);
         assert_eq!(stage.name(), "d2o");
+    }
+
+    #[cfg(feature = "pyramidkv")]
+    #[test]
+    fn pyramidkv_plumbs_prefill_attn_window() {
+        // R-P1-2: the PFA producer-arming window is plumbed from the consuming stage's `window_size`
+        // (64), NOT the engine's hardcoded fallback (32). `build_standard_loop` arms
+        // `set_prefill_attn` at exactly this width, so the engine observes the same last-64-queries
+        // mean kvpress's SnapKV scores on (closing the D1 divergence). This proves the surfacing seam
+        // without a model.
+        assert_eq!(
+            find_prefill_attn_stage_name().as_deref(),
+            Some("pyramidkv"),
+            "pyramidkv must be the registered PFA-reading stage under --features pyramidkv"
+        );
+        assert_eq!(
+            find_prefill_attn_window(),
+            Some(64),
+            "producer window must plumb to pyramidkv's window_size (64), not the 32 fallback"
+        );
     }
 
     // cross-crate linkme 실증 결과(M3): **dev-dep 선언만으로는 부족**하다. Rust 는 미참조

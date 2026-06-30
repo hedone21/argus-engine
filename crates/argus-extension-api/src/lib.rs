@@ -669,6 +669,17 @@ pub trait KVMutationStage: Send + Sync {
     /// transaction (T-8: bytes untouched).
     fn on_phase(&self, ctx: &dyn StageCtx, cache: &mut dyn CacheHandle)
     -> Result<(), CacheOpError>;
+
+    /// The trailing query window the PFA producer should SUM over for this stage, or `None` (no
+    /// preference — the engine arms its own default). A stage that reads
+    /// [`TensorKind::PrefillAttention`] and scores like SnapKV (PyramidKV) MUST return its scoring
+    /// `window_size` here: kvpress observes EXACTLY the last `window_size` queries, so an
+    /// engine-observed window of a different size sums a different (and differently-scaled) query
+    /// set and ranks different heavy hitters. ABI-additive default method (the static-linkme
+    /// [`KVMutationStage`] surface has no C-ABI to break); the ~11 score-free stages keep `None`.
+    fn prefill_attn_window(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The canonical 3-partition keep-set shape (T1): `[0..prefix)` (protected) + the top-`heavy`
