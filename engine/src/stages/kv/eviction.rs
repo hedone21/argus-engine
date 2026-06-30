@@ -61,6 +61,11 @@ pub struct EvictionStage {
     /// acc.importance_scores() 를 추출해 force_evict_with_scores 로 heavy-hitter/weighted-merge 정밀 선택, 직후 acc.reset().
     /// `None`(score-free = sliding/streaming 또는 더미) 이면 기존 score-free force_evict 유지.
     score_cell: Option<Arc<Mutex<Option<AttentionScoreAccumulator>>>>,
+    /// bench GPU-score 경로용 backend. `Some`(OpenCL + score-fed dispatcher) 이면 run_eviction 이
+    /// score 를 읽기 직전 GPU 누적 score 를 CPU accumulator 로 sync 한다(`gpu_score_active=true` 시
+    /// decode 가 CPU accumulate 를 건너뛰어 score 가 on-device 에만 쌓이므로 — eval/chat 동형 갭).
+    /// score-free(`one_shot`/`persistent`) 경로엔 `None`(sync 불필요). CPU 빌드에선 `sync_*` 가 no-op.
+    backend: Option<Arc<dyn crate::backend::Backend>>,
 }
 
 impl EvictionStage {
@@ -84,6 +89,7 @@ impl EvictionStage {
             min_band: None,
             armed: std::sync::atomic::AtomicBool::new(true),
             score_cell: None,
+            backend: None,
         }
     }
 
@@ -98,6 +104,9 @@ impl EvictionStage {
         cache_manager: Arc<Mutex<CacheManager>>,
         target_ratio: f32,
         score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
+        // bench GPU-score 경로: `Some`(OpenCL) 이면 run_eviction 이 score 읽기 직전 GPU→CPU sync.
+        // CPU/non-opencl 또는 dispatcher 가 backend 미보유면 `None`(기존 CPU accumulate 경로 무변).
+        backend: Option<Arc<dyn crate::backend::Backend>>,
     ) -> Self {
         Self {
             lifecycle: StageLifecycle::OneShot,
@@ -107,6 +116,7 @@ impl EvictionStage {
             min_band: None,
             armed: std::sync::atomic::AtomicBool::new(true),
             score_cell: Some(score_cell),
+            backend,
         }
     }
 
@@ -130,6 +140,7 @@ impl EvictionStage {
             min_band: Some(min_band),
             armed: std::sync::atomic::AtomicBool::new(true),
             score_cell: None,
+            backend: None,
         }
     }
 
@@ -144,10 +155,21 @@ impl EvictionStage {
     /// eviction 성공 직후 acc.reset() — KV geometry 변경 후 stale score 방지(§5.9.1 landmine 해소).
     fn run_eviction(&self) -> anyhow::Result<()> {
         use crate::kv::eviction::score_fed;
-        // §5.9.1 Track A: shared score-fed body (extract → route). Extract under the lock and
-        // release before routing. `bench` uses the CPU accumulate path on GPU backends, so there is
-        // no GPU score buffer to sync (unlike eval/chat) — the `score_fed::sync_gpu_scores_to_cpu`
-        // step is skipped here.
+        // §5.9.1 Track A: shared score-fed body (gpu_sync → extract → route → reset), the eval/chat
+        // EvictionHook quartet. When bench arms the GPU score path (`init_gpu_score_acc` in
+        // experiment_run → `gpu_score_active=true`), decode skips the CPU accumulate (acc_need=false)
+        // and scores live on-device; this syncs them into the CPU `score_cell` before reading. No-op
+        // on CPU / non-opencl (no-op stub) / when `backend` is None (score-free `one_shot`/
+        // `persistent`) / GPU acc inactive, so the host CPU-accumulate path is byte-identical.
+        if let (Some(be), Some(cell)) = (self.backend.as_ref(), self.score_cell.as_ref()) {
+            let mut guard = cell
+                .lock()
+                .expect("EvictionStage score_cell Mutex poisoned");
+            if let Some(acc) = guard.as_mut() {
+                score_fed::sync_gpu_scores_to_cpu(acc, be.as_ref());
+            }
+        }
+        // Extract under the lock and release before routing.
         let extracted = self.score_cell.as_ref().and_then(|cell| {
             let guard = cell
                 .lock()
@@ -181,15 +203,31 @@ impl EvictionStage {
             f.put_inner(c);
         }
         // Err → dispatcher 가 panic (fail-fast 계약, INV-DECODE-STAGE-004).
-        result?;
+        let evicted = result?.evicted;
 
-        // §5.9.1 Track A: eviction 성공 후 acc.reset() — stale score 방지(eval 정본 동형).
-        if let Some(cell) = self.score_cell.as_ref() {
-            let mut guard = cell
-                .lock()
-                .expect("EvictionStage score_cell Mutex poisoned");
-            if let Some(ref mut acc) = *guard {
-                acc.reset();
+        // §5.9.1 Track A: eviction 이 **실제로 token 을 제거했을 때만** reset — eval EvictionHook 정본
+        // (eviction_hook.rs:777 `evict_result.evicted` 게이트) 동형. cache 가 floor 이하라 `force_evict`
+        // 가 `Ok(evicted:false)`(cache_manager.rs:515/530/546)면 geometry 불변 → 누적 score 유지(주석
+        // "성공 후"의 본래 의도). 무조건 reset 은 no-op directive 가 score 를 날려 다음 eviction 의
+        // keep-set 을 eval 과 발산시키는 잠재 버그였다 — CPU·GPU 양쪽을 evicted 게이트로 묶어 해소.
+        if evicted {
+            if let Some(cell) = self.score_cell.as_ref() {
+                let mut guard = cell
+                    .lock()
+                    .expect("EvictionStage score_cell Mutex poisoned");
+                if let Some(ref mut acc) = *guard {
+                    acc.reset();
+                }
+            }
+            // Faithful-H2O (b): reset the GPU per-layer FLAT buffer in lockstep with the CPU acc.reset
+            // above. No-op when `backend` is None / unarmed / non-opencl stub.
+            if let (Some(be), Some(cell)) = (self.backend.as_ref(), self.score_cell.as_ref()) {
+                let guard = cell
+                    .lock()
+                    .expect("EvictionStage score_cell Mutex poisoned");
+                if let Some(acc) = guard.as_ref() {
+                    score_fed::reset_gpu_layer_flat(acc, be.as_ref());
+                }
             }
         }
 
@@ -516,6 +554,7 @@ mod tests {
             make_cache_manager(),
             TARGET_RATIO,
             Arc::clone(&score_cell),
+            None,
         );
 
         let mut profiler = OpProfiler::new();
@@ -542,6 +581,7 @@ mod tests {
             make_cache_manager(),
             TARGET_RATIO,
             empty_cell,
+            None,
         );
 
         let mut profiler = OpProfiler::new();
@@ -553,6 +593,48 @@ mod tests {
             h_scored.current_pos() < N_TOKENS,
             "score_cell None 도 eviction 실행 (got {})",
             h_scored.current_pos()
+        );
+    }
+
+    /// bench GPU-score 배선: backend 주입(`Some`)도 CPU backend 에선 sync 가 no-op(downcast-miss)이라
+    /// eviction 산출이 `backend=None`(=`one_shot_scored_resets_accumulator_after_eviction`)과
+    /// byte-identical 임을 고정한다. run_eviction 의 새 sync 블록(`if let (Some(be), Some(cell))`)이
+    /// CPU host 게이트에서 실제 진입하되 무영향임을 입증 — GPU sync 의 실효 검증은 온디바이스(수동).
+    #[test]
+    fn one_shot_scored_with_cpu_backend_syncs_noop_byte_identical() {
+        use crate::inference::attention_scores::AttentionScoreAccumulator;
+
+        let handle = Arc::new(StandardFormat::new(0, make_cache(N_TOKENS)));
+        let mut acc = AttentionScoreAccumulator::new(MAX_SEQ, KV_HEADS, 1, 0, 0.0);
+        acc.set_active(true);
+        acc.begin_step();
+        let score_cell = Arc::new(Mutex::new(Some(acc)));
+
+        // CPU backend 주입 — run_eviction 의 sync 블록이 진입하지만 OpenCLBackend downcast-miss 로 no-op.
+        let cpu_backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
+        let stage = EvictionStage::one_shot_scored(
+            vec![handle.clone()],
+            make_cache_manager(),
+            TARGET_RATIO,
+            Arc::clone(&score_cell),
+            Some(cpu_backend),
+        );
+
+        let mut profiler = OpProfiler::new();
+        let mut ctx = make_ctx(&mut profiler);
+        stage.on_phase(&LifecyclePhase::KvMutate, &mut ctx).unwrap();
+
+        // backend=None 경로와 동일 산출: eviction 발화(current_pos 감소) + reset → importance all-zero.
+        assert!(
+            handle.current_pos() < N_TOKENS,
+            "backend 주입도 eviction 발화 (got {})",
+            handle.current_pos()
+        );
+        let guard = score_cell.lock().unwrap();
+        let acc_ref = guard.as_ref().expect("acc still in cell");
+        assert!(
+            acc_ref.importance_scores().iter().all(|&s| s == 0.0),
+            "CPU backend sync no-op 후에도 reset() → all-zero (byte-identical)"
         );
     }
 }
