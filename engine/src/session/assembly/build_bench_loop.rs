@@ -367,7 +367,7 @@ pub fn build_bench_loop(
     // γ-3b: schedule_source 가 있어도 dispatcher 를 구성해야 evict directive 가 OneShot
     // EvictionStage 로 submit 된다 (설계 §13.4 "schedule.is_some() OR 추가").
     let dispatcher = if resilience.is_some() || shared_cm.is_some() || schedule_source.is_some() {
-        Some(CommandDispatcher::new(
+        let dispatcher = CommandDispatcher::new(
             Arc::clone(&registry),
             kv_handles.clone(),
             shared_cm.clone(),
@@ -388,7 +388,12 @@ pub fn build_bench_loop(
             Arc::clone(&hook_cell),
             // §5.9.1 Track A: ModelForward + EvictionStage 와 공유하는 score cell.
             Arc::clone(&score_cell),
-        ))
+        );
+        // bench GPU-score 경로: dispatcher 가 submit 하는 score-fed EvictionStage 에 decode 와 동일한
+        // backend Arc(= 동일 OpenCL = 동일 GPU score buffer)를 넘긴다. `gpu_score_active` 면 run_eviction
+        // 이 score 읽기 직전 GPU→CPU sync. backend_arc 는 mf 가 move 한 backend 의 clone(build 진입부
+        // 보유). non-opencl 이면 sync 가 no-op.
+        Some(dispatcher.with_backend(Some(Arc::clone(&backend_arc))))
     } else {
         None
     };

@@ -188,6 +188,12 @@ pub struct CommandDispatcher {
     /// RestoreDefaults recall 완료 후(submit_offload_recall) false. RestoreDefaults 시 recall
     /// submit 여부의 게이트 — offload 미적용이면 불필요 disk 접근 0.
     offload_armed: bool,
+    /// bench GPU-score 경로용 backend. `submit_evict` 가 `EvictionStage::one_shot_scored` 에 넘겨,
+    /// score-fed eviction 이 score 를 읽기 직전 GPU 누적 score 를 CPU accumulator 로 sync 하게 한다
+    /// (`init_gpu_score_acc` 로 `gpu_score_active=true` 일 때 decode 가 CPU accumulate 를 건너뛰므로).
+    /// 기본 `None`(ctor param 아님 — `reencode_fired_cell` 처럼 호출처 무변경); build_bench_loop 가
+    /// `with_backend` 로 OpenCL backend 를 주입한다. `None` 이면 기존 CPU accumulate 경로 무변.
+    backend: Option<Arc<dyn crate::backend::Backend>>,
 }
 
 impl CommandDispatcher {
@@ -236,7 +242,16 @@ impl CommandDispatcher {
             last_reencode_format: None,
             reencode_fired_cell: Arc::new(AtomicBool::new(false)),
             offload_armed: false,
+            backend: None,
         }
+    }
+
+    /// bench GPU-score 경로: score-fed `EvictionStage`(submit_evict)가 GPU 누적 score 를 CPU 로
+    /// sync 할 backend 를 주입한다. build_bench_loop 가 decode 와 동일한 OpenCL `Arc`(= 동일 GPU
+    /// score buffer)를 넘긴다. 미호출(chat/standard/test)이면 `None` → 기존 CPU accumulate 경로 무변.
+    pub fn with_backend(mut self, backend: Option<Arc<dyn crate::backend::Backend>>) -> Self {
+        self.backend = backend;
+        self
     }
 
     /// W-FORMAT-HET L1-runtime: the per-step re-encode-fired signal, for the assembly to hand to the
@@ -413,6 +428,7 @@ impl CommandDispatcher {
             Arc::clone(cm),
             target_ratio,
             Arc::clone(&self.score_cell),
+            self.backend.clone(),
         );
         self.registry.submit(Arc::new(stage));
     }
