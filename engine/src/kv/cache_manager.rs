@@ -563,6 +563,7 @@ impl CacheManager {
         target_len: usize,
         scores: ScoreContext,
         per_layer_target_len: Option<&[usize]>,
+        whole_model_positions: Option<&[usize]>,
     ) -> Result<EvictionResult> {
         if caches.is_empty() {
             return Ok(EvictionResult {
@@ -574,14 +575,18 @@ impl CacheManager {
 
         // WHOLE-MODEL routing: a stage that decides over all layers at once (caps `whole_model`, e.g.
         // TriAttention's global mode) bypasses the per-layer loop below. Per-layer policies (the common
-        // case) return `None` here → the loop runs unchanged (byte-identical). Positions are the
-        // single-prefill identity frame (`0..current`); a multi-round production caller that has the
-        // engine's `saved_positions` should call `run_cross_layer_keepset_eviction` directly with them
-        // (the per-layer-budget path is incompatible — asserted inside).
+        // case) return `None` here → the loop runs unchanged (byte-identical). `whole_model_positions`
+        // are the engine's absolute positions of the resident slots: the survivors' original positions +
+        // new tokens after a prior eviction (multi-round, e.g. the eval loop's `saved_positions`), or
+        // `None` → the single-prefill identity frame `0..current` (round-1, where slot index == absolute
+        // position — and identity IS the round-1 `saved_positions`). The position frame drives
+        // TriAttention's `round_start`, so threading the real positions keeps multi-round scoring
+        // faithful instead of mis-dating survivors as a fresh `0..current`.
         if let Some((stage, _caps)) = policy.as_whole_model_stage() {
             let current = max_cache_pos(caches);
-            let positions: Vec<usize> = (0..current).collect();
-            return Self::run_cross_layer_keepset_eviction(stage, caches, target_len, &positions);
+            let identity: Vec<usize> = (0..current).collect();
+            let positions = whole_model_positions.unwrap_or(&identity);
+            return Self::run_cross_layer_keepset_eviction(stage, caches, target_len, positions);
         }
 
         let current_pos = max_cache_pos(caches);
@@ -886,6 +891,7 @@ mod tests {
             0, // scalar fallback unused — every index is in range
             ScoreContext::None,
             Some(&budgets),
+            None,
         )
         .unwrap();
         assert!(res.evicted);
@@ -912,6 +918,7 @@ mod tests {
             &mut caches,
             30,
             ScoreContext::None,
+            None,
             None,
         )
         .unwrap();
@@ -1792,5 +1799,324 @@ mod cross_layer_parity_tests {
             "oracle_keepset_r2.txt",
             Some("oracle_positions_r2.txt"),
         );
+    }
+}
+
+/// P1: the PRODUCTION eval eviction path fires TriAttention's whole-model keep-set end-to-end.
+///
+/// Proves the full composition the eval loop uses — with NO bespoke harness call:
+/// 1. `make_stage_backed_policy("triattention", .., calib_path)` — the EXACT constructor
+///    `eval_setup.rs` resolves any `--eviction-policy <name> --set calib_path=…` through (generic by
+///    name; the calib rides the opaque `StageArgs` blob). The `whole_model = true` cap travels with it.
+/// 2. `CacheManager::force_evict_with_scores` — the entry the eval hook actually uses. TriAttention IS
+///    score-based (`caps.reads ∋ Key` → `stage_is_score_based` is true), so `post_prefill` extracts
+///    scores and `score_fed::route_evict(scores=Some(..), .., true, ratio)` dispatches the
+///    `ScoreContext::Flat` variant. Those scores are then DISCARDED for a whole-model stage:
+///    `run_policy_eviction` consults `as_whole_model_stage()` and short-circuits to the cross-layer path
+///    BEFORE any `ScoreContext` is read — so `force_evict` (None) and `force_evict_with_scores` (Flat)
+///    yield the IDENTICAL keep-set (the test pins that invariant too).
+/// 3. inside, `run_policy_eviction` → `as_whole_model_stage()` → `Some` → routes to
+///    `run_cross_layer_keepset_eviction`, whose ONE union keep-set fans out to every layer.
+///
+/// Self-contained: a deterministic synthetic calib written to a temp file (no external fixture), so it
+/// runs under `cargo test --workspace --features triattention`. Asserts the cache shrinks to budget on
+/// EVERY layer and that the keep-set (recovered from cache content) is identical across layers (the
+/// whole-model invariant). Mutation-proof: if the whole-model routing regressed to the per-layer loop,
+/// the keep-sets would differ per layer (each layer ranks its own keys), breaking the cross-layer assert.
+#[cfg(all(test, feature = "triattention"))]
+mod cross_layer_production_tests {
+    use super::*;
+    use crate::backend::cpu::CpuBackend;
+    use crate::buffer::DType;
+    use crate::kv::eviction::stage_registry::make_stage_backed_policy;
+    use crate::memory::host::shared::SharedBuffer;
+    use crate::resilience::sys_monitor::NoOpMonitor;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
+
+    const N_LAYERS: usize = 3;
+    const N_KV: usize = 2;
+    const HD: usize = 64; // freq_count = HD/2 = 32
+    const CALIB_HEADS: usize = 2; // attention heads (== N_KV → num_kv_groups = 1)
+    const RESIDENT: usize = 20;
+    const MAX_SEQ: usize = 32;
+    const PREFIX: usize = 4;
+
+    /// Serialize a deterministic synthetic calib (`TACALIB1`, the format `Calib::from_bytes` parses) for
+    /// `N_LAYERS × CALIB_HEADS × (HD/2)`. Values are non-degenerate so the score ordering is well-defined.
+    fn write_synthetic_calib(path: &std::path::Path) {
+        let fc = HD / 2;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"TACALIB1");
+        bytes.extend_from_slice(&(N_LAYERS as u32).to_le_bytes());
+        bytes.extend_from_slice(&(CALIB_HEADS as u32).to_le_bytes());
+        bytes.extend_from_slice(&(fc as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        for l in 0..N_LAYERS {
+            for h in 0..CALIB_HEADS {
+                for which in 0..3 {
+                    for f in 0..fc {
+                        let v = ((l * 7 + h * 3 + which * 2 + f) % 13) as f32 * 0.1 - 0.6;
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// An F32 SeqMajor cache with `RESIDENT` tokens; K = a deterministic UNIT-NORM per-(slot,head) key
+    /// whose per-channel content is strongly position-dependent (the spatial frequency across channels
+    /// scales with `pos`). Unit-norm so the TriAttention score is PHASE-driven, not magnitude-dominated —
+    /// which is what lets the position frame (`round_start`) reorder the union top-k (so P2's
+    /// mutation-proof can observe that `saved_positions` actually changes the keep-set). V left zero
+    /// (TriAttention reads only Key).
+    fn build_cache(layer: usize) -> KVCache {
+        let backend = Arc::new(CpuBackend::new());
+        let total = MAX_SEQ * N_KV * HD;
+        let shape = Shape::new(vec![1, MAX_SEQ, N_KV, HD]);
+        let mut c = KVCache::new(
+            Tensor::new(
+                shape.clone(),
+                Arc::new(SharedBuffer::new(total * 4, DType::F32)),
+                backend.clone(),
+            ),
+            Tensor::new(
+                shape,
+                Arc::new(SharedBuffer::new(total * 4, DType::F32)),
+                backend,
+            ),
+            MAX_SEQ,
+        );
+        c.set_current_pos(RESIDENT);
+        for pos in 0..RESIDENT {
+            for head in 0..N_KV {
+                // Per-channel pattern with a position-scaled spatial frequency, then L2-normalized.
+                let mut v = vec![0.0f32; HD];
+                let freq = 0.07 * (pos as f32 + 1.0) + 0.013 * (head as f32 + 1.0);
+                for (d, vd) in v.iter_mut().enumerate() {
+                    *vd = (freq * d as f32 + 0.3 * layer as f32).sin();
+                }
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                let off = c.offset(pos, head);
+                let kb = c.k_buffer.as_mut_slice::<f32>();
+                for d in 0..HD {
+                    kb[off + d] = v[d] / norm;
+                }
+            }
+        }
+        c
+    }
+
+    /// Head-0 key vector of cache slot `slot` (slot-unique by construction — see [`build_cache`]).
+    fn read_k_head0(cache: &KVCache, slot: usize) -> Vec<f32> {
+        let off = cache.offset(slot, 0);
+        cache.k_buffer.as_slice::<f32>()[off..off + HD].to_vec()
+    }
+
+    /// After eviction, recover the ascending list of ORIGINAL slot indices that survived in `cache`
+    /// (layer `layer`), by exact-matching each compacted slot's head-0 K against the deterministic
+    /// originals. CpuBackend F32 is exact and eviction never re-rotates K, so a survivor's bytes equal
+    /// its pre-eviction bytes — making this a fully LOCAL observation of the keep-set (no global
+    /// keepset-dump, so it is immune to cross-test capture interference under `cargo test`'s parallelism).
+    fn recovered_kept_slots(cache: &KVCache, layer: usize) -> Vec<usize> {
+        let orig = build_cache(layer);
+        (0..cache.current_pos())
+            .map(|i| {
+                let now = read_k_head0(cache, i);
+                (0..RESIDENT)
+                    .find(|&s| read_k_head0(&orig, s) == now)
+                    .expect("each survivor matches exactly one original slot")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn eval_production_path_fires_whole_model_keepset() {
+        let dir = std::env::temp_dir().join(format!("triattn_p1_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let calib_path = dir.join("synthetic_calib.bin");
+        write_synthetic_calib(&calib_path);
+
+        // (1) Production policy resolution by NAME + calib_path — exactly eval_setup.rs:187-211.
+        let params = argus_extension_api::StageParams {
+            eviction_window: 0,
+            protected_prefix: PREFIX,
+            keep_ratio: 0.0,
+            sink_size: 0,
+            streaming_window: 0,
+        };
+        let extra = vec![argus_extension_api::PluginArg {
+            key: "calib_path",
+            val: calib_path.to_str().unwrap(),
+        }];
+        let policy = make_stage_backed_policy("triattention", &params, &extra).expect(
+            "triattention resolves via the production registry (force-linked under feature)",
+        );
+        assert_eq!(policy.name(), "triattention");
+
+        let cm = CacheManager::new(policy, Box::new(NoOpMonitor), 0, 0.5);
+        let mut caches: Vec<KVCache> = (0..N_LAYERS).map(build_cache).collect();
+        assert_eq!(max_cache_pos(&caches), RESIDENT);
+
+        // (2) force_evict_with_scores = the entry the eval hook uses for TriAttention. It IS score-based
+        //     (caps.reads ∋ Key), so post_prefill extracts scores and route_evict dispatches the
+        //     ScoreContext::Flat variant. The whole-model branch in run_policy_eviction short-circuits on
+        //     as_whole_model_stage() BEFORE the ScoreContext is read, so the scores are discarded.
+        //     ratio 0.5 → target_len 10; decode_partition(20,10,prefix=4) → 4+6 = 10.
+        let importance = vec![0.0f32; RESIDENT]; // discarded by the whole-model short-circuit
+        let res = cm
+            .force_evict_with_scores(&mut caches, 0.5, &importance, None)
+            .expect("whole-model eviction succeeds via the score-based production entry");
+
+        // (3) the whole-model keep-set fired and shrank every layer to budget.
+        assert!(res.evicted, "whole-model keep-set must fire (evicted)");
+        assert_eq!(
+            res.new_pos, 10,
+            "cache must shrink to budget (4 prefix + 6 decode)"
+        );
+        for (l, c) in caches.iter().enumerate() {
+            assert_eq!(
+                c.current_pos(),
+                10,
+                "layer {l} must shrink to budget — the single keep-set fans out to every layer"
+            );
+        }
+
+        // The keep-set is IDENTICAL across layers (the whole-model invariant — a per-layer regression
+        // would rank each layer's own keys and diverge). Recovered from cache content (local, no global
+        // dump), so robust under parallel `cargo test`.
+        let kept0 = recovered_kept_slots(&caches[0], 0);
+        assert_eq!(kept0.len(), 10, "exactly budget slots kept");
+        assert_eq!(&kept0[..PREFIX], &[0, 1, 2, 3], "prefill prefix pinned");
+        for l in 1..N_LAYERS {
+            assert_eq!(
+                recovered_kept_slots(&caches[l], l),
+                kept0,
+                "whole-model keep-set must be identical across layers (layer {l})"
+            );
+        }
+
+        // (4) the whole-model branch discards the ScoreContext: the score-FREE entry (force_evict,
+        //     ScoreContext::None) produces the IDENTICAL keep-set. A regression that consumed scores
+        //     before the as_whole_model_stage() short-circuit would diverge here.
+        let mut caches_noscore: Vec<KVCache> = (0..N_LAYERS).map(build_cache).collect();
+        cm.force_evict(&mut caches_noscore, 0.5)
+            .expect("score-free entry also fires the whole-model keep-set");
+        for l in 0..N_LAYERS {
+            assert_eq!(
+                recovered_kept_slots(&caches_noscore[l], l),
+                recovered_kept_slots(&caches[l], l),
+                "force_evict (None) and force_evict_with_scores (Flat) must yield the identical \
+                 whole-model keep-set — scores are discarded by the branch (layer {l})"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2: `run_policy_eviction`'s whole-model branch threads the caller's `saved_positions` (multi-round
+    /// frame) into `run_cross_layer_keepset_eviction`, instead of always synthesizing the identity
+    /// `0..current` frame. Proven by routing the SAME non-identity round-2 positions through two paths:
+    /// - the DIRECT `run_cross_layer_keepset_eviction(stage, .., &positions)` — the exact call the
+    ///   fixture round-2 parity test (`live_parity_round2`) trusts against the reference oracle;
+    /// - the PRODUCTION `run_policy_eviction(policy, .., Some(&positions))` branch.
+    /// The two keep-sets must be byte-identical (symmetric_diff = 0) → the production branch is round-2
+    /// faithful (transitively, vs the oracle the direct path already matches). Mutation-proof: running
+    /// the production branch with `None` (identity) yields a DIFFERENT keep-set, proving the branch
+    /// actually consumes `saved_positions` rather than ignoring them (a frame that mis-dates survivors as
+    /// `0..current` shifts every decode token's `round_start − pos`, reordering the union top-k).
+    #[test]
+    fn whole_model_branch_threads_saved_positions_round2() {
+        let dir = std::env::temp_dir().join(format!("triattn_p2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let calib_path = dir.join("synthetic_calib.bin");
+        write_synthetic_calib(&calib_path);
+        let calib_str = calib_path.to_str().unwrap().to_string();
+        let target = 10usize;
+
+        // Round-2 NON-IDENTITY positions: survivors of a prior eviction (gaps) + recent decode tokens,
+        // so the resident frame is NOT 0..current. round_start = max+1 = 208 ≫ current(20).
+        let positions: Vec<usize> = vec![
+            0, 1, 2, 3, 9, 17, 33, 64, 96, 128, 160, 192, 200, 201, 202, 203, 204, 205, 206, 207,
+        ];
+        assert_eq!(positions.len(), RESIDENT);
+
+        // DIRECT cross-layer path (the oracle-trusted one) with these positions.
+        let calib_direct = triattention::Calib::from_path(&calib_str).unwrap();
+        let stage =
+            triattention::TriAttention::with_calib(calib_direct, PREFIX, 65536, false, 1_000_000.0);
+        let mut caches_direct: Vec<KVCache> = (0..N_LAYERS).map(build_cache).collect();
+        let res_direct = CacheManager::run_cross_layer_keepset_eviction(
+            &stage,
+            &mut caches_direct,
+            target,
+            &positions,
+        )
+        .unwrap();
+
+        // PRODUCTION branch: run_policy_eviction with Some(positions) — same StageBackedPolicy the eval
+        // path resolves, routed through the production kernel.
+        let params = argus_extension_api::StageParams {
+            eviction_window: 0,
+            protected_prefix: PREFIX,
+            keep_ratio: 0.0,
+            sink_size: 0,
+            streaming_window: 0,
+        };
+        let extra = vec![argus_extension_api::PluginArg {
+            key: "calib_path",
+            val: &calib_str,
+        }];
+        let policy = make_stage_backed_policy("triattention", &params, &extra).unwrap();
+        let mut caches_prod: Vec<KVCache> = (0..N_LAYERS).map(build_cache).collect();
+        let res_prod = CacheManager::run_policy_eviction(
+            policy.as_ref(),
+            &mut caches_prod,
+            target,
+            ScoreContext::None,
+            None,
+            Some(&positions),
+        )
+        .unwrap();
+
+        // Mutation-proof setup: the SAME production branch with identity (None) frame.
+        let mut caches_id: Vec<KVCache> = (0..N_LAYERS).map(build_cache).collect();
+        let res_id = CacheManager::run_policy_eviction(
+            policy.as_ref(),
+            &mut caches_id,
+            target,
+            ScoreContext::None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            res_direct.evicted && res_prod.evicted && res_id.evicted,
+            "all evict"
+        );
+        assert_eq!(res_prod.new_pos, res_direct.new_pos, "same shrink");
+
+        // Keep-sets recovered from cache content (local — no global dump, robust under parallelism).
+        let kept_direct = recovered_kept_slots(&caches_direct[0], 0);
+        let kept_prod = recovered_kept_slots(&caches_prod[0], 0);
+        let kept_id = recovered_kept_slots(&caches_id[0], 0);
+
+        // The production branch, given saved_positions, reproduces the DIRECT path's keep-set exactly
+        // (symmetric_diff = 0) — round-2 faithful (the direct path matches the reference oracle in the
+        // fixture round-2 parity test).
+        assert_eq!(
+            kept_prod, kept_direct,
+            "production branch keep-set == direct path keep-set for the SAME round-2 positions"
+        );
+        // Mutation-proof: the identity (None) frame yields a DIFFERENT keep-set — the branch genuinely
+        // consumes `saved_positions` (mis-dating survivors as 0..current reorders the union top-k).
+        assert_ne!(
+            kept_id, kept_prod,
+            "identity-frame keep-set must differ from the saved_positions keep-set (positions are used)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
