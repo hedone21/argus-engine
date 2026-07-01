@@ -244,6 +244,8 @@ pub fn build_bench_loop(
     faithful_h2o: bool,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
+    // Captured before `model` is moved into `mf` — the PFA handle row count for the prefill keep-set.
+    let n_heads_q = model.config.num_attention_heads;
     // decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고
     // (build_standard_loop 와 동일 — alloc-시점 로그는 drop돼도 찍혀 증거 못 됨).
     let kv_is_opaque = kv_caches.first().is_some_and(|c| c.is_opaque());
@@ -286,6 +288,26 @@ pub fn build_bench_loop(
         mf.arm_faithful_prefill_seed();
     }
 
+    // Direction-B unification: the caps-driven prefill-keepset arming — the SAME shared decision
+    // `build_standard_loop` (argus-cli) uses. Arms a PFA producer so a per-head SnapKV/PyramidKV runs
+    // faithfully in bench too (previously cli-only); the PrefillEnd consumer is submitted to the registry
+    // below. Gated on `cache_manager.is_none()` ⇒ the eviction policy is "none" (the happy path), which
+    // also excludes faithful_h2o (its h2o policy always builds a CacheManager). An explicit
+    // `eviction <policy>` keeps its own KvMutate path — no double eviction. `None` (no PFA-reading stage
+    // linked) leaves this dormant = byte-identical.
+    let keepset_arming = (cache_manager.is_none() && !faithful_h2o)
+        .then(crate::kv::eviction::stage_registry::resolve_prefill_keepset_arming)
+        .flatten();
+    let pfa_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>> = Arc::new(Mutex::new(None));
+    if let Some(arming) = &keepset_arming {
+        mf.set_prefill_attn(pfa_cell.clone(), arming.q_window);
+        eprintln!(
+            "[prefill-keepset] '{}' active — PFA producer arms q_window={} \
+             (SnapKV per-head keep-set staged at PrefillEnd)",
+            arming.stage_name, arming.q_window
+        );
+    }
+
     // β-3: pos-환류용 layer-0 fmt handle (§5.2.1 (가)). coercion: Arc<StandardFormat> →
     // Arc<dyn KVCacheFormat>.
     let kv_pos_handle: Option<Arc<dyn crate::format::KVCacheFormat>> = mf
@@ -318,6 +340,25 @@ pub fn build_bench_loop(
     // β-4: dispatcher 와 driver 가 공유하는 registry. dispatcher.submit(OneShot EvictionStage) →
     // driver 의 KvMutate dispatch(β-3 배선)가 소비.
     let registry = Arc::new(PipelineRegistry::new());
+
+    // Direction-B: the PrefillEnd keep-set consumer (pyramidkv) — submitted to the SAME registry as the
+    // pressure-driven persistent EvictionStage below (phase-disjoint: PrefillEnd vs KvMutate → submit
+    // order immaterial). Mirrors `build_standard_loop`. Reads the per-layer PFA the armed `mf` fills and
+    // applies the SnapKV per-head keep-set via the shared `apply_prefill_keepset` executor.
+    if let Some(arming) = &keepset_arming
+        && let Some(stage) =
+            crate::kv::eviction::stage_registry::make_prefill_keepset_stage(&arming.stage_name)
+    {
+        registry.submit(Arc::new(
+            crate::stages::kv::prefill_keepset::PrefillKeepSetStage::new(
+                kv_handles.clone(),
+                stage,
+                pfa_cell.clone(),
+                n_heads_q,
+                pressure_evict_ratio,
+            ),
+        ));
+    }
 
     // β-4: EngineCommand 분배자. **resilience-on 이면 CM 유무와 무관하게 구성** — control
     // 디렉티브(Throttle/SetTargetTbt/Suspend 등)는 CM 없이 소비 가능하고, v1 도 eviction=none +
