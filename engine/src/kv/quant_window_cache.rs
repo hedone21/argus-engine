@@ -1588,48 +1588,48 @@ impl QuantizedRecentWindowCache {
             if use_gather_fast {
                 #[cfg(feature = "opencl")]
                 {
-                // Fast path: pass entire input at once.
-                // D8: ABI struct(cl_mem) 시그니처. input/residual `&Tensor` 를 raw
-                // cl_mem 으로 추출해 `QuantAttnGatherArgs` 패킹 → trait 호출 → rc!=0 이면
-                // bail. cl_queue 는 엔진 live `cl_command_queue`(Stage E): dlopen plugin 이
-                // 같은 큐에 enqueue 하도록. 내장 OpenCL impl 은 무시(`&self.queue` 사용).
-                use crate::backend::opencl::get_cl_mem;
-                let slab = self.slab.as_ref().unwrap();
-                let gpu_res_k = slab.res_k.as_ref().unwrap();
-                let gpu_res_v = slab.res_v.as_ref().unwrap();
-                // `Mem::as_ptr()` 는 이미 `cl_mem`(= `*mut c_void`) 를 반환하므로 캐스트 불요.
-                let new_k_mem = get_cl_mem(new_k.buffer().as_ref())?.as_ptr();
-                let new_v_mem = get_cl_mem(new_v.buffer().as_ref())?.as_ptr();
-                let res_k_mem = get_cl_mem(gpu_res_k.buffer().as_ref())?.as_ptr();
-                let res_v_mem = get_cl_mem(gpu_res_v.buffer().as_ref())?.as_ptr();
-                let args_k = crate::backend::QuantAttnGatherArgs {
-                    cl_queue: backend_arc.cl_command_queue_ptr(),
-                    input_mem: new_k_mem,
-                    residual_mem: res_k_mem,
-                    kv_heads: self.kv_heads,
-                    res_cap: self.res_cap,
-                    head_dim: self.head_dim,
-                    seq_len: batch,
-                    res_pos: self.res_pos,
-                };
-                let rc_k = quant_attn_be.gather_update_quant(&args_k);
-                if rc_k != 0 {
-                    anyhow::bail!("quant-window gather_update_quant (K) failed (rc={rc_k})");
-                }
-                let args_v = crate::backend::QuantAttnGatherArgs {
-                    cl_queue: backend_arc.cl_command_queue_ptr(),
-                    input_mem: new_v_mem,
-                    residual_mem: res_v_mem,
-                    kv_heads: self.kv_heads,
-                    res_cap: self.res_cap,
-                    head_dim: self.head_dim,
-                    seq_len: batch,
-                    res_pos: self.res_pos,
-                };
-                let rc_v = quant_attn_be.gather_update_quant(&args_v);
-                if rc_v != 0 {
-                    anyhow::bail!("quant-window gather_update_quant (V) failed (rc={rc_v})");
-                }
+                    // Fast path: pass entire input at once.
+                    // D8: ABI struct(cl_mem) 시그니처. input/residual `&Tensor` 를 raw
+                    // cl_mem 으로 추출해 `QuantAttnGatherArgs` 패킹 → trait 호출 → rc!=0 이면
+                    // bail. cl_queue 는 엔진 live `cl_command_queue`(Stage E): dlopen plugin 이
+                    // 같은 큐에 enqueue 하도록. 내장 OpenCL impl 은 무시(`&self.queue` 사용).
+                    use crate::backend::opencl::get_cl_mem;
+                    let slab = self.slab.as_ref().unwrap();
+                    let gpu_res_k = slab.res_k.as_ref().unwrap();
+                    let gpu_res_v = slab.res_v.as_ref().unwrap();
+                    // `Mem::as_ptr()` 는 이미 `cl_mem`(= `*mut c_void`) 를 반환하므로 캐스트 불요.
+                    let new_k_mem = get_cl_mem(new_k.buffer().as_ref())?.as_ptr();
+                    let new_v_mem = get_cl_mem(new_v.buffer().as_ref())?.as_ptr();
+                    let res_k_mem = get_cl_mem(gpu_res_k.buffer().as_ref())?.as_ptr();
+                    let res_v_mem = get_cl_mem(gpu_res_v.buffer().as_ref())?.as_ptr();
+                    let args_k = crate::backend::QuantAttnGatherArgs {
+                        cl_queue: backend_arc.cl_command_queue_ptr(),
+                        input_mem: new_k_mem,
+                        residual_mem: res_k_mem,
+                        kv_heads: self.kv_heads,
+                        res_cap: self.res_cap,
+                        head_dim: self.head_dim,
+                        seq_len: batch,
+                        res_pos: self.res_pos,
+                    };
+                    let rc_k = quant_attn_be.gather_update_quant(&args_k);
+                    if rc_k != 0 {
+                        anyhow::bail!("quant-window gather_update_quant (K) failed (rc={rc_k})");
+                    }
+                    let args_v = crate::backend::QuantAttnGatherArgs {
+                        cl_queue: backend_arc.cl_command_queue_ptr(),
+                        input_mem: new_v_mem,
+                        residual_mem: res_v_mem,
+                        kv_heads: self.kv_heads,
+                        res_cap: self.res_cap,
+                        head_dim: self.head_dim,
+                        seq_len: batch,
+                        res_pos: self.res_pos,
+                    };
+                    let rc_v = quant_attn_be.gather_update_quant(&args_v);
+                    if rc_v != 0 {
+                        anyhow::bail!("quant-window gather_update_quant (V) failed (rc={rc_v})");
+                    }
                 }
             } else {
                 // Slow path: token-by-token copy_slice for the sub-range

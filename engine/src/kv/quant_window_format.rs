@@ -264,77 +264,77 @@ impl QuantWindowFormat {
         }
         #[cfg(feature = "opencl")]
         {
-        let n_heads_kv = cache.kv_heads();
-        let head_dim = cache.head_dim();
-        // Stage E: pull the cap from the cache's `quant_attn` handle (the same Arc
-        // the gate checks), cloned so its borrow of `cache` ends before the
-        // `set_attn_scores` (&mut) below. `backend` now only lends its cl_queue.
-        let quant_attn_be = cache
-            .quant_attn_cap()
-            .expect("attention_native gated on quant_attn_cap().is_some()")
-            .clone();
-        let raw = cache
-            .get_quant_window_raw_buffers()
-            .expect("attention_native gated on get_quant_window_raw_buffers().is_some()");
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let total = raw.q_tokens + raw.res_tokens;
+            let n_heads_kv = cache.kv_heads();
+            let head_dim = cache.head_dim();
+            // Stage E: pull the cap from the cache's `quant_attn` handle (the same Arc
+            // the gate checks), cloned so its borrow of `cache` ends before the
+            // `set_attn_scores` (&mut) below. `backend` now only lends its cl_queue.
+            let quant_attn_be = cache
+                .quant_attn_cap()
+                .expect("attention_native gated on quant_attn_cap().is_some()")
+                .clone();
+            let raw = cache
+                .get_quant_window_raw_buffers()
+                .expect("attention_native gated on get_quant_window_raw_buffers().is_some()");
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let total = raw.q_tokens + raw.res_tokens;
 
-        // native 커널 score 임시 버퍼 (caller scores 유무로 게이팅).
-        let mut tmp_scores: Vec<f32> = if scores.is_some() {
-            vec![0.0; n_heads_q * total]
-        } else {
-            Vec::new()
-        };
-        // D8: ABI struct(cl_mem) 시그니처. `&Tensor` 6개를 raw cl_mem 으로 추출해
-        // `QuantAttnArgs` 패킹. score 는 `(ptr, len)` 으로 변환(None → (null, 0)).
-        // cl_queue 는 엔진의 live `cl_command_queue` 를 넘긴다(Stage E): borrowed-context
-        // dlopen plugin 이 같은 in-order 큐에 enqueue 해야 score readback 순서가 보존된다.
-        // 엔진 내장 OpenCL impl 은 이 슬롯을 무시하고 `&self.queue` 를 직접 쓰므로 무영향.
-        use crate::backend::opencl::get_cl_mem;
-        // `Mem::as_ptr()` 는 이미 `cl_mem`(= `*mut c_void`) 를 반환하므로 캐스트 불요.
-        let q_mem = get_cl_mem(q.buffer().as_ref())?.as_ptr();
-        let qk_mem = get_cl_mem(raw.qk_buf.buffer().as_ref())?.as_ptr();
-        let qv_mem = get_cl_mem(raw.qv_buf.buffer().as_ref())?.as_ptr();
-        let res_k_mem = get_cl_mem(raw.res_k.buffer().as_ref())?.as_ptr();
-        let res_v_mem = get_cl_mem(raw.res_v.buffer().as_ref())?.as_ptr();
-        let out_mem = get_cl_mem(out.buffer().as_ref())?.as_ptr();
-        let (scores_ptr, scores_len): (*mut f32, usize) = if scores.is_some() {
-            (tmp_scores.as_mut_ptr(), tmp_scores.len())
-        } else {
-            (std::ptr::null_mut(), 0)
-        };
-        let args = crate::backend::QuantAttnArgs {
-            cl_queue: backend.cl_command_queue_ptr(),
-            q_mem,
-            qk_mem,
-            qv_mem,
-            res_k_mem,
-            res_v_mem,
-            out_mem,
-            scores_out: scores_ptr,
-            scores_len,
-            num_heads_q: n_heads_q,
-            num_heads_kv: n_heads_kv,
-            head_dim,
-            q_tokens: raw.q_tokens,
-            res_tokens: raw.res_tokens,
-            res_cap: raw.res_cap,
-            scale,
-            bits: raw.bits,
-        };
-        let rc = quant_attn_be.attention_gen_quant(&args);
-        if rc != 0 {
-            anyhow::bail!("quant-window attention_gen_quant failed (rc={rc})");
-        }
-        // 이후 `raw`(cache immutable borrow) 미사용 → NLL 이 set_attn_scores(가변) 전에 borrow 종료.
+            // native 커널 score 임시 버퍼 (caller scores 유무로 게이팅).
+            let mut tmp_scores: Vec<f32> = if scores.is_some() {
+                vec![0.0; n_heads_q * total]
+            } else {
+                Vec::new()
+            };
+            // D8: ABI struct(cl_mem) 시그니처. `&Tensor` 6개를 raw cl_mem 으로 추출해
+            // `QuantAttnArgs` 패킹. score 는 `(ptr, len)` 으로 변환(None → (null, 0)).
+            // cl_queue 는 엔진의 live `cl_command_queue` 를 넘긴다(Stage E): borrowed-context
+            // dlopen plugin 이 같은 in-order 큐에 enqueue 해야 score readback 순서가 보존된다.
+            // 엔진 내장 OpenCL impl 은 이 슬롯을 무시하고 `&self.queue` 를 직접 쓰므로 무영향.
+            use crate::backend::opencl::get_cl_mem;
+            // `Mem::as_ptr()` 는 이미 `cl_mem`(= `*mut c_void`) 를 반환하므로 캐스트 불요.
+            let q_mem = get_cl_mem(q.buffer().as_ref())?.as_ptr();
+            let qk_mem = get_cl_mem(raw.qk_buf.buffer().as_ref())?.as_ptr();
+            let qv_mem = get_cl_mem(raw.qv_buf.buffer().as_ref())?.as_ptr();
+            let res_k_mem = get_cl_mem(raw.res_k.buffer().as_ref())?.as_ptr();
+            let res_v_mem = get_cl_mem(raw.res_v.buffer().as_ref())?.as_ptr();
+            let out_mem = get_cl_mem(out.buffer().as_ref())?.as_ptr();
+            let (scores_ptr, scores_len): (*mut f32, usize) = if scores.is_some() {
+                (tmp_scores.as_mut_ptr(), tmp_scores.len())
+            } else {
+                (std::ptr::null_mut(), 0)
+            };
+            let args = crate::backend::QuantAttnArgs {
+                cl_queue: backend.cl_command_queue_ptr(),
+                q_mem,
+                qk_mem,
+                qv_mem,
+                res_k_mem,
+                res_v_mem,
+                out_mem,
+                scores_out: scores_ptr,
+                scores_len,
+                num_heads_q: n_heads_q,
+                num_heads_kv: n_heads_kv,
+                head_dim,
+                q_tokens: raw.q_tokens,
+                res_tokens: raw.res_tokens,
+                res_cap: raw.res_cap,
+                scale,
+                bits: raw.bits,
+            };
+            let rc = quant_attn_be.attention_gen_quant(&args);
+            if rc != 0 {
+                anyhow::bail!("quant-window attention_gen_quant failed (rc={rc})");
+            }
+            // 이후 `raw`(cache immutable borrow) 미사용 → NLL 이 set_attn_scores(가변) 전에 borrow 종료.
 
-        if let Some(dst) = scores {
-            let n = tmp_scores.len().min(dst.len());
-            dst[..n].copy_from_slice(&tmp_scores[..n]);
-            let valid_len = tmp_scores.len().checked_div(n_heads_q).unwrap_or(0);
-            cache.set_attn_scores(&tmp_scores, n_heads_q, valid_len, valid_len);
-        }
-        Ok(())
+            if let Some(dst) = scores {
+                let n = tmp_scores.len().min(dst.len());
+                dst[..n].copy_from_slice(&tmp_scores[..n]);
+                let valid_len = tmp_scores.len().checked_div(n_heads_q).unwrap_or(0);
+                cache.set_attn_scores(&tmp_scores, n_heads_q, valid_len, valid_len);
+            }
+            Ok(())
         }
     }
 }
