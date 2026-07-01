@@ -20,7 +20,16 @@ linkme = "0.3"
 # and dispatching on the lent cl_command_queue. Pinned to the engine's 0.19 for a single
 # workspace-unified ocl/cl-sys. The engine forwards its own `opencl` feature here.
 ocl = { version = "0.19", optional = true }
+# Under the `cuda` feature the crate hosts the CUDA half of the score axis (`gpu_reduce_cuda`):
+# it compiles `score_reduce.cu` via system nvcc from the host's borrowed CUcontext and dispatches on
+# the lent CUstream. Pinned to the engine's 0.19 with the SAME feature set so Cargo unifies to a
+# single cudarc build. The engine forwards its own `cuda`/`cuda-embedded` feature here.
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+  "std", "driver", "nvrtc", "cublas", "f16", "fallback-dynamic-loading", "cuda-11040",
+] }
 
 [features]
 # Enables the GPU score-reduce backend (`gpu_reduce`). Off for the pure-CPU producer build.
 opencl = ["dep:ocl"]
+# Enables the CUDA score-reduce backend (`gpu_reduce_cuda`).
+cuda = ["dep:cudarc"]

@@ -315,6 +315,7 @@ name = "attn-score"
 version = "0.1.0"
 dependencies = [
  "argus-extension-api",
+ "cudarc",
  "linkme",
  "ocl",
 ]

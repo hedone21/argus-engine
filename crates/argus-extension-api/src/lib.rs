@@ -2879,6 +2879,94 @@ pub fn registered_score_reducer_names() -> Vec<&'static str> {
     SCORE_REDUCERS.iter().map(|r| r.name).collect()
 }
 
+// ── OBSERVER/SCORE axis — (b) GPU half: the CUDA twin of ScoreReduceBackend ─────────────────────
+//
+// The OpenCL score-reduce seam above carries `cl_context`/`cl_command_queue`/`cl_mem` as `*mut c_void`.
+// CUDA device pointers are `u64` (CUdeviceptr), not pointers, so a parallel POD set keeps the typing
+// honest and lets a plugin register BOTH an OpenCL and a CUDA reducer under the same name in DISJOINT
+// slices (no collision). Registration is static-linkme only (no live cdylib), so these `repr(C)` structs
+// are a future-proofing gesture, not a frozen C-ABI. All scalar fields mirror `ScoreReduceArgs`.
+
+/// GPU context handles lent to a [`CudaScoreReduceBackend`] factory at construction (repr(C) POD).
+/// The CUDA analog of [`ScoreReduceMakeArgs`]; `build_opts` is replaced by the compute capability
+/// (the plugin derives nvcc `-arch=sm_{major}{minor}` from it).
+#[repr(C)]
+pub struct CudaScoreReduceMakeArgs {
+    /// Raw `CUcontext` (from `CudaContext::cu_ctx()`) the engine's score buffers live in. Borrowed.
+    pub cu_context: *mut c_void,
+    /// `CUdevice` ordinal (also the ordinal for `CudaContext::from_raw_context`). Borrowed.
+    pub cu_device: i32,
+    /// Compute capability major (for `nvcc -arch=sm_{major}{minor}`).
+    pub cc_major: i32,
+    /// Compute capability minor.
+    pub cc_minor: i32,
+}
+
+/// Per-dispatch args for a CUDA score reduce (repr(C) POD). The CUDA analog of [`ScoreReduceArgs`]:
+/// `cl_queue` → `cu_stream` (raw `CUstream`), and every `cl_mem` → a raw `CUdeviceptr` (`u64`). All
+/// buffers are engine-owned and lent for the call; the scalar fields are identical to the OpenCL args.
+#[repr(C)]
+pub struct CudaScoreReduceArgs {
+    /// Raw `CUstream` (from `CudaStream::cu_stream()`) to launch on. Borrowed.
+    pub cu_stream: *mut c_void,
+    /// `CUdeviceptr` of `[n_layers, n_heads_q, score_stride]` post-softmax scores, read-only. Borrowed.
+    pub score_buf: u64,
+    /// `CUdeviceptr` of `[max_seq_len]` cumulative flat importance, updated in place. Borrowed.
+    pub importance: u64,
+    /// `CUdeviceptr` of `[n_kv_heads * max_seq_len]` cumulative per-head importance, in place. Borrowed.
+    pub head_importance: u64,
+    /// `1.0 - decay`, pre-clamped to `[0,1]` by the engine.
+    pub decay_factor: f32,
+    pub n_layers: usize,
+    pub n_heads_q: usize,
+    /// `<= 16` for the fused kernel's stack array.
+    pub n_kv_heads: usize,
+    /// Work-items `0..cache_seq_len`.
+    pub cache_seq_len: usize,
+    /// Row stride of `score_buf` (== `max_seq_len`).
+    pub score_stride: usize,
+    /// Capacity stride of the cumulative buffers (== `max_seq_len`).
+    pub max_seq_len: usize,
+    /// `CUdeviceptr` of `[n_layers * max_seq_len]` per-layer flat importance; `0` on the collapsed-only
+    /// path (mirrors [`ScoreReduceArgs::layer_flat_importance`]).
+    pub layer_flat_importance: u64,
+}
+
+/// A CUDA score reducer — the device-side arithmetic of the observer/score axis. The CUDA twin of
+/// [`ScoreReduceBackend`]; the engine drives one [`reduce`](CudaScoreReduceBackend::reduce) per decode
+/// step on the lent stream.
+pub trait CudaScoreReduceBackend: Send + Sync {
+    /// Registry key (matched to the score producer name, e.g. `"attn_score"`).
+    fn name(&self) -> &str;
+    /// Dispatch the per-token fused reduce on `args.cu_stream`. Returns `0` on success, a negative code
+    /// on failure. Must not panic.
+    fn reduce(&self, args: &CudaScoreReduceArgs) -> i32;
+    /// Per-layer flat reduce (the `layer_flat_importance` path). Default `-1` (unsupported).
+    fn reduce_per_layer(&self, _args: &CudaScoreReduceArgs) -> i32 {
+        -1
+    }
+}
+
+/// Registration entry for one CUDA score reducer — the CUDA mirror of [`ScoreReduceReg`], static-linkme
+/// only.
+pub struct CudaScoreReduceReg {
+    /// Reducer name (registry key). Unique within the slice; matched to the producer name.
+    pub name: &'static str,
+    /// Factory from the lent CUDA context. Borrows `args` for the call only.
+    pub make: fn(&CudaScoreReduceMakeArgs) -> Result<Box<dyn CudaScoreReduceBackend>, String>,
+}
+
+/// Global CUDA score-reducer registration slice — the CUDA twin of [`SCORE_REDUCERS`]. The built-in
+/// attention-score reducer registers here via `#[distributed_slice(CUDA_SCORE_REDUCERS)]` under the
+/// `cuda` feature, disjoint from (and coexisting with) the OpenCL `SCORE_REDUCERS` registration.
+#[distributed_slice]
+pub static CUDA_SCORE_REDUCERS: [CudaScoreReduceReg] = [..];
+
+/// Find a registered CUDA score reducer by name.
+pub fn find_cuda_score_reducer(name: &str) -> Option<&'static CudaScoreReduceReg> {
+    CUDA_SCORE_REDUCERS.iter().find(|r| r.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

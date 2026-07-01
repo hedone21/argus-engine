@@ -22,6 +22,11 @@ use linkme::distributed_slice;
 #[cfg(feature = "opencl")]
 mod gpu_reduce;
 
+// CUDA twin of `gpu_reduce`: the `CudaScoreReduceBackend` that owns `score_reduce.cu`. Force-linked
+// alongside the CPU producer and gated on `cuda`, since it pulls in `cudarc`.
+#[cfg(feature = "cuda")]
+mod gpu_reduce_cuda;
+
 /// The built-in attention-score producer. Accumulates per-token attention importance scores across
 /// layers (and, in GQA mode, per-KV-head importance + the CAOTE last-layer attention).
 ///
