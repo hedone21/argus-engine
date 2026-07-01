@@ -14,6 +14,7 @@
 //! - nvcc-compiled kernels: rms_norm, rope, softmax, silu_mul, attention_gen, flash-attn, etc.
 //! - F32xF16 matmul: cast F32->F16 via custom kernel, then cuBLAS F16xF16.
 
+pub mod gpu_score;
 pub mod kernels;
 pub mod memory;
 
@@ -241,6 +242,18 @@ pub struct CudaBackend {
     /// through `Backend::cpu_companion()` so they share a single CPU backend
     /// instance instead of constructing a fresh one per fallback call.
     cpu_companion: Arc<dyn Backend>,
+
+    /// `CUdevice` handle (from `device::get(ordinal)`), lent to the `attn-score`
+    /// plugin's CUDA reducer factory in `with_cuda_score_reduce_make_args`.
+    cu_device: cuda_sys::CUdevice,
+
+    /// §13.8-L S-L-2: GPU-side attention score accumulator (score-based KV
+    /// eviction). `None` until `init_gpu_score_acc`. Behind `Arc<...Cell>` so
+    /// the `#[derive(Clone)]` all-`Arc` backend shares one accumulator across
+    /// clones; the `UnsafeCell` gives the `&self → &mut` access the neutral
+    /// forward-gen seam needs (single-threaded inference, INV-018). Discrete-GPU
+    /// twin of the OpenCL backend's `gpu_score_acc: UnsafeCell<...>`.
+    gpu_score_acc: Arc<gpu_score::CudaScoreAccCell>,
 }
 
 impl CudaBackend {
@@ -332,6 +345,8 @@ impl CudaBackend {
             // 2026-05-24): shared singleton — feature detection runs once.
             // LAYER-EXEMPT: cross_backend_bootstrap — §13.8-P cpu_companion init.
             cpu_companion: crate::backend::cpu::cpu_singleton(),
+            cu_device,
+            gpu_score_acc: Arc::new(gpu_score::CudaScoreAccCell::new()),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -348,6 +363,100 @@ impl CudaBackend {
     /// Compute capability as (major, minor).
     pub fn compute_capability(&self) -> (i32, i32) {
         self.compute_capability
+    }
+
+    /// Build a [`argus_extension_api::CudaScoreReduceMakeArgs`] from this
+    /// backend's live CUDA context and invoke `f` with it. Used by
+    /// [`init_gpu_score_acc`](Self::init_gpu_score_acc) to construct the
+    /// `attn_score` CUDA reducer via `find_cuda_score_reducer`. The plugin
+    /// reconstructs the context with `from_raw_context` (ManuallyDrop) and
+    /// compiles its `score_reduce.cu` from it. Mirror of the OpenCL
+    /// `with_score_reduce_make_args`.
+    pub fn with_cuda_score_reduce_make_args<R>(
+        &self,
+        f: impl FnOnce(&argus_extension_api::CudaScoreReduceMakeArgs) -> R,
+    ) -> R {
+        let make_args = argus_extension_api::CudaScoreReduceMakeArgs {
+            cu_context: self.ctx.cu_ctx() as *mut std::ffi::c_void,
+            cu_device: self.cu_device,
+            cc_major: self.compute_capability.0,
+            cc_minor: self.compute_capability.1,
+        };
+        f(&make_args)
+    }
+
+    /// Initialize the GPU-side attention score accumulator (discrete-GPU twin of
+    /// `OpenCLBackend::init_gpu_score_acc`).
+    ///
+    /// Resolves the `attn_score` CUDA score-reduce policy from the technique
+    /// registry (which compiles its own `score_reduce.cu` from this backend's
+    /// borrowed context) and allocates the persistent VRAM score buffers. On any
+    /// failure the accumulator is not created and the caller falls back to the
+    /// per-token CPU score-readback path. Must be called before the decode loop.
+    pub fn init_gpu_score_acc(
+        &self,
+        n_layers: usize,
+        n_heads_q: usize,
+        n_kv_heads: usize,
+        max_seq_len: usize,
+        decay: f32,
+    ) -> Result<()> {
+        if n_kv_heads > 16 {
+            anyhow::bail!(
+                "CudaGpuScoreAccumulator: n_kv_heads={n_kv_heads} exceeds the fused reduce kernel \
+                 limit of 16 (step_head_local[16] in attn-score's score_reduce.cu)"
+            );
+        }
+        let reducer = self.with_cuda_score_reduce_make_args(|make_args| {
+            argus_extension_api::find_cuda_score_reducer("attn_score")
+                .ok_or_else(|| {
+                    anyhow!(
+                        "CudaScoreReduceBackend 'attn_score' not registered — ensure the engine \
+                         forwards `attn-score/cuda` and the `use attn_score as _;` force-link"
+                    )
+                })
+                .and_then(|reg| {
+                    (reg.make)(make_args)
+                        .map_err(|e| anyhow!("attn_score CUDA reduce make failed: {e}"))
+                })
+        })?;
+        let acc = gpu_score::CudaGpuScoreAccumulator::new(
+            reducer,
+            n_layers,
+            n_heads_q,
+            n_kv_heads,
+            max_seq_len,
+            decay,
+        )?;
+        // SAFETY: single-threaded inference (same as OpenCL gpu_score UnsafeCell).
+        unsafe {
+            *self.gpu_score_acc.get() = Some(acc);
+        }
+        log::info!(
+            "CUDA GPU score accumulator initialized (n_layers={}, n_heads_q={}, n_kv_heads={}, \
+             max_seq={})",
+            n_layers,
+            n_heads_q,
+            n_kv_heads,
+            max_seq_len
+        );
+        Ok(())
+    }
+
+    /// Reference to the CUDA GPU score accumulator (if initialized).
+    pub fn gpu_score_acc(&self) -> Option<&gpu_score::CudaGpuScoreAccumulator> {
+        // SAFETY: single-threaded inference.
+        unsafe { self.gpu_score_acc.get().as_ref() }
+    }
+
+    /// Mutable reference to the CUDA GPU score accumulator (if initialized).
+    ///
+    /// # Safety
+    /// Uses `UnsafeCell` — caller must ensure single-threaded access (INV-018).
+    #[allow(clippy::mut_from_ref)]
+    pub fn gpu_score_acc_mut(&self) -> Option<&mut gpu_score::CudaGpuScoreAccumulator> {
+        // SAFETY: single-threaded inference, same as OpenCL gpu_score UnsafeCell.
+        unsafe { self.gpu_score_acc.get().as_mut() }
     }
 
     /// Enable or disable the experimental deferred-sync mode.
@@ -672,6 +781,18 @@ impl Backend for CudaBackend {
 
     fn is_discrete_gpu(&self) -> bool {
         !self.is_uma
+    }
+
+    /// §13.8-L S-L-2: expose the CUDA GPU score accumulator to the neutral
+    /// forward-gen seam (`forward_gen_fmt` calls `set_current_layer_idx`;
+    /// `transformer.rs` reads `is_active`). Mirror of the OpenCL override.
+    fn gpu_score_acc(&self) -> Option<&dyn crate::backend::GpuScoreAccess> {
+        Self::gpu_score_acc(self).map(|s| s as &dyn crate::backend::GpuScoreAccess)
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn gpu_score_acc_mut(&self) -> Option<&mut dyn crate::backend::GpuScoreAccess> {
+        Self::gpu_score_acc_mut(self).map(|s| s as &mut dyn crate::backend::GpuScoreAccess)
     }
 
     fn bind_current_thread(&self) -> Result<()> {
@@ -1588,37 +1709,61 @@ impl Backend for CudaBackend {
         let vp = v_ptr.unwrap();
         let op = out_ptr.unwrap();
 
+        // GPU score accumulator (§13.8-L): when active, bind its persistent VRAM
+        // `score_buf` slice for the current layer (the layer index was set by the
+        // neutral forward-gen seam via `set_current_layer_idx`) so the flash
+        // kernel writes post-softmax scores on-device — eliminating the per-token
+        // CPU readback. Takes precedence over the `scores_out` scratch path (when
+        // the accumulator is armed, `transformer.rs` sets `need_scores=false`, so
+        // `scores_out` is `None` anyway; the reduce runs at `end_step`). The score
+        // pointer is a byte offset into the u64 device pointer; the stride is in
+        // f32 elements (matching the kernel's `scores_out[h * score_stride + t]`).
+        let acc_score_bind: Option<(u64, i32)> = self.gpu_score_acc().and_then(|acc| {
+            if acc.is_active() {
+                let base = acc.score_buf_device_ptr();
+                let byte_off = (acc.layer_offset_elems(acc.current_layer_idx()) as u64)
+                    * std::mem::size_of::<f32>() as u64;
+                Some((base + byte_off, acc.score_stride() as i32))
+            } else {
+                None
+            }
+        });
+
         // Prepare scores buffer + stride (row length per head) before kernel launch.
         // We pin the MutexGuard for the duration of the launch so the
         // underlying CudaHostBuffer lives at least until the device sync below.
-        let (score_dptr, score_stride_i32, scratch_guard) = if let Some(ref slice) = scores_out {
-            let stride = if num_heads_q == 0 {
-                0
-            } else {
-                slice.len() / num_heads_q
-            };
-            if stride == 0 || stride < cache_seq_len {
-                // Malformed caller buffer: disable GPU score export to avoid OOB.
-                (0u64, 0i32, None)
-            } else {
-                let need_bytes = num_heads_q
-                    .checked_mul(stride)
-                    .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
-                    .ok_or_else(|| anyhow!("score buffer size overflow"))?;
-                let mut guard = self.score_tmp_buf.lock().unwrap();
-                let need_realloc = guard
-                    .as_ref()
-                    .map(|b| b.size() < need_bytes)
-                    .unwrap_or(true);
-                if need_realloc {
-                    *guard = Some(CudaHostBuffer::new(need_bytes, DType::F32)?);
+        let (score_dptr, score_stride_i32, scratch_guard) =
+            if let Some((dptr, stride)) = acc_score_bind {
+                // On-device accumulator slice — no host scratch, no CPU copy-back.
+                (dptr, stride, None)
+            } else if let Some(ref slice) = scores_out {
+                let stride = if num_heads_q == 0 {
+                    0
+                } else {
+                    slice.len() / num_heads_q
+                };
+                if stride == 0 || stride < cache_seq_len {
+                    // Malformed caller buffer: disable GPU score export to avoid OOB.
+                    (0u64, 0i32, None)
+                } else {
+                    let need_bytes = num_heads_q
+                        .checked_mul(stride)
+                        .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+                        .ok_or_else(|| anyhow!("score buffer size overflow"))?;
+                    let mut guard = self.score_tmp_buf.lock().unwrap();
+                    let need_realloc = guard
+                        .as_ref()
+                        .map(|b| b.size() < need_bytes)
+                        .unwrap_or(true);
+                    if need_realloc {
+                        *guard = Some(CudaHostBuffer::new(need_bytes, DType::F32)?);
+                    }
+                    let dptr = guard.as_ref().unwrap().device_ptr();
+                    (dptr, stride as i32, Some(guard))
                 }
-                let dptr = guard.as_ref().unwrap().device_ptr();
-                (dptr, stride as i32, Some(guard))
-            }
-        } else {
-            (0u64, 0i32, None)
-        };
+            } else {
+                (0u64, 0i32, None)
+            };
 
         // Shared memory: cache_seq_len floats for scores
         let shmem = (cache_seq_len * std::mem::size_of::<f32>()) as u32;

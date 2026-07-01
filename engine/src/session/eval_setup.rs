@@ -325,7 +325,34 @@ fn build_eval_score_accumulator(
             }
         }
     }
-    let _ = backend; // opencl feature off 일 때 미사용 경고 회피.
+    // CUDA twin of the GPU-accumulator init (discrete-GPU / Jetson).
+    #[cfg(feature = "cuda")]
+    if needs_score_based
+        && let Some(cuda_be) = backend
+            .as_any()
+            .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+    {
+        match cuda_be.init_gpu_score_acc(
+            model.config.num_hidden_layers,
+            model.config.num_attention_heads,
+            model.config.num_key_value_heads,
+            max_seq_len,
+            args.h2o_decay(),
+        ) {
+            Ok(()) => {
+                if let Some(gpu_acc) = cuda_be.gpu_score_acc_mut() {
+                    gpu_acc.set_active(true);
+                }
+                eprintln!(
+                    "[GPU Score] CUDA accumulator initialized — per-token readback eliminated"
+                );
+            }
+            Err(e) => {
+                eprintln!("[GPU Score] CUDA init failed (falling back to CPU path): {e}");
+            }
+        }
+    }
+    let _ = backend; // opencl/cuda feature off 일 때 미사용 경고 회피.
 
     Some(acc)
 }

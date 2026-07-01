@@ -979,6 +979,26 @@ fn build_chat_eviction_internal(
         }
     }
 
+    // CUDA twin of the GPU-accumulator init (discrete-GPU / Jetson).
+    #[cfg(feature = "cuda")]
+    if score_based
+        && let Some(cuda_be) = ctx
+            .backend
+            .as_any()
+            .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+    {
+        let _ = cuda_be.init_gpu_score_acc(
+            ctx.model.config.num_hidden_layers,
+            ctx.model.config.num_attention_heads,
+            ctx.model.config.num_key_value_heads,
+            max_seq_len,
+            args.h2o_decay(),
+        );
+        if let Some(gpu_acc) = cuda_be.gpu_score_acc_mut() {
+            gpu_acc.set_active(true);
+        }
+    }
+
     Ok((Some(cache_manager), Some(acc), score_based, eviction_policy))
 }
 

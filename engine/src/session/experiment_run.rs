@@ -200,6 +200,32 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
                     }
                 }
             }
+            // CUDA twin of the GPU-accumulator init (discrete-GPU / Jetson).
+            #[cfg(feature = "cuda")]
+            if let Some(cuda_be) = backend
+                .as_any()
+                .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+            {
+                match cuda_be.init_gpu_score_acc(
+                    n_layers,
+                    n_heads,
+                    n_kv_heads,
+                    max_seq_len,
+                    args.h2o_decay(),
+                ) {
+                    Ok(()) => {
+                        if let Some(gpu_acc) = cuda_be.gpu_score_acc_mut() {
+                            gpu_acc.set_active(true);
+                        }
+                        eprintln!(
+                            "[GPU Score] CUDA accumulator initialized — per-token readback eliminated"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[GPU Score] CUDA init failed (falling back to CPU path): {e}");
+                    }
+                }
+            }
             Arc::new(Mutex::new(Some(acc)))
         } else {
             Arc::new(Mutex::new(None))
@@ -549,6 +575,32 @@ pub fn run_experiment_schedule_path(
                         eprintln!(
                             "[GPU Score] Failed to initialize (falling back to CPU path): {e}"
                         );
+                    }
+                }
+            }
+            // CUDA twin of the GPU-accumulator init (discrete-GPU / Jetson).
+            #[cfg(feature = "cuda")]
+            if let Some(cuda_be) = backend
+                .as_any()
+                .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+            {
+                match cuda_be.init_gpu_score_acc(
+                    n_layers,
+                    n_heads,
+                    n_kv_heads,
+                    max_seq_len,
+                    args.h2o_decay(),
+                ) {
+                    Ok(()) => {
+                        if let Some(gpu_acc) = cuda_be.gpu_score_acc_mut() {
+                            gpu_acc.set_active(true);
+                        }
+                        eprintln!(
+                            "[GPU Score] CUDA accumulator initialized — per-token readback eliminated"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[GPU Score] CUDA init failed (falling back to CPU path): {e}");
                     }
                 }
             }

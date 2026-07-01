@@ -73,9 +73,10 @@ impl CudaScoreReduceBackend for AttnScoreCudaReducer {
 
 impl AttnScoreCudaReducer {
     fn reduce_inner(&self, args: &CudaScoreReduceArgs) -> Result<(), String> {
-        if args.cu_stream.is_null() {
-            return Err("null cu_stream".to_string());
-        }
+        // NOTE: a null `cu_stream` is NOT an error — CUDA's legacy default stream
+        // (stream 0) is represented as a null pointer, and that is exactly what the
+        // engine lends (`CudaContext::default_stream().cu_stream()`), same as its own
+        // kernel launches and cuBLAS binding. Launch on it verbatim.
         let stream = args.cu_stream as cuda_sys::CUstream;
 
         // Locals must outlive the launch: `kernel_params` holds pointers to each of them, and
@@ -121,9 +122,7 @@ impl AttnScoreCudaReducer {
         if args.layer_flat_importance == 0 {
             return Err("null layer_flat_importance".to_string());
         }
-        if args.cu_stream.is_null() {
-            return Err("null cu_stream".to_string());
-        }
+        // null `cu_stream` == CUDA default stream (see `reduce_inner`); not an error.
         let stream = args.cu_stream as cuda_sys::CUstream;
 
         let score_buf = args.score_buf;
@@ -172,11 +171,15 @@ fn compile_cu_to_ptx(src: &str, cc_major: i32, cc_minor: i32) -> Result<String, 
         f.write_all(src.as_bytes())
             .map_err(|e| format!("write .cu: {e}"))?;
     }
-    let nvcc = ["/usr/local/cuda-11.4/bin/nvcc", "/usr/local/cuda/bin/nvcc", "/opt/cuda/bin/nvcc"]
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "nvcc".to_string());
+    let nvcc = [
+        "/usr/local/cuda-11.4/bin/nvcc",
+        "/usr/local/cuda/bin/nvcc",
+        "/opt/cuda/bin/nvcc",
+    ]
+    .iter()
+    .find(|p| std::path::Path::new(p).exists())
+    .map(|s| s.to_string())
+    .unwrap_or_else(|| "nvcc".to_string());
     let std_flag = std::env::var("LLMRS_NVCC_STD").unwrap_or_else(|_| "c++17".to_string());
     let ccbin = std::env::var("LLMRS_NVCC_CCBIN").ok();
 
