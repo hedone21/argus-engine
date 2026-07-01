@@ -166,6 +166,21 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     // Pass 0 here; the loop will use kv_budget_ratio × prompt_len.
     let effective_budget = if ratio_mode { 0 } else { args.kv_budget() };
 
+    // REQ-3: warn ONCE at setup if an engine KV budget disagrees with faithful h2o's own absolute
+    // hh+recent(+prefix). h2o's `partition` ignores --kv-budget/target_len, so a mismatch silently
+    // makes --kv-budget non-authoritative (the cache settles at hh+recent+prefix, not the cap) — see
+    // the worked example in the request spec §2(b). No-op for any non-h2o policy / no budget set.
+    if let Some(w) = crate::session::cli::h2o_budget_mismatch_warning(
+        args.eviction_policy(),
+        args.h2o_hh_size(),
+        args.h2o_recent_size(),
+        actual_protected_prefix,
+        args.kv_budget(),
+        args.kv_budget_ratio(),
+    ) {
+        eprintln!("{w}");
+    }
+
     eprintln!(
         "[Eval-LL] {} questions, policy={}, kv_budget={}, kv_budget_ratio={}, mode={}",
         questions.len(),
