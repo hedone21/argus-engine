@@ -373,6 +373,130 @@ mod tests {
         assert!((head[5] - 0.5).abs() < 1e-6, "kv1 tok1 = {}", head[5]); // idx 1*max_seq+1
     }
 
+    /// REQ-1 (faithful-H2O × query-agnostic prefill timing): the per-`(layer, token)` FLAT importance
+    /// that faithful h2o actually ranks on (`enable_per_layer_flat`, divergence `(b)`) is equivalent
+    /// within fp whether the faithful-H2O `(c)` prefill seed is produced by the BATCHED column-sum
+    /// fold (`seed_prefill_importance`, the default post_prefill_probe path) or by the ONLINE per-step
+    /// fold that `--evict-timing prefill_end/prefill_streaming` runs token-by-token. Per-layer FLAT is
+    /// pure SUM-across-steps with NO cross-layer MAX, so `Σ_step Σ_head A` (inline) == `Σ_head Σ_step A`
+    /// == `Σ_head PFA` (batched) — the equivalence that lets `eval_loop.rs` drop the old
+    /// `faithful_h2o && token_by_token` reject. Causal masking is identical in both modes (a query row
+    /// `i` sees keys `0..=i` either way), so there is no causal difference to reconcile.
+    ///
+    /// The COLLAPSED `importance` buffer, by contrast, does per-step cross-layer MAX then SUM, so its
+    /// two-mode order differs (`Σ_i MAX_l` vs `MAX_l Σ_i`) — asserted divergent below to prove the
+    /// per-layer FLAT match is specific, not an artifact of a degenerate fixture. Faithful h2o does not
+    /// rank on the collapsed buffer, so that divergence is inert.
+    #[test]
+    fn test_prefill_seed_batched_equals_token_by_token_per_layer_flat() {
+        let n_layers = 2;
+        let n_heads_q = 4;
+        let n_kv_heads = 2;
+        let prefix_len = 3;
+        let max_seq = 4;
+
+        let softmax_row = |vals: &[f32]| -> Vec<f32> {
+            let m = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = vals.iter().map(|v| (v - m).exp()).collect();
+            let s: f32 = exps.iter().sum();
+            exps.iter().map(|e| e / s).collect()
+        };
+
+        // attn[l][i] = the layout-[n_heads_q * prefix_len] causal score row for query `i` (keys
+        // `0..=i` nonzero) — exactly what one decode-style token-by-token step feeds. The recency
+        // slope depends on the layer, so the two layers have genuinely different distributions
+        // (softmax is shift-invariant, so a per-layer *constant* offset would collapse them).
+        let mut attn = vec![vec![vec![0.0f32; n_heads_q * prefix_len]; prefix_len]; n_layers];
+        for l in 0..n_layers {
+            for i in 0..prefix_len {
+                for h in 0..n_heads_q {
+                    let logits: Vec<f32> = (0..=i)
+                        .map(|k| 0.2 * h as f32 - (0.15 + 0.1 * l as f32) * (i - k) as f32)
+                        .collect();
+                    let probs = softmax_row(&logits);
+                    for (k, p) in probs.iter().enumerate() {
+                        attn[l][i][h * prefix_len + k] = *p;
+                    }
+                }
+            }
+        }
+
+        // ── Batched path: per-layer PFA column-sums, folded in one synthetic step ──
+        let pfa: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| {
+                let mut col = vec![0.0f32; n_heads_q * prefix_len];
+                for i in 0..prefix_len {
+                    for (x, c) in col.iter_mut().enumerate() {
+                        *c += attn[l][i][x];
+                    }
+                }
+                col
+            })
+            .collect();
+        let mut acc_batched =
+            AttentionScoreAccumulator::new_gqa(max_seq, n_heads_q, n_kv_heads, n_layers, 0, 0.0);
+        acc_batched.set_active(true);
+        acc_batched.enable_per_layer_flat(); // faithful-H2O (b)
+        seed_prefill_importance(&mut acc_batched, &pfa, prefix_len, n_heads_q, n_kv_heads);
+        let flat_batched = acc_batched.layer_flat_importance().unwrap().to_vec();
+        let imp_batched = acc_batched.importance_scores().to_vec();
+
+        // ── Token-by-token path: one decode-style step per query, online fold ──
+        let mut acc_tbt =
+            AttentionScoreAccumulator::new_gqa(max_seq, n_heads_q, n_kv_heads, n_layers, 0, 0.0);
+        acc_tbt.set_active(true);
+        acc_tbt.enable_per_layer_flat();
+        for i in 0..prefix_len {
+            acc_tbt.begin_step();
+            for l in 0..n_layers {
+                acc_tbt.set_current_layer(l);
+                // Query row `i` attends to keys `0..=i` (cache_seq_len = i+1), stride = prefix_len.
+                acc_tbt.accumulate_layer_gqa(
+                    &attn[l][i],
+                    prefix_len,
+                    i + 1,
+                    n_heads_q,
+                    n_kv_heads,
+                    0,
+                );
+            }
+            acc_tbt.end_step();
+        }
+        let flat_tbt = acc_tbt.layer_flat_importance().unwrap().to_vec();
+        let imp_tbt = acc_tbt.importance_scores().to_vec();
+
+        // The per-layer FLAT buffer faithful h2o ranks on matches within fp tolerance.
+        assert_eq!(flat_batched.len(), flat_tbt.len());
+        for (idx, (a, b)) in flat_batched.iter().zip(flat_tbt.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "per-layer FLAT diverged at idx {idx}: batched={a} tbt={b}"
+            );
+        }
+        // Non-trivial fixture: real column mass accumulated (not all-zero).
+        assert!(
+            flat_batched.iter().any(|&v| v > 1e-3),
+            "fixture should produce non-zero per-layer FLAT importance"
+        );
+        // The two layers really are distinct (guards against the shift-invariance trap): layer 1's
+        // FLAT row differs from layer 0's.
+        let l0 = &flat_batched[0..prefix_len];
+        let l1 = &flat_batched[max_seq..max_seq + prefix_len];
+        assert!(
+            l0.iter().zip(l1).any(|(a, b)| (a - b).abs() > 1e-4),
+            "fixture layers must differ so the per-layer match is a real check"
+        );
+        // And the COLLAPSED importance diverges across the two modes (Σ_i MAX_l ≠ MAX_l Σ_i) — proof
+        // the FLAT match above is buffer-specific, not a degenerate all-equal fixture.
+        assert!(
+            imp_batched
+                .iter()
+                .zip(&imp_tbt)
+                .any(|(a, b)| (a - b).abs() > 1e-4),
+            "collapsed importance should differ by aggregation order (batched={imp_batched:?} tbt={imp_tbt:?})"
+        );
+    }
+
     #[test]
     fn test_accumulate_single_layer() {
         let mut acc = AttentionScoreAccumulator::new(8, 2, 4, 0, 0.0);

@@ -211,9 +211,162 @@ pub fn parse_qcf_sample_layers(spec: &str, n_layers: usize) -> Result<Vec<usize>
     Ok(out)
 }
 
+/// REQ-3: surface a one-time setup warning when an engine-level KV budget disagrees with faithful
+/// h2o's own ABSOLUTE `hh_size + recent_size (+ protected_prefix)`.
+///
+/// Faithful h2o sizes its resident cache purely from its absolute budget — `H2o::partition` reads
+/// neither `--kv-budget` nor the streaming `target_len`. So a `--kv-budget B` that differs from
+/// `hh + recent + prefix` is silently non-authoritative: the cache settles near `hh + recent + prefix`,
+/// not `B`, with no per-eviction-event diagnostic. This returns a human-readable warning (or `None`
+/// when there is nothing to reconcile) so the caller emits it once at setup. Pure — unit testable
+/// without a model or a parsed `Args`.
+pub fn h2o_budget_mismatch_warning(
+    policy: &str,
+    hh_size: Option<usize>,
+    recent_size: Option<usize>,
+    protected_prefix: usize,
+    kv_budget: usize,
+    kv_budget_ratio: f32,
+) -> Option<String> {
+    if policy != "h2o" {
+        return None;
+    }
+    // Missing budgets are a hard error elsewhere (`require_h2o_budgets`); nothing to reconcile here.
+    let (hh, recent) = (hh_size?, recent_size?);
+    let h2o_keep = protected_prefix + hh + recent;
+
+    if kv_budget > 0 {
+        // Absolute streaming/overflow cap. Allow a one-token slack (float-floor rounding of the
+        // streaming low-water) before warning.
+        if (h2o_keep as i64 - kv_budget as i64).abs() > 1 {
+            return Some(format!(
+                "[h2o-budget] WARNING: --kv-budget {kv_budget} disagrees with faithful h2o's absolute \
+                 budget hh_size + recent_size + protected_prefix = {hh} + {recent} + {protected_prefix} \
+                 = {h2o_keep}. h2o sizes its cache from the absolute budget and ignores --kv-budget for \
+                 the keep decision, so the resident cache settles near {h2o_keep} tokens, NOT {kv_budget}. \
+                 Set --kv-budget = {h2o_keep} (or drop it) to make the streaming cap authoritative."
+            ));
+        }
+        return None;
+    }
+    if kv_budget_ratio > 0.0 {
+        return Some(format!(
+            "[h2o-budget] WARNING: --kv-budget-ratio {kv_budget_ratio} does not size faithful h2o's \
+             cache — h2o keeps an ABSOLUTE hh_size + recent_size + protected_prefix = {hh} + {recent} \
+             + {protected_prefix} = {h2o_keep} tokens regardless of the ratio. The ratio only gates \
+             whether the per-question overflow pass runs."
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── REQ-2: require_h2o_budgets contract (the guard argus-eval now wires in) ──
+
+    #[test]
+    fn require_h2o_budgets_rejects_missing_and_accepts_present() {
+        // h2o with NO budgets → hard error (argus-eval used to silently zero both → empty cache).
+        let missing =
+            Args::try_parse_from(["test", "eviction", "plugin", "--name", "h2o"]).unwrap();
+        assert_eq!(missing.eviction_policy(), "h2o");
+        assert!(
+            missing.require_h2o_budgets().is_err(),
+            "h2o without --set hh_size/recent_size must be rejected"
+        );
+        // Only one of the two present → still rejected.
+        let half = Args::try_parse_from([
+            "test",
+            "eviction",
+            "plugin",
+            "--name",
+            "h2o",
+            "--set",
+            "hh_size=64",
+        ])
+        .unwrap();
+        assert!(
+            half.require_h2o_budgets().is_err(),
+            "partial budgets rejected"
+        );
+        // Both present → accepted.
+        let ok = Args::try_parse_from([
+            "test",
+            "eviction",
+            "plugin",
+            "--name",
+            "h2o",
+            "--set",
+            "hh_size=64",
+            "--set",
+            "recent_size=64",
+        ])
+        .unwrap();
+        assert!(
+            ok.require_h2o_budgets().is_ok(),
+            "explicit budgets accepted"
+        );
+        // Non-h2o policy → no-op regardless.
+        let sliding =
+            Args::try_parse_from(["test", "eviction", "plugin", "--name", "sliding"]).unwrap();
+        assert!(sliding.require_h2o_budgets().is_ok());
+    }
+
+    // ── REQ-3: h2o_budget_mismatch_warning (pure) ──
+
+    #[test]
+    fn h2o_budget_warn_noop_for_non_h2o() {
+        assert!(h2o_budget_mismatch_warning("sliding", Some(64), Some(64), 0, 128, 0.0).is_none());
+        assert!(h2o_budget_mismatch_warning("d2o", None, None, 0, 128, 0.0).is_none());
+    }
+
+    #[test]
+    fn h2o_budget_warn_missing_budgets_is_noop() {
+        // require_h2o_budgets owns the hard error; this reconciler stays quiet.
+        assert!(h2o_budget_mismatch_warning("h2o", None, Some(64), 0, 128, 0.0).is_none());
+        assert!(h2o_budget_mismatch_warning("h2o", Some(64), None, 0, 128, 0.0).is_none());
+    }
+
+    #[test]
+    fn h2o_budget_warn_absolute_agree_is_noop() {
+        // hh + recent + prefix == kv_budget → authoritative, no warning. (±1 slack tolerated.)
+        assert!(h2o_budget_mismatch_warning("h2o", Some(100), Some(28), 0, 128, 0.0).is_none());
+        assert!(h2o_budget_mismatch_warning("h2o", Some(100), Some(100), 0, 200, 0.0).is_none());
+        assert!(h2o_budget_mismatch_warning("h2o", Some(64), Some(64), 0, 129, 0.0).is_none()); // +1 slack
+    }
+
+    #[test]
+    fn h2o_budget_warn_absolute_mismatch_fires() {
+        // Spec §2(b) worked example: --kv-budget 128 with hh=100+recent=100 → h2o_keep=200 ≠ 128.
+        let w = h2o_budget_mismatch_warning("h2o", Some(100), Some(100), 0, 128, 0.0)
+            .expect("mismatch must warn");
+        assert!(w.contains("--kv-budget 128"));
+        assert!(
+            w.contains("200"),
+            "warning states the real settling point: {w}"
+        );
+    }
+
+    #[test]
+    fn h2o_budget_warn_prefix_folds_into_total() {
+        // 60 + 60 + 8 = 128 == --kv-budget 128 → agrees (prefix counted).
+        assert!(h2o_budget_mismatch_warning("h2o", Some(60), Some(60), 8, 128, 0.0).is_none());
+        // 60 + 60 + 0 = 120 vs 128 → 8 apart → warns.
+        assert!(h2o_budget_mismatch_warning("h2o", Some(60), Some(60), 0, 128, 0.0).is_some());
+    }
+
+    #[test]
+    fn h2o_budget_warn_ratio_mode_notes_absolute_sizing() {
+        // Ratio does not size h2o's cache; warn informationally.
+        let w = h2o_budget_mismatch_warning("h2o", Some(50), Some(50), 0, 0, 0.5)
+            .expect("ratio + h2o must note absolute sizing");
+        assert!(w.contains("--kv-budget-ratio"));
+        assert!(w.contains("100"));
+        // No engine budget at all → nothing to reconcile.
+        assert!(h2o_budget_mismatch_warning("h2o", Some(50), Some(50), 0, 0, 0.0).is_none());
+    }
 
     #[test]
     fn auto_llama3_8b() {

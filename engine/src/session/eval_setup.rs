@@ -176,6 +176,14 @@ fn build_eval_cache_manager(
     backend: &Arc<dyn Backend>,
     actual_protected_prefix: usize,
 ) -> Result<CacheManager> {
+    // REQ-2: faithful h2o has no default budget (the budget IS the policy), so reject a run that
+    // selects `eviction plugin --name h2o` without `--set hh_size=… --set recent_size=…` — otherwise
+    // `parse_h2o_budgets` silently defaults both to 0 and every eviction empties the cache with no
+    // diagnostic. `argus-cli generate` already guards this via `require_h2o_budgets`; this is the
+    // single chokepoint for the eval-ll + ppl eviction-stage paths (both call this fn; the
+    // quant-window path builds no eviction stage and never reaches here). No-op for any non-h2o policy.
+    args.require_h2o_budgets()?;
+
     let monitor: Box<dyn SystemMonitor> = if backend.is_discrete_gpu() {
         Box::new(NoOpMonitor)
     } else {

@@ -250,8 +250,10 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
         // produces is query-informed. `--evict-timing prefill_end` suppresses it
         // (`runs_query_probe()` = false) and instead ranks on the context importance
         // accumulated by the token-by-token prefill above — a query-agnostic decision.
-        // Faithful-H2O (c): the prefill column-sum seed (in run_full_prefill) IS the importance
-        // source, so suppress the query probe to avoid double-counting on top of the seed.
+        // Faithful-H2O (c): the prefill-attention seed IS the importance source — the batched
+        // column-sum fold (run_full_prefill) under post_prefill_probe, or the inline per-step fold
+        // (run_token_by_token_prefill) under prefill_end/prefill_streaming — so suppress the query
+        // probe in every mode to avoid double-counting on top of the seed.
         if effective_eval_config.evict_timing.runs_query_probe()
             && hook.needs_score_probe(kv_caches)
             && !effective_eval_config.faithful_h2o
@@ -740,14 +742,41 @@ fn run_prefill<C: EvalCacheKind>(
         eval_config.effective_budget,
         prompt_ids.len(),
     );
-    // Faithful-H2O (c) needs the BATCHED prefill (the PFA column-sum seam in `run_full_prefill`);
-    // token-by-token prefill (quant-window cache / --evict-timing prefill_end|prefill_streaming)
-    // cannot produce it. Reject cleanly rather than silently skip the seed.
-    if eval_config.faithful_h2o && token_by_token {
+    // Faithful-H2O (c) — the prefill-attention seed — is produced two equivalent ways depending on
+    // the prefill execution mode, so the two are composable and NEITHER skips the seed:
+    //   • BATCHED (default post_prefill_probe timing, `run_full_prefill`): one batched pass emits the
+    //     PFA column-sums, folded post-forward via `seed_prefill_importance_dual`.
+    //   • TOKEN-BY-TOKEN (`--evict-timing prefill_end|prefill_streaming`, `run_token_by_token_prefill`):
+    //     each prompt token is a decode-style step (`workspace: Some`), so `accumulate_layer_gqa`
+    //     folds that step's attention into the SAME accumulator inline — an online running fold.
+    // For the per-`(layer, token)` FLAT buffer h2o actually ranks on under faithful (`enable_per_layer_flat`,
+    // divergence `(b)`; extract_scores → route_evict prioritizes it), the two are byte-equivalent within
+    // fp: per-layer FLAT is pure SUM-across-steps with NO cross-layer MAX, so `Σ_step Σ_head A` (inline)
+    // == `Σ_head Σ_step A` == `Σ_head PFA` (batched). Faithful forces `time_normalize=false` (eval_setup)
+    // in BOTH modes so the sum is not divided by a step count. This is the query-agnostic
+    // "compress from the start" seed the streaming/prefill_end cell needs. (The collapsed `importance`
+    // and per-head buffers DO differ by aggregation order across the two modes, but faithful h2o does
+    // not rank on them.) See the equivalence unit test in `inference::attention_scores`.
+    //
+    // Spec §4: this online fold is CPU-correct, but the GPU per-`(layer, token)` reduce is armed only by
+    // the BATCHED `seed_prefill_importance_dual`, so on an ACTIVE GPU score path a token-by-token
+    // faithful run would under-seed on-device and silently mis-rank. Keep the clean reject for THAT
+    // combo only — GPU incremental seeding is a documented follow-up; the CPU path (the lab's) is
+    // fully supported. On a CPU-only build this `cfg` block is compiled out entirely (INV-147).
+    #[cfg(feature = "opencl")]
+    if eval_config.faithful_h2o
+        && token_by_token
+        && backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .and_then(|ocl| ocl.gpu_score_acc())
+            .is_some_and(|gpu_acc| gpu_acc.is_active())
+    {
         anyhow::bail!(
-            "faithful h2o requires batched prefill for the (c) prefill-attention seed; \
-             token-by-token prefill (quant-window cache or \
-             --evict-timing prefill_end/prefill_streaming) is unsupported with faithful h2o."
+            "faithful h2o + token-by-token prefill (--evict-timing prefill_end/prefill_streaming) is \
+             not yet supported on the GPU score path (spec §4: GPU incremental prefill-attention \
+             seeding is a follow-up). Run CPU-only for the query-agnostic timing, or keep the default \
+             post_prefill_probe timing on GPU."
         );
     }
     if token_by_token {
