@@ -49,10 +49,14 @@ use std::sync::Mutex;
 use anyhow::Result;
 use argus_extension_api::{
     QuantCacheBackend, QuantCacheRawBuffersOut, QuantCacheUpdateArgs, QuantCacheViewOut,
-    ViewLayoutTag,
 };
+// Used by the opencl-gated `layout_tag` and by the `cfg(test)` assertions; keep it under either.
+#[cfg(any(feature = "opencl", test))]
+use argus_extension_api::ViewLayoutTag;
 
 use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
+// Only consumed by `layout_tag`, which is reached solely from the opencl-gated `assemble_view`.
+#[cfg(feature = "opencl")]
 use crate::kv_cache_ops::KVLayout;
 use crate::tensor::Tensor;
 
@@ -99,7 +103,8 @@ impl InTreeQuantWindowShim {
 }
 
 /// `KVLayout` (engine) → `ViewLayoutTag` (ABI closed vocabulary). Keeps the ABI from naming the
-/// engine's `KVLayout`.
+/// engine's `KVLayout`. Only used by the opencl-gated `assemble_view` cl_mem path.
+#[cfg(feature = "opencl")]
 fn layout_tag(layout: KVLayout) -> ViewLayoutTag {
     match layout {
         KVLayout::SeqMajor => ViewLayoutTag::SeqMajor,
@@ -134,51 +139,72 @@ impl QuantCacheBackend for InTreeQuantWindowShim {
     }
 
     fn assemble_view(&self, out: &mut QuantCacheViewOut) -> i32 {
-        use crate::backend::opencl::get_cl_mem;
-        let mut cache = self.inner.lock().unwrap();
-        let layout = cache.layout();
-        let tokens = cache.current_pos();
-        let (k_view, v_view) = cache.get_view();
-        // GPU mode: the assembled view buffers are `cl_mem`. CPU mode: host buffers → no cl_mem,
-        // and attention uses the F32 view directly, not this seam (RC_NO_CL_MEM).
-        let (Ok(k_mem), Ok(v_mem)) = (
-            get_cl_mem(k_view.buffer().as_ref()),
-            get_cl_mem(v_view.buffer().as_ref()),
-        ) else {
-            return RC_NO_CL_MEM;
-        };
-        out.k_mem = k_mem.as_ptr();
-        out.v_mem = v_mem.as_ptr();
-        out.tokens = tokens;
-        out.layout = layout_tag(layout) as u32;
-        RC_OK
+        // The assembled-view seam marshals `cl_mem` handles and is OpenCL-only. On a non-opencl
+        // (CUDA/CPU) build there is no cl_mem, so return the no-cl-mem sentinel — exactly what the
+        // opencl path returns for host buffers (callers then use the F32 view). The CUDA analog
+        // lands with the KIVI-CUDA cap.
+        #[cfg(not(feature = "opencl"))]
+        {
+            let _ = out;
+            RC_NO_CL_MEM
+        }
+        #[cfg(feature = "opencl")]
+        {
+            use crate::backend::opencl::get_cl_mem;
+            let mut cache = self.inner.lock().unwrap();
+            let layout = cache.layout();
+            let tokens = cache.current_pos();
+            let (k_view, v_view) = cache.get_view();
+            // GPU mode: the assembled view buffers are `cl_mem`. CPU mode: host buffers → no cl_mem,
+            // and attention uses the F32 view directly, not this seam (RC_NO_CL_MEM).
+            let (Ok(k_mem), Ok(v_mem)) = (
+                get_cl_mem(k_view.buffer().as_ref()),
+                get_cl_mem(v_view.buffer().as_ref()),
+            ) else {
+                return RC_NO_CL_MEM;
+            };
+            out.k_mem = k_mem.as_ptr();
+            out.v_mem = v_mem.as_ptr();
+            out.tokens = tokens;
+            out.layout = layout_tag(layout) as u32;
+            RC_OK
+        }
     }
 
     fn get_raw_buffers(&self, out: &mut QuantCacheRawBuffersOut) -> bool {
-        use crate::backend::opencl::get_cl_mem;
-        let cache = self.inner.lock().unwrap();
-        // None on CPU / bits=16 / empty — exactly the native-attention gate
-        // (`QuantWindowFormat::attention_into`).
-        let Some(raw) = cache.get_quant_window_raw_buffers() else {
-            return false;
-        };
-        let (Ok(qk), Ok(qv), Ok(rk), Ok(rv)) = (
-            get_cl_mem(raw.qk_buf.buffer().as_ref()),
-            get_cl_mem(raw.qv_buf.buffer().as_ref()),
-            get_cl_mem(raw.res_k.buffer().as_ref()),
-            get_cl_mem(raw.res_v.buffer().as_ref()),
-        ) else {
-            return false;
-        };
-        out.qk_mem = qk.as_ptr();
-        out.qv_mem = qv.as_ptr();
-        out.res_k_mem = rk.as_ptr();
-        out.res_v_mem = rv.as_ptr();
-        out.q_tokens = raw.q_tokens;
-        out.res_tokens = raw.res_tokens;
-        out.res_cap = raw.res_cap;
-        out.bits = raw.bits;
-        true
+        // Raw `cl_mem` buffer export is OpenCL-only; a non-opencl build has no cl_mem to hand out.
+        #[cfg(not(feature = "opencl"))]
+        {
+            let _ = out;
+            false
+        }
+        #[cfg(feature = "opencl")]
+        {
+            use crate::backend::opencl::get_cl_mem;
+            let cache = self.inner.lock().unwrap();
+            // None on CPU / bits=16 / empty — exactly the native-attention gate
+            // (`QuantWindowFormat::attention_into`).
+            let Some(raw) = cache.get_quant_window_raw_buffers() else {
+                return false;
+            };
+            let (Ok(qk), Ok(qv), Ok(rk), Ok(rv)) = (
+                get_cl_mem(raw.qk_buf.buffer().as_ref()),
+                get_cl_mem(raw.qv_buf.buffer().as_ref()),
+                get_cl_mem(raw.res_k.buffer().as_ref()),
+                get_cl_mem(raw.res_v.buffer().as_ref()),
+            ) else {
+                return false;
+            };
+            out.qk_mem = qk.as_ptr();
+            out.qv_mem = qv.as_ptr();
+            out.res_k_mem = rk.as_ptr();
+            out.res_v_mem = rv.as_ptr();
+            out.q_tokens = raw.q_tokens;
+            out.res_tokens = raw.res_tokens;
+            out.res_cap = raw.res_cap;
+            out.bits = raw.bits;
+            true
+        }
     }
 
     fn transition_bits(&self, target_bits: u8) -> i32 {

@@ -1549,6 +1549,10 @@ impl QuantizedRecentWindowCache {
         // (Phase α-W-4 §3.3). R3: GPU 모드면 OpenCL backend 라 caller 가 Some 보장.
         // owned clone 으로 self 의 mutable borrow(gpu_res_k/flush_residual_gpu)와
         // 충돌 회피 (기존 backend_arc 패턴과 동일).
+        // The `quant_attn` cap is only consumed by the OpenCL single-shot gather fast path below;
+        // a non-opencl (CUDA/CPU) build takes the generic `copy_slice` slow path, which needs no
+        // cap, so gate the handle pull on opencl (avoids a spurious "kivi handle missing" bail).
+        #[cfg(feature = "opencl")]
         let quant_attn_be = self
             .quant_attn
             .as_ref()
@@ -1574,7 +1578,16 @@ impl QuantizedRecentWindowCache {
             // SAFETY: We rely on the kernel only reading `seq_len` tokens from the start of the input buffer.
             // To avoid GPU sub-buffer complexity, if written==0 and batch==seq_len we pass as-is.
             // Otherwise, we fall back to the CPU copy_slice approach per token.
-            if written == 0 && batch == seq_len {
+            // Single-shot GPU gather kernel (marshals cl_mem + the KIVI cap) is OpenCL-only;
+            // any other GPU backend takes the generic `copy_slice` slow path below.
+            #[cfg(feature = "opencl")]
+            let use_gather_fast = written == 0 && batch == seq_len;
+            #[cfg(not(feature = "opencl"))]
+            let use_gather_fast = false;
+
+            if use_gather_fast {
+                #[cfg(feature = "opencl")]
+                {
                 // Fast path: pass entire input at once.
                 // D8: ABI struct(cl_mem) 시그니처. input/residual `&Tensor` 를 raw
                 // cl_mem 으로 추출해 `QuantAttnGatherArgs` 패킹 → trait 호출 → rc!=0 이면
@@ -1616,6 +1629,7 @@ impl QuantizedRecentWindowCache {
                 let rc_v = quant_attn_be.gather_update_quant(&args_v);
                 if rc_v != 0 {
                     anyhow::bail!("quant-window gather_update_quant (V) failed (rc={rc_v})");
+                }
                 }
             } else {
                 // Slow path: token-by-token copy_slice for the sub-range

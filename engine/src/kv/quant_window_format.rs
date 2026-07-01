@@ -251,6 +251,19 @@ impl QuantWindowFormat {
         scores: Option<&mut [f32]>,
         cache: &mut QuantizedRecentWindowCache,
     ) -> Result<()> {
+        // Native fused dequant+attention marshals `cl_mem` handles into `QuantAttnArgs` and is
+        // OpenCL-only today. `attention_into` only routes here when a quant_attn cap with a GPU
+        // kernel is present (KIVI, OpenCL-only), so on a non-opencl (CUDA/CPU) build this is
+        // unreachable — bail defensively. The CUDA analog lands with the KIVI-CUDA cap.
+        #[cfg(not(feature = "opencl"))]
+        {
+            let _ = (q, backend, out, n_heads_q, scores, cache);
+            anyhow::bail!(
+                "quant-window native attention requires the opencl backend (no CUDA quant-attn kernel yet)"
+            );
+        }
+        #[cfg(feature = "opencl")]
+        {
         let n_heads_kv = cache.kv_heads();
         let head_dim = cache.head_dim();
         // Stage E: pull the cap from the cache's `quant_attn` handle (the same Arc
@@ -322,6 +335,7 @@ impl QuantWindowFormat {
             cache.set_attn_scores(&tmp_scores, n_heads_q, valid_len, valid_len);
         }
         Ok(())
+        }
     }
 }
 
