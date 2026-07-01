@@ -1,13 +1,18 @@
-//! CUDA backend for Jetson (SM >= 7.2, UMA).
+//! CUDA backend for discrete PC GPUs (feature `cuda`, e.g. GeForce/RTX, SM >= 7.0).
 //!
-//! Phase 4: NVRTC custom kernels — all ops run on GPU, no CPU fallback
-//! except Q4_0 matmul (cuBLAS doesn't support Q4 natively).
+//! Discrete-GPU sibling of `cuda_embedded` (Jetson/UMA). Kernels are compiled at
+//! `CudaBackend::new()` by shelling out to the system `nvcc` (`--ptx -arch=sm_XX`), so the
+//! generated PTX matches whatever CUDA toolkit is on PATH — the cudarc version pin only fixes
+//! the driver-API/cuBLAS FFI bindings, not the kernel PTX. All forward-critical ops run on the
+//! GPU; the correctness-preserving CPU-companion fallbacks are Q4_0 matmul (cuBLAS has no Q4
+//! path) and non-F16/F32 KV attention.
 //!
 //! Key components:
-//! - `CudaHostBuffer` (cuMemHostAlloc + DEVICEMAP): zero-copy CPU+GPU access
-//! - cuBLAS `cublasGemmEx`: F32xF32, F16xF16 matmul
-//! - NVRTC custom kernels: rms_norm, rope, softmax, silu_mul, attention_gen, etc.
-//! - F32xF16 matmul: cast F32->F16 via custom kernel, then cuBLAS F16xF16
+//! - `CudaBuffer` (cuMemAllocManaged): host-addressable managed memory for discrete GPUs
+//!   (migrates to VRAM on first GPU touch); `CudaHostBuffer` (pinned) for the UMA path.
+//! - cuBLAS `cublasGemmEx`: F32xF32, F16xF16, F32xF16 matmul.
+//! - nvcc-compiled kernels: rms_norm, rope, softmax, silu_mul, attention_gen, flash-attn, etc.
+//! - F32xF16 matmul: cast F32->F16 via custom kernel, then cuBLAS F16xF16.
 
 pub mod kernels;
 pub mod memory;
@@ -589,6 +594,52 @@ impl CudaBackend {
         }
         eprintln!(" OK");
 
+        // === Test 4: Q4_0 dequant GEMV — one block (k=32), scale d=2.0, every nibble = 9 →
+        // (9-8)=+1 per weight element, activation all 1.0 ⇒ out = 32 * (1.0 * 2.0) = 64.0.
+        // Validates mul_mv_q4_0_f32: the f16-scale read, the (nibble-8) zero point, the
+        // interleaved low/high nibble mapping, and the grid=(n,m,1)/block=32 launch on this
+        // device (the whole Q4_0 weight-GEMM path hinges on this kernel being correct). ===
+        let mut w_bytes = [0x99u8; 18];
+        w_bytes[0] = 0x00; // half(2.0) = 0x4000, little-endian
+        w_bytes[1] = 0x40;
+        let wq_buf = CudaHostBuffer::new(18, DType::Q4_0)?;
+        let aq_buf = CudaHostBuffer::new(32 * 4, DType::F32)?;
+        let oq_buf = CudaHostBuffer::new(4, DType::F32)?;
+        unsafe {
+            let w = std::slice::from_raw_parts_mut(wq_buf.as_mut_ptr(), 18);
+            w.copy_from_slice(&w_bytes);
+            let a = std::slice::from_raw_parts_mut(aq_buf.as_mut_ptr() as *mut f32, 32);
+            a.iter_mut().for_each(|x| *x = 1.0);
+        }
+        let wq_ptr = wq_buf.device_ptr();
+        let aq_ptr = aq_buf.device_ptr();
+        let oq_ptr = oq_buf.device_ptr();
+        let (qm, qn, qk): (i32, i32, i32) = (1, 1, 32);
+        unsafe {
+            stream
+                .launch_builder(&self.kernels.mul_mv_q4_0_f32)
+                .arg(&wq_ptr)
+                .arg(&aq_ptr)
+                .arg(&oq_ptr)
+                .arg(&qm)
+                .arg(&qn)
+                .arg(&qk)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| anyhow!("self-test mul_mv_q4_0_f32 launch failed: {e}"))?;
+        }
+        self.synchronize()?;
+        let q_out = unsafe { *(oq_buf.as_ptr() as *const f32) };
+        eprint!("[CUDA self-test] q4_0 gemv:  {q_out:.2}");
+        if (q_out - 64.0).abs() > 0.05 {
+            eprintln!(" FAIL (expected 64.00)");
+            return Err(anyhow!("self-test mul_mv_q4_0_f32 FAILED: got {q_out}"));
+        }
+        eprintln!(" OK");
+
         Ok(())
     }
 
@@ -731,14 +782,62 @@ impl Backend for CudaBackend {
         let a_dtype = a.dtype();
         let b_dtype = b.dtype();
 
-        // Q4_0 weights always go through CPU fallback. Sync first so the
-        // CPU read of `a`/`b` host pointers observes all in-flight GPU
-        // writes — the matching guard at the top of every other fallback
-        // path. Without it, `--cuda-sync-policy minimal` (default) skips
-        // the upstream Matmul sync and the fallback sees stale activations,
-        // producing non-deterministic Q4 prefill output (Bug A/B,
+        // Q4_0 weight GEMM. cuBLAS has no Q4 path, so run the on-device dequant-GEMV kernel
+        // `mul_mv_q4_0_f32` when the weight is Q4_0, the activation is F32 (the only case the
+        // forward pass produces), and all three buffers expose device pointers. It reproduces the
+        // CPU reference math (matmul_transposed_q4_0 "path B") on the GPU, covering every
+        // qkv/o/ffn/lm_head GEMM in decode and prefill. Anything else (e.g. a Q4_0 *activation*,
+        // which never occurs on the weight path, or a buffer without a device pointer) falls back
+        // to the CPU companion — sync first (`FallbackPre`) so the host-pointer read observes all
+        // in-flight GPU writes, else `--cuda-sync-policy minimal` skips the upstream Matmul sync
+        // and the fallback sees stale activations (non-deterministic Q4 prefill; Bug A/B,
         // 2026-04-27).
         if b_dtype == DType::Q4_0 || a_dtype == DType::Q4_0 {
+            if b_dtype == DType::Q4_0 && a_dtype == DType::F32 {
+                let a_dev = Self::get_device_ptr(a.buffer().as_ref());
+                let b_dev = Self::get_device_ptr(b.buffer().as_ref());
+                let out_dev = Self::get_device_ptr(out.buffer().as_ref());
+                if let (Some(a_ptr), Some(b_ptr), Some(out_ptr)) = (a_dev, b_dev, out_dev) {
+                    let a_dims = a.shape().dims();
+                    let b_dims = b.shape().dims();
+                    let a_rank = a_dims.len();
+                    let b_rank = b_dims.len();
+                    let k = a_dims[a_rank - 1] as i32;
+                    let m: i32 = a_dims[..a_rank - 1].iter().product::<usize>() as i32;
+                    let n = b_dims[b_rank - 2] as i32;
+                    debug_assert_eq!(
+                        b_dims[b_rank - 1] as i32,
+                        k,
+                        "Q4_0 matmul_transposed inner-dim mismatch"
+                    );
+                    // grid = (n, m, 1), block = (32,1,1): one warp per output element. `n` (up to
+                    // vocab size) goes on the x-dim (2^31-1 limit); `m` (token count, small) on
+                    // the y-dim (65535 limit).
+                    let cfg = LaunchConfig {
+                        grid_dim: (n as u32, m as u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let stream = self.ctx.default_stream();
+                    // SAFETY: a_ptr (F32 [m,k]), b_ptr (raw Q4_0 [n,k/32] 18-byte blocks), out_ptr
+                    // (F32 [m,n]) are valid managed/host device allocations; the dims come from the
+                    // shape accessors and the kernel reads exactly these extents.
+                    unsafe {
+                        stream
+                            .launch_builder(&self.kernels.mul_mv_q4_0_f32)
+                            .arg(&b_ptr)
+                            .arg(&a_ptr)
+                            .arg(&out_ptr)
+                            .arg(&m)
+                            .arg(&n)
+                            .arg(&k)
+                            .launch(cfg)
+                            .map_err(|e| anyhow!("mul_mv_q4_0_f32 kernel launch failed: {e}"))?;
+                    }
+                    self.maybe_sync_cat(SyncCat::Matmul)?;
+                    return Ok(());
+                }
+            }
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
             return self.cpu_companion().matmul_transposed(a, b, out);
         }
