@@ -185,3 +185,54 @@ pub fn reset_gpu_scores(acc: &AttentionScoreAccumulator, backend: &dyn Backend) 
     #[cfg(not(any(feature = "opencl", feature = "cuda")))]
     let _ = (acc, backend);
 }
+
+/// Arm the GPU-side score accumulator on `backend` — the init/arming counterpart of
+/// [`sync_gpu_scores_to_cpu`] / [`reset_gpu_scores`], collapsing the five hand-rolled arming blocks
+/// (`eval_setup`, `experiment_run` ×2, `chat`) into one. cfg-gated OpenCL/CUDA downcast →
+/// `init_gpu_score_acc(dims, decay)` → `set_active(true)` **only on a successful init**: a failed
+/// device init returns early via `?` before the slot is populated, so `gpu_score_acc_mut()` is `None`
+/// and `set_active` is never reached — byte-identical to every prior site (they each set_active only
+/// after `Ok(())`, and `chat`'s `if let Some(..)` guard behaved the same on failure).
+///
+/// Returns `Ok(true)` when a GPU accumulator was initialized and armed, `Ok(false)` when no GPU
+/// backend matched (CPU build / CPU backend — a no-op), and `Err` when a matching device's init
+/// failed. The caller keeps the score-based gate and decides whether to log: `bench`/`eval` log the
+/// outcome so a silent CPU-accumulate fallback can't masquerade as the ~2× per-token readback path;
+/// `chat` is intentionally silent.
+pub fn arm_gpu_score_acc(
+    backend: &dyn Backend,
+    n_layers: usize,
+    n_heads_q: usize,
+    n_kv_heads: usize,
+    max_seq_len: usize,
+    decay: f32,
+) -> Result<bool> {
+    #[cfg(feature = "opencl")]
+    if let Some(ocl_be) = backend
+        .as_any()
+        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+    {
+        ocl_be.init_gpu_score_acc(n_layers, n_heads_q, n_kv_heads, max_seq_len, decay)?;
+        if let Some(gpu_acc) = ocl_be.gpu_score_acc_mut() {
+            gpu_acc.set_active(true);
+        }
+        return Ok(true);
+    }
+
+    // CUDA twin (discrete-GPU / Jetson).
+    #[cfg(feature = "cuda")]
+    if let Some(cuda_be) = backend
+        .as_any()
+        .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+    {
+        cuda_be.init_gpu_score_acc(n_layers, n_heads_q, n_kv_heads, max_seq_len, decay)?;
+        if let Some(gpu_acc) = cuda_be.gpu_score_acc_mut() {
+            gpu_acc.set_active(true);
+        }
+        return Ok(true);
+    }
+
+    // CPU-only build / CPU backend: nothing to arm.
+    let _ = (backend, n_layers, n_heads_q, n_kv_heads, max_seq_len, decay);
+    Ok(false)
+}

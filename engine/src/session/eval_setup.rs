@@ -304,63 +304,29 @@ fn build_eval_score_accumulator(
         acc.enable_layer_head_dump();
     }
 
-    // OpenCL backend 면 GPU-side accumulator 초기화 — per-token GPU→CPU readback 제거.
-    // Caps-driven arming: only arm the GPU score path when the eviction policy actually consumes
-    // scores (`StageCaps.reads` non-empty). A score-free policy (sliding/streaming) or a
-    // measurement-only `--qcf-mode caote`/`--enable-resilience` build still gets the CPU accumulator
-    // above, but never writes/reduces GPU scores it would never read.
-    #[cfg(feature = "opencl")]
-    if needs_score_based
-        && let Some(ocl_be) = backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-    {
-        match ocl_be.init_gpu_score_acc(
+    // GPU-side accumulator init — per-token GPU→CPU readback 제거. Caps-driven arming: only arm the
+    // GPU score path when the eviction policy actually consumes scores (`StageCaps.reads` non-empty).
+    // A score-free policy (sliding/streaming) or a measurement-only `--qcf-mode caote`/
+    // `--enable-resilience` build still gets the CPU accumulator above, but never writes/reduces GPU
+    // scores it would never read.
+    if needs_score_based {
+        match crate::kv::eviction::score_fed::arm_gpu_score_acc(
+            &**backend,
             model.config.num_hidden_layers,
             model.config.num_attention_heads,
             model.config.num_key_value_heads,
             max_seq_len,
             args.h2o_decay(),
         ) {
-            Ok(()) => {
-                if let Some(gpu_acc) = ocl_be.gpu_score_acc_mut() {
-                    gpu_acc.set_active(true);
-                }
+            Ok(true) => {
                 eprintln!("[GPU Score] Accumulator initialized — per-token readback eliminated");
             }
+            Ok(false) => {}
             Err(e) => {
                 eprintln!("[GPU Score] Failed to initialize (falling back to CPU path): {e}");
             }
         }
     }
-    // CUDA twin of the GPU-accumulator init (discrete-GPU / Jetson).
-    #[cfg(feature = "cuda")]
-    if needs_score_based
-        && let Some(cuda_be) = backend
-            .as_any()
-            .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
-    {
-        match cuda_be.init_gpu_score_acc(
-            model.config.num_hidden_layers,
-            model.config.num_attention_heads,
-            model.config.num_key_value_heads,
-            max_seq_len,
-            args.h2o_decay(),
-        ) {
-            Ok(()) => {
-                if let Some(gpu_acc) = cuda_be.gpu_score_acc_mut() {
-                    gpu_acc.set_active(true);
-                }
-                eprintln!(
-                    "[GPU Score] CUDA accumulator initialized — per-token readback eliminated"
-                );
-            }
-            Err(e) => {
-                eprintln!("[GPU Score] CUDA init failed (falling back to CPU path): {e}");
-            }
-        }
-    }
-    let _ = backend; // opencl/cuda feature off 일 때 미사용 경고 회피.
 
     Some(acc)
 }

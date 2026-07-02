@@ -165,67 +165,31 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
             if faithful {
                 acc.enable_per_layer_flat();
             }
-            // GPU-side accumulator init (OpenCL only) — mirrors `eval_setup`/`chat`. Arming the GPU
+            // GPU-side accumulator init (OpenCL/CUDA) — mirrors `eval_setup`/`chat`. Arming the GPU
             // score path makes `gpu_score_active=true`, so the flash kernel emits per-key scores
             // on-device (a byproduct of the softmax it already computes) instead of forcing a
             // per-token GPU→CPU readback — that readback is what makes bench score-based decode ~2×.
             // The bench `EvictionStage` syncs these back (`score_fed::sync_gpu_scores_to_cpu`) before
-            // a score-fed eviction reads them, so the keep-set matches the CPU path.
-            #[cfg(feature = "opencl")]
-            if let Some(ocl_be) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            {
-                // Log the init result (eval_setup 동형, chat 의 `let _ =` 와 의도적으로 다름): bench 는
-                // measurement tool 이라 init 실패 시 silent 하게 느린 CPU-accumulate 로 폴백하면 그 자체가
-                // 이 fix 가 없애려는 ~2× 로 보여 측정을 오염시킨다. set_active 는 Ok 일 때만 호출해
-                // 실패 후 stale buffer 무장도 피한다.
-                match ocl_be.init_gpu_score_acc(
-                    n_layers,
-                    n_heads,
-                    n_kv_heads,
-                    max_seq_len,
-                    args.h2o_decay(),
-                ) {
-                    Ok(()) => {
-                        if let Some(gpu_acc) = ocl_be.gpu_score_acc_mut() {
-                            gpu_acc.set_active(true);
-                        }
-                        eprintln!(
-                            "[GPU Score] Accumulator initialized — per-token readback eliminated"
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[GPU Score] Failed to initialize (falling back to CPU path): {e}"
-                        );
-                    }
+            // a score-fed eviction reads them, so the keep-set matches the CPU path. Log the outcome
+            // (eval_setup 동형, chat 의 `let _ =` 와 의도적으로 다름): bench 는 measurement tool 이라 init
+            // 실패 시 silent CPU-accumulate 폴백이 이 fix 가 없애려는 ~2× 로 보여 측정을 오염시킨다.
+            // `arm_gpu_score_acc` 는 Ok 일 때만 set_active 하므로 실패 후 stale buffer 무장도 피한다.
+            match crate::kv::eviction::score_fed::arm_gpu_score_acc(
+                &*backend,
+                n_layers,
+                n_heads,
+                n_kv_heads,
+                max_seq_len,
+                args.h2o_decay(),
+            ) {
+                Ok(true) => {
+                    eprintln!(
+                        "[GPU Score] Accumulator initialized — per-token readback eliminated"
+                    );
                 }
-            }
-            // CUDA twin of the GPU-accumulator init (discrete-GPU / Jetson).
-            #[cfg(feature = "cuda")]
-            if let Some(cuda_be) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
-            {
-                match cuda_be.init_gpu_score_acc(
-                    n_layers,
-                    n_heads,
-                    n_kv_heads,
-                    max_seq_len,
-                    args.h2o_decay(),
-                ) {
-                    Ok(()) => {
-                        if let Some(gpu_acc) = cuda_be.gpu_score_acc_mut() {
-                            gpu_acc.set_active(true);
-                        }
-                        eprintln!(
-                            "[GPU Score] CUDA accumulator initialized — per-token readback eliminated"
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("[GPU Score] CUDA init failed (falling back to CPU path): {e}");
-                    }
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("[GPU Score] Failed to initialize (falling back to CPU path): {e}");
                 }
             }
             Arc::new(Mutex::new(Some(acc)))
@@ -543,67 +507,31 @@ pub fn run_experiment_schedule_path(
             if faithful {
                 acc.enable_per_layer_flat();
             }
-            // GPU-side accumulator init (OpenCL only) — mirrors `eval_setup`/`chat`. Arming the GPU
+            // GPU-side accumulator init (OpenCL/CUDA) — mirrors `eval_setup`/`chat`. Arming the GPU
             // score path makes `gpu_score_active=true`, so the flash kernel emits per-key scores
             // on-device (a byproduct of the softmax it already computes) instead of forcing a
             // per-token GPU→CPU readback — that readback is what makes bench score-based decode ~2×.
             // The bench `EvictionStage` syncs these back (`score_fed::sync_gpu_scores_to_cpu`) before
-            // a score-fed eviction reads them, so the keep-set matches the CPU path.
-            #[cfg(feature = "opencl")]
-            if let Some(ocl_be) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            {
-                // Log the init result (eval_setup 동형, chat 의 `let _ =` 와 의도적으로 다름): bench 는
-                // measurement tool 이라 init 실패 시 silent 하게 느린 CPU-accumulate 로 폴백하면 그 자체가
-                // 이 fix 가 없애려는 ~2× 로 보여 측정을 오염시킨다. set_active 는 Ok 일 때만 호출해
-                // 실패 후 stale buffer 무장도 피한다.
-                match ocl_be.init_gpu_score_acc(
-                    n_layers,
-                    n_heads,
-                    n_kv_heads,
-                    max_seq_len,
-                    args.h2o_decay(),
-                ) {
-                    Ok(()) => {
-                        if let Some(gpu_acc) = ocl_be.gpu_score_acc_mut() {
-                            gpu_acc.set_active(true);
-                        }
-                        eprintln!(
-                            "[GPU Score] Accumulator initialized — per-token readback eliminated"
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[GPU Score] Failed to initialize (falling back to CPU path): {e}"
-                        );
-                    }
+            // a score-fed eviction reads them, so the keep-set matches the CPU path. Log the outcome
+            // (eval_setup 동형, chat 의 `let _ =` 와 의도적으로 다름): bench 는 measurement tool 이라 init
+            // 실패 시 silent CPU-accumulate 폴백이 이 fix 가 없애려는 ~2× 로 보여 측정을 오염시킨다.
+            // `arm_gpu_score_acc` 는 Ok 일 때만 set_active 하므로 실패 후 stale buffer 무장도 피한다.
+            match crate::kv::eviction::score_fed::arm_gpu_score_acc(
+                &*backend,
+                n_layers,
+                n_heads,
+                n_kv_heads,
+                max_seq_len,
+                args.h2o_decay(),
+            ) {
+                Ok(true) => {
+                    eprintln!(
+                        "[GPU Score] Accumulator initialized — per-token readback eliminated"
+                    );
                 }
-            }
-            // CUDA twin of the GPU-accumulator init (discrete-GPU / Jetson).
-            #[cfg(feature = "cuda")]
-            if let Some(cuda_be) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
-            {
-                match cuda_be.init_gpu_score_acc(
-                    n_layers,
-                    n_heads,
-                    n_kv_heads,
-                    max_seq_len,
-                    args.h2o_decay(),
-                ) {
-                    Ok(()) => {
-                        if let Some(gpu_acc) = cuda_be.gpu_score_acc_mut() {
-                            gpu_acc.set_active(true);
-                        }
-                        eprintln!(
-                            "[GPU Score] CUDA accumulator initialized — per-token readback eliminated"
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("[GPU Score] CUDA init failed (falling back to CPU path): {e}");
-                    }
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("[GPU Score] Failed to initialize (falling back to CPU path): {e}");
                 }
             }
             Arc::new(Mutex::new(Some(acc)))

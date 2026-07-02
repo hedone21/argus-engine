@@ -27,6 +27,16 @@ project is pre-1.0; minor releases may include breaking changes.
 
 ### Changed
 
+- Unified the GPU score-accumulator arming into one helper, `score_fed::arm_gpu_score_acc`,
+  replacing four hand-rolled `init_gpu_score_acc` + `set_active` blocks (`eval`, `bench` ×2, `chat`)
+  that had drifted in their failure-logging. It sits next to its `sync_gpu_scores_to_cpu` /
+  `reset_gpu_scores` siblings and arms `set_active` only after a successful device init, so behavior
+  is byte-identical on the success path and equivalent on failure (a failed init leaves the
+  accumulator unarmed and falls back to the CPU path — only stderr diagnostics were unified). This is
+  the GPU-half counterpart to the host-side prefill-keepset arming already shared across the loops,
+  removing one copy of the "three files × two backends" duplication. Compiles + clippy-clean on
+  `opencl` / CPU-only / `cuda` / `cuda-embedded`; no user-facing change.
+
 - **Host default backend is now `cuda` on a CUDA build.** `argus-cli` / `argus-bench` /
   `argus-chat` / `argus-eval` share one `--backend`/`-b` default that is now three-way: an Android
   target still defaults to `opencl`; a host built with `--features cuda` (or `cuda-embedded`) now
