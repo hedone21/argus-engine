@@ -236,3 +236,29 @@ pub fn arm_gpu_score_acc(
     let _ = (backend, n_layers, n_heads_q, n_kv_heads, max_seq_len, decay);
     Ok(false)
 }
+
+/// Whether an ACTIVE GPU score accumulator exists on `backend` (OpenCL or CUDA). The eval loop uses
+/// this to reject the one unsupported combo — faithful-H2O token-by-token prefill on an armed GPU
+/// score path, where the online CPU fold is correct but the GPU per-`(layer, token)` reduce is only
+/// seeded by the batched path (see `eval_loop`). Returns false on CPU backends and on cuda-embedded
+/// (which has no GPU score accumulator).
+pub fn gpu_score_acc_active(backend: &dyn Backend) -> bool {
+    #[cfg(feature = "opencl")]
+    if let Some(ocl_be) = backend
+        .as_any()
+        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+    {
+        return ocl_be.gpu_score_acc().is_some_and(|g| g.is_active());
+    }
+
+    #[cfg(feature = "cuda")]
+    if let Some(cuda_be) = backend
+        .as_any()
+        .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+    {
+        return cuda_be.gpu_score_acc().is_some_and(|g| g.is_active());
+    }
+
+    let _ = backend;
+    false
+}
