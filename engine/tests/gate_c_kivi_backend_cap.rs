@@ -30,7 +30,11 @@ fn build_plugin_so(pkg: &str, with_export: bool, dst_name: &str) -> PathBuf {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args(["build", "-p", pkg, "--message-format=json"]);
     if with_export {
-        cmd.args(["--features", "plugin-cdylib"]);
+        // `opencl` is required: kivi's backend-cap (`kivi_abi`) IS the OpenCL QuantAttnBackend,
+        // registered behind `#[cfg(feature = "opencl")]`. `ocl` became an optional dep in the
+        // CUDA split (the crate now has separate `opencl`/`cuda` features), so the cdylib must
+        // opt into `opencl` to export a backend-cap — before the split `ocl` was always compiled.
+        cmd.args(["--features", "opencl,plugin-cdylib"]);
     }
     let out = cmd
         .output()

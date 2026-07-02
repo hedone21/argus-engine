@@ -15,15 +15,10 @@ use anyhow::Result;
 use std::sync::Arc;
 
 /// Memory allocator for the CUDA backend.
+#[derive(Default)]
 pub struct CudaMemory {
     /// If true, use managed memory (discrete GPU). Otherwise pinned host (UMA).
     use_managed: bool,
-}
-
-impl Default for CudaMemory {
-    fn default() -> Self {
-        Self { use_managed: false }
-    }
 }
 
 impl CudaMemory {

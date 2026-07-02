@@ -411,8 +411,12 @@ impl SessionInitCtx {
                 // from the force-linked static `CUDA_QUANT_ATTN_REGS`, built from this backend's live
                 // CUcontext. Registered as `dyn CudaQuantAttnBackend` (a distinct TypeId from the
                 // OpenCL `dyn QuantAttnBackend`, pulled separately by the quant-window setup). No
-                // dlopen path — the CUDA axis is static-linkme only.
+                // dlopen path — the CUDA axis is static-linkme only. Discrete-GPU (`cuda`) only —
+                // matches the P3 score-axis scoping; cuda-embedded has no KV-plugin dispatch.
+                // `mut` used only by the `cuda` register below; cuda-embedded leaves caps empty.
+                #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
                 let mut caps = CapabilityRegistry::new();
+                #[cfg(feature = "cuda")]
                 if let Some(name) = args.backend_cap.as_deref() {
                     let cap: Option<Arc<dyn argus_extension_api::CudaQuantAttnBackend>> =
                         gpu_concrete.with_cuda_quant_attn_make_args(|make_args| {
@@ -427,6 +431,15 @@ impl SessionInitCtx {
                         )
                     })?;
                     caps.register::<dyn argus_extension_api::CudaQuantAttnBackend>(cap);
+                }
+                // cuda-embedded: no CUDA KV-plugin dispatch. Fail loudly rather than silently
+                // ignoring the flag, so the user isn't misled into thinking the cap is active.
+                #[cfg(feature = "cuda-embedded")]
+                if args.backend_cap.is_some() {
+                    anyhow::bail!(
+                        "--backend-cap is not supported on the cuda-embedded backend \
+                         (CUDA KV-plugin dispatch is discrete-GPU / `cuda` only)"
+                    );
                 }
                 let gpu: Arc<dyn Backend> = gpu_concrete;
                 (

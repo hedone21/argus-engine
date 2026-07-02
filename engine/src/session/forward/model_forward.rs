@@ -620,12 +620,15 @@ impl Forward for ModelForward {
         // 는 plan path 지원하나 CPU-side AttentionScoreAccumulator 는 forward_into layer loop 에서만
         // 누적). accumulator 가 active 면 단일 lock 스코프에서 begin_step() 호출 + guard 해제 후
         // forward args 에 `Some(&mut acc)` 주입(end_step 은 forward_into 내부 자동 — 재호출 금지).
+        // opencl plan-bypass 게이트 전용(cuda 는 plan path 없음 → 아래 fallback 에서 직접 재평가하므로 미사용).
+        #[cfg_attr(not(feature = "opencl"), allow(unused_variables))]
         let score_active = self.score_cell_active();
 
         // read stage 활성 시 plan path 우회. plan path(execute_plan)는 layer loop 를
         // bypass 하므로 read_plan seam(transformer.rs:1628)이 발화하지 못한다 — forward_into(layer
         // loop) 폴백만이 read_plan 을 정확히 호출한다(score_active 우회와 동형). None(production)이면
-        // 비용 0(이 bool 1회 평가).
+        // 비용 0(이 bool 1회 평가). opencl plan-bypass 게이트 전용(cuda 는 plan path 없음 → 미사용).
+        #[cfg_attr(not(feature = "opencl"), allow(unused_variables))]
         let read_stage_active = self.read_stage.is_some();
 
         // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan.

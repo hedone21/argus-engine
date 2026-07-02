@@ -1358,13 +1358,7 @@ impl Backend for CudaBackend {
         }
         let head_dim = dims[rank - 1];
         let n_heads = dims[rank - 2];
-        let seq_len: usize = dims[..rank - 1]
-            .iter()
-            .rev()
-            .skip(1)
-            .next()
-            .copied()
-            .unwrap_or(1);
+        let seq_len: usize = dims[..rank - 1].iter().rev().nth(1).copied().unwrap_or(1);
 
         let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "rope_inplace x")?;
         let hd = head_dim as i32;
@@ -1772,11 +1766,7 @@ impl Backend for CudaBackend {
                 // On-device accumulator slice — no host scratch, no CPU copy-back.
                 (dptr, stride, None)
             } else if let Some(ref slice) = scores_out {
-                let stride = if num_heads_q == 0 {
-                    0
-                } else {
-                    slice.len() / num_heads_q
-                };
+                let stride = slice.len().checked_div(num_heads_q).unwrap_or(0);
                 if stride == 0 || stride < cache_seq_len {
                     // Malformed caller buffer: disable GPU score export to avoid OOB.
                     (0u64, 0i32, None)
@@ -2039,7 +2029,7 @@ impl Backend for CudaBackend {
         let dev_buf = CudaDeviceBuffer::new(size, src.dtype())?;
         // SAFETY: dispatcher worker keeps `src` alive until the
         // recorded event fires. Stream is owned by this backend.
-        dev_buf.copy_from_host_async(src_ptr, size, transfer_stream.cu_stream() as _)?;
+        unsafe { dev_buf.copy_from_host_async(src_ptr, size, transfer_stream.cu_stream() as _) }?;
 
         let event = self
             .ctx

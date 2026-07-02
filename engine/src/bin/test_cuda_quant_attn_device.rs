@@ -48,7 +48,7 @@ fn main() -> anyhow::Result<()> {
     let scale = 1.0f32 / (hd as f32).sqrt();
 
     let dev = |bytes: usize| -> anyhow::Result<CudaDeviceBuffer> {
-        Ok(CudaDeviceBuffer::new(bytes.max(1), DType::F32)?)
+        CudaDeviceBuffer::new(bytes.max(1), DType::F32)
     };
     let upload = |buf: &CudaDeviceBuffer, data: &[f32]| -> anyhow::Result<()> {
         buf.copy_from_host(data.as_ptr() as *const u8, std::mem::size_of_val(data))?;
@@ -301,7 +301,7 @@ fn main() -> anyhow::Result<()> {
 
     // F16 device buffer + readback helpers (view buffers are F16).
     let dev_f16 = |elems: usize| -> anyhow::Result<CudaDeviceBuffer> {
-        Ok(CudaDeviceBuffer::new((elems * 2).max(1), DType::F16)?)
+        CudaDeviceBuffer::new((elems * 2).max(1), DType::F16)
     };
     let download_f16 = |buf: &CudaDeviceBuffer, elems: usize| -> anyhow::Result<Vec<f32>> {
         let mut raw = vec![0u16; elems];

@@ -298,10 +298,10 @@ impl QuantWindowFormat {
                 cap.as_ref(),
                 backend,
                 q,
-                &raw.qk_buf,
-                &raw.qv_buf,
-                &raw.res_k,
-                &raw.res_v,
+                raw.qk_buf,
+                raw.qv_buf,
+                raw.res_k,
+                raw.res_v,
                 out,
                 scores_ptr,
                 scores_len,
@@ -314,14 +314,18 @@ impl QuantWindowFormat {
                 scale,
                 raw.bits,
             )?;
-            // End the `raw` (cache immutable) borrow before `set_attn_scores` (&mut cache).
-            drop(raw);
+            // `raw`'s last use is the `attention()` call above; NLL ends its (cache
+            // immutable) borrow there, so `set_attn_scores` (&mut cache) below is free.
             if let Some(dst) = scores {
                 let n = tmp_scores.len().min(dst.len());
                 dst[..n].copy_from_slice(&tmp_scores[..n]);
                 let valid_len = tmp_scores.len().checked_div(n_heads_q).unwrap_or(0);
                 cache.set_attn_scores(&tmp_scores, n_heads_q, valid_len, valid_len);
             }
+            // Needed, not needless: the sibling `#[cfg]` blocks below are parsed as
+            // statements, so under `cuda` this block is the last statement (no tail
+            // expr) and must `return` to satisfy the `Result<()>` return type.
+            #[allow(clippy::needless_return)]
             return Ok(());
         }
         #[cfg(not(any(feature = "opencl", feature = "cuda")))]
