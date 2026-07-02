@@ -1518,6 +1518,17 @@ impl TransformerModel {
             backend.scale(&mut x, scale)?;
         }
 
+        // dump-importance L0 fix: the importance collector reads `x` on the host via
+        // `x.as_slice::<f32>()` in `snapshot_before` below. On a GPU backend the embedding
+        // gather above is an on-device ("zero-sync") write, so layer-0's snapshot would read
+        // stale/zero managed memory before that write lands → `opr=0` at L0 only. One sync
+        // makes the gather's write host-visible. L1+ are already coherent via each layer's
+        // compute. Gated on the collector (production forward: collector=None → skipped →
+        // INV-147 byte-identical) and GPU (no-op path on CPU).
+        if importance_collector.is_some() && backend.is_gpu() {
+            backend.synchronize()?;
+        }
+
         let is_gemma3 = self.config.arch == ModelArch::Gemma3;
 
         // prefill owned PrefillWorkspace (forward_into:1583-1607 미러, CPU/GPU 모두 할당 — fmt 경로는
