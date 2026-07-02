@@ -334,11 +334,14 @@ impl ChatSession {
                     unreachable!()
                 };
 
-                // GPU score sync before reading importance (faithful-H2O b/c on OpenCL): pull the
-                // on-device accumulated scores into the CPU accumulator so the turn-boundary
+                // GPU score sync before reading importance (faithful-H2O b/c on OpenCL/CUDA): pull
+                // the on-device accumulated scores into the CPU accumulator so the turn-boundary
                 // eviction ranks on decode-time attention, not just the prefill seed. No-op on CPU
-                // backends. (Closes the chat-on-GPU sync gap — eval already does this.)
-                #[cfg(feature = "opencl")]
+                // backends and on cuda-embedded (no GPU score accumulator). The call site must be
+                // gated on the SAME features the helper acts under (`any(opencl, cuda)`) — a
+                // `cuda`-without-`opencl` build arms the cuda_pc accumulator but, when gated on
+                // `opencl` only, never pulled it back, so eviction ranked on the stale prefill seed.
+                #[cfg(any(feature = "opencl", feature = "cuda"))]
                 if score_based {
                     let backend_ptr = self
                         .decode_loop
@@ -456,10 +459,11 @@ impl ChatSession {
             return Ok(());
         };
 
-        // GPU score sync before reading importance (faithful-H2O b/c on OpenCL): pull the on-device
-        // accumulated scores into the CPU accumulator. No-op on CPU backends. (Closes the
-        // chat-on-GPU sync gap — eval already does this; mirrors `ensure_capacity`.)
-        #[cfg(feature = "opencl")]
+        // GPU score sync before reading importance (faithful-H2O b/c on OpenCL/CUDA): pull the
+        // on-device accumulated scores into the CPU accumulator. No-op on CPU backends and on
+        // cuda-embedded. Gated on `any(opencl, cuda)` to match the helper (mirrors `ensure_capacity`;
+        // closes the chat-on-GPU sync gap for `cuda`-without-`opencl` builds too).
+        #[cfg(any(feature = "opencl", feature = "cuda"))]
         if score_based {
             let backend_ptr = self
                 .decode_loop
