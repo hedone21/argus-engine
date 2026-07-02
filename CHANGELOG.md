@@ -95,6 +95,21 @@ project is pre-1.0; minor releases may include breaking changes.
   Phase 2-B / Sprint-2c / v2 fields) was kept; stale "unwired" doc-comments on the now-live
   format-axis modules were corrected.
 
+### Fixed
+
+- Closed three GPU score-accumulator coherence gaps in the chat and eval loops (each fixes a silent
+  mis-ranking that only manifests on a specific GPU build; the paths they don't touch are unchanged):
+  - **`argus-chat` on a `cuda`-without-`opencl` build** never synced the on-device attention scores
+    back to the CPU accumulator (the two turn-boundary sync sites were gated on `opencl` only), so
+    eviction ranked on the stale prefill seed. Both sites are now gated on `any(opencl, cuda)`.
+  - **`argus-chat` `/reset`** cleared the host score accumulator but left the GPU cumulative-importance
+    buffers intact, so on a GPU backend the next conversation ranked on importance accumulated across
+    the reset. `/reset` now clears the device buffers in lockstep.
+  - **`argus-eval` faithful-H2O token-by-token prefill** (`--evict-timing prefill_end/prefill_streaming`)
+    on an active GPU score path was rejected only for OpenCL; the discrete `cuda` backend silently
+    under-seeded and mis-ranked. The guard is now backend-agnostic (`score_fed::gpu_score_acc_active`),
+    covering both GPU backends while leaving the CPU path — the supported one — untouched.
+
 ## [0.1.0] - 2026-06-14
 
 Initial public release.
