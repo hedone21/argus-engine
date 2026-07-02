@@ -259,14 +259,34 @@ fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
                  use the standard --eval-ll path"
             );
         }
-        // Both dumps capture per-layer attention on the CPU path only (the GPU flash /
-        // GPU score kernels short-circuit it), so require a CPU backend rather than
-        // emit a buffer of zeros.
+        // answer_attention / answer_attention_steps capture per-key attention via the PFA
+        // side channel materialized on the CPU forward path only, so they still require a CPU
+        // backend rather than emit a buffer of zeros.
+        //
+        // evict_importance reads the accumulator's per-(layer, KV-head) importance, which on a GPU
+        // backend is populated by the faithful-H2O prefill-attention seed (`seed_prefill_importance`
+        // folds the host-mirror PFA into the accumulator on the CPU side, so it is resident on GPU
+        // too). That seed runs only for the `h2o` policy; other score policies (d2o/h2o_plus) would
+        // leave the per-head buffer zeroed on GPU, so restrict evict_importance to `h2o` there.
         if args.backend != "cpu" {
-            bail!(
-                "argus-eval: --dump requires --backend cpu \
-                 (per-layer attention capture is CPU-only)"
-            );
+            use argus_engine::session::eval::dump::{
+                DUMP_ANSWER_ATTENTION, DUMP_ANSWER_ATTENTION_STEPS, DUMP_EVICT_IMPORTANCE,
+            };
+            for kind in [DUMP_ANSWER_ATTENTION, DUMP_ANSWER_ATTENTION_STEPS] {
+                if args.dump_enabled(kind) {
+                    bail!(
+                        "argus-eval: --dump {kind} requires --backend cpu \
+                         (per-key attention capture is CPU-only)"
+                    );
+                }
+            }
+            if args.dump_enabled(DUMP_EVICT_IMPORTANCE) && args.eviction_policy() != "h2o" {
+                bail!(
+                    "argus-eval: --dump evict_importance on a GPU backend requires the h2o \
+                     eviction policy (`eviction plugin --name h2o`); other policies' \
+                     per-(layer, KV-head) importance is not GPU-resident — use --backend cpu"
+                );
+            }
         }
         // evict_importance profiles a real eviction event — it needs an eviction policy.
         if args.dump_enabled(argus_engine::session::eval::dump::DUMP_EVICT_IMPORTANCE) {
@@ -760,9 +780,11 @@ mod tests {
         assert!(err.to_string().contains("all layers tracked"), "{}", err);
     }
 
-    /// Both dump kinds require a CPU backend (per-layer capture is CPU-only).
+    /// evict_importance on a GPU backend is allowed with the h2o policy: the faithful-H2O
+    /// prefill-attention seed makes the per-(layer, KV-head) importance GPU-resident (it is
+    /// folded into the accumulator on the CPU side from the host-mirror PFA).
     #[test]
-    fn reject_dump_evict_importance_requires_cpu() {
+    fn accept_dump_evict_importance_h2o_gpu() {
         let args = make_args(&[
             "--eval-ll",
             "--eval-continuation",
@@ -777,6 +799,28 @@ mod tests {
             "plugin",
             "--name",
             "h2o",
+        ]);
+        assert!(reject_unsupported_modes_eval(&args).is_ok());
+    }
+
+    /// evict_importance on a GPU backend with a non-h2o score policy is rejected: those policies
+    /// have no prefill-attention seed, so the per-head buffer would be zeroed on GPU.
+    #[test]
+    fn reject_dump_evict_importance_non_h2o_gpu() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "evict_importance",
+            "--dump-dir",
+            "/tmp/d",
+            "--backend",
+            "opencl",
+            "eviction",
+            "plugin",
+            "--name",
+            "d2o",
         ]);
         let err = reject_unsupported_modes_eval(&args).unwrap_err();
         assert!(err.to_string().contains("cpu"), "{}", err);
