@@ -24,15 +24,18 @@
 //! not the per-head buffer. `--answer-attention-steps-per-head` opts into the full per-head dump
 //! (`attn_by_layer_head`), with the size cost logged at startup.
 //!
-//! ## CPU-only
+//! ## Backend
 //!
-//! PFA is computed only on the CPU attention path (the GPU flash kernel short-circuits before it).
-//! The caller (`argus-eval`) fail-fasts on a non-CPU backend; this module asserts it defensively.
+//! PFA is materialized on both CPU and GPU. On GPU the flash prefill kernel computes the attention
+//! output, then the host-mirror re-runs the same scalar `prefill_attention_scores` (its per-row arm)
+//! over K read back from VRAM (see `standard_format.rs` `attention_into`), so the per-step PFA buffer
+//! this dump reads is filled regardless of backend. GPU vs CPU differ only by the RoPE/KV-write
+//! floating-point rounding folded into K, not by a zero-vs-nonzero gap.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::backend::Backend;
@@ -219,14 +222,6 @@ pub fn run_answer_attention_steps_dump(
     per_head: bool,
     full: bool,
 ) -> Result<()> {
-    if backend.is_gpu() {
-        // PFA is CPU-only (the GPU flash kernel short-circuits before it). The caller already
-        // fail-fasts; assert defensively so a buffer of zeros is never emitted as "ground truth".
-        bail!(
-            "answer_attention_steps dump requires a CPU backend (prefill-attention capture is CPU-only)"
-        );
-    }
-
     let n_layers = model.config.num_hidden_layers;
     let n_heads_q = model.config.num_attention_heads;
     let n_kv_heads = model.config.num_key_value_heads;
