@@ -47,7 +47,7 @@ git clone https://github.com/hedone21/argus-engine.git
 cd argus-engine
 cargo build --release
 
-# 1. CPU에서 단일 프롬프트 생성 (호스트 기본 백엔드)
+# 1. CPU에서 단일 프롬프트 생성 (-b cpu; --features cuda 빌드는 CUDA 백엔드가 기본)
 ./target/release/argus-cli -m model.gguf --prompt "Hello" -n 50 -b cpu
 
 # 2. 같은 프롬프트를 Adreno OpenCL GPU에서 (백엔드는 플래그 하나로 전환)

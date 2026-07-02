@@ -51,7 +51,7 @@ git clone https://github.com/hedone21/argus-engine.git
 cd argus-engine
 cargo build --release
 
-# 1. Single-prompt generation on CPU (default host backend)
+# 1. Single-prompt generation on CPU (-b cpu; a --features cuda build defaults to the CUDA backend)
 ./target/release/argus-cli -m model.gguf --prompt "Hello" -n 50 -b cpu
 
 # 2. Same prompt on the Adreno OpenCL GPU — one flag switches the backend

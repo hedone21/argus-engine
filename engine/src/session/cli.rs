@@ -640,12 +640,29 @@ pub struct Args {
     pub num_tokens: usize,
 
     /// Backend to use: "cpu", "opencl", or "cuda" (build with --features cuda).
-    /// Default: Android target → "opencl" (Adreno production path), else → "cpu".
+    /// Default: Android target → "opencl" (Adreno production path); a host built with a
+    /// CUDA feature → "cuda"; otherwise → "cpu". On a CUDA build, pass `--backend cpu`
+    /// to force the CPU path. (Mirrors the AUF primary-variant default, which already
+    /// selects `CudaAos` under `cuda`/`cuda-embedded`.)
     #[cfg(target_os = "android")]
     #[arg(short, long, default_value = "opencl")]
     pub backend: String,
 
-    #[cfg(not(target_os = "android"))]
+    /// Backend to use: "cpu", "opencl", or "cuda". Host CUDA build → default "cuda"
+    /// (pass `--backend cpu` to force CPU).
+    #[cfg(all(
+        not(target_os = "android"),
+        any(feature = "cuda", feature = "cuda-embedded")
+    ))]
+    #[arg(short, long, default_value = "cuda")]
+    pub backend: String,
+
+    /// Backend to use: "cpu", "opencl", or "cuda" (build with --features cuda).
+    /// Host build without a CUDA feature → default "cpu".
+    #[cfg(all(
+        not(target_os = "android"),
+        not(any(feature = "cuda", feature = "cuda-embedded"))
+    ))]
     #[arg(short, long, default_value = "cpu")]
     pub backend: String,
 
