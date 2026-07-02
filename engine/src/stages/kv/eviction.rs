@@ -219,14 +219,14 @@ impl EvictionStage {
                     acc.reset();
                 }
             }
-            // Faithful-H2O (b): reset the GPU per-layer FLAT buffer in lockstep with the CPU acc.reset
-            // above. No-op when `backend` is None / unarmed / non-opencl stub.
+            // Reset the GPU accumulator in lockstep with the CPU acc.reset above.
+            // No-op when `backend` is None / unarmed / non-opencl stub.
             if let (Some(be), Some(cell)) = (self.backend.as_ref(), self.score_cell.as_ref()) {
                 let guard = cell
                     .lock()
                     .expect("EvictionStage score_cell Mutex poisoned");
                 if let Some(acc) = guard.as_ref() {
-                    score_fed::reset_gpu_layer_flat(acc, be.as_ref());
+                    score_fed::reset_gpu_scores(acc, be.as_ref());
                 }
             }
         }
