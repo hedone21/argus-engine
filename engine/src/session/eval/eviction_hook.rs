@@ -191,6 +191,27 @@ pub struct EvictionHook {
     resident_orig: Vec<usize>,
     /// Streaming per-event dump snapshots, drained by the loop after prefill.
     streaming_dumps: Vec<crate::session::eval::dump::EvictImportanceSnapshot>,
+
+    /// Direction-B: a configured per-head prefill keep-set (pyramidkv/SnapKV) for the eval loop.
+    /// `Some` iff a `TensorKind::PrefillAttention`-reading stage is registered AND the run is on the
+    /// happy path (eviction policy "none") — wired by `with_prefill_keepset`. The cli/bench loops run
+    /// this stage through `PrefillKeepSetStage` on the decode-loop registry; eval has no registry, so
+    /// `post_prefill` drives the SAME shared `apply_prefill_keepset` executor. `None` = no keep-set,
+    /// the prefill PFA producer stays unarmed (byte-identical).
+    prefill_keepset: Option<PrefillKeepsetState>,
+}
+
+/// A configured eval prefill keep-set (see [`EvictionHook::prefill_keepset`]). Holds the registered
+/// keep-set stage, the producer observation window the eval prefill arms at, the head geometry the PFA
+/// handle needs, the keep budget ratio, and a slot for the per-layer PFA the armed prefill produced.
+pub struct PrefillKeepsetState {
+    stage: Box<dyn argus_extension_api::KVMutationStage>,
+    q_window: usize,
+    n_heads_q: usize,
+    target_ratio: f32,
+    /// Filled by [`StepHook::stage_prefill_attn`] right after the prefill forward; consumed once at
+    /// `post_prefill`.
+    staged_pfa: Option<Vec<Vec<f32>>>,
 }
 
 /// Streaming low-water mark: on overflow, evict down to `floor(budget * KEEP)` so
@@ -281,7 +302,31 @@ impl EvictionHook {
             last_evict_dump: None,
             resident_orig: Vec::new(),
             streaming_dumps: Vec::new(),
+            prefill_keepset: None,
         }
+    }
+
+    /// Direction-B: configure the per-head prefill keep-set (pyramidkv) the eval loop applies at
+    /// `post_prefill`. The caller resolves `(stage, q_window)` from the shared
+    /// `resolve_prefill_keepset_arming` (the SAME decision cli/bench use) so the eval keep-set is
+    /// byte-identical to those loops. `n_heads_q` is the attention head count (PFA handle rows);
+    /// `target_ratio` is the keep budget (`--eviction-target-ratio`). Builder form — no behavior change
+    /// unless called.
+    pub fn with_prefill_keepset(
+        mut self,
+        stage: Box<dyn argus_extension_api::KVMutationStage>,
+        q_window: usize,
+        n_heads_q: usize,
+        target_ratio: f32,
+    ) -> Self {
+        self.prefill_keepset = Some(PrefillKeepsetState {
+            stage,
+            q_window,
+            n_heads_q,
+            target_ratio,
+            staged_pfa: None,
+        });
+        self
     }
 
     /// Assemble the IMP-1 `evict_importance` snapshot from the accumulator's
@@ -507,7 +552,37 @@ impl EvictionHook {
 }
 
 impl StepHook<KVCache> for EvictionHook {
+    fn prefill_attn_window(&self) -> Option<usize> {
+        self.prefill_keepset.as_ref().map(|k| k.q_window)
+    }
+
+    fn stage_prefill_attn(&mut self, pfa: Vec<Vec<f32>>) {
+        if let Some(k) = self.prefill_keepset.as_mut() {
+            k.staged_pfa = Some(pfa);
+        }
+    }
+
     fn post_prefill(&mut self, caches: &mut [KVCache]) {
+        // Direction-B: a configured per-head prefill keep-set (pyramidkv) IS the eviction on the eval
+        // happy path — drive the SAME shared `apply_prefill_keepset` executor the cli/bench registry
+        // path uses (eval has no decode-loop registry), then return. The PFA the armed prefill produced
+        // was hand off via `stage_prefill_attn`; with no PFA staged (GPU early-return or producer
+        // unarmed) the stage degrades to its layer-wide fallback, still safe.
+        if let Some(k) = self.prefill_keepset.as_mut()
+            && let Some(pfa) = k.staged_pfa.take()
+        {
+            if let Err(e) = crate::stages::kv::prefill_keepset::apply_prefill_keepset(
+                caches,
+                k.stage.as_ref(),
+                &pfa,
+                k.n_heads_q,
+                k.target_ratio,
+            ) {
+                eprintln!("[prefill-keepset] eval keep-set failed: {e}");
+            }
+            return;
+        }
+
         // After full batch prefill, evict if cache exceeds budget.
         // This replaces the old chunked-prefill approach that decoded overflow
         // tokens one-by-one (causing 2-3.3x slowdown).
@@ -1018,6 +1093,61 @@ mod tests {
             false,  // dump_evict_importance
             false,  // streaming_overflow
         )
+    }
+
+    /// Direction-B: the eval hook wired with the shared arming (pyramidkv @ window 64 — the SAME
+    /// caps-driven decision cli/bench consult). (1) it arms the PFA producer at that window
+    /// (`prefill_attn_window`), so the generic prefill emits a `TensorKind::PrefillAttention` producer;
+    /// (2) a staged PFA → `post_prefill` applies the keep-set via the shared `apply_prefill_keepset`
+    /// executor, shrinking the cache. This pins the EvictionHook → eval assembly seam; the per-head
+    /// faithfulness vs kvpress is pinned by the prefill_keepset tests (same executor).
+    #[cfg(feature = "pyramidkv")]
+    #[test]
+    fn eval_hook_arms_pfa_window_and_applies_keepset() {
+        use crate::backend::Backend;
+        use crate::backend::cpu::CpuBackend;
+        use crate::buffer::DType;
+        use crate::memory::host::shared::SharedBuffer;
+        use crate::shape::Shape;
+        use crate::tensor::Tensor;
+        use std::sync::Arc;
+
+        let stage =
+            crate::kv::eviction::stage_registry::make_prefill_keepset_stage("pyramidkv").unwrap();
+        let mut hook = make_hook(0, false).with_prefill_keepset(stage, 64, 1, 0.5);
+
+        // (1) The hook arms the PFA producer at the caps-driven window (NOT the unarmed default).
+        assert_eq!(
+            hook.prefill_attn_window(),
+            Some(64),
+            "eval hook must arm the PFA producer at pyramidkv's window_size (64)"
+        );
+
+        // (2) Stage a PFA + drive post_prefill. A small SeqMajor cache (prefix 8): pyramidkv at
+        // ratio 0.5 → budget 4 ≤ window → keep the 4 most-recent (the sub-window LayerWide path,
+        // layout-agnostic). The point is that the keep-set FIRED via the hook (8 → 4).
+        let prefix = 8usize;
+        let (kv_heads, head_dim, max_seq) = (1usize, 2usize, 32usize);
+        let total = max_seq * kv_heads * head_dim;
+        let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mk = || {
+            Tensor::new(
+                Shape::new(vec![1, max_seq, kv_heads, head_dim]),
+                Arc::new(SharedBuffer::new(total * 4, DType::F32)),
+                be.clone(),
+            )
+        };
+        let mut cache = KVCache::new(mk(), mk(), max_seq);
+        cache.current_pos = prefix;
+
+        hook.stage_prefill_attn(vec![vec![0.0f32; prefix]]); // 1 attention head × prefix cols
+        let mut caches = vec![cache];
+        hook.post_prefill(&mut caches);
+        assert_eq!(
+            caches[0].current_pos(),
+            4,
+            "post_prefill must apply the keep-set via the shared executor (8 → budget 4)"
+        );
     }
 
     #[test]

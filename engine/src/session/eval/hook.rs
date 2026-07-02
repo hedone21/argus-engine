@@ -36,6 +36,20 @@ pub trait StepHook<C> {
     /// residuals or flush proxy collection.
     fn post_prefill(&mut self, caches: &mut [C]);
 
+    /// The PFA observation window this hook wants armed during prefill, or `None` (the default —
+    /// no prefill-attention producer). Direction-B unification: when a per-head SnapKV/PyramidKV
+    /// keep-set is configured, `EvictionHook` returns `Some(window_size)` so the generic prefill
+    /// arms a `TensorKind::PrefillAttention` producer at exactly that width (the SAME caps-driven
+    /// window `build_standard_loop`/`build_bench_loop` arm at). `None` keeps prefill byte-identical.
+    fn prefill_attn_window(&self) -> Option<usize> {
+        None
+    }
+
+    /// Hand the per-layer PFA buffer (`[n_heads_q * prefix_len]` per layer) the armed prefill produced
+    /// to this hook, so its `post_prefill` can apply the keep-set. Default no-op (only `EvictionHook`
+    /// with a prefill keep-set configured consumes it). Called once, right after the prefill forward.
+    fn stage_prefill_attn(&mut self, _pfa: Vec<Vec<f32>>) {}
+
     /// Reset caches for a new question evaluation.
     fn reset_caches(&mut self, caches: &mut [C]);
 

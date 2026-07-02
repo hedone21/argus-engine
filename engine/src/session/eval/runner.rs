@@ -295,6 +295,30 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         args.evict_timing().evicts_on_overflow(),
     );
 
+    // Direction-B unification: wire the per-head prefill keep-set (pyramidkv) on the happy path
+    // (eviction policy "none"), so a `TensorKind::PrefillAttention`-reading stage runs faithfully in
+    // eval too — the SAME caps-driven decision cli/bench consult (`resolve_prefill_keepset_arming`). The
+    // hook then arms the PFA producer during prefill and applies the per-head keep-set at post_prefill
+    // via the shared `apply_prefill_keepset` executor. `None`/non-"none" policy → unchanged
+    // (byte-identical). An explicit `eviction <policy>` keeps its own budget/score-fed path.
+    if args.eviction_policy() == "none"
+        && let Some(arming) = crate::kv::eviction::stage_registry::resolve_prefill_keepset_arming()
+        && let Some(stage) =
+            crate::kv::eviction::stage_registry::make_prefill_keepset_stage(&arming.stage_name)
+    {
+        eprintln!(
+            "[prefill-keepset] '{}' active — PFA producer arms q_window={} \
+             (SnapKV per-head keep-set applied at post_prefill)",
+            arming.stage_name, arming.q_window
+        );
+        hook = hook.with_prefill_keepset(
+            stage,
+            arming.q_window,
+            model.config.num_attention_heads,
+            args.eviction_target_ratio(),
+        );
+    }
+
     // ── Trajectory mode dispatch ──────────────────────────────────────────
     // When `--qcf-trajectory` is active alongside `--qcf-dump` and
     // `--force-swap-ratio`, we run eval-ll K+1 times (K = decision layer

@@ -51,10 +51,6 @@ use crate::stages::kv::prefill_keepset::PrefillKeepSetStage;
 /// 15% headroom 은 decode loop 의 8-step pressure 캐시 지연(`PRESSURE_QUERY_INTERVAL`)을 덮는다.
 const KV_FILL_HIGH_WATER_PCT: u32 = 85;
 
-/// R-P1-1: PFA producer 무장 시 사용할 q_window 기본값(kvpress 관례). plugin policy 화(§8 열린 결정)는
-/// R-P1-2 에서 plugin StageParams 로 plumb. PR1 은 consumer plugin 0개라 dormant.
-const PFA_Q_WINDOW_DEFAULT: usize = 32;
-
 /// Phase 4-4-a: standard generate happy path 진입 가드.
 ///
 /// 다음을 모두 만족할 때만 `true`. 미통과 args는 generate.rs 기존 path 사용.
@@ -168,9 +164,10 @@ pub fn build_standard_loop(
     // byte-identical. cell 은 producer(ModelForward)와 consumer(PrefillKeepSetStage)가 공유한다.
     let n_heads_q = model.config.num_attention_heads;
     let pfa_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>> = Arc::new(Mutex::new(None));
-    let prefill_attn_stage_name =
-        crate::kv::eviction::stage_registry::find_prefill_attn_stage_name();
-    let arm_prefill_keepset = prefill_attn_stage_name.is_some();
+    // The shared caps-driven arming decision (the SAME one bench/eval now consult — the direction-B
+    // root-cause fix). `Some` iff a PFA-reading keep-set stage (pyramidkv) is registered.
+    let keepset_arming = crate::kv::eviction::stage_registry::resolve_prefill_keepset_arming();
+    let arm_prefill_keepset = keepset_arming.is_some();
     // L1-runtime format re-encode arming: only when `--kv-format` resolves to a registered
     // `KVFormatPolicy` (a single format name → `find_format_policy` None → not armed → byte-identical).
     let format_policy_name = kv_format_policy
@@ -215,23 +212,20 @@ pub fn build_standard_loop(
     // R-P1-1: PFA producer 무장(consumer plugin 발견 시에만). mf 가 move 되기 전 &mut 로 cell + q_window
     // 주입. 미무장(PR1)이면 미진입 → ModelForward 의 prefill PFA 경로는 wants_prefill_attn=false 로
     // byte-identical.
-    if arm_prefill_keepset {
+    if let Some(arming) = &keepset_arming {
         // R-P1-2: plumb the producer's observation window from the consuming stage's declared
-        // `prefill_attn_window` (its scoring `window_size`). SnapKV/PyramidKV need the SUM over
-        // EXACTLY `window_size` trailing queries — a mismatched window ranks different heavy hitters
-        // (the D1 divergence). Falls back to the engine default for a stage that declares none.
-        let q_window = crate::kv::eviction::stage_registry::find_prefill_attn_window()
-            .unwrap_or(PFA_Q_WINDOW_DEFAULT);
-        mf.set_prefill_attn(pfa_cell.clone(), q_window);
+        // `prefill_attn_window` (its scoring `window_size`), now resolved by the shared helper.
+        // SnapKV/PyramidKV need the SUM over EXACTLY `window_size` trailing queries — a mismatched
+        // window ranks different heavy hitters (the D1 divergence).
+        mf.set_prefill_attn(pfa_cell.clone(), arming.q_window);
         // Arming log, consistent with the [read-stage] / [format-reencode] sites below — the PFA
         // producer was previously silent. Surfaces the plumbed observation window (q_window) so a
         // run can confirm SnapKV/PyramidKV observe their `window_size` (not the 32 fallback).
-        if let Some(name) = prefill_attn_stage_name.as_ref() {
-            eprintln!(
-                "[prefill-keepset] '{name}' active — PFA producer arms q_window={q_window} \
-                 (SnapKV per-head keep-set staged at PrefillEnd)"
-            );
-        }
+        eprintln!(
+            "[prefill-keepset] '{}' active — PFA producer arms q_window={} \
+             (SnapKV per-head keep-set staged at PrefillEnd)",
+            arming.stage_name, arming.q_window
+        );
     }
 
     // KV format handles — eviction stage prune 대상 + resilience heartbeat + eviction 후
@@ -362,14 +356,14 @@ pub fn build_standard_loop(
     // 이 등록돼 있을 때만 submit — PR1 은 0개라 미진입(dormant, byte-identical). EvictionStage(KvMutate)
     // 와 phase-disjoint 라 submit 순서 무관. arm 시 needs_registry 가 true → 아래에서 kv_pos_handle 도
     // 자동 wire(§5.3a reconcile 활성).
-    if arm_prefill_keepset
+    if let Some(arming) = &keepset_arming
         && let Some(registry) = registry.as_ref()
-        && let Some(name) = prefill_attn_stage_name.as_ref()
-        && let Some(reg) = argus_extension_api::find_mutation_stage(name)
+        && let Some(stage) =
+            crate::kv::eviction::stage_registry::make_prefill_keepset_stage(&arming.stage_name)
     {
         registry.submit(Arc::new(PrefillKeepSetStage::new(
             kv_handles.clone(),
-            (reg.make)(argus_extension_api::StageParams::default(), &[]),
+            stage,
             pfa_cell.clone(),
             n_heads_q,
             eviction_target_ratio,

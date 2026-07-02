@@ -24,6 +24,69 @@ use crate::kv::standard_format::StandardFormat;
 use crate::pipeline::{LifecyclePhase, PipelineStage, StageContext, StageLifecycle, StageOutcome};
 use crate::stages::kv::mutation::SnapshotStageCtx;
 
+/// Apply a PFA-driven keep-set (SnapKV/PyramidKV) to a slice of resident caches at prefill end — the
+/// shared executor for EVERY loop (the direction-B Phase-2 unification). Loops over `caches` (enumerate
+/// order == layer idx), builds the per-layer `for_prefill_attn` READ view + an [`EngineCacheHandle`]
+/// WRITE view (the read view copies the cache scalars and borrows only `pfa`, so the two never alias),
+/// drives the stage's `on_phase`, and commits. Panic-safe per layer (an untrusted plugin's panic becomes
+/// an `Err`, never an unwind past the caller's cache bookkeeping). `pfa[layer]` is the producer's
+/// `[n_heads_q * prefix_len]` SUM-pooled attention for that layer; a layer with an empty cache or no PFA
+/// row is skipped.
+///
+/// [`PrefillKeepSetStage`] (the cli/bench registry path) calls this after `take_inner`; the eval loop
+/// (no registry, no `ModelForward`) calls it directly on its `&mut [KVCache]`. One executor ⇒ the keep-set
+/// is byte-identical across loops (the same kvpress oracle pins it — see
+/// `prefill_end_real_pyramidkv_byte_identical_vs_kvpress`).
+pub fn apply_prefill_keepset(
+    caches: &mut [KVCache],
+    stage: &dyn KVMutationStage,
+    pfa: &[Vec<f32>],
+    n_heads_q: usize,
+    target_ratio: f32,
+) -> anyhow::Result<()> {
+    let n_layers = caches.len();
+    for (layer_idx, cache) in caches.iter_mut().enumerate() {
+        let prefix_len = cache.current_pos();
+        if prefix_len == 0 || layer_idx >= pfa.len() {
+            continue;
+        }
+        let target_len = ((prefix_len as f32) * target_ratio) as usize;
+        // Read ctx with the per-layer PFA slice injected. `for_prefill_attn` copies the cache scalars
+        // and borrows ONLY `pfa` (outside the cache), so it coexists with the `&mut` handle below — the
+        // read view and the write view never alias.
+        let sctx = SnapshotStageCtx::for_prefill_attn(
+            cache,
+            target_len,
+            layer_idx,
+            n_layers,
+            &pfa[layer_idx],
+            n_heads_q,
+        );
+        let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
+        // catch_unwind (mirror of `KVMutationDriverStage`, P0-5a): a panic in an untrusted plugin's
+        // on_phase must not unwind past the caller's rewrap/bookkeeping. Convert it to an `anyhow::Err`.
+        let driven = catch_unwind(AssertUnwindSafe(move || -> anyhow::Result<()> {
+            let mut handle = handle;
+            stage.on_phase(&sctx, &mut handle).map_err(|e| {
+                anyhow::anyhow!("prefill keep-set stage '{}' failed: {e}", stage.name())
+            })?;
+            handle.commit()?;
+            Ok(())
+        }));
+        match driven {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "prefill keep-set stage '{}' panicked during on_phase/commit",
+                    stage.name()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `PrefillEnd` phase 에서 PFA 기반 keep-set 을 1회 적용하는 OneShot Stage.
 pub struct PrefillKeepSetStage {
     /// register 시점 보유 핸들 — enumerate 순서 == layer idx(EvictionStage 와 동일 W1 불변식).
@@ -86,54 +149,17 @@ impl PipelineStage for PrefillKeepSetStage {
             None => return Ok(StageOutcome::Consumed),
         };
 
-        // UER (Unwrap-Evict-Rewrap, EvictionStage 미러): take_inner → per-layer (stage.on_phase via the
-        // v3 handle) → put_inner. `?` 전파는 rewrap 이후로 미룬다(placeholder 폐기 보장).
+        // UER (Unwrap-Evict-Rewrap, EvictionStage 미러): take_inner → shared per-layer executor
+        // ([`apply_prefill_keepset`], the eval loop's twin) → put_inner. `?` 전파는 rewrap 이후로
+        // 미룬다(placeholder 폐기 보장).
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
-        let n_layers = temp.len();
-        let result = (|| -> anyhow::Result<()> {
-            for (layer_idx, cache) in temp.iter_mut().enumerate() {
-                let prefix_len = cache.current_pos();
-                if prefix_len == 0 || layer_idx >= pfa.len() {
-                    continue;
-                }
-                let target_len = ((prefix_len as f32) * self.target_ratio) as usize;
-                // Read ctx with the per-layer PFA slice injected. `for_prefill_attn` copies the cache
-                // scalars and borrows ONLY `pfa` (outside the cache), so it coexists with the `&mut`
-                // handle below — the read view and the write view never alias.
-                let sctx = SnapshotStageCtx::for_prefill_attn(
-                    cache,
-                    target_len,
-                    layer_idx,
-                    n_layers,
-                    &pfa[layer_idx],
-                    self.n_heads_q,
-                );
-                let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
-                // catch_unwind (mirror of `KVMutationDriverStage`, P0-5a): a panic in an untrusted
-                // plugin's on_phase must not unwind past the `put_inner` rewrap below (which would leave
-                // the StandardFormat handles empty). Convert it to an `anyhow::Err`.
-                let stage = self.stage.as_ref();
-                let driven = catch_unwind(AssertUnwindSafe(move || -> anyhow::Result<()> {
-                    let mut handle = handle;
-                    stage.on_phase(&sctx, &mut handle).map_err(|e| {
-                        anyhow::anyhow!("prefill keep-set stage '{}' failed: {e}", stage.name())
-                    })?;
-                    handle.commit()?;
-                    Ok(())
-                }));
-                match driven {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        return Err(anyhow::anyhow!(
-                            "prefill keep-set stage '{}' panicked during on_phase/commit",
-                            self.stage.name()
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        })();
+        let result = apply_prefill_keepset(
+            &mut temp,
+            self.stage.as_ref(),
+            pfa,
+            self.n_heads_q,
+            self.target_ratio,
+        );
         for (f, c) in self.handles.iter().zip(temp) {
             f.put_inner(c);
         }
@@ -462,6 +488,39 @@ mod tests {
         // 압축 후 head h pos i 값 = (h*1000 + kept_h[i] + 1). kv0 keeps even {0,2,4,6}, kv1 odd {1,3,5,7}.
         let inner = handle.take_inner();
         let k = inner.k_buffer.as_slice::<f32>();
+        let expected: [[usize; 4]; 2] = [[0, 2, 4, 6], [1, 3, 5, 7]];
+        for (kv, kept) in expected.iter().enumerate() {
+            for (i, &orig) in kept.iter().enumerate() {
+                let off = (kv * MAX_SEQ + i) * HEAD_DIM; // HeadMajor offset.
+                assert_eq!(
+                    k[off],
+                    (kv * 1000 + orig + 1) as f32,
+                    "kv-head {kv} compacted pos {i} should hold original pos {orig}"
+                );
+            }
+        }
+    }
+
+    /// The eval/bench NO-REGISTRY entry: [`apply_prefill_keepset`] driven DIRECTLY on a `&mut [KVCache]`
+    /// slice (no StandardFormat handles, no decode-loop registry — exactly what
+    /// `EvictionHook::post_prefill` does in the eval loop) applies the SAME per-head keep-set as the
+    /// `PrefillKeepSetStage` registry path (cli/bench). Pins the direction-B unification: the loops decide
+    /// byte-identically because they share this one executor. (Real-pyramidkv-via-`apply_prefill_keepset`
+    /// is covered by `prefill_end_real_pyramidkv_byte_identical_vs_kvpress`, which now delegates here.)
+    #[test]
+    fn eval_entry_apply_prefill_keepset_perhead_headmajor() {
+        let n_kv_heads = 2;
+        let n_heads_q = 4; // GQA 2:1.
+        let prefix_len = 8;
+        let target = 4; // ratio 0.5.
+        let mut caches = vec![make_head_major_cache(n_kv_heads, prefix_len)];
+        let pfa = vec![divergent_pfa(n_heads_q, n_kv_heads, prefix_len)];
+
+        apply_prefill_keepset(&mut caches, &PerHeadTopKStage, &pfa, n_heads_q, 0.5).unwrap();
+
+        assert_eq!(caches[0].current_pos(), target, "per-head keep len");
+        // kv0 keeps even {0,2,4,6}, kv1 odd {1,3,5,7} — same divergent result as the registry path.
+        let k = caches[0].k_buffer.as_slice::<f32>();
         let expected: [[usize; 4]; 2] = [[0, 2, 4, 6], [1, 3, 5, 7]];
         for (kv, kept) in expected.iter().enumerate() {
             for (i, &orig) in kept.iter().enumerate() {

@@ -938,10 +938,21 @@ fn run_full_prefill<C: EvalCacheKind>(
     );
 
     let fp_need = kv_caches.first().is_some_and(|c| c.needs_scores());
-    // Faithful-H2O (c): arm a full-prompt-window PFA producer so the batched prefill emits per-key
-    // column-sums (CPU prefill only; GPU early-returns → buffer stays zero, harmless). `usize::MAX`
-    // clamps to the prompt length.
-    let mut pfa_buf: Option<Vec<Vec<f32>>> = eval_config.faithful_h2o.then(|| {
+    // PFA producer arming — unified across faithful-H2O and the direction-B prefill keep-set:
+    //   * faithful-H2O (c): a FULL-prompt-window producer (`usize::MAX` clamps to prompt_len) whose
+    //     per-key column-sums seed the score accumulator (eviction policy "h2o").
+    //   * keep-set (pyramidkv): a producer at the stage's `window_size` (asked of the hook via
+    //     `prefill_attn_window`, the SAME caps-driven window cli/bench arm at), consumed by the hook's
+    //     `post_prefill` per-head keep-set (the "none" happy path).
+    // The two are mutually exclusive. `None` from both → no producer → byte-identical. On a GPU backend
+    // the host-mirror PFA (standard_format.rs, reached via `forward_into`) fills the buffer with a real
+    // per-key attention, so the per-head keep-set is faithful on device too — not a CPU-only path.
+    let pfa_window: Option<usize> = if eval_config.faithful_h2o {
+        Some(usize::MAX)
+    } else {
+        hook.prefill_attn_window()
+    };
+    let mut pfa_buf: Option<Vec<Vec<f32>>> = pfa_window.map(|_| {
         let c = &model.config;
         (0..c.num_hidden_layers)
             .map(|_| vec![0.0f32; c.num_attention_heads * prompt_len])
@@ -965,25 +976,30 @@ fn run_full_prefill<C: EvalCacheKind>(
             cache_self_need_scores: fp_need,
             layer_boundary_hook: None,
             read_stage: None,
-            prefill_attn: pfa_buf.as_mut().map(|b| (b, usize::MAX)),
+            prefill_attn: pfa_buf.as_mut().zip(pfa_window),
             prefill_attn_per_row: None,
         })
     })?;
 
-    // Faithful-H2O (c): fold the prefill column-sums into the eval score accumulator (the same one
-    // h2o eviction ranks on). Replaces the query probe under faithful (suppressed in the caller).
-    if let Some(buf) = pfa_buf
-        && let Some(acc) = hook.score_accumulator()
-    {
-        let c = &model.config;
-        crate::inference::attention_scores::seed_prefill_importance_dual(
-            acc,
-            backend.as_ref(),
-            &buf,
-            prompt_len,
-            c.num_attention_heads,
-            c.num_key_value_heads,
-        );
+    // Consume the PFA: faithful-H2O folds the column-sums into the eval score accumulator (the same one
+    // h2o eviction ranks on, replacing the query probe); the keep-set hands the buffer to the hook to
+    // apply its per-head keep-set at `post_prefill`.
+    if let Some(buf) = pfa_buf {
+        if eval_config.faithful_h2o {
+            if let Some(acc) = hook.score_accumulator() {
+                let c = &model.config;
+                crate::inference::attention_scores::seed_prefill_importance_dual(
+                    acc,
+                    backend.as_ref(),
+                    &buf,
+                    prompt_len,
+                    c.num_attention_heads,
+                    c.num_key_value_heads,
+                );
+            }
+        } else {
+            hook.stage_prefill_attn(buf);
+        }
     }
 
     // Read logits (only last position — much smaller than full prompt × vocab)
