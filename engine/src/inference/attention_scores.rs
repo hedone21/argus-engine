@@ -294,8 +294,33 @@ pub fn seed_prefill_importance_dual(
     n_kv_heads: usize,
 ) {
     seed_prefill_importance(acc, pfa, prefix_len, n_heads_q, n_kv_heads);
-    #[cfg(not(feature = "opencl"))]
-    let _ = backend; // GPU seed only exists on the OpenCL backend.
+    #[cfg(not(any(feature = "opencl", feature = "cuda")))]
+    let _ = backend; // GPU seed only exists on a GPU backend.
+
+    // CUDA twin of the GPU prefill seed (discrete-GPU / Jetson). Mirrors the OpenCL
+    // arithmetic exactly; the accumulator's transfer calls take no queue/stream.
+    #[cfg(feature = "cuda")]
+    if let Some(cuda_be) = backend
+        .as_any()
+        .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+        && let Some(gpu_acc) = cuda_be.gpu_score_acc_mut()
+        && gpu_acc.is_active()
+    {
+        let flat = acc.raw_importance_scores().to_vec();
+        if let Some(head) = acc.head_importance_scores()
+            && let Err(e) = gpu_acc.seed_cumulative(&flat, head)
+        {
+            log::warn!("faithful-H2O CUDA prefill seed skipped: {e}");
+        }
+        if let Some(layer_flat) = acc.layer_flat_importance() {
+            let layer_flat = layer_flat.to_vec();
+            gpu_acc.enable_per_layer_flat();
+            if let Err(e) = gpu_acc.seed_layer_flat_cumulative(&layer_flat) {
+                log::warn!("faithful-H2O CUDA per-layer prefill seed skipped: {e}");
+            }
+        }
+    }
+
     #[cfg(feature = "opencl")]
     if let Some(ocl) = backend
         .as_any()

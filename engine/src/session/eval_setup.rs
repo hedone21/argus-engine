@@ -333,7 +333,34 @@ fn build_eval_score_accumulator(
             }
         }
     }
-    let _ = backend; // opencl feature off 일 때 미사용 경고 회피.
+    // CUDA twin of the GPU-accumulator init (discrete-GPU / Jetson).
+    #[cfg(feature = "cuda")]
+    if needs_score_based
+        && let Some(cuda_be) = backend
+            .as_any()
+            .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+    {
+        match cuda_be.init_gpu_score_acc(
+            model.config.num_hidden_layers,
+            model.config.num_attention_heads,
+            model.config.num_key_value_heads,
+            max_seq_len,
+            args.h2o_decay(),
+        ) {
+            Ok(()) => {
+                if let Some(gpu_acc) = cuda_be.gpu_score_acc_mut() {
+                    gpu_acc.set_active(true);
+                }
+                eprintln!(
+                    "[GPU Score] CUDA accumulator initialized — per-token readback eliminated"
+                );
+            }
+            Err(e) => {
+                eprintln!("[GPU Score] CUDA init failed (falling back to CPU path): {e}");
+            }
+        }
+    }
+    let _ = backend; // opencl/cuda feature off 일 때 미사용 경고 회피.
 
     Some(acc)
 }
@@ -682,6 +709,8 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
 
     // quant-window native attention handle 을 caps 에서 1회 pull (closure 밖). OpenCL 면 Some.
     let quant_attn_cap = caps.get::<dyn QuantAttnBackend>();
+    // CUDA twin (P4b): the `kivi_abi` CudaQuantAttnBackend cap (Some only on CUDA + --backend-cap).
+    let quant_attn_cuda_cap = caps.get::<dyn argus_extension_api::CudaQuantAttnBackend>();
     let mut kv_caches: Vec<QuantizedRecentWindowCache> = (0..num_layers)
         .map(|_| {
             QuantizedRecentWindowCache::new_gpu(
@@ -692,6 +721,7 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
                 quant_window_bits,
                 backend.clone(),
                 quant_attn_cap.clone(),
+                quant_attn_cuda_cap.clone(),
                 memory.clone(),
             )
         })

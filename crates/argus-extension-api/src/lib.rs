@@ -2879,6 +2879,256 @@ pub fn registered_score_reducer_names() -> Vec<&'static str> {
     SCORE_REDUCERS.iter().map(|r| r.name).collect()
 }
 
+// ── OBSERVER/SCORE axis — (b) GPU half: the CUDA twin of ScoreReduceBackend ─────────────────────
+//
+// The OpenCL score-reduce seam above carries `cl_context`/`cl_command_queue`/`cl_mem` as `*mut c_void`.
+// CUDA device pointers are `u64` (CUdeviceptr), not pointers, so a parallel POD set keeps the typing
+// honest and lets a plugin register BOTH an OpenCL and a CUDA reducer under the same name in DISJOINT
+// slices (no collision). Registration is static-linkme only (no live cdylib), so these `repr(C)` structs
+// are a future-proofing gesture, not a frozen C-ABI. All scalar fields mirror `ScoreReduceArgs`.
+
+/// GPU context handles lent to a [`CudaScoreReduceBackend`] factory at construction (repr(C) POD).
+/// The CUDA analog of [`ScoreReduceMakeArgs`]; `build_opts` is replaced by the compute capability
+/// (the plugin derives nvcc `-arch=sm_{major}{minor}` from it).
+#[repr(C)]
+pub struct CudaScoreReduceMakeArgs {
+    /// Raw `CUcontext` (from `CudaContext::cu_ctx()`) the engine's score buffers live in. Borrowed.
+    pub cu_context: *mut c_void,
+    /// `CUdevice` ordinal (also the ordinal for `CudaContext::from_raw_context`). Borrowed.
+    pub cu_device: i32,
+    /// Compute capability major (for `nvcc -arch=sm_{major}{minor}`).
+    pub cc_major: i32,
+    /// Compute capability minor.
+    pub cc_minor: i32,
+}
+
+/// Per-dispatch args for a CUDA score reduce (repr(C) POD). The CUDA analog of [`ScoreReduceArgs`]:
+/// `cl_queue` → `cu_stream` (raw `CUstream`), and every `cl_mem` → a raw `CUdeviceptr` (`u64`). All
+/// buffers are engine-owned and lent for the call; the scalar fields are identical to the OpenCL args.
+#[repr(C)]
+pub struct CudaScoreReduceArgs {
+    /// Raw `CUstream` (from `CudaStream::cu_stream()`) to launch on. Borrowed.
+    pub cu_stream: *mut c_void,
+    /// `CUdeviceptr` of `[n_layers, n_heads_q, score_stride]` post-softmax scores, read-only. Borrowed.
+    pub score_buf: u64,
+    /// `CUdeviceptr` of `[max_seq_len]` cumulative flat importance, updated in place. Borrowed.
+    pub importance: u64,
+    /// `CUdeviceptr` of `[n_kv_heads * max_seq_len]` cumulative per-head importance, in place. Borrowed.
+    pub head_importance: u64,
+    /// `1.0 - decay`, pre-clamped to `[0,1]` by the engine.
+    pub decay_factor: f32,
+    pub n_layers: usize,
+    pub n_heads_q: usize,
+    /// `<= 16` for the fused kernel's stack array.
+    pub n_kv_heads: usize,
+    /// Work-items `0..cache_seq_len`.
+    pub cache_seq_len: usize,
+    /// Row stride of `score_buf` (== `max_seq_len`).
+    pub score_stride: usize,
+    /// Capacity stride of the cumulative buffers (== `max_seq_len`).
+    pub max_seq_len: usize,
+    /// `CUdeviceptr` of `[n_layers * max_seq_len]` per-layer flat importance; `0` on the collapsed-only
+    /// path (mirrors [`ScoreReduceArgs::layer_flat_importance`]).
+    pub layer_flat_importance: u64,
+}
+
+/// A CUDA score reducer — the device-side arithmetic of the observer/score axis. The CUDA twin of
+/// [`ScoreReduceBackend`]; the engine drives one [`reduce`](CudaScoreReduceBackend::reduce) per decode
+/// step on the lent stream.
+pub trait CudaScoreReduceBackend: Send + Sync {
+    /// Registry key (matched to the score producer name, e.g. `"attn_score"`).
+    fn name(&self) -> &str;
+    /// Dispatch the per-token fused reduce on `args.cu_stream`. Returns `0` on success, a negative code
+    /// on failure. Must not panic.
+    fn reduce(&self, args: &CudaScoreReduceArgs) -> i32;
+    /// Per-layer flat reduce (the `layer_flat_importance` path). Default `-1` (unsupported).
+    fn reduce_per_layer(&self, _args: &CudaScoreReduceArgs) -> i32 {
+        -1
+    }
+}
+
+/// Registration entry for one CUDA score reducer — the CUDA mirror of [`ScoreReduceReg`], static-linkme
+/// only.
+pub struct CudaScoreReduceReg {
+    /// Reducer name (registry key). Unique within the slice; matched to the producer name.
+    pub name: &'static str,
+    /// Factory from the lent CUDA context. Borrows `args` for the call only.
+    pub make: fn(&CudaScoreReduceMakeArgs) -> Result<Box<dyn CudaScoreReduceBackend>, String>,
+}
+
+/// Global CUDA score-reducer registration slice — the CUDA twin of [`SCORE_REDUCERS`]. The built-in
+/// attention-score reducer registers here via `#[distributed_slice(CUDA_SCORE_REDUCERS)]` under the
+/// `cuda` feature, disjoint from (and coexisting with) the OpenCL `SCORE_REDUCERS` registration.
+#[distributed_slice]
+pub static CUDA_SCORE_REDUCERS: [CudaScoreReduceReg] = [..];
+
+/// Find a registered CUDA score reducer by name.
+pub fn find_cuda_score_reducer(name: &str) -> Option<&'static CudaScoreReduceReg> {
+    CUDA_SCORE_REDUCERS.iter().find(|r| r.name == name)
+}
+
+// ─── CUDA QuantAttn (ATTENTION backend-cap) axis ────────────────────────────────────────────────
+//
+// The CUDA twin of the OpenCL [`QuantAttnBackend`] family (KIVI quantized-KV fused attention). Same
+// handle-translation rule as the CUDA score axis: `cl_context`→`cu_context:*mut c_void`;
+// `cl_device_id`+`build_opts`→`cu_device:i32`+`cc_major/cc_minor:i32` (nvcc `-arch=sm_XY`);
+// `cl_command_queue`→`cu_stream:*mut c_void`; every `cl_mem`(`*mut c_void`)→`u64` CUdeviceptr;
+// `scores_out` stays `*mut f32` (host readback pointer, NOT a device buffer). Registered in a DISJOINT
+// static-linkme slice (`CUDA_QUANT_ATTN_REGS`) — no cdylib `QuantAttnVTable` twin, no new
+// `BACKEND_CAP_CATEGORY_*` (the CUDA axis is static-linkme only, like the score axis). All scalar
+// fields mirror the OpenCL args 1:1; `#[repr(C)]` is future-proofing, not a frozen C-ABI.
+
+/// GPU context handles lent to a [`CudaQuantAttnBackend`] factory at construction (repr(C) POD).
+/// CUDA analog of [`QuantAttnMakeArgs`]; `build_opts` is replaced by the compute capability.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CudaQuantAttnMakeArgs {
+    /// Raw `CUcontext` (from `CudaContext::cu_ctx()`) the engine's KV buffers live in. Borrowed.
+    pub cu_context: *mut c_void,
+    /// `CUdevice` ordinal (also the ordinal for `CudaContext::from_raw_context`). Borrowed.
+    pub cu_device: i32,
+    /// Compute capability major (for `nvcc -arch=sm_{major}{minor}`).
+    pub cc_major: i32,
+    /// Compute capability minor.
+    pub cc_minor: i32,
+}
+
+/// Per-call args for CUDA fused dequant+attention (repr(C) POD). CUDA analog of [`QuantAttnArgs`]:
+/// `cl_queue`→`cu_stream`, six `cl_mem`→`u64` CUdeviceptr, `scores_out` stays `*mut f32` (host).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CudaQuantAttnArgs {
+    /// Raw `CUstream` to launch on (may be null == default stream). Borrowed.
+    pub cu_stream: *mut c_void,
+    /// `CUdeviceptr` of Q `[num_heads_q, head_dim]` F32. Borrowed.
+    pub q_mem: u64,
+    /// `CUdeviceptr` of quantized key blocks (per-channel, flush-interleaved). Borrowed.
+    pub qk_mem: u64,
+    /// `CUdeviceptr` of quantized value blocks (per-token, flush-interleaved). Borrowed.
+    pub qv_mem: u64,
+    /// `CUdeviceptr` of F32 residual keys `[kv_heads, res_cap, head_dim]`. Borrowed.
+    pub res_k_mem: u64,
+    /// `CUdeviceptr` of F32 residual values `[kv_heads, res_cap, head_dim]`. Borrowed.
+    pub res_v_mem: u64,
+    /// `CUdeviceptr` of output `[num_heads_q, head_dim]` F32, written. Borrowed.
+    pub out_mem: u64,
+    /// Host pointer for post-softmax score readback (may be null == skip). NOT a device buffer.
+    pub scores_out: *mut f32,
+    pub scores_len: usize,
+    pub num_heads_q: usize,
+    pub num_heads_kv: usize,
+    pub head_dim: usize,
+    pub q_tokens: usize,
+    pub res_tokens: usize,
+    pub res_cap: usize,
+    pub scale: f32,
+    pub bits: u8,
+}
+
+/// Per-call args for the CUDA residual gather-update (repr(C) POD). CUDA analog of [`QuantAttnGatherArgs`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CudaQuantAttnGatherArgs {
+    /// Raw `CUstream` (may be null == default stream). Borrowed.
+    pub cu_stream: *mut c_void,
+    /// `CUdeviceptr` of input `[seq_len, kv_heads, head_dim]` F32. Borrowed.
+    pub input_mem: u64,
+    /// `CUdeviceptr` of residual `[kv_heads, res_cap, head_dim]` F32, written. Borrowed.
+    pub residual_mem: u64,
+    pub kv_heads: usize,
+    pub res_cap: usize,
+    pub head_dim: usize,
+    pub seq_len: usize,
+    pub res_pos: usize,
+}
+
+/// Per-call args for the CUDA Q2 dequant-flush (repr(C) POD). CUDA analog of [`QuantDequantFlushArgs`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CudaQuantDequantFlushArgs {
+    /// Raw `CUstream` (may be null == default stream). Borrowed.
+    pub cu_stream: *mut c_void,
+    /// `CUdeviceptr` of source quantized blocks. Borrowed.
+    pub q_blocks_mem: u64,
+    /// `CUdeviceptr` of destination F16 attention buffer. Borrowed.
+    pub attn_mem: u64,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    /// K: groups_per_flush; V: flush_tokens.
+    pub n_groups_or_tokens: usize,
+    pub tok_base: usize,
+    pub block_start: usize,
+    pub bits: u8,
+    pub is_key: bool,
+}
+
+/// Per-call args for the CUDA residual-scatter into the F16 view (repr(C) POD). CUDA analog of
+/// [`QuantScatterResidualArgs`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CudaQuantScatterResidualArgs {
+    /// Raw `CUstream` (may be null == default stream). Borrowed.
+    pub cu_stream: *mut c_void,
+    /// `CUdeviceptr` of F32 residual ring source. Borrowed.
+    pub res_mem: u64,
+    /// `CUdeviceptr` of F16 attention view destination. Borrowed.
+    pub attn_mem: u64,
+    pub kv_heads: usize,
+    pub res_cap: usize,
+    pub head_dim: usize,
+    pub res_pos: usize,
+    pub tok_base: usize,
+}
+
+/// A CUDA quantized-KV attention backend — the CUDA twin of [`QuantAttnBackend`]. Like the OpenCL
+/// trait it has NO `name` method (the name lives on [`CudaQuantAttnReg`]). Returns `0` on success, a
+/// negative code on failure; must not panic (C3 panic=abort across the C boundary in the OpenCL twin —
+/// kept here for symmetry even though the CUDA axis is static-linkme).
+pub trait CudaQuantAttnBackend: Send + Sync {
+    /// Whether a native fused attention kernel exists for `bits` (2/4/8).
+    fn has_quant_attn_kernel(&self, bits: u8) -> bool;
+    /// Advisory nosub flag (mirrors the OpenCL twin; the engine reads the real flag off the backend).
+    fn is_nosub_device(&self) -> bool;
+    /// Fused dequant+attention on `args.cu_stream`.
+    fn attention_gen_quant(&self, args: &CudaQuantAttnArgs) -> i32;
+    /// Residual gather-update.
+    fn gather_update_quant(&self, args: &CudaQuantAttnGatherArgs) -> i32;
+    /// Q2 dequant-flush into the F16 view. Default `-1` (unsupported).
+    fn dequant_flush(&self, _args: &CudaQuantDequantFlushArgs) -> i32 {
+        -1
+    }
+    /// Residual scatter into the F16 view. Default `-1` (unsupported).
+    fn scatter_residual(&self, _args: &CudaQuantScatterResidualArgs) -> i32 {
+        -1
+    }
+}
+
+/// Registration entry for one CUDA quant-attn backend — the CUDA mirror of [`QuantAttnReg`],
+/// static-linkme only. `make` returns `Result` (nvcc/PTX compile can fail at runtime), unlike the
+/// OpenCL `QuantAttnReg` whose `make` is infallible.
+pub struct CudaQuantAttnReg {
+    /// Registry key (e.g. `"kivi_abi"`, matched to the OpenCL `--backend-cap` selector).
+    pub name: &'static str,
+    /// Factory from the lent CUDA context. Borrows `args` for the call only.
+    pub make: fn(&CudaQuantAttnMakeArgs) -> Result<Box<dyn CudaQuantAttnBackend>, String>,
+}
+
+/// Global CUDA quant-attn registration slice — the CUDA twin of [`QUANT_ATTN_REGS`]. Disjoint from
+/// the OpenCL slice and the dynamic `PLUGIN_BACKEND_CAP_VTABLES` path; the KIVI plugin registers here
+/// under the `cuda` feature.
+#[distributed_slice]
+pub static CUDA_QUANT_ATTN_REGS: [CudaQuantAttnReg] = [..];
+
+/// Find a registered CUDA quant-attn backend by name.
+pub fn find_cuda_quant_attn(name: &str) -> Option<&'static CudaQuantAttnReg> {
+    CUDA_QUANT_ATTN_REGS.iter().find(|r| r.name == name)
+}
+
+/// Names of all statically-registered CUDA quant-attn backends (fat-LTO name-survival diagnostics).
+pub fn registered_cuda_quant_attn_names() -> Vec<&'static str> {
+    CUDA_QUANT_ATTN_REGS.iter().map(|r| r.name).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

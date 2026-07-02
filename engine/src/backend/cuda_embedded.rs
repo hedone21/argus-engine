@@ -710,10 +710,10 @@ impl CudaBackend {
     #[inline]
     fn invalidate_q8_cache_if_matches(&self, written_ptr: u64) {
         let mut c = self.q8_1_cache.lock().unwrap();
-        if let Some((cached_ptr, _)) = *c {
-            if cached_ptr == written_ptr {
-                *c = None;
-            }
+        if let Some((cached_ptr, _)) = *c
+            && cached_ptr == written_ptr
+        {
+            *c = None;
         }
     }
 
@@ -1262,7 +1262,7 @@ fn fallback_counter(tag: &str) -> &'static AtomicU64 {
 fn cpu_fallback_log(tag: &'static str) {
     let c = fallback_counter(tag);
     let n = c.fetch_add(1, Ordering::Relaxed) + 1;
-    if std::env::var("LLM_RS_TRACE_FALLBACK").is_ok() && (n <= 3 || n % 500 == 0) {
+    if std::env::var("LLM_RS_TRACE_FALLBACK").is_ok() && (n <= 3 || n.is_multiple_of(500)) {
         eprintln!("[cpu_fallback] {}: count={}", tag, n);
     }
 }
@@ -1480,7 +1480,6 @@ impl Backend for CudaBackend {
                 let out_dev = Self::get_device_ptr(out.buffer().as_ref());
                 if let (Some(a_ptr), Some(b_ptr), Some(out_ptr)) = (a_dev, b_dev, out_dev) {
                     const GEMV_WARP: u32 = 32;
-                    const Q4_0_NWARPS: u32 = 4;
                     const MMVQ_NWARPS: u32 = 4;
                     let k_i32 = k_u as i32;
                     let n_i32 = n_u as i32;
@@ -2285,13 +2284,7 @@ impl Backend for CudaBackend {
         }
         let head_dim = dims[rank - 1];
         let n_heads = dims[rank - 2];
-        let seq_len: usize = dims[..rank - 1]
-            .iter()
-            .rev()
-            .skip(1)
-            .next()
-            .copied()
-            .unwrap_or(1);
+        let seq_len: usize = dims[..rank - 1].iter().rev().nth(1).copied().unwrap_or(1);
 
         let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "rope_inplace x")?;
         self.invalidate_q8_cache_if_matches(x_ptr);
@@ -2648,11 +2641,7 @@ impl Backend for CudaBackend {
         // We pin the MutexGuard for the duration of the launch so the underlying
         // CudaHostBuffer lives at least until the device sync below.
         let (score_dptr, score_stride_i32, scratch_guard) = if let Some(ref slice) = scores_out {
-            let stride = if num_heads_q == 0 {
-                0
-            } else {
-                slice.len() / num_heads_q
-            };
+            let stride = slice.len().checked_div(num_heads_q).unwrap_or(0);
             if stride == 0 || stride < cache_seq_len {
                 // Malformed caller buffer: disable GPU score export to avoid OOB.
                 (0u64, 0i32, None)
@@ -2932,8 +2921,7 @@ impl Backend for CudaBackend {
         // SAFETY: caller (async swap dispatcher) keeps `src` alive
         // until the event we record below has fired. Stream is owned
         // by this backend.
-        dev_buf
-            .copy_from_host_async(src_ptr, size, transfer_stream.cu_stream() as _)
+        unsafe { dev_buf.copy_from_host_async(src_ptr, size, transfer_stream.cu_stream() as _) }
             .with_context(|| format!("async weight H2D copy ({size} bytes)"))?;
 
         let event = self
@@ -2965,6 +2953,11 @@ impl Backend for CudaBackend {
     /// Downcasts the dst buffer to `CudaDeviceBuffer` and reuses its
     /// device pointer — no `cuMemAlloc` happens here. Caller must keep
     /// `src..src+len` alive until the returned event fires.
+    ///
+    /// `not_unsafe_ptr_arg_deref`: this is a `Backend` trait method whose
+    /// signature (`src: *const u8`) is fixed by the trait; the raw-pointer
+    /// safety contract is documented above and upheld by the caller.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn enqueue_write_into_async(
         &self,
         dst: &crate::tensor::Tensor,
@@ -3032,8 +3025,10 @@ impl Backend for CudaBackend {
             return Ok(crate::backend::GpuEvent::default());
         };
 
-        cuda_buf
-            .copy_from_host_async(src, len, transfer_stream.cu_stream() as _)
+        // SAFETY: caller keeps `src` alive until the recorded event fires
+        // (sync fallback above covers the no-stream case). Stream is owned
+        // by this backend.
+        unsafe { cuda_buf.copy_from_host_async(src, len, transfer_stream.cu_stream() as _) }
             .with_context(|| format!("async H2D into pool buffer ({len} bytes)"))?;
 
         let event = self

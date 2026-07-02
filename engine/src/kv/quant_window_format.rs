@@ -175,14 +175,27 @@ impl KVCacheFormat for QuantWindowFormat {
         // object) rather than `backend.as_quant_attn()`, and the nosub device
         // property is read off the backend directly (byte-identical to the prior
         // `cap.is_nosub_device()` which delegated to `OpenCLBackend::is_nosub`).
+        // Native gate: OpenCL (`quant_attn_cap`) OR CUDA (`quant_attn_cuda_cap`, P4b) must expose a
+        // kernel for `raw.bits`, and there must be tokens. The two caps are distinct TypeIds, so check
+        // both — on CUDA the OpenCL cap is always None (and vice versa).
         let use_native = backend.is_gpu()
             && backend.is_nosub_device()
             && cache
                 .get_quant_window_raw_buffers()
-                .zip(cache.quant_attn_cap())
-                .map(|(raw, quant_attn_be)| {
-                    quant_attn_be.has_quant_attn_kernel(raw.bits)
-                        && (raw.q_tokens + raw.res_tokens) > 0
+                .map(|raw| {
+                    let tokens = (raw.q_tokens + raw.res_tokens) > 0;
+                    let opencl_ok = cache
+                        .quant_attn_cap()
+                        .map(|c| c.has_quant_attn_kernel(raw.bits))
+                        .unwrap_or(false);
+                    #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+                    let cuda_ok = cache
+                        .quant_attn_cuda_cap()
+                        .map(|c| c.has_quant_attn_kernel(raw.bits))
+                        .unwrap_or(false);
+                    #[cfg(not(any(feature = "cuda", feature = "cuda-embedded")))]
+                    let cuda_ok = false;
+                    tokens && (opencl_ok || cuda_ok)
                 })
                 .unwrap_or(false);
 
@@ -251,77 +264,149 @@ impl QuantWindowFormat {
         scores: Option<&mut [f32]>,
         cache: &mut QuantizedRecentWindowCache,
     ) -> Result<()> {
-        let n_heads_kv = cache.kv_heads();
-        let head_dim = cache.head_dim();
-        // Stage E: pull the cap from the cache's `quant_attn` handle (the same Arc
-        // the gate checks), cloned so its borrow of `cache` ends before the
-        // `set_attn_scores` (&mut) below. `backend` now only lends its cl_queue.
-        let quant_attn_be = cache
-            .quant_attn_cap()
-            .expect("attention_native gated on quant_attn_cap().is_some()")
-            .clone();
-        let raw = cache
-            .get_quant_window_raw_buffers()
-            .expect("attention_native gated on get_quant_window_raw_buffers().is_some()");
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let total = raw.q_tokens + raw.res_tokens;
-
-        // native 커널 score 임시 버퍼 (caller scores 유무로 게이팅).
-        let mut tmp_scores: Vec<f32> = if scores.is_some() {
-            vec![0.0; n_heads_q * total]
-        } else {
-            Vec::new()
-        };
-        // D8: ABI struct(cl_mem) 시그니처. `&Tensor` 6개를 raw cl_mem 으로 추출해
-        // `QuantAttnArgs` 패킹. score 는 `(ptr, len)` 으로 변환(None → (null, 0)).
-        // cl_queue 는 엔진의 live `cl_command_queue` 를 넘긴다(Stage E): borrowed-context
-        // dlopen plugin 이 같은 in-order 큐에 enqueue 해야 score readback 순서가 보존된다.
-        // 엔진 내장 OpenCL impl 은 이 슬롯을 무시하고 `&self.queue` 를 직접 쓰므로 무영향.
-        use crate::backend::opencl::get_cl_mem;
-        // `Mem::as_ptr()` 는 이미 `cl_mem`(= `*mut c_void`) 를 반환하므로 캐스트 불요.
-        let q_mem = get_cl_mem(q.buffer().as_ref())?.as_ptr();
-        let qk_mem = get_cl_mem(raw.qk_buf.buffer().as_ref())?.as_ptr();
-        let qv_mem = get_cl_mem(raw.qv_buf.buffer().as_ref())?.as_ptr();
-        let res_k_mem = get_cl_mem(raw.res_k.buffer().as_ref())?.as_ptr();
-        let res_v_mem = get_cl_mem(raw.res_v.buffer().as_ref())?.as_ptr();
-        let out_mem = get_cl_mem(out.buffer().as_ref())?.as_ptr();
-        let (scores_ptr, scores_len): (*mut f32, usize) = if scores.is_some() {
-            (tmp_scores.as_mut_ptr(), tmp_scores.len())
-        } else {
-            (std::ptr::null_mut(), 0)
-        };
-        let args = crate::backend::QuantAttnArgs {
-            cl_queue: backend.cl_command_queue_ptr(),
-            q_mem,
-            qk_mem,
-            qv_mem,
-            res_k_mem,
-            res_v_mem,
-            out_mem,
-            scores_out: scores_ptr,
-            scores_len,
-            num_heads_q: n_heads_q,
-            num_heads_kv: n_heads_kv,
-            head_dim,
-            q_tokens: raw.q_tokens,
-            res_tokens: raw.res_tokens,
-            res_cap: raw.res_cap,
-            scale,
-            bits: raw.bits,
-        };
-        let rc = quant_attn_be.attention_gen_quant(&args);
-        if rc != 0 {
-            anyhow::bail!("quant-window attention_gen_quant failed (rc={rc})");
+        // Native fused dequant+attention marshals `cl_mem` handles into `QuantAttnArgs` and is
+        // OpenCL-only today. `attention_into` only routes here when a quant_attn cap with a GPU
+        // kernel is present (KIVI, OpenCL-only), so on a non-opencl (CUDA/CPU) build this is
+        // unreachable — bail defensively. The CUDA analog lands with the KIVI-CUDA cap.
+        // P4b: CUDA native fused dequant+attention (KIVI `kivi_abi` cap). Mirrors the OpenCL block
+        // below via the `quant_window_cuda` helper — pulls the cuda cap + raw device buffers, packs
+        // `CudaQuantAttnArgs`, dispatches `attention_gen_quant`, and folds scores back like OpenCL.
+        #[cfg(feature = "cuda")]
+        {
+            let n_heads_kv = cache.kv_heads();
+            let head_dim = cache.head_dim();
+            let cap = cache
+                .quant_attn_cuda_cap()
+                .expect("attention_native gated on quant_attn_cuda_cap().is_some()")
+                .clone();
+            let raw = cache
+                .get_quant_window_raw_buffers()
+                .expect("attention_native gated on get_quant_window_raw_buffers().is_some()");
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let total = raw.q_tokens + raw.res_tokens;
+            let mut tmp_scores: Vec<f32> = if scores.is_some() {
+                vec![0.0; n_heads_q * total]
+            } else {
+                Vec::new()
+            };
+            let (scores_ptr, scores_len): (*mut f32, usize) = if scores.is_some() {
+                (tmp_scores.as_mut_ptr(), tmp_scores.len())
+            } else {
+                (std::ptr::null_mut(), 0)
+            };
+            crate::kv::quant_window_cuda::attention(
+                cap.as_ref(),
+                backend,
+                q,
+                raw.qk_buf,
+                raw.qv_buf,
+                raw.res_k,
+                raw.res_v,
+                out,
+                scores_ptr,
+                scores_len,
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                raw.q_tokens,
+                raw.res_tokens,
+                raw.res_cap,
+                scale,
+                raw.bits,
+            )?;
+            // `raw`'s last use is the `attention()` call above; NLL ends its (cache
+            // immutable) borrow there, so `set_attn_scores` (&mut cache) below is free.
+            if let Some(dst) = scores {
+                let n = tmp_scores.len().min(dst.len());
+                dst[..n].copy_from_slice(&tmp_scores[..n]);
+                let valid_len = tmp_scores.len().checked_div(n_heads_q).unwrap_or(0);
+                cache.set_attn_scores(&tmp_scores, n_heads_q, valid_len, valid_len);
+            }
+            // Needed, not needless: the sibling `#[cfg]` blocks below are parsed as
+            // statements, so under `cuda` this block is the last statement (no tail
+            // expr) and must `return` to satisfy the `Result<()>` return type.
+            #[allow(clippy::needless_return)]
+            return Ok(());
         }
-        // 이후 `raw`(cache immutable borrow) 미사용 → NLL 이 set_attn_scores(가변) 전에 borrow 종료.
-
-        if let Some(dst) = scores {
-            let n = tmp_scores.len().min(dst.len());
-            dst[..n].copy_from_slice(&tmp_scores[..n]);
-            let valid_len = tmp_scores.len().checked_div(n_heads_q).unwrap_or(0);
-            cache.set_attn_scores(&tmp_scores, n_heads_q, valid_len, valid_len);
+        #[cfg(not(any(feature = "opencl", feature = "cuda")))]
+        {
+            let _ = (q, backend, out, n_heads_q, scores, cache);
+            anyhow::bail!("quant-window native attention requires the opencl or cuda backend");
         }
-        Ok(())
+        #[cfg(feature = "opencl")]
+        {
+            let n_heads_kv = cache.kv_heads();
+            let head_dim = cache.head_dim();
+            // Stage E: pull the cap from the cache's `quant_attn` handle (the same Arc
+            // the gate checks), cloned so its borrow of `cache` ends before the
+            // `set_attn_scores` (&mut) below. `backend` now only lends its cl_queue.
+            let quant_attn_be = cache
+                .quant_attn_cap()
+                .expect("attention_native gated on quant_attn_cap().is_some()")
+                .clone();
+            let raw = cache
+                .get_quant_window_raw_buffers()
+                .expect("attention_native gated on get_quant_window_raw_buffers().is_some()");
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let total = raw.q_tokens + raw.res_tokens;
+
+            // native 커널 score 임시 버퍼 (caller scores 유무로 게이팅).
+            let mut tmp_scores: Vec<f32> = if scores.is_some() {
+                vec![0.0; n_heads_q * total]
+            } else {
+                Vec::new()
+            };
+            // D8: ABI struct(cl_mem) 시그니처. `&Tensor` 6개를 raw cl_mem 으로 추출해
+            // `QuantAttnArgs` 패킹. score 는 `(ptr, len)` 으로 변환(None → (null, 0)).
+            // cl_queue 는 엔진의 live `cl_command_queue` 를 넘긴다(Stage E): borrowed-context
+            // dlopen plugin 이 같은 in-order 큐에 enqueue 해야 score readback 순서가 보존된다.
+            // 엔진 내장 OpenCL impl 은 이 슬롯을 무시하고 `&self.queue` 를 직접 쓰므로 무영향.
+            use crate::backend::opencl::get_cl_mem;
+            // `Mem::as_ptr()` 는 이미 `cl_mem`(= `*mut c_void`) 를 반환하므로 캐스트 불요.
+            let q_mem = get_cl_mem(q.buffer().as_ref())?.as_ptr();
+            let qk_mem = get_cl_mem(raw.qk_buf.buffer().as_ref())?.as_ptr();
+            let qv_mem = get_cl_mem(raw.qv_buf.buffer().as_ref())?.as_ptr();
+            let res_k_mem = get_cl_mem(raw.res_k.buffer().as_ref())?.as_ptr();
+            let res_v_mem = get_cl_mem(raw.res_v.buffer().as_ref())?.as_ptr();
+            let out_mem = get_cl_mem(out.buffer().as_ref())?.as_ptr();
+            let (scores_ptr, scores_len): (*mut f32, usize) = if scores.is_some() {
+                (tmp_scores.as_mut_ptr(), tmp_scores.len())
+            } else {
+                (std::ptr::null_mut(), 0)
+            };
+            let args = crate::backend::QuantAttnArgs {
+                cl_queue: backend.cl_command_queue_ptr(),
+                q_mem,
+                qk_mem,
+                qv_mem,
+                res_k_mem,
+                res_v_mem,
+                out_mem,
+                scores_out: scores_ptr,
+                scores_len,
+                num_heads_q: n_heads_q,
+                num_heads_kv: n_heads_kv,
+                head_dim,
+                q_tokens: raw.q_tokens,
+                res_tokens: raw.res_tokens,
+                res_cap: raw.res_cap,
+                scale,
+                bits: raw.bits,
+            };
+            let rc = quant_attn_be.attention_gen_quant(&args);
+            if rc != 0 {
+                anyhow::bail!("quant-window attention_gen_quant failed (rc={rc})");
+            }
+            // 이후 `raw`(cache immutable borrow) 미사용 → NLL 이 set_attn_scores(가변) 전에 borrow 종료.
+
+            if let Some(dst) = scores {
+                let n = tmp_scores.len().min(dst.len());
+                dst[..n].copy_from_slice(&tmp_scores[..n]);
+                let valid_len = tmp_scores.len().checked_div(n_heads_q).unwrap_or(0);
+                cache.set_attn_scores(&tmp_scores, n_heads_q, valid_len, valid_len);
+            }
+            Ok(())
+        }
     }
 }
 

@@ -114,6 +114,7 @@ dependencies = [
  "example-keep-recent",
  "h2o",
  "half",
+ "kivi",
  "layer-importance",
  "libc",
  "libloading 0.8.9",
@@ -315,6 +316,7 @@ name = "attn-score"
 version = "0.1.0"
 dependencies = [
  "argus-extension-api",
+ "cudarc",
  "linkme",
  "ocl",
 ]
@@ -1099,6 +1101,7 @@ name = "kivi"
 version = "0.1.0"
 dependencies = [
  "argus-extension-api",
+ "cudarc",
  "linkme",
  "ocl",
 ]

@@ -44,9 +44,13 @@ path = "src/bin/auf_tool.rs"
 name = "signal_injector"
 path = "src/bin/signal_injector.rs"
 
+# GPU test/dev bins that reference `backend::opencl` unconditionally: gate on the
+# opencl feature so a cuda-only build (`--no-default-features --features cuda`) skips
+# them instead of failing to compile. Not production bins.
 [[bin]]
 name = "test_backend"
 path = "src/bin/test_backend.rs"
+required-features = ["opencl"]
 
 [[bin]]
 name = "test_model"
@@ -55,18 +59,32 @@ path = "src/bin/test_model.rs"
 [[bin]]
 name = "test_q4_soa_byte_equal"
 path = "src/bin/test_q4_soa_byte_equal.rs"
+required-features = ["opencl"]
 
 [[bin]]
 name = "test_kv_reencode_device"
 path = "src/bin/test_kv_reencode_device.rs"
+required-features = ["opencl"]
 
 [[bin]]
 name = "test_faithful_h2o_gpu_seed_device"
 path = "src/bin/test_faithful_h2o_gpu_seed_device.rs"
+required-features = ["opencl"]
 
 [[bin]]
 name = "test_cross_layer_host_mirror_device"
 path = "src/bin/test_cross_layer_host_mirror_device.rs"
+required-features = ["opencl"]
+
+[[bin]]
+name = "test_cuda_gpu_score_device"
+path = "src/bin/test_cuda_gpu_score_device.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_cuda_quant_attn_device"
+path = "src/bin/test_cuda_quant_attn_device.rs"
+required-features = ["cuda"]
 
 [dependencies]
 # Shared IPC protocol types (manager <-> engine). Separate repo.
@@ -110,6 +128,11 @@ pyramidkv = { path = "../crates/techniques/pyramidkv", optional = true }
 # `triattention` feature, force-linked so its `caps.reads ∋ Key` registration is visible to
 # `find_mutation_stage("triattention")`. Default OFF (the caote/rkv/pyramidkv precedent).
 triattention = { path = "../crates/techniques/triattention", optional = true }
+# KIVI (Q2/Q4/Q8 quantized-KV fused attention, ATTENTION backend-cap). On OpenCL it is a dlopen
+# `.so` plugin (NOT depended on here). On CUDA the axis is static-linkme only (no cdylib vtable), so
+# the engine force-links this crate under its own `cuda`/`cuda-embedded` feature to register the
+# `CudaQuantAttnBackend` "kivi_abi" — selected with the same `--backend-cap kivi_abi` key.
+kivi = { path = "../crates/techniques/kivi", optional = true }
 # H2O (Heavy-Hitter Oracle, score-based KVCacheStage). Extracted from the engine core;
 # non-optional, force-linked so `eviction h2o` resolves the out-of-tree plugin.
 h2o = { path = "../crates/techniques/h2o" }
@@ -215,6 +238,9 @@ pyramidkv = ["dep:pyramidkv"]
 # Links + force-links the `triattention` technique crate (trigonometric frequency-domain KV
 # eviction). Registers "triattention" with `caps.reads ∋ Key`. Default OFF (build-time opt-in).
 triattention = ["dep:triattention"]
-cuda = ["cudarc"]               # PC / discrete GPU
-cuda-embedded = ["cudarc"]      # Embedded UMA, e.g. Jetson Xavier
+# CUDA backends forward `attn-score/cuda` (GPU score-reduce half) + `kivi/cuda` (CUDA quantized-KV
+# attention cap, force-linked because the CUDA axis is static-linkme only) — the CUDA twins of the
+# OpenCL forward above and the dlopen KIVI plugin.
+cuda = ["cudarc", "attn-score/cuda", "dep:kivi", "kivi/cuda"]               # PC / discrete GPU
+cuda-embedded = ["cudarc", "attn-score/cuda", "dep:kivi", "kivi/cuda"]      # Embedded UMA, e.g. Jetson Xavier
 resilience = ["zbus"]

@@ -67,6 +67,13 @@ use layer_importance as _;
 // fat-LTO --gc-sections rationale as above). `attn_score` is the default scoring path → non-optional.
 use attn_score as _;
 
+// KIVI CUDA quant-attn force-link (feature `cuda`/`cuda-embedded`). The CUDA ATTENTION axis is
+// static-linkme only (no cdylib vtable twin), so — unlike the OpenCL dlopen `.so` path — the CUDA
+// KIVI backend must be force-linked to make its `#[distributed_slice(CUDA_QUANT_ATTN_REGS)]`
+// registration visible to `find_cuda_quant_attn("kivi_abi")`. OpenCL builds don't link kivi here.
+#[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+use kivi as _;
+
 // R-KV measurement force-link (feature `rkv`). Extracted from the engine core into the `rkv`
 // technique crate (registers "rkv"); feature OFF = unlinked + `eviction rkv` subcommand absent.
 #[cfg(feature = "rkv")]

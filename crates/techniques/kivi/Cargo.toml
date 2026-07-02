@@ -12,10 +12,22 @@ crate-type = ["cdylib", "rlib"] # rlib=정적 force-link 가시성, cdylib=dlope
 [dependencies]
 argus-extension-api = { path = "../../argus-extension-api" }
 linkme = "0.3" # 매크로 확장이 linkme:: 경로(재노출)를 쓰므로 plugin 직접 dep 필수
-# FORMAT Phase 2 Stage E: the plugin compiles kivi_q2.cl/kivi_attn.cl from the host's
-# borrowed cl_context in make() and enqueues on the lent cl_command_queue. Pinned to the
-# engine's 0.19 for a single workspace-unified ocl/cl-sys (one ICD loader, one symbol set).
-ocl = "0.19"
+# FORMAT Phase 2 Stage E: under `opencl` the plugin compiles kivi_q2.cl/kivi_attn.cl from the host's
+# borrowed cl_context in make() and enqueues on the lent cl_command_queue. Pinned to the engine's 0.19
+# for a single workspace-unified ocl/cl-sys (one ICD loader, one symbol set).
+ocl = { version = "0.19", optional = true }
+# Under `cuda` the plugin hosts the CUDA half of the ATTENTION axis (`gpu_kivi_cuda`): it compiles
+# kivi_q2.cu/kivi_attn.cu via system nvcc from the host's borrowed CUcontext and dispatches on the lent
+# CUstream. SAME 0.19 feature set as the engine + attn-score so Cargo unifies to one cudarc build. The
+# CUDA axis is static-linkme only, so the engine force-links this crate under its own `cuda` feature.
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+  "std", "driver", "nvrtc", "cublas", "f16", "fallback-dynamic-loading", "cuda-11040",
+] }
 
 [features]
+# GPU OpenCL KIVI backend (the dlopen `.so` path). Compiles the .cl kernels + registers the OpenCL
+# QuantAttnBackend (static QUANT_ATTN_REGS + cdylib vtable when `plugin-cdylib` is also on).
+opencl = ["dep:ocl"]
+# CUDA KIVI backend (`gpu_kivi_cuda`), static-linkme only — the engine force-links it under `cuda`.
+cuda = ["dep:cudarc"]
 plugin-cdylib = [] # cdylib C-ABI export 게이트. .so 빌드 시에만 ON. 정적 force-link 시 #[no_mangle] 충돌 차단

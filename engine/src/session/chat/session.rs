@@ -727,6 +727,10 @@ pub(crate) fn build_chat_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<C
     let residual_size = ctx.args.effective_quant_window_residual_size();
     // §4.3: cap pull moved into the quant_attn closure (gated by `needs_quant_attn`).
     let quant_attn = ctx.caps.get::<dyn QuantAttnBackend>();
+    // CUDA twin (P4b): the `kivi_abi` CudaQuantAttnBackend (Some only on CUDA + --backend-cap).
+    let quant_attn_cuda = ctx
+        .caps
+        .get::<dyn argus_extension_api::CudaQuantAttnBackend>();
 
     eprintln!(
         "[Chat/quant-window] bits={}, residual_size={}, max_seq_len={}",
@@ -742,6 +746,7 @@ pub(crate) fn build_chat_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<C
         bits,
         &ctx.backend,
         &quant_attn,
+        &quant_attn_cuda,
         &ctx.memory,
     );
 
@@ -975,6 +980,26 @@ fn build_chat_eviction_internal(
             args.h2o_decay(),
         );
         if let Some(gpu_acc) = ocl_be.gpu_score_acc_mut() {
+            gpu_acc.set_active(true);
+        }
+    }
+
+    // CUDA twin of the GPU-accumulator init (discrete-GPU / Jetson).
+    #[cfg(feature = "cuda")]
+    if score_based
+        && let Some(cuda_be) = ctx
+            .backend
+            .as_any()
+            .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+    {
+        let _ = cuda_be.init_gpu_score_acc(
+            ctx.model.config.num_hidden_layers,
+            ctx.model.config.num_attention_heads,
+            ctx.model.config.num_key_value_heads,
+            max_seq_len,
+            args.h2o_decay(),
+        );
+        if let Some(gpu_acc) = cuda_be.gpu_score_acc_mut() {
             gpu_acc.set_active(true);
         }
     }

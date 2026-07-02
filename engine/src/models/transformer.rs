@@ -1801,6 +1801,21 @@ impl TransformerModel {
             gpu_acc.end_step(ocl_be.queue.as_core(), cache_seq_len)?;
         }
 
+        // CUDA twin of the GPU score step flush. The reduce runs on the engine's
+        // default stream (same stream the attention kernels wrote score_buf on),
+        // so stream ordering guarantees it sees every layer's writes.
+        #[cfg(feature = "cuda")]
+        if gpu_score_active
+            && let Some(cuda_be) = backend
+                .as_any()
+                .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+            && let Some(gpu_acc) = cuda_be.gpu_score_acc_mut()
+        {
+            let cache_seq_len = fmts[0].current_pos();
+            let cu_stream = cuda_be.context().default_stream().cu_stream() as *mut std::ffi::c_void;
+            gpu_acc.end_step(cu_stream, cache_seq_len)?;
+        }
+
         // 3. Final Norm.
         backend.rms_norm(
             &mut x,

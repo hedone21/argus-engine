@@ -787,6 +787,9 @@ pub struct QuantWindowBenchCtx {
     pub model: TransformerModel,
     /// quant-window native attention capability (OpenCL backend 면 `Some` 필수 — alloc_quant_window_kv_caches R3).
     pub quant_attn: Option<Arc<dyn QuantAttnBackend>>,
+    /// CUDA twin of `quant_attn` (P4b) — the `kivi_abi` CudaQuantAttnBackend cap (Some only on CUDA
+    /// + `--backend-cap`). Threaded to `alloc_quant_window_kv_caches`.
+    pub quant_attn_cuda: Option<Arc<dyn argus_extension_api::CudaQuantAttnBackend>>,
     pub tokenizer: Tokenizer,
     pub tokens: Vec<u32>,
     pub max_seq_len: usize,
@@ -830,6 +833,10 @@ pub fn build_quant_window_bench_ctx(args: Args) -> anyhow::Result<QuantWindowBen
     let model = init.model;
     // quant-window native attention capability pull (R3: OpenCL backend 면 Some 필수, init.rs 가 register).
     let quant_attn = init.caps.get::<dyn QuantAttnBackend>();
+    // CUDA twin (P4b): the `kivi_abi` CudaQuantAttnBackend (Some only on CUDA + --backend-cap kivi_abi).
+    let quant_attn_cuda = init
+        .caps
+        .get::<dyn argus_extension_api::CudaQuantAttnBackend>();
 
     let max_seq_len = args.max_seq_len;
     let vocab_size = model.config.vocab_size;
@@ -876,6 +883,7 @@ pub fn build_quant_window_bench_ctx(args: Args) -> anyhow::Result<QuantWindowBen
         hardware,
         model,
         quant_attn,
+        quant_attn_cuda,
         tokenizer,
         tokens,
         max_seq_len,

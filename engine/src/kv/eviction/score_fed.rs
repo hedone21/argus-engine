@@ -103,8 +103,8 @@ pub fn route_evict(
 /// accumulator before a score-based eviction reads them. No-op on CPU backends / when the GPU
 /// accumulator is inactive, so the host path is byte-identical. Used by `eval` (always) and `chat`
 /// (closing the chat-on-GPU sync gap); `bench` uses the CPU accumulate path and never calls this.
-#[cfg(feature = "opencl")]
 pub fn sync_gpu_scores_to_cpu(acc: &mut AttentionScoreAccumulator, backend: &dyn Backend) {
+    #[cfg(feature = "opencl")]
     if acc.is_active()
         && let Some(ocl_be) = backend
             .as_any()
@@ -122,19 +122,41 @@ pub fn sync_gpu_scores_to_cpu(acc: &mut AttentionScoreAccumulator, backend: &dyn
             acc.import_gpu_layer_flat(&layer_flat);
         }
     }
-}
 
-/// CPU-only build: no GPU accumulator exists, so the sync is a no-op.
-#[cfg(not(feature = "opencl"))]
-pub fn sync_gpu_scores_to_cpu(_acc: &mut AttentionScoreAccumulator, _backend: &dyn Backend) {}
+    // CUDA twin (discrete-GPU / Jetson). The on-device reduce ran on the engine's
+    // default stream, while the DtoH readback uses the null stream, so we sync the
+    // device first to guarantee the reduce's writes are visible.
+    #[cfg(feature = "cuda")]
+    if acc.is_active()
+        && let Some(cuda_be) = backend
+            .as_any()
+            .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+        && let Some(gpu_acc) = cuda_be.gpu_score_acc()
+        && gpu_acc.is_active()
+    {
+        let _ = crate::backend::Backend::synchronize(cuda_be);
+        if let Ok((flat, head)) = gpu_acc.sync_to_cpu() {
+            acc.import_gpu_scores(&flat, &head);
+            if acc.layer_flat_importance().is_some()
+                && let Ok(layer_flat) = gpu_acc.sync_layer_flat_to_cpu()
+            {
+                acc.import_gpu_layer_flat(&layer_flat);
+            }
+        }
+    }
+
+    // CPU-only build: no GPU accumulator exists, so the sync is a no-op.
+    #[cfg(not(any(feature = "opencl", feature = "cuda")))]
+    let _ = (acc, backend);
+}
 
 /// Reset the GPU per-`(layer, token)` FLAT cumulative buffer at an eviction boundary, in lockstep
 /// with the CPU `acc.reset()` (faithful-H2O `(b)`). Without this a 2nd eviction would rank GPU
 /// per-layer importance monotonically accumulated since prefill (misaligned with the compacted
 /// cache) while the CPU twin starts fresh — they would diverge. Touches ONLY the per-layer buffer
 /// (the collapsed GPU buffers keep their existing behavior — INV-147). No-op on CPU / unarmed.
-#[cfg(feature = "opencl")]
 pub fn reset_gpu_layer_flat(acc: &AttentionScoreAccumulator, backend: &dyn Backend) {
+    #[cfg(feature = "opencl")]
     if acc.is_active()
         && acc.layer_flat_importance().is_some()
         && let Some(ocl_be) = backend
@@ -145,8 +167,21 @@ pub fn reset_gpu_layer_flat(acc: &AttentionScoreAccumulator, backend: &dyn Backe
     {
         let _ = gpu_acc.reset_layer_flat(ocl_be.queue.as_core());
     }
-}
 
-/// CPU-only build: no GPU per-layer buffer exists, so the reset is a no-op.
-#[cfg(not(feature = "opencl"))]
-pub fn reset_gpu_layer_flat(_acc: &AttentionScoreAccumulator, _backend: &dyn Backend) {}
+    // CUDA twin (discrete-GPU / Jetson).
+    #[cfg(feature = "cuda")]
+    if acc.is_active()
+        && acc.layer_flat_importance().is_some()
+        && let Some(cuda_be) = backend
+            .as_any()
+            .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+        && let Some(gpu_acc) = cuda_be.gpu_score_acc()
+        && gpu_acc.is_active()
+    {
+        let _ = gpu_acc.reset_layer_flat();
+    }
+
+    // CPU-only build: no GPU per-layer buffer exists, so the reset is a no-op.
+    #[cfg(not(any(feature = "opencl", feature = "cuda")))]
+    let _ = (acc, backend);
+}

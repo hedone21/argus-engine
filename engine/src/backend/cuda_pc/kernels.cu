@@ -27,6 +27,59 @@ __device__ __forceinline__ float warp_reduce_max(float x) {
     return x;
 }
 
+// =================================================================
+// Q4_0 dequant GEMV/GEMM:  out[m,n] = a[m,k] (F32) * dequant(W_q4_0[n,k])^T
+//
+// Weight `w_blocks` is the raw GGUF Q4_0 block grid [n, k/32], 18 bytes/block:
+//   half d @ +0 ; uint8 qs[16] @ +2.  qs[z]&0xF -> element z ; qs[z]>>4 -> element z+16.
+//   dequant value = ((nibble as int8) - 8) * d.
+// This reproduces the CPU reference exactly (cpu/common.rs matmul_transposed_q4_0, the
+// pure-F32 "path B": sum += d * Σ (nibble-8) * a[·]) — no Q8_0 activation re-quant, no SOA.
+//
+// Launch: grid = (n, m, 1); block = (32, 1, 1). One warp computes one output element:
+//   blockIdx.x = j (weight row / output column), blockIdx.y = i (activation row / token).
+// Each lane accumulates a strided subset of the k/32 blocks, then warp_reduce_sum.
+// The j/i guard is uniform across the warp (derived from blockIdx), so every lane that
+// reaches warp_reduce_sum participates in the __shfl — no divergent-shuffle hazard.
+// =================================================================
+extern "C" __global__ void mul_mv_q4_0_f32(
+    const unsigned char * __restrict__ w_blocks,
+    const float * __restrict__ a,
+    float * __restrict__ out,
+    int m, int n, int k)
+{
+    const int j = blockIdx.x;     // output column = weight row (0..n)
+    const int i = blockIdx.y;     // output row = activation token (0..m)
+    const int lane = threadIdx.x; // 0..31
+    if (j >= n || i >= m) return;
+
+    const int nb = k / 32;                                 // blocks per row (k % 32 == 0)
+    const size_t row_base = (size_t)j * (size_t)nb * 18;   // byte offset of weight row j
+    const float * a_row = a + (size_t)i * (size_t)k;
+
+    float acc = 0.0f;
+    for (int b = lane; b < nb; b += WARP_SIZE) {
+        const unsigned char * blk = w_blocks + row_base + (size_t)b * 18;
+        // 18 is even and managed allocations are >=256B aligned, so the half load is 2B-aligned.
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const unsigned char * qs = blk + 2;
+        const float * a_blk = a_row + (size_t)b * 32;
+        float isum = 0.0f;
+        #pragma unroll
+        for (int z = 0; z < 16; ++z) {
+            const unsigned char q = qs[z];
+            const int v0 = (int)(q & 0x0F) - 8;   // element z
+            const int v1 = (int)(q >> 4)   - 8;   // element z+16
+            isum += (float)v0 * a_blk[z] + (float)v1 * a_blk[z + 16];
+        }
+        acc += d * isum;
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) {
+        out[(size_t)i * (size_t)n + (size_t)j] = acc;
+    }
+}
+
 // Block-wide reduction using shared memory for inter-warp communication.
 // Returns the reduced value to all threads (broadcast from thread 0).
 __device__ __forceinline__ float block_reduce_sum(float val) {

@@ -348,7 +348,7 @@ impl CudaDeviceBuffer {
     /// Caller must ensure the bytes at `src..src+len` remain valid until
     /// the stream-recorded write actually fires (typically by holding
     /// the source weight tensor alive across the dispatcher commit).
-    pub fn copy_from_host_async(
+    pub unsafe fn copy_from_host_async(
         &self,
         src: *const u8,
         len: usize,

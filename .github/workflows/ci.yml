@@ -54,6 +54,36 @@ jobs:
       - name: build (${{ matrix.label }})
         run: cargo build --release --bin argus-cli --bin argus-chat ${{ matrix.args }}
 
+  cuda:
+    # The CUDA backends (discrete-GPU `cuda` + Jetson-UMA `cuda-embedded`) compile + lint on a
+    # GPU-less runner with no CUDA toolkit installed: cudarc's `fallback-dynamic-loading` skips
+    # build-time linking against libcuda, and the `.cu` kernels are compiled at runtime (there is
+    # no build-time nvcc). Device correctness is verified manually on real GPUs — this leg exists
+    # only to stop the cfg-gated CUDA paths (invisible to the default OpenCL clippy/build jobs
+    # above) from bit-rotting. clippy is used rather than a plain build because it is a superset:
+    # it compiles *and* lints (the discrete `cuda` and `cuda-embedded` code had never been linted
+    # before this leg). `profile` is included to match the default feature shape (`opencl,profile`);
+    # without it the orthogonal, repo-wide profile-off `let_unit_value` lints (from the `qcf_timer!`
+    # macro) would fire here and drown out genuine CUDA regressions. `--no-default-features` drops
+    # OpenCL, so no `ocl-icd-opencl-dev` apt install is needed.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: cuda
+            args: "--features cuda,profile"
+          - label: cuda-embedded
+            args: "--features cuda-embedded,profile"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (${{ matrix.label }})
+        run: cargo clippy -p argus-engine --no-default-features ${{ matrix.args }} --lib --bins -- -D warnings
+
   test:
     runs-on: ubuntu-latest
     strategy:
