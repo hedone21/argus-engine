@@ -175,14 +175,27 @@ impl KVCacheFormat for QuantWindowFormat {
         // object) rather than `backend.as_quant_attn()`, and the nosub device
         // property is read off the backend directly (byte-identical to the prior
         // `cap.is_nosub_device()` which delegated to `OpenCLBackend::is_nosub`).
+        // Native gate: OpenCL (`quant_attn_cap`) OR CUDA (`quant_attn_cuda_cap`, P4b) must expose a
+        // kernel for `raw.bits`, and there must be tokens. The two caps are distinct TypeIds, so check
+        // both — on CUDA the OpenCL cap is always None (and vice versa).
         let use_native = backend.is_gpu()
             && backend.is_nosub_device()
             && cache
                 .get_quant_window_raw_buffers()
-                .zip(cache.quant_attn_cap())
-                .map(|(raw, quant_attn_be)| {
-                    quant_attn_be.has_quant_attn_kernel(raw.bits)
-                        && (raw.q_tokens + raw.res_tokens) > 0
+                .map(|raw| {
+                    let tokens = (raw.q_tokens + raw.res_tokens) > 0;
+                    let opencl_ok = cache
+                        .quant_attn_cap()
+                        .map(|c| c.has_quant_attn_kernel(raw.bits))
+                        .unwrap_or(false);
+                    #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+                    let cuda_ok = cache
+                        .quant_attn_cuda_cap()
+                        .map(|c| c.has_quant_attn_kernel(raw.bits))
+                        .unwrap_or(false);
+                    #[cfg(not(any(feature = "cuda", feature = "cuda-embedded")))]
+                    let cuda_ok = false;
+                    tokens && (opencl_ok || cuda_ok)
                 })
                 .unwrap_or(false);
 
@@ -255,12 +268,66 @@ impl QuantWindowFormat {
         // OpenCL-only today. `attention_into` only routes here when a quant_attn cap with a GPU
         // kernel is present (KIVI, OpenCL-only), so on a non-opencl (CUDA/CPU) build this is
         // unreachable — bail defensively. The CUDA analog lands with the KIVI-CUDA cap.
-        #[cfg(not(feature = "opencl"))]
+        // P4b: CUDA native fused dequant+attention (KIVI `kivi_abi` cap). Mirrors the OpenCL block
+        // below via the `quant_window_cuda` helper — pulls the cuda cap + raw device buffers, packs
+        // `CudaQuantAttnArgs`, dispatches `attention_gen_quant`, and folds scores back like OpenCL.
+        #[cfg(feature = "cuda")]
+        {
+            let n_heads_kv = cache.kv_heads();
+            let head_dim = cache.head_dim();
+            let cap = cache
+                .quant_attn_cuda_cap()
+                .expect("attention_native gated on quant_attn_cuda_cap().is_some()")
+                .clone();
+            let raw = cache
+                .get_quant_window_raw_buffers()
+                .expect("attention_native gated on get_quant_window_raw_buffers().is_some()");
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let total = raw.q_tokens + raw.res_tokens;
+            let mut tmp_scores: Vec<f32> = if scores.is_some() {
+                vec![0.0; n_heads_q * total]
+            } else {
+                Vec::new()
+            };
+            let (scores_ptr, scores_len): (*mut f32, usize) = if scores.is_some() {
+                (tmp_scores.as_mut_ptr(), tmp_scores.len())
+            } else {
+                (std::ptr::null_mut(), 0)
+            };
+            crate::kv::quant_window_cuda::attention(
+                cap.as_ref(),
+                backend,
+                q,
+                &raw.qk_buf,
+                &raw.qv_buf,
+                &raw.res_k,
+                &raw.res_v,
+                out,
+                scores_ptr,
+                scores_len,
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                raw.q_tokens,
+                raw.res_tokens,
+                raw.res_cap,
+                scale,
+                raw.bits,
+            )?;
+            // End the `raw` (cache immutable) borrow before `set_attn_scores` (&mut cache).
+            drop(raw);
+            if let Some(dst) = scores {
+                let n = tmp_scores.len().min(dst.len());
+                dst[..n].copy_from_slice(&tmp_scores[..n]);
+                let valid_len = tmp_scores.len().checked_div(n_heads_q).unwrap_or(0);
+                cache.set_attn_scores(&tmp_scores, n_heads_q, valid_len, valid_len);
+            }
+            return Ok(());
+        }
+        #[cfg(not(any(feature = "opencl", feature = "cuda")))]
         {
             let _ = (q, backend, out, n_heads_q, scores, cache);
-            anyhow::bail!(
-                "quant-window native attention requires the opencl backend (no CUDA quant-attn kernel yet)"
-            );
+            anyhow::bail!("quant-window native attention requires the opencl or cuda backend");
         }
         #[cfg(feature = "opencl")]
         {

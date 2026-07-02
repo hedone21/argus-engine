@@ -299,8 +299,134 @@ fn main() -> anyhow::Result<()> {
         println!("[C] gather_update round-trip: SeqMajor→head-first remap exact ✓");
     }
 
+    // F16 device buffer + readback helpers (view buffers are F16).
+    let dev_f16 = |elems: usize| -> anyhow::Result<CudaDeviceBuffer> {
+        Ok(CudaDeviceBuffer::new((elems * 2).max(1), DType::F16)?)
+    };
+    let download_f16 = |buf: &CudaDeviceBuffer, elems: usize| -> anyhow::Result<Vec<f32>> {
+        let mut raw = vec![0u16; elems];
+        buf.copy_to_host(raw.as_mut_ptr() as *mut u8, elems * 2)?;
+        Ok(raw.into_iter().map(f16_bits_to_f32).collect())
+    };
+
+    // ── Test D: scatter_residual (F32 ring → F16 view) — the short-prompt prefill view path ───────
+    // Calls the plugin backend directly with raw device ptrs (like A/B/C), isolating the kernel.
+    {
+        let res_pos = 5usize;
+        let tok_base = 0usize;
+        let mut residual = vec![0.0f32; nhkv * res_cap * hd];
+        for t in 0..res_pos {
+            for d in 0..hd {
+                residual[t * hd + d] = ((t * 4 + d) % 8) as f32 * 0.5; // {0,0.5,..,3.5} exact in f16
+            }
+        }
+        let res_buf = dev(residual.len() * 4)?;
+        upload(&res_buf, &residual)?;
+        let view_elems = (tok_base + res_pos) * nhkv * hd;
+        let view_buf = dev_f16(view_elems)?;
+        let rc = backend.scatter_residual(&argus_extension_api::CudaQuantScatterResidualArgs {
+            cu_stream,
+            res_mem: res_buf.device_ptr(),
+            attn_mem: view_buf.device_ptr(),
+            kv_heads: nhkv,
+            res_cap,
+            head_dim: hd,
+            res_pos,
+            tok_base,
+        });
+        assert_eq!(rc, 0, "scatter_residual rc");
+        let view = download_f16(&view_buf, view_elems)?;
+        for t in 0..res_pos {
+            for d in 0..hd {
+                let got = view[(tok_base + t) * nhkv * hd + d];
+                let exp = residual[t * hd + d];
+                assert!(
+                    (got - exp).abs() < 1e-3,
+                    "D: view[t{t},d{d}]={got} != {exp} (scatter_residual)"
+                );
+            }
+        }
+        println!("[D] scatter_residual: F32 ring → F16 SeqMajor view exact ✓");
+    }
+
+    // ── Test E: dequant_flush_q2 (per-channel K → F16 view), one group of 32 tokens ───────────────
+    {
+        let d_h = 0.5f32;
+        let m_h = 1.0f32;
+        let d_bits = f32_to_f16_bits(d_h);
+        let m_bits = f32_to_f16_bits(m_h);
+        let code_k = |t: usize, ch: usize| -> u8 { ((t * 3 + ch) % 4) as u8 };
+        let deq = |code: u8| -> f32 { code as f32 * d_h + m_h };
+        let mut q2_k = Vec::<u8>::new();
+        for ch in 0..hd {
+            let codes: Vec<u8> = (0..32).map(|t| code_k(t, ch)).collect();
+            q2_k.extend_from_slice(&pack_q2_block(&codes, d_bits, m_bits));
+        }
+        let qk_buf = dev(q2_k.len())?;
+        qk_buf.copy_from_host(q2_k.as_ptr(), q2_k.len())?;
+        let view_elems = 32 * nhkv * hd;
+        let view_buf = dev_f16(view_elems)?;
+        let rc = backend.dequant_flush(&argus_extension_api::CudaQuantDequantFlushArgs {
+            cu_stream,
+            q_blocks_mem: qk_buf.device_ptr(),
+            attn_mem: view_buf.device_ptr(),
+            kv_heads: nhkv,
+            head_dim: hd,
+            n_groups_or_tokens: 1, // groups_per_flush
+            tok_base: 0,
+            block_start: 0,
+            bits: 2,
+            is_key: true,
+        });
+        assert_eq!(rc, 0, "dequant_flush rc");
+        let view = download_f16(&view_buf, view_elems)?;
+        for t in 0..32 {
+            for ch in 0..hd {
+                let got = view[t * nhkv * hd + ch];
+                let exp = deq(code_k(t, ch));
+                assert!(
+                    (got - exp).abs() < 1e-3,
+                    "E: view[t{t},ch{ch}]={got} != {exp} (dequant_flush key)"
+                );
+            }
+        }
+        println!("[E] dequant_flush_q2 (per-channel key): Q2 → F16 SeqMajor view exact ✓");
+    }
+
     println!("ALL PASS: CUDA KIVI quant-attn plugin verified on-device (kivi_abi)");
     Ok(())
+}
+
+/// IEEE-754 binary16 bits → f32.
+#[cfg(feature = "cuda")]
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x3ff) as u32;
+    let f32_bits = if exp == 0 {
+        if mant == 0 {
+            sign << 31
+        } else {
+            // subnormal → normalize
+            let mut e = -1i32;
+            let mut m = mant;
+            loop {
+                e += 1;
+                m <<= 1;
+                if m & 0x400 != 0 {
+                    break;
+                }
+            }
+            let f_exp = (127 - 15 - e) as u32;
+            (sign << 31) | (f_exp << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if exp == 0x1f {
+        (sign << 31) | (0xff << 23) | (mant << 13)
+    } else {
+        let f_exp = exp + (127 - 15);
+        (sign << 31) | (f_exp << 23) | (mant << 13)
+    };
+    f32::from_bits(f32_bits)
 }
 
 /// Round-to-nearest f32 → IEEE-754 binary16 bit pattern (test values are exact powers, so the

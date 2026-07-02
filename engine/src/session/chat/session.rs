@@ -727,6 +727,10 @@ pub(crate) fn build_chat_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<C
     let residual_size = ctx.args.effective_quant_window_residual_size();
     // §4.3: cap pull moved into the quant_attn closure (gated by `needs_quant_attn`).
     let quant_attn = ctx.caps.get::<dyn QuantAttnBackend>();
+    // CUDA twin (P4b): the `kivi_abi` CudaQuantAttnBackend (Some only on CUDA + --backend-cap).
+    let quant_attn_cuda = ctx
+        .caps
+        .get::<dyn argus_extension_api::CudaQuantAttnBackend>();
 
     eprintln!(
         "[Chat/quant-window] bits={}, residual_size={}, max_seq_len={}",
@@ -742,6 +746,7 @@ pub(crate) fn build_chat_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<C
         bits,
         &ctx.backend,
         &quant_attn,
+        &quant_attn_cuda,
         &ctx.memory,
     );
 

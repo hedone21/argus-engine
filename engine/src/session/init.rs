@@ -407,15 +407,35 @@ impl SessionInitCtx {
                         );
                     }
                 }
+                // P4b: `--backend-cap <name>` resolves the CUDA quant-attn cap (KIVI `kivi_abi`)
+                // from the force-linked static `CUDA_QUANT_ATTN_REGS`, built from this backend's live
+                // CUcontext. Registered as `dyn CudaQuantAttnBackend` (a distinct TypeId from the
+                // OpenCL `dyn QuantAttnBackend`, pulled separately by the quant-window setup). No
+                // dlopen path — the CUDA axis is static-linkme only.
+                let mut caps = CapabilityRegistry::new();
+                if let Some(name) = args.backend_cap.as_deref() {
+                    let cap: Option<Arc<dyn argus_extension_api::CudaQuantAttnBackend>> =
+                        gpu_concrete.with_cuda_quant_attn_make_args(|make_args| {
+                            argus_extension_api::find_cuda_quant_attn(name)
+                                .and_then(|reg| (reg.make)(make_args).ok())
+                                .map(Arc::from)
+                        });
+                    let cap = cap.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Unknown/failed --backend-cap '{name}' for CUDA (not in static \
+                             CUDA_QUANT_ATTN_REGS, or its nvcc/PTX build failed)"
+                        )
+                    })?;
+                    caps.register::<dyn argus_extension_api::CudaQuantAttnBackend>(cap);
+                }
                 let gpu: Arc<dyn Backend> = gpu_concrete;
-                // CUDA backend 는 quant-window native attention capability 미보유 → 빈 registry.
                 (
                     gpu.clone(),
                     gpu_mem.clone(),
                     Some(gpu),
                     Some(gpu_mem),
                     true,
-                    CapabilityRegistry::new(),
+                    caps,
                 )
             }
             _ => anyhow::bail!(
@@ -423,12 +443,13 @@ impl SessionInitCtx {
                 args.backend
             ),
         };
-        // --backend-cap is OpenCL-only: the CPU/CUDA arms register an empty capability
-        // registry, so a named capability cannot be installed there. Warn, don't fail.
-        if args.backend_cap.is_some() && !matches!(args.backend.as_str(), "opencl" | "gpu") {
+        // --backend-cap is honored on OpenCL (dlopen QuantAttn cap) and CUDA (force-linked
+        // CudaQuantAttn cap, P4b); the CPU arm registers an empty registry, so warn there.
+        if args.backend_cap.is_some() && !matches!(args.backend.as_str(), "opencl" | "gpu" | "cuda")
+        {
             eprintln!(
-                "[init] --backend-cap '{}' ignored: only the OpenCL backend exposes a quant-window \
-                 attention capability (backend = {})",
+                "[init] --backend-cap '{}' ignored: only the OpenCL/CUDA backends expose a \
+                 quant-window attention capability (backend = {})",
                 args.backend_cap.as_deref().unwrap_or(""),
                 args.backend
             );

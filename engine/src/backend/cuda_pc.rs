@@ -800,6 +800,15 @@ impl Backend for CudaBackend {
         !self.is_uma
     }
 
+    /// KIVI quant-window native-attention gate (quant_window_format.rs). The KIVI CUDA kernels use
+    /// SLM tree-reduction (no warp/sub-group ops), so the "nosub" path is the correct one on CUDA —
+    /// return `true` so `use_native` fires when a `kivi_abi` CUDA cap + kernel are present. With no
+    /// cap registered, `use_native` stays false (cap gate) and the F32-view fallback runs. OpenCL
+    /// reads its own `is_nosub` flag; the default (backend.rs) is `false`.
+    fn is_nosub_device(&self) -> bool {
+        true
+    }
+
     /// §13.8-L S-L-2: expose the CUDA GPU score accumulator to the neutral
     /// forward-gen seam (`forward_gen_fmt` calls `set_current_layer_idx`;
     /// `transformer.rs` reads `is_active`). Mirror of the OpenCL override.
@@ -831,9 +840,18 @@ impl Backend for CudaBackend {
         head_dim: usize,
         kv_capacity: usize,
         batch_size: usize,
-        _is_head_major: bool,
+        is_head_major: bool,
     ) -> Result<bool> {
         let kv_dtype = k_cache.dtype();
+
+        // The CUDA prefill kernel assumes a HeadMajor KV layout ([kv_heads, capacity, head_dim]).
+        // The quant-window assembled view is SeqMajor ([total, kv_heads, head_dim]) — reading it with
+        // HeadMajor strides yields garbage. Decline SeqMajor so the caller's CPU fallback handles it
+        // (correct on managed memory; prefill is one-shot). Standard KV is HeadMajor → unaffected.
+        if !is_head_major {
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
+            return Ok(false);
+        }
 
         // Only support F32/F16 KV and head_dim in {64, 128, 256}
         if !matches!(head_dim, 64 | 128 | 256) || kv_dtype == DType::Q4_0 {

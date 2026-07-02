@@ -398,6 +398,7 @@ mod tests {
                 bits,
                 backend.clone(),
                 Some(quant_attn),
+                None, // OpenCL host-harness — no CUDA cap.
                 gpu_mem.clone(),
             );
             assert!(cache.is_gpu(), "real OpenCL backend must enter GPU mode");

@@ -294,6 +294,8 @@ pub fn run_quant_window_ppl(
                 2,
                 backend.clone(),
                 quant_attn.clone(),
+                // ppl runner does not resolve a CUDA quant-attn cap → CPU mode on CUDA.
+                None,
                 memory.clone(),
             )
         })

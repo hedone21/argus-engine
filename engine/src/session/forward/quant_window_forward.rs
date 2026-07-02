@@ -323,9 +323,12 @@ pub fn alloc_quant_window_kv_caches(
     bits: u8,
     backend: &Arc<dyn Backend>,
     quant_attn: &Option<Arc<dyn QuantAttnBackend>>,
+    quant_attn_cuda: &Option<Arc<dyn argus_extension_api::CudaQuantAttnBackend>>,
     memory: &Arc<dyn Memory>,
 ) -> Vec<QuantizedRecentWindowCache> {
-    if backend.name() == "OpenCL" {
+    // OpenCL (dlopen KIVI cap) and CUDA (force-linked kivi/cuda cap) both build GPU-mode caches via
+    // `new_gpu` (which itself gates on the backend name); any other backend uses CPU mode.
+    if matches!(backend.name(), "OpenCL" | "CUDA") {
         (0..num_layers)
             .map(|_| {
                 QuantizedRecentWindowCache::new_gpu(
@@ -336,6 +339,7 @@ pub fn alloc_quant_window_kv_caches(
                     bits,
                     backend.clone(),
                     quant_attn.clone(),
+                    quant_attn_cuda.clone(),
                     memory.clone(),
                 )
             })
@@ -380,6 +384,7 @@ mod tests {
             2,   // bits
             &backend,
             &quant_attn,
+            &None,
             &memory,
         );
 
@@ -411,6 +416,7 @@ mod tests {
                 bits,
                 &backend,
                 &quant_attn,
+                &None,
                 &memory,
             );
             for cache in &caches {

@@ -37,6 +37,7 @@ pub fn build_bench_quant_window_loop(
     memory: Arc<dyn Memory>,
     model: TransformerModel,
     quant_attn: &Option<Arc<dyn QuantAttnBackend>>,
+    quant_attn_cuda: &Option<Arc<dyn argus_extension_api::CudaQuantAttnBackend>>,
     initial_bits: u8,
     residual_size: usize,
     max_seq_len: usize,
@@ -63,6 +64,7 @@ pub fn build_bench_quant_window_loop(
         initial_bits,
         &backend,
         quant_attn,
+        quant_attn_cuda,
         &memory,
     );
 

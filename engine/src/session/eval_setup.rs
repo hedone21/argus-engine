@@ -701,6 +701,8 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
 
     // quant-window native attention handle 을 caps 에서 1회 pull (closure 밖). OpenCL 면 Some.
     let quant_attn_cap = caps.get::<dyn QuantAttnBackend>();
+    // CUDA twin (P4b): the `kivi_abi` CudaQuantAttnBackend cap (Some only on CUDA + --backend-cap).
+    let quant_attn_cuda_cap = caps.get::<dyn argus_extension_api::CudaQuantAttnBackend>();
     let mut kv_caches: Vec<QuantizedRecentWindowCache> = (0..num_layers)
         .map(|_| {
             QuantizedRecentWindowCache::new_gpu(
@@ -711,6 +713,7 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
                 quant_window_bits,
                 backend.clone(),
                 quant_attn_cap.clone(),
+                quant_attn_cuda_cap.clone(),
                 memory.clone(),
             )
         })

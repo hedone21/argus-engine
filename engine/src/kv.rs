@@ -21,6 +21,9 @@ pub mod offload_format;
 pub mod quant_window_cache;
 // EPIC 4 PR3 de-risk: first in-tree QuantCacheBackend over the real cache (host-only harness).
 pub mod quant_window_cache_abi_shim;
+// P4b: CUDA marshalling for the KIVI quant-window native path (CudaQuantAttn* dispatch helpers).
+#[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+pub mod quant_window_cuda;
 pub mod quant_window_format;
 // D3 — engine-side executor for the format/precision axis (KVFormatPlan). Honest reject of
 // heterogeneous-within-layer plans (no current container holds per-head/per-token precision).

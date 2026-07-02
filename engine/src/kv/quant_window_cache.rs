@@ -213,6 +213,12 @@ pub struct QuantizedRecentWindowCache {
     /// buffer ownership 인 `slab` 과 별개로 보관(Stage C 에서 vtable/handle 은
     /// DynQuantCache 가 slab 과 나란히 소유).
     quant_attn: Option<Arc<dyn QuantAttnBackend>>,
+    /// CUDA twin of `quant_attn` (P4b). `Some` ↔ GPU mode + CUDA backend + `--backend-cap kivi_abi`.
+    /// The 3 native GPU sites (flush/assemble/attention) dispatch through this handle on CUDA via the
+    /// `quant_window_cuda` helper. `None` on OpenCL/CPU builds (the type is ungated in extension-api,
+    /// so the field is always present — only cuda ever populates it). Separate TypeId from
+    /// `QuantAttnBackend`, pulled via `caps.get::<dyn CudaQuantAttnBackend>()`.
+    quant_attn_cuda: Option<Arc<dyn argus_extension_api::CudaQuantAttnBackend>>,
     /// Engine-owned GPU buffer set (residual/attn/Q-block + backend/memory).
     /// `Some` ↔ GPU mode enabled (the slab's `backend` is the GPU-mode sentinel;
     /// `is_gpu() == slab.is_some()`). The individual buffer `Option<Tensor>`
@@ -325,6 +331,7 @@ impl QuantizedRecentWindowCache {
             last_attn_scores: None,
             // GPU fields — None in CPU-only mode
             quant_attn: None,
+            quant_attn_cuda: None,
             slab: None,
             gpu_q2k_blocks: 0,
             gpu_q2v_blocks: 0,
@@ -378,11 +385,22 @@ impl QuantizedRecentWindowCache {
         bits: u8,
         backend: Arc<dyn Backend>,
         quant_attn: Option<Arc<dyn QuantAttnBackend>>,
+        quant_attn_cuda: Option<Arc<dyn argus_extension_api::CudaQuantAttnBackend>>,
         memory: Arc<dyn Memory>,
     ) -> Self {
         let mut cache = Self::new_with_bits(kv_heads, head_dim, max_seq_len, residual_size, bits);
 
-        if backend.name() != "OpenCL" {
+        // GPU mode requires a GPU backend whose buffers/kernels this path can marshal: OpenCL (the
+        // dlopen KIVI cap) or CUDA (the force-linked `kivi/cuda` cap). On CUDA, GPU mode is gated on
+        // the cap being present — without `--backend-cap kivi_abi` there is no CUDA quant-attn
+        // backend to dispatch, so fall back to CPU mode (correct, just not GPU-native). OpenCL keeps
+        // its name-only gate (a missing cap bails later, unchanged). Any other backend (CPU) uses the
+        // CPU-only cache. Buffer alloc + zero-init below are backend-generic (memory.alloc +
+        // backend.write_buffer); the only CUDA-specific parts are this gate + the native dispatch
+        // sites (which branch on `quant_attn_cuda`).
+        let gpu_mode = backend.name() == "OpenCL"
+            || (backend.name() == "CUDA" && quant_attn_cuda.is_some() && bits == 2);
+        if !gpu_mode {
             return cache;
         }
 
@@ -523,6 +541,7 @@ impl QuantizedRecentWindowCache {
                 }
 
                 cache.quant_attn = quant_attn;
+                cache.quant_attn_cuda = quant_attn_cuda;
                 cache.slab = Some(GpuKvBuffers {
                     backend,
                     memory,
@@ -2069,6 +2088,62 @@ impl QuantizedRecentWindowCache {
             }
         }
 
+        // P4b: CUDA twin of the flush GPU dispatch. GPU mode is Q2-only on CUDA (new_gpu gate), so
+        // upload the Q2 blocks (generic write_buffer_range) then run the plugin `dequant_flush` to
+        // fill the F16 attention view. Mirrors the opencl block via the `quant_window_cuda` helper.
+        #[cfg(feature = "cuda")]
+        {
+            let backend = self.slab.as_ref().unwrap().backend.clone();
+            backend.write_buffer_range(
+                self.slab.as_mut().unwrap().q2k.as_mut().unwrap(),
+                &k_bytes,
+                k_byte_offset,
+            )?;
+            backend.write_buffer_range(
+                self.slab.as_mut().unwrap().q2v.as_mut().unwrap(),
+                &v_bytes,
+                v_byte_offset,
+            )?;
+            let cap = self
+                .quant_attn_cuda
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quant-window CUDA GPU mode but kivi_abi cuda handle missing")
+                })?
+                .clone();
+            {
+                let slab = self.slab.as_ref().unwrap();
+                let q2k = slab.q2k.as_ref().unwrap();
+                let attn_k = slab.attn_k.as_ref().unwrap();
+                crate::kv::quant_window_cuda::dequant_flush_q2(
+                    cap.as_ref(),
+                    backend.as_ref(),
+                    q2k,
+                    attn_k,
+                    self.kv_heads,
+                    self.head_dim,
+                    n_groups,
+                    tok_base,
+                    k_block_start,
+                    true,
+                )?;
+                let q2v = slab.q2v.as_ref().unwrap();
+                let attn_v = slab.attn_v.as_ref().unwrap();
+                crate::kv::quant_window_cuda::dequant_flush_q2(
+                    cap.as_ref(),
+                    backend.as_ref(),
+                    q2v,
+                    attn_v,
+                    self.kv_heads,
+                    self.head_dim,
+                    flush_tokens,
+                    tok_base,
+                    v_block_start,
+                    false,
+                )?;
+            }
+        }
+
         self.gpu_q2k_blocks += new_k_blocks;
         self.gpu_q2v_blocks += new_v_blocks;
 
@@ -2269,6 +2344,54 @@ impl QuantizedRecentWindowCache {
                 if rc_v != 0 {
                     anyhow::bail!("quant-window scatter_residual (V) failed (rc={rc_v})");
                 }
+            }
+            return Ok(());
+        }
+
+        // P4b: CUDA twin — scatter the F32 residual ring into the F16 attention view via the plugin
+        // `scatter_residual` kernel (mirrors the opencl block via the `quant_window_cuda` helper).
+        #[cfg(feature = "cuda")]
+        {
+            if self.res_pos > 0 {
+                let cap = self
+                    .quant_attn_cuda
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "quant-window CUDA GPU mode but kivi_abi cuda handle missing"
+                        )
+                    })?
+                    .clone();
+                let backend = self.slab.as_ref().unwrap().backend.clone();
+                let slab = self.slab.as_ref().unwrap();
+                let res_k = slab.res_k.as_ref().unwrap();
+                let attn_k = slab.attn_k.as_ref().unwrap();
+                crate::kv::quant_window_cuda::scatter_residual(
+                    cap.as_ref(),
+                    backend.as_ref(),
+                    res_k,
+                    attn_k,
+                    self.kv_heads,
+                    self.res_cap,
+                    self.head_dim,
+                    self.res_pos,
+                    self.q2_tokens,
+                    true,
+                )?;
+                let res_v = slab.res_v.as_ref().unwrap();
+                let attn_v = slab.attn_v.as_ref().unwrap();
+                crate::kv::quant_window_cuda::scatter_residual(
+                    cap.as_ref(),
+                    backend.as_ref(),
+                    res_v,
+                    attn_v,
+                    self.kv_heads,
+                    self.res_cap,
+                    self.head_dim,
+                    self.res_pos,
+                    self.q2_tokens,
+                    false,
+                )?;
             }
             return Ok(());
         }
@@ -2528,6 +2651,16 @@ impl QuantizedRecentWindowCache {
     /// keeping a single cap source once the quant-window kernels move to a dlopen plugin.
     pub(crate) fn quant_attn_cap(&self) -> Option<&Arc<dyn QuantAttnBackend>> {
         self.quant_attn.as_ref()
+    }
+
+    /// CUDA twin of [`quant_attn_cap`](Self::quant_attn_cap) (P4b). The native GPU sites branch on
+    /// this to dispatch the `kivi_abi` CUDA cap via `quant_window_cuda`. Only consumed on CUDA
+    /// (`attention_native` cuda branch) — gate it out of OpenCL/CPU builds to avoid a dead_code warn.
+    #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+    pub(crate) fn quant_attn_cuda_cap(
+        &self,
+    ) -> Option<&Arc<dyn argus_extension_api::CudaQuantAttnBackend>> {
+        self.quant_attn_cuda.as_ref()
     }
 
     /// Memory usage in bytes for currently stored KV data.
@@ -3377,7 +3510,7 @@ mod tests {
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
         let cache =
-            QuantizedRecentWindowCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
+            QuantizedRecentWindowCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, None, memory);
         // CpuBackend.name() != "OpenCL" → must fall back to CPU mode
         assert!(
             !cache.is_gpu(),
@@ -3886,7 +4019,7 @@ mod tests {
 
         // new_gpu with non-OpenCL backend falls back to CPU mode
         let cache_cpu =
-            QuantizedRecentWindowCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
+            QuantizedRecentWindowCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, None, memory);
         assert!(!cache_cpu.is_gpu());
         // CPU mode: attn_k_buf/attn_v_buf should be fully allocated
         let attn_cap = cache_cpu.attn_k_buf.size() + cache_cpu.attn_v_buf.size();
@@ -4016,6 +4149,7 @@ mod tests {
             res_cap,
             2,
             cpu_backend,
+            None,
             None,
             memory,
         );
@@ -4185,7 +4319,7 @@ mod tests {
         let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
         let memory: Arc<dyn crate::memory::Memory> = Arc::new(Galloc::new());
         let cache =
-            QuantizedRecentWindowCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, memory);
+            QuantizedRecentWindowCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, None, None, memory);
         // CPU fallback: no GPU buffer slab at all (so no F16 attn buffers).
         assert!(
             cache.slab.is_none(),
