@@ -2967,6 +2967,168 @@ pub fn find_cuda_score_reducer(name: &str) -> Option<&'static CudaScoreReduceReg
     CUDA_SCORE_REDUCERS.iter().find(|r| r.name == name)
 }
 
+// ─── CUDA QuantAttn (ATTENTION backend-cap) axis ────────────────────────────────────────────────
+//
+// The CUDA twin of the OpenCL [`QuantAttnBackend`] family (KIVI quantized-KV fused attention). Same
+// handle-translation rule as the CUDA score axis: `cl_context`→`cu_context:*mut c_void`;
+// `cl_device_id`+`build_opts`→`cu_device:i32`+`cc_major/cc_minor:i32` (nvcc `-arch=sm_XY`);
+// `cl_command_queue`→`cu_stream:*mut c_void`; every `cl_mem`(`*mut c_void`)→`u64` CUdeviceptr;
+// `scores_out` stays `*mut f32` (host readback pointer, NOT a device buffer). Registered in a DISJOINT
+// static-linkme slice (`CUDA_QUANT_ATTN_REGS`) — no cdylib `QuantAttnVTable` twin, no new
+// `BACKEND_CAP_CATEGORY_*` (the CUDA axis is static-linkme only, like the score axis). All scalar
+// fields mirror the OpenCL args 1:1; `#[repr(C)]` is future-proofing, not a frozen C-ABI.
+
+/// GPU context handles lent to a [`CudaQuantAttnBackend`] factory at construction (repr(C) POD).
+/// CUDA analog of [`QuantAttnMakeArgs`]; `build_opts` is replaced by the compute capability.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CudaQuantAttnMakeArgs {
+    /// Raw `CUcontext` (from `CudaContext::cu_ctx()`) the engine's KV buffers live in. Borrowed.
+    pub cu_context: *mut c_void,
+    /// `CUdevice` ordinal (also the ordinal for `CudaContext::from_raw_context`). Borrowed.
+    pub cu_device: i32,
+    /// Compute capability major (for `nvcc -arch=sm_{major}{minor}`).
+    pub cc_major: i32,
+    /// Compute capability minor.
+    pub cc_minor: i32,
+}
+
+/// Per-call args for CUDA fused dequant+attention (repr(C) POD). CUDA analog of [`QuantAttnArgs`]:
+/// `cl_queue`→`cu_stream`, six `cl_mem`→`u64` CUdeviceptr, `scores_out` stays `*mut f32` (host).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CudaQuantAttnArgs {
+    /// Raw `CUstream` to launch on (may be null == default stream). Borrowed.
+    pub cu_stream: *mut c_void,
+    /// `CUdeviceptr` of Q `[num_heads_q, head_dim]` F32. Borrowed.
+    pub q_mem: u64,
+    /// `CUdeviceptr` of quantized key blocks (per-channel, flush-interleaved). Borrowed.
+    pub qk_mem: u64,
+    /// `CUdeviceptr` of quantized value blocks (per-token, flush-interleaved). Borrowed.
+    pub qv_mem: u64,
+    /// `CUdeviceptr` of F32 residual keys `[kv_heads, res_cap, head_dim]`. Borrowed.
+    pub res_k_mem: u64,
+    /// `CUdeviceptr` of F32 residual values `[kv_heads, res_cap, head_dim]`. Borrowed.
+    pub res_v_mem: u64,
+    /// `CUdeviceptr` of output `[num_heads_q, head_dim]` F32, written. Borrowed.
+    pub out_mem: u64,
+    /// Host pointer for post-softmax score readback (may be null == skip). NOT a device buffer.
+    pub scores_out: *mut f32,
+    pub scores_len: usize,
+    pub num_heads_q: usize,
+    pub num_heads_kv: usize,
+    pub head_dim: usize,
+    pub q_tokens: usize,
+    pub res_tokens: usize,
+    pub res_cap: usize,
+    pub scale: f32,
+    pub bits: u8,
+}
+
+/// Per-call args for the CUDA residual gather-update (repr(C) POD). CUDA analog of [`QuantAttnGatherArgs`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CudaQuantAttnGatherArgs {
+    /// Raw `CUstream` (may be null == default stream). Borrowed.
+    pub cu_stream: *mut c_void,
+    /// `CUdeviceptr` of input `[seq_len, kv_heads, head_dim]` F32. Borrowed.
+    pub input_mem: u64,
+    /// `CUdeviceptr` of residual `[kv_heads, res_cap, head_dim]` F32, written. Borrowed.
+    pub residual_mem: u64,
+    pub kv_heads: usize,
+    pub res_cap: usize,
+    pub head_dim: usize,
+    pub seq_len: usize,
+    pub res_pos: usize,
+}
+
+/// Per-call args for the CUDA Q2 dequant-flush (repr(C) POD). CUDA analog of [`QuantDequantFlushArgs`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CudaQuantDequantFlushArgs {
+    /// Raw `CUstream` (may be null == default stream). Borrowed.
+    pub cu_stream: *mut c_void,
+    /// `CUdeviceptr` of source quantized blocks. Borrowed.
+    pub q_blocks_mem: u64,
+    /// `CUdeviceptr` of destination F16 attention buffer. Borrowed.
+    pub attn_mem: u64,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    /// K: groups_per_flush; V: flush_tokens.
+    pub n_groups_or_tokens: usize,
+    pub tok_base: usize,
+    pub block_start: usize,
+    pub bits: u8,
+    pub is_key: bool,
+}
+
+/// Per-call args for the CUDA residual-scatter into the F16 view (repr(C) POD). CUDA analog of
+/// [`QuantScatterResidualArgs`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CudaQuantScatterResidualArgs {
+    /// Raw `CUstream` (may be null == default stream). Borrowed.
+    pub cu_stream: *mut c_void,
+    /// `CUdeviceptr` of F32 residual ring source. Borrowed.
+    pub res_mem: u64,
+    /// `CUdeviceptr` of F16 attention view destination. Borrowed.
+    pub attn_mem: u64,
+    pub kv_heads: usize,
+    pub res_cap: usize,
+    pub head_dim: usize,
+    pub res_pos: usize,
+    pub tok_base: usize,
+}
+
+/// A CUDA quantized-KV attention backend — the CUDA twin of [`QuantAttnBackend`]. Like the OpenCL
+/// trait it has NO `name` method (the name lives on [`CudaQuantAttnReg`]). Returns `0` on success, a
+/// negative code on failure; must not panic (C3 panic=abort across the C boundary in the OpenCL twin —
+/// kept here for symmetry even though the CUDA axis is static-linkme).
+pub trait CudaQuantAttnBackend: Send + Sync {
+    /// Whether a native fused attention kernel exists for `bits` (2/4/8).
+    fn has_quant_attn_kernel(&self, bits: u8) -> bool;
+    /// Advisory nosub flag (mirrors the OpenCL twin; the engine reads the real flag off the backend).
+    fn is_nosub_device(&self) -> bool;
+    /// Fused dequant+attention on `args.cu_stream`.
+    fn attention_gen_quant(&self, args: &CudaQuantAttnArgs) -> i32;
+    /// Residual gather-update.
+    fn gather_update_quant(&self, args: &CudaQuantAttnGatherArgs) -> i32;
+    /// Q2 dequant-flush into the F16 view. Default `-1` (unsupported).
+    fn dequant_flush(&self, _args: &CudaQuantDequantFlushArgs) -> i32 {
+        -1
+    }
+    /// Residual scatter into the F16 view. Default `-1` (unsupported).
+    fn scatter_residual(&self, _args: &CudaQuantScatterResidualArgs) -> i32 {
+        -1
+    }
+}
+
+/// Registration entry for one CUDA quant-attn backend — the CUDA mirror of [`QuantAttnReg`],
+/// static-linkme only. `make` returns `Result` (nvcc/PTX compile can fail at runtime), unlike the
+/// OpenCL `QuantAttnReg` whose `make` is infallible.
+pub struct CudaQuantAttnReg {
+    /// Registry key (e.g. `"kivi_abi"`, matched to the OpenCL `--backend-cap` selector).
+    pub name: &'static str,
+    /// Factory from the lent CUDA context. Borrows `args` for the call only.
+    pub make: fn(&CudaQuantAttnMakeArgs) -> Result<Box<dyn CudaQuantAttnBackend>, String>,
+}
+
+/// Global CUDA quant-attn registration slice — the CUDA twin of [`QUANT_ATTN_REGS`]. Disjoint from
+/// the OpenCL slice and the dynamic `PLUGIN_BACKEND_CAP_VTABLES` path; the KIVI plugin registers here
+/// under the `cuda` feature.
+#[distributed_slice]
+pub static CUDA_QUANT_ATTN_REGS: [CudaQuantAttnReg] = [..];
+
+/// Find a registered CUDA quant-attn backend by name.
+pub fn find_cuda_quant_attn(name: &str) -> Option<&'static CudaQuantAttnReg> {
+    CUDA_QUANT_ATTN_REGS.iter().find(|r| r.name == name)
+}
+
+/// Names of all statically-registered CUDA quant-attn backends (fat-LTO name-survival diagnostics).
+pub fn registered_cuda_quant_attn_names() -> Vec<&'static str> {
+    CUDA_QUANT_ATTN_REGS.iter().map(|r| r.name).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

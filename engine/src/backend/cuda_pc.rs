@@ -385,6 +385,23 @@ impl CudaBackend {
         f(&make_args)
     }
 
+    /// Build a [`argus_extension_api::CudaQuantAttnMakeArgs`] from this backend's live CUDA context
+    /// and invoke `f` with it. Used by the session-init KIVI resolver to construct the `kivi_abi`
+    /// CUDA quant-attn backend via `find_cuda_quant_attn`. Structural twin of
+    /// [`with_cuda_score_reduce_make_args`](Self::with_cuda_score_reduce_make_args).
+    pub fn with_cuda_quant_attn_make_args<R>(
+        &self,
+        f: impl FnOnce(&argus_extension_api::CudaQuantAttnMakeArgs) -> R,
+    ) -> R {
+        let make_args = argus_extension_api::CudaQuantAttnMakeArgs {
+            cu_context: self.ctx.cu_ctx() as *mut std::ffi::c_void,
+            cu_device: self.cu_device,
+            cc_major: self.compute_capability.0,
+            cc_minor: self.compute_capability.1,
+        };
+        f(&make_args)
+    }
+
     /// Initialize the GPU-side attention score accumulator (discrete-GPU twin of
     /// `OpenCLBackend::init_gpu_score_acc`).
     ///
