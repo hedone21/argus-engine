@@ -27,6 +27,14 @@ project is pre-1.0; minor releases may include breaking changes.
 
 ### Changed
 
+- **Host default backend is now `cuda` on a CUDA build.** `argus-cli` / `argus-bench` /
+  `argus-chat` / `argus-eval` share one `--backend`/`-b` default that is now three-way: an Android
+  target still defaults to `opencl`; a host built with `--features cuda` (or `cuda-embedded`) now
+  defaults to **`cuda`**; every other host build still defaults to `cpu`. This matches the AUF
+  primary-variant default, which already selects `CudaAos` under `cuda`/`cuda-embedded`. To run on
+  the CPU from a CUDA build, pass `--backend cpu` explicitly — the CUDA init error now also points
+  at that flag. Non-CUDA builds are unaffected.
+
 - Added a plugin-declared argument channel to `argus-extension-api`. `KVCacheStageReg` gained
   `make_with_args(StageParams, StageArgs)` alongside `make`, where `StageArgs = &[PluginArg]` is an
   opaque `key=value` blob the engine routes **without knowing any technique's private params**. The

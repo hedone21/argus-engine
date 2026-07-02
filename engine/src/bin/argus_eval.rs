@@ -611,7 +611,8 @@ mod tests {
             "--dump-dir",
             "/tmp/d",
         ]);
-        // Default backend on the host (non-android) is "cpu".
+        // Default backend on a host build without a CUDA feature (the default test
+        // build) is "cpu"; answer_attention is accepted on any backend regardless.
         assert!(reject_unsupported_modes_eval(&args).is_ok());
         assert!(args.dump_enabled("answer_attention"));
         assert_eq!(

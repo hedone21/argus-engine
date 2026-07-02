@@ -350,7 +350,17 @@ impl SessionInitCtx {
             }
             #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
             "cuda" => {
-                let gpu_concrete = Arc::new(crate::backend::cuda::CudaBackend::new()?);
+                // The CUDA backend is the default on a CUDA build (see cli.rs), so a
+                // GPU-less / driver-less host would otherwise fail here with only the
+                // raw init error. Append the recovery flag so the actionable hint
+                // reaches users who never read `--help`.
+                let gpu_concrete =
+                    Arc::new(crate::backend::cuda::CudaBackend::new().map_err(|e| {
+                        anyhow::anyhow!(
+                            "{e}\nhint: the CUDA backend is the default on a CUDA build — \
+                             pass `--backend cpu` to run on the CPU instead"
+                        )
+                    })?);
                 let gpu_mem: Arc<dyn Memory> = if gpu_concrete.is_discrete_gpu() {
                     Arc::new(crate::backend::cuda::memory::CudaMemory::managed())
                 } else {
