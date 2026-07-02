@@ -962,46 +962,20 @@ fn build_chat_eviction_internal(
         acc.enable_per_layer_flat();
     }
 
-    // GPU-side accumulator init (OpenCL only). Caps-driven arming: only when the policy consumes
+    // GPU-side accumulator init (OpenCL/CUDA). Caps-driven arming: only when the policy consumes
     // scores (`score_based`); a score-free policy still runs eviction but never reads importance, so
-    // arming the GPU score path for it would write/reduce scores that are never read.
-    #[cfg(feature = "opencl")]
-    if score_based
-        && let Some(ocl_be) = ctx
-            .backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-    {
-        let _ = ocl_be.init_gpu_score_acc(
+    // arming the GPU score path for it would write/reduce scores that are never read. Chat is
+    // intentionally silent on init failure (unlike bench/eval, which log) — it just falls back to the
+    // CPU accumulate path.
+    if score_based {
+        let _ = crate::kv::eviction::score_fed::arm_gpu_score_acc(
+            &*ctx.backend,
             ctx.model.config.num_hidden_layers,
             ctx.model.config.num_attention_heads,
             ctx.model.config.num_key_value_heads,
             max_seq_len,
             args.h2o_decay(),
         );
-        if let Some(gpu_acc) = ocl_be.gpu_score_acc_mut() {
-            gpu_acc.set_active(true);
-        }
-    }
-
-    // CUDA twin of the GPU-accumulator init (discrete-GPU / Jetson).
-    #[cfg(feature = "cuda")]
-    if score_based
-        && let Some(cuda_be) = ctx
-            .backend
-            .as_any()
-            .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
-    {
-        let _ = cuda_be.init_gpu_score_acc(
-            ctx.model.config.num_hidden_layers,
-            ctx.model.config.num_attention_heads,
-            ctx.model.config.num_key_value_heads,
-            max_seq_len,
-            args.h2o_decay(),
-        );
-        if let Some(gpu_acc) = cuda_be.gpu_score_acc_mut() {
-            gpu_acc.set_active(true);
-        }
     }
 
     Ok((Some(cache_manager), Some(acc), score_based, eviction_policy))
