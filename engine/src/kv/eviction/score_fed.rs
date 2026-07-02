@@ -5,7 +5,7 @@
 //!
 //! Each binary keeps its own *trigger* (cli=none, bench=pressure edge, eval=post_prefill/
 //! streaming, chat=turn-boundary) and its own ownership/locking/cache-wrapping; it calls into
-//! these free functions for the *body*. The reset half (`acc.reset()` + [`reset_gpu_layer_flat`])
+//! these free functions for the *body*. The reset half (`acc.reset()` + [`reset_gpu_scores`])
 //! is sequenced by the caller after a confirmed evict because it interleaves with each site's
 //! own bookkeeping (dump capture, counters).
 //!
@@ -150,38 +150,38 @@ pub fn sync_gpu_scores_to_cpu(acc: &mut AttentionScoreAccumulator, backend: &dyn
     let _ = (acc, backend);
 }
 
-/// Reset the GPU per-`(layer, token)` FLAT cumulative buffer at an eviction boundary, in lockstep
-/// with the CPU `acc.reset()` (faithful-H2O `(b)`). Without this a 2nd eviction would rank GPU
-/// per-layer importance monotonically accumulated since prefill (misaligned with the compacted
-/// cache) while the CPU twin starts fresh — they would diverge. Touches ONLY the per-layer buffer
-/// (the collapsed GPU buffers keep their existing behavior — INV-147). No-op on CPU / unarmed.
-pub fn reset_gpu_layer_flat(acc: &AttentionScoreAccumulator, backend: &dyn Backend) {
+/// Reset the GPU cumulative importance buffers (collapsed flat + per-KV-head + per-`(layer, token)`
+/// FLAT + step counters) at an eviction boundary, in lockstep with the CPU `acc.reset()`. Without
+/// this a 2nd eviction would rank GPU importance monotonically accumulated since prefill (misaligned
+/// with the compacted cache) while the CPU twin starts fresh — the two would diverge, corrupting
+/// both the score-based eviction ranking AND the `a2sf` / `evict_importance` dumps that read the
+/// accumulator. The GPU reduce accumulates on-device and is otherwise never reset. Mirrors the full
+/// CPU `acc.reset()` (not just the per-layer buffer). No-op on CPU backends / when unarmed.
+pub fn reset_gpu_scores(acc: &AttentionScoreAccumulator, backend: &dyn Backend) {
     #[cfg(feature = "opencl")]
     if acc.is_active()
-        && acc.layer_flat_importance().is_some()
         && let Some(ocl_be) = backend
             .as_any()
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-        && let Some(gpu_acc) = ocl_be.gpu_score_acc()
+        && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
         && gpu_acc.is_active()
     {
-        let _ = gpu_acc.reset_layer_flat(ocl_be.queue.as_core());
+        let _ = gpu_acc.reset(ocl_be.queue.as_core());
     }
 
     // CUDA twin (discrete-GPU / Jetson).
     #[cfg(feature = "cuda")]
     if acc.is_active()
-        && acc.layer_flat_importance().is_some()
         && let Some(cuda_be) = backend
             .as_any()
             .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
-        && let Some(gpu_acc) = cuda_be.gpu_score_acc()
+        && let Some(gpu_acc) = cuda_be.gpu_score_acc_mut()
         && gpu_acc.is_active()
     {
-        let _ = gpu_acc.reset_layer_flat();
+        let _ = gpu_acc.reset();
     }
 
-    // CPU-only build: no GPU per-layer buffer exists, so the reset is a no-op.
+    // CPU-only build: no GPU accumulator exists, so the reset is a no-op.
     #[cfg(not(any(feature = "opencl", feature = "cuda")))]
     let _ = (acc, backend);
 }

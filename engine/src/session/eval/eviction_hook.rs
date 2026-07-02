@@ -388,15 +388,14 @@ impl EvictionHook {
         }
     }
 
-    /// Reset the GPU per-`(layer, token)` FLAT cumulative buffer at an eviction boundary, in lockstep
-    /// with the CPU `acc.reset()` (faithful-H2O `(b)`). The GPU per-layer reduce accumulates on-device
-    /// and is otherwise never reset, so without this a 2nd eviction would rank GPU per-layer importance
-    /// monotonically accumulated since prefill (misaligned with the compacted cache) while the CPU twin
-    /// starts fresh — they would diverge. No-op on CPU backends / when per-layer is not armed; touches
-    /// ONLY the per-layer buffer (the collapsed GPU buffers keep their existing behavior).
-    fn reset_gpu_layer_flat(&self) {
+    /// Reset the GPU cumulative importance buffers (collapsed + per-KV-head + per-layer FLAT + step
+    /// counters) at an eviction boundary, in lockstep with the CPU `acc.reset()`. The GPU reduce
+    /// accumulates on-device and is otherwise never reset, so without this a 2nd eviction would rank
+    /// GPU importance monotonically accumulated since prefill (misaligned with the compacted cache)
+    /// while the CPU twin starts fresh — they would diverge. No-op on CPU backends / when unarmed.
+    fn reset_gpu_scores(&self) {
         if let Some(acc) = self.score_accumulator.as_ref() {
-            crate::kv::eviction::score_fed::reset_gpu_layer_flat(acc, self.backend.as_ref());
+            crate::kv::eviction::score_fed::reset_gpu_scores(acc, self.backend.as_ref());
         }
     }
 
@@ -476,9 +475,9 @@ impl EvictionHook {
             if let Some(acc) = self.score_accumulator.as_mut() {
                 acc.reset();
             }
-            // Faithful-H2O (b): reset the GPU per-layer buffer in lockstep (CPU acc.reset above zeroed
-            // the CPU twin; the GPU reduce accumulates on-device and is otherwise never reset).
-            self.reset_gpu_layer_flat();
+            // Reset the GPU accumulator in lockstep (CPU acc.reset above zeroed the CPU twin; the GPU
+            // reduce accumulates on-device and is otherwise never reset).
+            self.reset_gpu_scores();
         } else if self.dump_evict_importance {
             // No eviction fired — drop the armed capture so it can't leak forward.
             crate::kv::eviction::keepset_dump::disarm_capture();
@@ -864,8 +863,8 @@ impl StepHook<KVCache> for EvictionHook {
             if let Some(acc) = self.score_accumulator.as_mut() {
                 acc.reset();
             }
-            // Faithful-H2O (b): reset the GPU per-layer buffer in lockstep with the CPU reset above.
-            self.reset_gpu_layer_flat();
+            // Reset the GPU accumulator in lockstep with the CPU reset above.
+            self.reset_gpu_scores();
 
             // Store QCF result for extra_question_fields
             self.eviction_qcf = Some(EvictionQcfResult {
@@ -888,8 +887,8 @@ impl StepHook<KVCache> for EvictionHook {
         if let Some(acc) = self.score_accumulator.as_mut() {
             acc.reset();
         }
-        // Faithful-H2O (b): reset the GPU per-layer buffer in lockstep with the CPU reset above.
-        self.reset_gpu_layer_flat();
+        // Reset the GPU accumulator in lockstep with the CPU reset above.
+        self.reset_gpu_scores();
         self.eviction_count = 0;
         self.evicted_total = 0;
         self.eviction_qcf = None;

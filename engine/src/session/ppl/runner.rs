@@ -1028,6 +1028,16 @@ pub fn run_ppl(
             if before_len > eviction_threshold {
                 let ratio = effective_budget as f32 / before_len as f32;
 
+                // GPU score sync before the eviction reads importance (mirrors eval-ll's
+                // EvictionHook; no-op on CPU / when the GPU accumulator is unarmed). On a GPU
+                // backend `init_gpu_score_acc` sets `need_scores=false`, so the CPU accumulator
+                // is stale until synced — this fixes BOTH the a2sf snapshot below AND the
+                // score-based eviction ranking (`extract_scores` further down), keeping the dump
+                // from perturbing the measurement.
+                if let Some(acc) = score_accumulator.as_mut() {
+                    crate::kv::eviction::score_fed::sync_gpu_scores_to_cpu(acc, backend.as_ref());
+                }
+
                 // score-decay 측정: eviction(+ acc.reset) 직전 importance 스냅샷(읽기 전용). budget=top-k.
                 if args.dump_a2sf.is_some()
                     && let Some(acc) = score_accumulator.as_ref()
@@ -1065,7 +1075,8 @@ pub fn run_ppl(
                     && (v_cpu_data.is_some() || !kv_caches[0].v_buffer.buffer().as_ptr().is_null());
 
                 // Perform eviction — shared score-fed body (extract → route; force, ratio).
-                // ppl uses the CPU accumulate path (no GPU score sync here).
+                // GPU scores were synced into the CPU accumulator above, so `extract_scores`
+                // reads real importance on both CPU and GPU backends.
                 use crate::kv::eviction::score_fed;
                 let extracted = if score_based_eviction {
                     score_accumulator
@@ -1175,6 +1186,11 @@ pub fn run_ppl(
                     // start_pos continues via `start_pos += 1` in the main loop.
                     if let Some(acc) = score_accumulator.as_mut() {
                         acc.reset();
+                        // Reset the GPU accumulator in lockstep (mirrors eval-ll/bench). Without this
+                        // the GPU importance keeps accumulating since prefill while the CPU twin above
+                        // starts fresh, so a 2nd eviction's synced scores (and the a2sf dump) would
+                        // diverge from the CPU oracle. No-op on CPU / when unarmed.
+                        score_fed::reset_gpu_scores(acc, backend.as_ref());
                     }
                     eprintln!(
                         "[PPL] Eviction at step {}: {} → {} tokens (removed {})",
@@ -1200,6 +1216,12 @@ pub fn run_ppl(
 
     // score-decay 측정: run 종료 시점 스냅샷(step=-1) + 누적 스냅샷을 JSON 파일로 덤프(읽기 전용).
     if let Some(dump_path) = args.dump_a2sf.as_ref() {
+        // Sync GPU scores into the CPU accumulator before the final snapshot reads them
+        // (no-op on CPU / when the GPU accumulator is unarmed). This is a dump-only,
+        // post-run read, so it never touches the measured eviction path.
+        if let Some(acc) = score_accumulator.as_mut() {
+            crate::kv::eviction::score_fed::sync_gpu_scores_to_cpu(acc, backend.as_ref());
+        }
         if let Some(acc) = score_accumulator.as_ref()
             && acc.is_active()
         {
