@@ -260,33 +260,27 @@ fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
             );
         }
         // answer_attention / answer_attention_steps capture per-key attention via the PFA
-        // side channel materialized on the CPU forward path only, so they still require a CPU
-        // backend rather than emit a buffer of zeros.
+        // side channel. That side channel is materialized on the GPU path too: the flash prefill
+        // kernel computes `out`, then the host-mirror re-runs the same scalar `prefill_attention_scores`
+        // over K read back from VRAM (standard_format.rs `attention_into`), so the PFA buffer these
+        // dumps read is filled on GPU as well (the same mechanism faithful-H2O / pyramidkv rely on).
+        // Both dumps use a fresh uncompressed StandardFormat reference cache and are policy-independent,
+        // so no backend or eviction-policy restriction applies.
         //
         // evict_importance reads the accumulator's per-(layer, KV-head) importance, which on a GPU
         // backend is populated by the faithful-H2O prefill-attention seed (`seed_prefill_importance`
         // folds the host-mirror PFA into the accumulator on the CPU side, so it is resident on GPU
         // too). That seed runs only for the `h2o` policy; other score policies (d2o/h2o_plus) would
         // leave the per-head buffer zeroed on GPU, so restrict evict_importance to `h2o` there.
-        if args.backend != "cpu" {
-            use argus_engine::session::eval::dump::{
-                DUMP_ANSWER_ATTENTION, DUMP_ANSWER_ATTENTION_STEPS, DUMP_EVICT_IMPORTANCE,
-            };
-            for kind in [DUMP_ANSWER_ATTENTION, DUMP_ANSWER_ATTENTION_STEPS] {
-                if args.dump_enabled(kind) {
-                    bail!(
-                        "argus-eval: --dump {kind} requires --backend cpu \
-                         (per-key attention capture is CPU-only)"
-                    );
-                }
-            }
-            if args.dump_enabled(DUMP_EVICT_IMPORTANCE) && args.eviction_policy() != "h2o" {
-                bail!(
-                    "argus-eval: --dump evict_importance on a GPU backend requires the h2o \
-                     eviction policy (`eviction plugin --name h2o`); other policies' \
-                     per-(layer, KV-head) importance is not GPU-resident — use --backend cpu"
-                );
-            }
+        if args.backend != "cpu"
+            && args.dump_enabled(argus_engine::session::eval::dump::DUMP_EVICT_IMPORTANCE)
+            && args.eviction_policy() != "h2o"
+        {
+            bail!(
+                "argus-eval: --dump evict_importance on a GPU backend requires the h2o \
+                 eviction policy (`eviction plugin --name h2o`); other policies' \
+                 per-(layer, KV-head) importance is not GPU-resident — use --backend cpu"
+            );
         }
         // evict_importance profiles a real eviction event — it needs an eviction policy.
         if args.dump_enabled(argus_engine::session::eval::dump::DUMP_EVICT_IMPORTANCE) {
@@ -530,8 +524,11 @@ mod tests {
         assert!(err.to_string().contains("--dump-dir"), "{}", err);
     }
 
+    /// answer_attention on a GPU backend is now accepted: the host-mirror in
+    /// `standard_format.rs` fills the PFA buffer on GPU too (the dump is a
+    /// policy-independent standalone reference forward), so the CPU-only guard was lifted.
     #[test]
-    fn reject_dump_answer_attention_requires_cpu_backend() {
+    fn accept_dump_answer_attention_gpu_backend() {
         let args = make_args(&[
             "--eval-ll",
             "--eval-continuation",
@@ -543,8 +540,25 @@ mod tests {
             "--backend",
             "opencl",
         ]);
-        let err = reject_unsupported_modes_eval(&args).unwrap_err();
-        assert!(err.to_string().contains("cpu"), "{}", err);
+        assert!(reject_unsupported_modes_eval(&args).is_ok());
+    }
+
+    /// answer_attention_steps on a GPU backend is likewise accepted (same host-mirror
+    /// substrate, per-row PFA arm).
+    #[test]
+    fn accept_dump_answer_attention_steps_gpu_backend() {
+        let args = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention_steps",
+            "--dump-dir",
+            "/tmp/d",
+            "--backend",
+            "opencl",
+        ]);
+        assert!(reject_unsupported_modes_eval(&args).is_ok());
     }
 
     #[test]
@@ -627,24 +641,6 @@ mod tests {
         );
         // The per-head flag defaults off (head-mean).
         assert!(!args.answer_attention_steps_per_head);
-    }
-
-    /// answer_attention_steps inherits the CPU-backend requirement (PFA is CPU-only).
-    #[test]
-    fn reject_dump_answer_attention_steps_requires_cpu_backend() {
-        let args = make_args(&[
-            "--eval-ll",
-            "--eval-continuation",
-            "x",
-            "--dump",
-            "answer_attention_steps",
-            "--dump-dir",
-            "/tmp/d",
-            "--backend",
-            "opencl",
-        ]);
-        let err = reject_unsupported_modes_eval(&args).unwrap_err();
-        assert!(err.to_string().contains("cpu"), "{}", err);
     }
 
     /// The per-head flag parses and is independent of which dump is selected.
