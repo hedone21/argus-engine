@@ -92,6 +92,11 @@ pub struct ChatModeBuild {
     /// The eviction policy name to set on the resilience adapter (`""` for
     /// quantized/offload, which have no in-loop eviction).
     pub eviction_policy: String,
+    /// Caps-driven PFA keep-set arming (the producer cell is armed on `ModelForward` during the
+    /// forward build; the consumer `PrefillKeepSetStage` is submitted to the chat registry in
+    /// `build_chat_session`). `Some` only for the Standard mode when a PFA-reading stage is registered
+    /// and no score-based policy owns the cache.
+    pub keepset: Option<crate::session::chat::session::ChatKeepsetArming>,
     /// The `ChatKvMode` stats-line payload (Standard owns its CacheManager; the
     /// quantized/offload variants carry their display knobs).
     pub kv_mode: crate::session::chat::session::ChatKvMode,

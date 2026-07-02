@@ -99,11 +99,16 @@ pub struct PrefillKeepSetStage {
     n_heads_q: usize,
     /// keep budget ratio (`target_len = prefix_len * ratio`).
     target_ratio: f32,
+    /// `OneShot` for the single-prefill loops (cli/bench/eval — GC'd after the first `PrefillEnd`);
+    /// `Persistent` for chat's re-entrant per-turn prefill loop, where one registry is reused across
+    /// turns and the stage must survive to prune every turn's prefill.
+    lifecycle: StageLifecycle,
 }
 
 impl PrefillKeepSetStage {
     /// 무장된 PFA producer cell + keep-set plugin 으로 stage 를 만든다(assembly 가 PFA-reading stage
-    /// 발견 시 submit). `handles` enumerate 순서는 layer idx 와 일치해야 한다.
+    /// 발견 시 submit). `handles` enumerate 순서는 layer idx 와 일치해야 한다. `OneShot` — a single
+    /// prefill per process (cli/bench/eval); the dispatcher GCs it after the first `PrefillEnd`.
     pub fn new(
         handles: Vec<Arc<StandardFormat>>,
         stage: Box<dyn KVMutationStage>,
@@ -117,6 +122,29 @@ impl PrefillKeepSetStage {
             prefill_attn_cell,
             n_heads_q,
             target_ratio,
+            lifecycle: StageLifecycle::OneShot,
+        }
+    }
+
+    /// `Persistent` variant for chat's multi-turn loop: chat builds one registry and reuses the single
+    /// `DecodeLoop` across turns, so a `OneShot` keep-set would be GC'd after turn 1 and silently stop
+    /// pruning turns 2..N. This variant returns [`StageOutcome::Continue`] at `PrefillEnd` (a
+    /// `Persistent` stage returning `Consumed` trips a `PipelineRegistry::dispatch` debug_assert) so it
+    /// survives and prunes every turn's prefill.
+    pub fn persistent(
+        handles: Vec<Arc<StandardFormat>>,
+        stage: Box<dyn KVMutationStage>,
+        prefill_attn_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+        n_heads_q: usize,
+        target_ratio: f32,
+    ) -> Self {
+        Self {
+            handles,
+            stage,
+            prefill_attn_cell,
+            n_heads_q,
+            target_ratio,
+            lifecycle: StageLifecycle::Persistent,
         }
     }
 }
@@ -127,7 +155,7 @@ impl PipelineStage for PrefillKeepSetStage {
     }
 
     fn lifecycle(&self) -> StageLifecycle {
-        StageLifecycle::OneShot
+        self.lifecycle
     }
 
     fn on_phase(
@@ -139,14 +167,21 @@ impl PipelineStage for PrefillKeepSetStage {
         if *phase != LifecyclePhase::PrefillEnd {
             return Ok(StageOutcome::Continue);
         }
-        // PFA cell read. 미무장/미산출(None)이면 no-op Consumed.
+        // "done for this prefill" outcome: OneShot (cli/bench/eval) → Consumed so the dispatcher GCs
+        // the single-use stage; Persistent (chat's re-entrant loop) → Continue so it survives to prune
+        // the next turn's prefill (a Persistent stage returning Consumed trips a dispatch debug_assert).
+        let done = match self.lifecycle {
+            StageLifecycle::OneShot => StageOutcome::Consumed,
+            StageLifecycle::Persistent => StageOutcome::Continue,
+        };
+        // PFA cell read. 미무장/미산출(None)이면 no-op.
         let pfa_guard = self
             .prefill_attn_cell
             .lock()
             .expect("PrefillKeepSetStage PFA cell Mutex poisoned");
         let pfa = match pfa_guard.as_ref() {
             Some(v) => v,
-            None => return Ok(StageOutcome::Consumed),
+            None => return Ok(done),
         };
 
         // UER (Unwrap-Evict-Rewrap, EvictionStage 미러): take_inner → shared per-layer executor
@@ -165,7 +200,7 @@ impl PipelineStage for PrefillKeepSetStage {
         }
         result?;
         drop(pfa_guard);
-        Ok(StageOutcome::Consumed)
+        Ok(done)
     }
 }
 
@@ -318,6 +353,74 @@ mod tests {
                 "compacted pos {i} should hold original pos {orig}"
             );
         }
+    }
+
+    #[test]
+    fn persistent_variant_survives_repeated_prefill_ends() {
+        // Regression (chat multi-turn): a OneShot keep-set returns Consumed at PrefillEnd, so the
+        // dispatcher GCs it and chat's reused registry would prune only turn 1. The persistent()
+        // variant must return Continue (so it is NOT GC'd) and prune EVERY turn's prefill.
+        let n_heads_q = 2;
+        let handle = Arc::new(StandardFormat::new(0, make_cache(8)));
+        let cell = odd_favoring_pfa(n_heads_q, 8);
+        let stage = PrefillKeepSetStage::persistent(
+            vec![handle.clone()],
+            Box::new(TopKPfaStage),
+            cell.clone(),
+            n_heads_q,
+            0.5,
+        );
+        assert!(matches!(stage.lifecycle(), StageLifecycle::Persistent));
+
+        let mut profiler = OpProfiler::new();
+
+        // Turn 1: prefix 8 → keep 4. Outcome MUST be Continue (Consumed would trip GC → turn-2 skip).
+        {
+            let mut ctx = make_ctx(&mut profiler);
+            let outcome = stage
+                .on_phase(&LifecyclePhase::PrefillEnd, &mut ctx)
+                .unwrap();
+            assert!(
+                matches!(outcome, StageOutcome::Continue),
+                "persistent keep-set must return Continue so the dispatcher does not GC it"
+            );
+        }
+        assert_eq!(handle.current_pos(), 4, "turn 1 keep = 8 * 0.5");
+
+        // Turn 2: simulate the next turn's prefill (cache refilled to pos 8, PFA cell re-armed) and
+        // dispatch PrefillEnd AGAIN on the same instance. A GC'd OneShot would be gone; persistent
+        // prunes again → current_pos back to 4.
+        handle.put_inner(make_cache(8));
+        *cell.lock().unwrap() = odd_favoring_pfa(n_heads_q, 8).lock().unwrap().take();
+        {
+            let mut ctx = make_ctx(&mut profiler);
+            let outcome = stage
+                .on_phase(&LifecyclePhase::PrefillEnd, &mut ctx)
+                .unwrap();
+            assert!(matches!(outcome, StageOutcome::Continue));
+        }
+        assert_eq!(
+            handle.current_pos(),
+            4,
+            "turn 2 keep-set must fire again (persistent), not be skipped after turn 1"
+        );
+    }
+
+    #[test]
+    fn oneshot_new_returns_consumed_at_prefill_end() {
+        // The single-prefill loops (cli/bench/eval) keep OneShot semantics: Consumed at PrefillEnd so
+        // the dispatcher GCs the single-use stage. Guards the persistent/oneshot split.
+        let handle = Arc::new(StandardFormat::new(0, make_cache(8)));
+        let cell = odd_favoring_pfa(2, 8);
+        let stage =
+            PrefillKeepSetStage::new(vec![handle.clone()], Box::new(TopKPfaStage), cell, 2, 0.5);
+        assert!(matches!(stage.lifecycle(), StageLifecycle::OneShot));
+        let mut profiler = OpProfiler::new();
+        let mut ctx = make_ctx(&mut profiler);
+        let outcome = stage
+            .on_phase(&LifecyclePhase::PrefillEnd, &mut ctx)
+            .unwrap();
+        assert!(matches!(outcome, StageOutcome::Consumed));
     }
 
     #[test]

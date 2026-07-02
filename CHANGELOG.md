@@ -10,6 +10,15 @@ project is pre-1.0; minor releases may include breaking changes.
 
 ### Added
 
+- **`argus-chat` now honors a registered prefill-attention keep-set stage** (pyramidkv / SnapKV
+  per-head, `caps.reads ∋ PrefillAttention`), reaching parity with `argus-cli` / `argus-bench` /
+  `argus-eval`. Previously chat's only PFA producer was the faithful-H2O full-window seed, so a
+  registered keep-set was silently ignored. Chat now arms the keep-set producer when no score-based
+  policy owns the cache (mirroring the bench gate, which also keeps it mutually exclusive with the
+  faithful-H2O seed) and submits a `PrefillKeepSetStage` to the chat pipeline registry; since
+  `DecodeLoop::prefill` dispatches the `PrefillEnd` phase every turn, the keep-set prunes each turn's
+  prefill. With no such stage registered (the default) the path is inert and byte-identical.
+
 - Added a synthetic **`kivi`** backend-capability plugin (`crates/techniques/kivi`, registers
   `kivi_abi`) — the last KV technique to move out, and the first non-example user of the
   backend-capability axis (`register_kivi_attention_plugin!`). It exercises the full dynamic

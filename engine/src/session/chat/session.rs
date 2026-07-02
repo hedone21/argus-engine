@@ -53,6 +53,20 @@ pub struct FaithfulPrefillSeed {
     pub backend: Arc<dyn crate::backend::Backend>,
 }
 
+/// Caps-driven PFA keep-set arming carried from `build_chat_standard_forward` (which arms the producer
+/// cell on `ModelForward`) to `build_chat_session` (which submits the consumer `PrefillKeepSetStage`
+/// once the chat registry exists). Present only when a PFA-reading stage is registered
+/// (`caps.reads ∋ PrefillAttention`, e.g. `--features pyramidkv`) AND no score-based eviction policy
+/// owns the cache — mirroring the `cache_manager.is_none() && !faithful_h2o` gate in `build_bench_loop`.
+pub struct ChatKeepsetArming {
+    /// PFA producer cell shared with `ModelForward::set_prefill_attn`; read by the `PrefillEnd` stage.
+    pub cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+    /// Registered keep-set stage name (resolved via `resolve_prefill_keepset_arming`).
+    pub stage_name: String,
+    pub n_heads_q: usize,
+    pub target_ratio: f32,
+}
+
 /// `ChatKvMode::Standard` variant inner payload.
 ///
 /// `CacheManager` + `AttentionScoreAccumulator`로 인해 ~376 bytes로 enum 전체가
@@ -102,6 +116,12 @@ pub struct ChatSession {
     /// `chat_*_eviction_keeps_cumulative_rope_pos` 가 핀한다(PR #62 형제 경로 검증 = NOT-A-BUG).
     pub pos: usize,
     max_seq_len: usize,
+    /// Layer-0 physical KV handle for capacity accounting on the keep-set path. A `PrefillEnd`
+    /// keep-set (eviction=none, `cache_manager` None) compacts the physical cache each turn WITHOUT
+    /// bumping `evicted_total`, so the `cumulative - evicted_total` identity `occupancy()` relies on
+    /// over-reports. `occupancy()` reads this handle's `current_pos()` on that path instead. `None`
+    /// for test sessions and modes with no resident `StandardFormat`.
+    kv_pos_handle: Option<Arc<dyn KVCacheFormat>>,
     /// β-6: turn별 stop condition 을 `ChatStopStage`(DecodeEnd 구독)에 전달하는 공유 슬롯.
     /// `run_turn` 이 turn 시작 시 arm, run 후 자동 disarm(RAII guard).
     stop_slot: Arc<ChatStopSlot>,
@@ -123,6 +143,7 @@ impl ChatSession {
         decode_loop: DecodeLoop,
         kv_mode: ChatKvMode,
         max_seq_len: usize,
+        kv_pos_handle: Option<Arc<dyn KVCacheFormat>>,
         stop_slot: Arc<ChatStopSlot>,
         stream_slot: Arc<ChatStreamSlot>,
         sampling: Option<SharedSamplingConfig>,
@@ -132,6 +153,7 @@ impl ChatSession {
             kv_mode,
             pos: 0,
             max_seq_len,
+            kv_pos_handle,
             stop_slot,
             stream_slot,
             sampling,
@@ -151,6 +173,7 @@ impl ChatSession {
             kv_mode,
             pos: 0,
             max_seq_len,
+            kv_pos_handle: None,
             stop_slot,
             stream_slot,
             sampling: None,
@@ -589,6 +612,18 @@ impl ChatSession {
     fn occupancy(&self) -> usize {
         let cumulative = self.decode_loop.pos_snapshot();
         match &self.kv_mode {
+            // Keep-set path (cache_manager None + a PrefillEnd keep-set): the prune compacts the
+            // physical cache each turn WITHOUT bumping `evicted_total`, so `cumulative - evicted_total`
+            // over-reports and `ensure_capacity` would bail prematurely. Read the true physical
+            // `current_pos` from the layer-0 handle instead. Also correct for a plain eviction=none
+            // cache (current_pos == cumulative). Falls back to the identity when no handle is wired
+            // (test sessions). The CacheManager (score-based) path below keeps the identity — try_evict
+            // maintains `evicted_total` in lockstep with the physical prune.
+            ChatKvMode::Standard(s) if s.cache_manager.is_none() => self
+                .kv_pos_handle
+                .as_ref()
+                .map(|h| h.current_pos())
+                .unwrap_or_else(|| cumulative.saturating_sub(s.evicted_total)),
             ChatKvMode::Standard(s) => cumulative.saturating_sub(s.evicted_total),
             ChatKvMode::NonEvicting { .. } => cumulative,
         }
@@ -715,6 +750,30 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
         None
     };
 
+    // Caps-driven PFA keep-set (pyramidkv/SnapKV per-head) for chat — armed only when no score-based
+    // eviction policy owns the cache (eviction=none → cache_manager None), mirroring build_bench_loop's
+    // `cache_manager.is_none() && !faithful_h2o` gate (faithful_h2o always has a cache_manager, so it is
+    // excluded here → the two PFA producers never share the one cell). A registered PFA-reading stage
+    // (caps.reads ∋ PrefillAttention, e.g. --features pyramidkv) auto-arms via
+    // resolve_prefill_keepset_arming; with none registered it is None → set_prefill_attn is never called
+    // → byte-identical. The consumer PrefillKeepSetStage (PrefillEnd) is submitted to the chat registry
+    // in build_chat_session; DecodeLoop::prefill dispatches PrefillEnd each turn, so the keep-set prunes
+    // each turn's prefill (mirrors build_standard_loop).
+    let chat_keepset = if cache_manager.is_none()
+        && let Some(arming) = crate::kv::eviction::stage_registry::resolve_prefill_keepset_arming()
+    {
+        let cell = Arc::new(Mutex::new(None));
+        mf.set_prefill_attn(cell.clone(), arming.q_window);
+        Some(ChatKeepsetArming {
+            cell,
+            stage_name: arming.stage_name,
+            n_heads_q: fp_n_heads_q,
+            target_ratio,
+        })
+    } else {
+        None
+    };
+
     // Resilience: heartbeat KV handle (layer-0 StandardFormat) + dispatcher kv_handles.
     // `fmt_caches()` is populated by `ModelForward::new`. Read before `mf` is moved.
     let kv_handles = mf.fmt_caches().to_vec();
@@ -729,6 +788,7 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
         kv_handle,
         quant_handle: None,
         eviction_policy: policy_name.clone(),
+        keepset: chat_keepset,
         kv_mode: ChatKvMode::Standard(Box::new(ChatKvModeStandard {
             cache_manager,
             score_accumulator,
@@ -797,6 +857,7 @@ pub(crate) fn build_chat_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<C
         kv_handle,
         quant_handle,
         eviction_policy: String::new(), // quant-window: no in-loop eviction policy.
+        keepset: None,                  // quant-window has no PFA keep-set path.
         kv_mode: ChatKvMode::NonEvicting {
             stats_fragment: format!("mode=kivi bits={bits} residual={residual_size}"),
         },
@@ -853,6 +914,7 @@ pub(crate) fn build_chat_offload_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatMo
         kv_handle: None,
         quant_handle: None,
         eviction_policy: String::new(),
+        keepset: None, // offload has no PFA keep-set path.
         kv_mode: ChatKvMode::NonEvicting {
             stats_fragment: format!(
                 "mode=offload store={offload_mode} prefetch_depth={max_prefetch_depth}"
@@ -1084,10 +1146,64 @@ mod tests {
             })),
             pos: 0,
             max_seq_len,
+            kv_pos_handle: None,
             stop_slot,
             stream_slot,
             sampling: None,
         }
+    }
+
+    /// A resident layer-0 KV handle (real `StandardFormat`) with a fixed physical `current_pos`, for
+    /// the keep-set occupancy regression below.
+    fn kv_handle_with_pos(pos: usize, max: usize) -> Arc<dyn KVCacheFormat> {
+        let (kv_heads, head_dim) = (1usize, 2usize);
+        let total = max * kv_heads * head_dim;
+        let kb = Arc::new(crate::memory::host::shared::SharedBuffer::new(
+            total * 4,
+            crate::buffer::DType::F32,
+        ));
+        let vb = Arc::new(crate::memory::host::shared::SharedBuffer::new(
+            total * 4,
+            crate::buffer::DType::F32,
+        ));
+        let be: Arc<dyn crate::backend::Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
+        let sh = crate::shape::Shape::new(vec![1, max, kv_heads, head_dim]);
+        let mut c = crate::kv::kv_cache::KVCache::new(
+            crate::tensor::Tensor::new(sh.clone(), kb, be.clone()),
+            crate::tensor::Tensor::new(sh, vb, be),
+            max,
+        );
+        c.current_pos = pos;
+        Arc::new(StandardFormat::new(0, c)) as Arc<dyn KVCacheFormat>
+    }
+
+    /// Regression (PR3 keep-set): a `PrefillEnd` keep-set compacts the physical cache WITHOUT bumping
+    /// `evicted_total`, so the `cumulative - evicted_total` identity over-reports. `occupancy()` must
+    /// read the layer-0 handle's physical `current_pos` on the keep-set path (cache_manager None), or
+    /// `ensure_capacity` falsely bails while the pruned cache has ample room.
+    #[test]
+    fn occupancy_reads_physical_pos_on_keepset_path() {
+        let mut session = make_mock_session(16); // Standard, cache_manager None.
+        // Post-keep-set state: physical pos 4 < cumulative 8.
+        session.kv_pos_handle = Some(kv_handle_with_pos(4, 16));
+        session.prefill(&[1u32, 2, 3, 4, 5, 6, 7, 8]).unwrap(); // decode_loop.pos → 8 (cumulative).
+        assert_eq!(
+            session.occupancy(),
+            4,
+            "keep-set path reads physical current_pos (4), not cumulative (8)"
+        );
+        // And ensure_capacity must NOT falsely bail: occupancy(4) + 8 = 12 ≤ 16.
+        assert!(
+            session.ensure_capacity(8).is_ok(),
+            "physical cache (4) has room for 8 more within max_seq_len 16 — must not bail"
+        );
+        // Sanity: with no handle wired, it falls back to the identity (cumulative - evicted_total = 8).
+        session.kv_pos_handle = None;
+        assert_eq!(
+            session.occupancy(),
+            8,
+            "no handle → falls back to cumulative - evicted_total"
+        );
     }
 
     // ─── G2: multi-turn pos 누적 보존 ─────────────────────────────────────
@@ -1181,6 +1297,7 @@ mod tests {
             },
             pos: 10,
             max_seq_len: 2048,
+            kv_pos_handle: None,
             stop_slot,
             stream_slot,
             sampling: None,
@@ -1212,6 +1329,7 @@ mod tests {
             },
             pos: 9,
             max_seq_len: 10,
+            kv_pos_handle: None,
             stop_slot,
             stream_slot,
             sampling: None,
@@ -1241,6 +1359,7 @@ mod tests {
             },
             pos: 9,
             max_seq_len: 10,
+            kv_pos_handle: None,
             stop_slot,
             stream_slot,
             sampling: None,
@@ -1338,6 +1457,7 @@ mod tests {
             })),
             pos: 0,
             max_seq_len: 10,
+            kv_pos_handle: None,
             stop_slot,
             stream_slot,
             sampling: None,
@@ -1445,6 +1565,7 @@ mod tests {
             })),
             pos: 0,
             max_seq_len,
+            kv_pos_handle: None,
             stop_slot,
             stream_slot,
             sampling: None,
@@ -1616,6 +1737,7 @@ mod tests {
             },
             pos: 100,
             max_seq_len: 512,
+            kv_pos_handle: None,
             stop_slot,
             stream_slot,
             sampling: None,
@@ -1643,6 +1765,7 @@ mod tests {
             },
             pos: 77,
             max_seq_len: 512,
+            kv_pos_handle: None,
             stop_slot,
             stream_slot,
             sampling: None,
