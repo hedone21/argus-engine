@@ -283,10 +283,29 @@ impl ChatSession {
         // 1. Forward 내부 KV reset
         self.decode_loop.forward_mut().reset_kv()?;
 
-        // 2. score_accumulator + evicted_total reset (Standard 모드만)
+        // 2. score_accumulator + evicted_total reset (Standard 모드만). The GPU cumulative-importance
+        //    buffers must be cleared in lockstep with the host `acc.reset()`, or the next conversation
+        //    ranks on device importance accumulated across `/reset` — on the non-faithful score-based
+        //    path nothing re-seeds (overwrites) the GPU buffers, so the residue poisons the next
+        //    conversation's scores. `reset_gpu_scores` is self-guarding (no-op when the GPU acc is
+        //    unarmed) and gated on `any(opencl, cuda)` (no-op on CPU / cuda-embedded).
+        #[cfg(any(feature = "opencl", feature = "cuda"))]
+        let backend_ptr = self
+            .decode_loop
+            .forward_mut()
+            .backend()
+            .map(|b| b as *const dyn crate::backend::Backend);
         if let ChatKvMode::Standard(s) = &mut self.kv_mode {
             if let Some(acc) = s.score_accumulator.as_mut() {
                 acc.reset();
+                #[cfg(any(feature = "opencl", feature = "cuda"))]
+                if let Some(bp) = backend_ptr {
+                    // SAFETY: `bp` points at the backend owned by `decode_loop`; `acc` is in the
+                    // disjoint `kv_mode` field. The raw pointer is not retained past this call.
+                    unsafe {
+                        crate::kv::eviction::score_fed::reset_gpu_scores(acc, &*bp);
+                    }
+                }
             }
             s.evicted_total = 0;
         }
