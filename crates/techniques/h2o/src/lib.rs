@@ -16,8 +16,8 @@
 
 use argus_extension_api::{
     CacheHandle, CacheOpError, EstimatorCtx, KVMutationStage, KeepSpec, KeepTopK, MutationPhase,
-    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCaps, StageCtx, StageParams,
-    TensorKind, compile_keep_top_k, redistribute_value, register_kv_mutation_stage,
+    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, SignalId, StageArgs, StageCaps, StageCtx,
+    StageParams, TensorKind, compile_keep_top_k, redistribute_value, register_kv_mutation_stage,
 };
 use linkme::distributed_slice;
 
@@ -25,6 +25,11 @@ use linkme::distributed_slice;
 /// stay faithful to the reference, which has no attention sink — protects NO prefix by default.
 const H2O_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::Scores],
+    // Declares the same read by its open signal name (L1 signal-axis inversion): `attn_score`
+    // produces `"attn.cum_importance"`. The boot signal-occupancy self-test checks this handshake by
+    // name (`descriptor::validate_signal_occupancy`), the signal-axis sibling of the `reads`↔`produces`
+    // TensorKind occupancy invariant.
+    reads_signals: &[SignalId("attn.cum_importance")],
     default_protected_prefix: 0,
     produces_merge_plan: false,
     whole_model: false,

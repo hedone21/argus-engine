@@ -69,14 +69,16 @@
 //! all to recency — so it is always safe to run.
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, KVMutationStage, KeepSpec, KeepTopK, MutationPhase, StageArgs,
-    StageCaps, StageCtx, StageParams, TensorKind, compile_keep_top_k, register_kv_mutation_stage,
+    CacheHandle, CacheOpError, KVMutationStage, KeepSpec, KeepTopK, MutationPhase, SignalId,
+    StageArgs, StageCaps, StageCtx, StageParams, TensorKind, compile_keep_top_k,
+    register_kv_mutation_stage,
 };
 
 /// The caps for the v3 registration: PyramidKV reads the prefill attention (SnapKV score
 /// source); protects no prefix; drop-only.
 const PYRAMIDKV_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::PrefillAttention],
+    reads_signals: &[],
     default_protected_prefix: 0,
     produces_merge_plan: false,
     whole_model: false,
@@ -372,7 +374,9 @@ impl PyramidKv {
         let heavy = n_kept - window;
 
         // (1) Faithful per-head SnapKV path: requires PrefillAttention (per attention head, pre-GQA).
-        if let Some(pfa) = ctx.tensor(TensorKind::PrefillAttention) {
+        // Read via the open signal name (L1 signal-axis inversion) — `signal()` bridges
+        // `"attn.prefill_window"` back to `tensor(PrefillAttention)`, so this is byte-identical.
+        if let Some(pfa) = ctx.signal(SignalId("attn.prefill_window")) {
             let shape = pfa.shape();
             let n_q = shape.rows;
             let cols = shape.cols;

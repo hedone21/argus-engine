@@ -10,7 +10,9 @@
 //! (The former scalar/NEON inline accumulation lives in git history; the NEON specialization was
 //! removed earlier for producing incorrect results on ARM at negligible benefit.)
 
-use argus_extension_api::{ScoreProducer, ScoreProducerParams, find_score_producer};
+use argus_extension_api::{
+    DecodeAttnCtx, ScoreProducer, ScoreProducerParams, find_score_producer, find_signal_producer,
+};
 
 /// Resolve the built-in [`ScoreProducer`] (`"attn_score"`) or panic with a force-link hint. The
 /// producer lives in the `attn-score` crate, force-linked in `kv::eviction::stage_registry`; a miss
@@ -38,6 +40,22 @@ pub fn ensure_score_producers_registered() -> anyhow::Result<()> {
             "built-in ScoreProducer 'attn_score' not registered — suspect linkme fat-LTO \
              --gc-sections silent drop of the attn-score crate (force-linked in \
              kv::eviction::stage_registry)."
+        );
+    }
+    ensure_signal_producers_registered()
+}
+
+/// Assert the built-in `attn_score` [`argus_extension_api::SignalProducer`] is registered (the
+/// signal-axis sibling of [`ensure_score_producers_registered`], L1 signal-axis inversion). The
+/// `attn_score` crate registers on both the score and signal axes; this guards the `SIGNAL_PRODUCERS`
+/// half against the same fat-LTO `--gc-sections` silent drop, at the same production boot points (it is
+/// called from [`ensure_score_producers_registered`]).
+pub fn ensure_signal_producers_registered() -> anyhow::Result<()> {
+    if find_signal_producer("attn_score").is_none() {
+        anyhow::bail!(
+            "built-in SignalProducer 'attn_score' not registered — suspect linkme fat-LTO \
+             --gc-sections silent drop of the attn-score crate's SIGNAL_PRODUCERS registration \
+             (force-linked in kv::eviction::stage_registry)."
         );
     }
     Ok(())
@@ -142,6 +160,18 @@ impl AttentionScoreAccumulator {
             n_kv_heads,
             score_offset,
         );
+    }
+
+    /// The `DecodeAttn` tap (L1 signal-axis inversion, P2). The decode driver assembles a
+    /// [`DecodeAttnCtx`] and dispatches here; the shell forwards to the producer's general
+    /// [`argus_extension_api::SignalProducer::on_decode_attn`], which folds this layer's scores by
+    /// GQA-vs-flat mode (the branch + per-layer attribution the engine core used to hold inline).
+    /// Byte-identical to the former direct `set_current_layer` + `accumulate_layer(_gqa)` calls: same
+    /// producer, same arguments, one extra non-branching upcast. The `accumulate_layer*` /
+    /// `set_current_layer` methods above stay — the prefill seed path (`seed_prefill_importance`) still
+    /// calls them; only the transformer decode driver moved to this tap.
+    pub fn on_decode_attn(&mut self, ctx: &DecodeAttnCtx) {
+        self.producer.as_signal_producer().on_decode_attn(ctx);
     }
 
     /// Called once per decode step after all layers (flush step-local MAX into cumulative importance).

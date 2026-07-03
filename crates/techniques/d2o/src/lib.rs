@@ -38,6 +38,7 @@ use std::sync::Mutex;
 /// matching; protects 4 sinks by default.
 const D2O_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::Scores, TensorKind::Key],
+    reads_signals: &[],
     default_protected_prefix: 4,
     produces_merge_plan: true,
     whole_model: false,

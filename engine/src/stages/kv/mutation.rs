@@ -1533,6 +1533,7 @@ mod tests {
         let handle = Arc::new(StandardFormat::new(0, make_int_cache(8)));
         let caps = StageCaps {
             reads: &[TensorKind::Value],
+            reads_signals: &[],
             default_protected_prefix: 0,
             produces_merge_plan: false,
             whole_model: false,

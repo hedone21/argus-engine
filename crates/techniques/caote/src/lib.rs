@@ -23,6 +23,7 @@ const CAOTE_CAPS: StageCaps = StageCaps {
         TensorKind::Value,
         TensorKind::AttnWeights,
     ],
+    reads_signals: &[],
     default_protected_prefix: 4,
     produces_merge_plan: false,
     whole_model: false,

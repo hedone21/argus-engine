@@ -37,6 +37,7 @@ use argus_extension_api::{
 /// importance (the fusion term I), protecting 4 sinks by default.
 const RKV_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::Key, TensorKind::Scores],
+    reads_signals: &[],
     default_protected_prefix: 4,
     produces_merge_plan: false,
     whole_model: false,
