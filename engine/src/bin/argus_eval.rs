@@ -692,6 +692,35 @@ mod tests {
         assert!(full.answer_attention_steps_full());
     }
 
+    /// The predicting-row flag parses and defaults off (existing records unchanged).
+    #[test]
+    fn answer_attention_steps_predict_row_flag_parses() {
+        let off = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention_steps",
+            "--dump-dir",
+            "/tmp/d",
+        ]);
+        assert!(reject_unsupported_modes_eval(&off).is_ok());
+        assert!(!off.answer_attention_steps_predict_row);
+
+        let on = make_args(&[
+            "--eval-ll",
+            "--eval-continuation",
+            "x",
+            "--dump",
+            "answer_attention_steps",
+            "--dump-dir",
+            "/tmp/d",
+            "--answer-attention-steps-predict-row",
+        ]);
+        assert!(reject_unsupported_modes_eval(&on).is_ok());
+        assert!(on.answer_attention_steps_predict_row);
+    }
+
     /// An out-of-set scope value is rejected by clap (closed value set).
     #[test]
     fn answer_attention_steps_scope_rejects_unknown_value() {

@@ -1158,6 +1158,16 @@ pub struct Args {
     )]
     pub answer_attention_steps_scope: String,
 
+    /// `--dump answer_attention_steps` (decode scope): also emit the *predicting* row — the query
+    /// at `prompt_len - 1` whose logits DECIDE the first gold token — as one extra record per
+    /// question (`step: -1`, `query_role: "predicting_row"`). The default decode window starts at
+    /// `prompt_len` (the gold token's OWN row), so this row is otherwise never dumped. No-op under
+    /// `--answer-attention-steps-scope full` (every row already dumped) or when `prompt_len == 0`.
+    /// Default off → the existing records are unchanged. No effect unless `answer_attention_steps`
+    /// is requested.
+    #[arg(long)]
+    pub answer_attention_steps_predict_row: bool,
+
     /// eval-LL KV eviction timing (when eviction fires and which importance drives
     /// it). `post_prefill_probe` (default) = today's behavior: full prefill, a
     /// post-question probe, one eviction — the importance is query-informed.

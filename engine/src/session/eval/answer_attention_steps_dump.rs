@@ -31,6 +31,26 @@
 //! over K read back from VRAM (see `standard_format.rs` `attention_into`), so the per-step PFA buffer
 //! this dump reads is filled regardless of backend. GPU vs CPU differ only by the RoPE/KV-write
 //! floating-point rounding folded into K, not by a zero-vs-nonzero gap.
+//!
+//! ## Row semantics (decode scope, schema 3)
+//!
+//! Each decode record is **self-describing** so the "which row is this?" ambiguity that mislabeled
+//! a head in the lab (a duplicate-token head read as an induction head) can't recur. Two roles over
+//! the same `[layer][head][token]` shape:
+//! - `query_role: "gold_token_row"` (`step >= 0`) — the row IS gold token `step` being processed;
+//!   its logits predict `step + 1`. Here `query_pos == gold_token_position == prompt_len + step`.
+//! - `query_role: "predicting_row"` (`step == -1`, opt-in `--answer-attention-steps-predict-row`) —
+//!   `query_pos == prompt_len - 1`, the row whose logits DECIDE the first gold token
+//!   (`gold_token_position == prompt_len`). The producer prepends exactly this one row: the
+//!   predicting row of gold `s + 1` already equals the gold-token row of `s`, so `prompt_len - 1`
+//!   is the only row missing from the default window.
+//!
+//! `keys_span == [0, prompt_len)` (context only; rows need not sum to 1 — the self/gold keys are
+//! cut). A consumer that sums the per-step rows to cross-check the v1 `answer_attention` sum must
+//! include only `step >= 0` (the v1 sum never covered `prompt_len - 1`).
+//!
+//! `schema_version` is **3**, not 2: the `full` scope already occupies 2. It is a shape
+//! discriminator (1 = original decode, 2 = full, 3 = self-describing decode), not an ordering.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -53,8 +73,14 @@ use super::fmt_bridge::EvalCacheKind;
 use super::output::EvalQuestion;
 
 /// Schema version of the decode-default `answer_attention_steps` record (trailing gold rows over
-/// the context columns).
-pub const ANSWER_ATTENTION_STEPS_SCHEMA_VERSION: u32 = 1;
+/// the context columns), now self-describing (`query_pos`/`query_role`/`keys_span`).
+///
+/// **3, not 2** — `2` is already [`ANSWER_ATTENTION_STEPS_SCHEMA_VERSION_FULL`] (the `full`-scope
+/// record, which landed after the row-semantics request was drafted). `1` = the original decode
+/// record without the self-describing fields. The number is a shape discriminator, not an ordering:
+/// consumers key row interpretation on `query_role` and use the version to reject pre-enrichment
+/// dumps.
+pub const ANSWER_ATTENTION_STEPS_SCHEMA_VERSION: u32 = 3;
 
 /// Schema version of the `full`-scope record (every forward row over the full key axis).
 pub const ANSWER_ATTENTION_STEPS_SCHEMA_VERSION_FULL: u32 = 2;
@@ -73,10 +99,20 @@ struct AnswerAttentionStepRecord<'a> {
     /// Gold continuation length (number of output steps captured).
     q_window: usize,
     gold_index: usize,
-    /// Which output step (`0..q_window`).
-    step: usize,
-    /// Absolute index of the gold token emitted at this step = `prompt_len + step`.
+    /// Which output step. `0..q_window` for gold-token rows; `-1` for the opt-in predicting row
+    /// (`--answer-attention-steps-predict-row`), which precedes step 0.
+    step: i64,
+    /// Absolute row index whose distribution this record holds (`prompt_len + step` for gold rows;
+    /// `prompt_len - 1` for the predicting row).
+    query_pos: usize,
+    /// `"gold_token_row"` — the row IS gold token `step` being processed (its logits predict
+    /// `step + 1`); or `"predicting_row"` — the row whose logits DECIDE the first gold token.
+    query_role: &'static str,
+    /// Absolute index of the gold token this row concerns. Gold rows: the token AT this row
+    /// (`prompt_len + step`, so `== query_pos`). Predicting row: the token it decides (`prompt_len`).
     gold_token_position: usize,
+    /// Half-open key span kept in `attn_by_layer` (`[0, prompt_len)`); rows need not sum to 1.
+    keys_span: [usize; 2],
     /// `[num_hidden_layers][prompt_len]` — head-mean post-softmax over context.
     attn_by_layer: Vec<Vec<f32>>,
 }
@@ -90,8 +126,15 @@ struct AnswerAttentionStepRecordPerHead<'a> {
     prompt_len: usize,
     q_window: usize,
     gold_index: usize,
-    step: usize,
+    /// `0..q_window` for gold-token rows; `-1` for the opt-in predicting row.
+    step: i64,
+    /// Absolute row index this record holds (see [`AnswerAttentionStepRecord::query_pos`]).
+    query_pos: usize,
+    /// `"gold_token_row"` or `"predicting_row"` (see [`AnswerAttentionStepRecord::query_role`]).
+    query_role: &'static str,
     gold_token_position: usize,
+    /// Half-open key span kept (`[0, prompt_len)`); rows need not sum to 1.
+    keys_span: [usize; 2],
     /// `[num_hidden_layers][num_attention_heads][prompt_len]` — per-head post-softmax over context.
     attn_by_layer_head: Vec<Vec<Vec<f32>>>,
 }
@@ -197,6 +240,41 @@ fn build_step_attn_by_layer_head(
         .collect()
 }
 
+/// Semantic identity of a decode-scope buffer slot — which query row it holds and how a consumer
+/// should read it.
+struct DecodeRowMeta {
+    step: i64,
+    query_pos: usize,
+    query_role: &'static str,
+    gold_token_position: usize,
+}
+
+/// Map a decode-scope buffer slot to its record identity.
+///
+/// Without the predicting row the buffer holds the `q_window` trailing gold rows: slot `s` is gold
+/// token `s` at row `prompt_len + s` (`"gold_token_row"`). With `emit_predict` the producer prepends
+/// row `prompt_len - 1`, so slot 0 is the predicting row (`"predicting_row"`, `step -1`, deciding
+/// gold token `prompt_len`) and slots `1..` are the same gold rows shifted up by one.
+fn decode_row_meta(slot: usize, emit_predict: bool, prompt_len: usize) -> DecodeRowMeta {
+    if emit_predict && slot == 0 {
+        DecodeRowMeta {
+            step: -1,
+            query_pos: prompt_len - 1,
+            query_role: "predicting_row",
+            gold_token_position: prompt_len,
+        }
+    } else {
+        let step = if emit_predict { slot - 1 } else { slot };
+        let pos = prompt_len + step;
+        DecodeRowMeta {
+            step: step as i64,
+            query_pos: pos,
+            query_role: "gold_token_row",
+            gold_token_position: pos,
+        }
+    }
+}
+
 /// Run the `answer_attention_steps` (IMP-4) dump over `questions`, writing one JSONL record per
 /// captured row whose gold choice is known. `per_head` = full per-head dump (default head-mean).
 ///
@@ -206,6 +284,10 @@ fn build_step_attn_by_layer_head(
 /// - `true` (full, schema 2): EVERY forward row (prefill `0..prompt_len` then decode
 ///   `prompt_len..seq_len`) over the FULL key axis `[0, seq_len)` (causal → zeros above the
 ///   diagonal) — one record per `(question, row in 0..seq_len)`. Quadratic in `seq_len`.
+///
+/// `predict_row` (decode scope only) prepends one extra record per question for the row that
+/// DECIDES the first gold token (`query_pos = prompt_len - 1`, `query_role = "predicting_row"`,
+/// `step = -1`); no-op under `full` (which already dumps every row) or when `prompt_len == 0`.
 ///
 /// The skip rules (ambiguous gold / out-of-range / empty continuation / too long) mirror v1.
 /// `out_path` is created (with parent dirs); `vocab_size` sizes the throwaway logits buffer.
@@ -221,6 +303,7 @@ pub fn run_answer_attention_steps_dump(
     out_path: &Path,
     per_head: bool,
     full: bool,
+    predict_row: bool,
 ) -> Result<()> {
     let n_layers = model.config.num_hidden_layers;
     let n_heads_q = model.config.num_attention_heads;
@@ -246,6 +329,13 @@ pub fn run_answer_attention_steps_dump(
             } else {
                 ""
             },
+        );
+    }
+
+    if predict_row && full {
+        eprintln!(
+            "[dump:answer_attention_steps] --answer-attention-steps-predict-row is a no-op under \
+             scope=full (every forward row, incl. prompt_len-1, is already dumped)"
         );
     }
 
@@ -355,8 +445,18 @@ pub fn run_answer_attention_steps_dump(
         // head-mean accumulates over heads → pre-zero; per-head assigns each (row,h) slot but
         // masked key positions stay zero → pre-zero too.
         let prefix_len = seq_len;
-        // Capture window: `full` = every forward row (0..seq_len); decode = trailing gold rows.
-        let cap = if full { seq_len } else { q_window };
+        // Prepend the predicting row (`prompt_len - 1`) in decode scope when armed: guard
+        // `prompt_len >= 1` (no row before an empty context) and `!full` (full already dumps
+        // every row). When set, the producer's row window widens by one at the front simply by
+        // passing `cap = q_window + 1` (loop start `seq_len - cap == prompt_len - 1`).
+        let emit_predict = predict_row && !full && prompt_len >= 1;
+        // Capture window: `full` = every forward row (0..seq_len); decode = trailing gold rows
+        // (plus the one predicting row when armed).
+        let cap = if full {
+            seq_len
+        } else {
+            q_window + emit_predict as usize
+        };
         // Kept key columns: `full` = whole key axis [0, seq_len); decode = context [0, prompt_len).
         let keep_cols = if full { prefix_len } else { prompt_len };
         let per_layer_len = if per_head {
@@ -437,13 +537,15 @@ pub fn run_answer_attention_steps_dump(
                     })?;
                 }
             } else {
-                // decode default: trailing gold rows over context columns (schema 1, unchanged).
-                let step = row;
-                let gold_token_position = prompt_len + step;
+                // decode (schema 3): trailing gold rows over context columns, self-describing.
+                // `row` is the buffer slot; `decode_row_meta` maps it to the record identity —
+                // slot 0 is the predicting row when armed, otherwise gold rows are slot==step.
+                let meta = decode_row_meta(row, emit_predict, prompt_len);
+                let keys_span = [0, keep_cols]; // = [0, prompt_len) in decode scope.
                 if per_head {
                     let attn_by_layer_head = build_step_attn_by_layer_head(
                         &per_row_buf,
-                        step,
+                        row,
                         n_heads_q,
                         prefix_len,
                         keep_cols,
@@ -455,13 +557,16 @@ pub fn run_answer_attention_steps_dump(
                         prompt_len,
                         q_window,
                         gold_index,
-                        step,
-                        gold_token_position,
+                        step: meta.step,
+                        query_pos: meta.query_pos,
+                        query_role: meta.query_role,
+                        gold_token_position: meta.gold_token_position,
+                        keys_span,
                         attn_by_layer_head,
                     })?;
                 } else {
                     let attn_by_layer =
-                        build_step_attn_by_layer(&per_row_buf, step, prefix_len, keep_cols);
+                        build_step_attn_by_layer(&per_row_buf, row, prefix_len, keep_cols);
                     writer.write_record(&AnswerAttentionStepRecord {
                         kind: DUMP_ANSWER_ATTENTION_STEPS,
                         schema_version: ANSWER_ATTENTION_STEPS_SCHEMA_VERSION,
@@ -469,8 +574,11 @@ pub fn run_answer_attention_steps_dump(
                         prompt_len,
                         q_window,
                         gold_index,
-                        step,
-                        gold_token_position,
+                        step: meta.step,
+                        query_pos: meta.query_pos,
+                        query_role: meta.query_role,
+                        gold_token_position: meta.gold_token_position,
+                        keys_span,
                         attn_by_layer,
                     })?;
                 }
@@ -498,6 +606,54 @@ mod tests {
         assert_eq!(effective_gold_index(None, 1), Some(0));
         assert_eq!(effective_gold_index(None, 3), None);
         assert_eq!(effective_gold_index(None, 0), None);
+    }
+
+    #[test]
+    fn decode_row_meta_maps_slots_to_roles() {
+        let prompt_len = 5;
+
+        // No predicting row: slot s is gold row s (query_pos == gold_token_position == prompt_len+s).
+        let g0 = decode_row_meta(0, false, prompt_len);
+        assert_eq!(
+            (g0.step, g0.query_role, g0.query_pos, g0.gold_token_position),
+            (0, "gold_token_row", 5, 5)
+        );
+        let g2 = decode_row_meta(2, false, prompt_len);
+        assert_eq!((g2.step, g2.query_pos, g2.gold_token_position), (2, 7, 7));
+
+        // Predicting row armed: slot 0 is the predicting row (prompt_len - 1, step -1, deciding
+        // gold token prompt_len); slots 1.. are the gold rows shifted up by one.
+        let p = decode_row_meta(0, true, prompt_len);
+        assert_eq!(
+            (p.step, p.query_role, p.query_pos, p.gold_token_position),
+            (-1, "predicting_row", 4, 5)
+        );
+        let g0b = decode_row_meta(1, true, prompt_len);
+        assert_eq!(
+            (g0b.step, g0b.query_role, g0b.query_pos),
+            (0, "gold_token_row", 5)
+        );
+
+        // Invariant: gold row `s` reports the SAME identity with or without the flag — the flag only
+        // shifts its BUFFER slot (s → s+1), never the numbers a consumer reads.
+        for s in 0..4usize {
+            let without = decode_row_meta(s, false, prompt_len);
+            let with = decode_row_meta(s + 1, true, prompt_len);
+            assert_eq!(
+                (
+                    with.step,
+                    with.query_pos,
+                    with.query_role,
+                    with.gold_token_position
+                ),
+                (
+                    without.step,
+                    without.query_pos,
+                    without.query_role,
+                    without.gold_token_position
+                ),
+            );
+        }
     }
 
     #[test]
