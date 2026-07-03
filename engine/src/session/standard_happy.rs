@@ -232,6 +232,7 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         cache_manager,
         mutation_driver,
         args.eviction_target_ratio(),
+        args.protected_prefix(),
         Some(Arc::clone(&stream_slot)),
         args.kv_format.as_deref(),
     )?;

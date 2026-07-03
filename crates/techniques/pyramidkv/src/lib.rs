@@ -173,6 +173,7 @@ fn per_head_keep(
     window: usize,
     kernel: usize,
     heavy: usize,
+    protected: usize,
 ) -> Vec<Vec<usize>> {
     let groups = (n_q_heads / n_kv_heads).max(1);
     let heavy_len = current - window; // scoring region [0, current-window); window is force-kept
@@ -203,11 +204,14 @@ fn per_head_keep(
                     s * inv_groups
                 })
                 .collect();
-            // window force-kept (recent), top `heavy` from the scored region; ascending keep-list.
+            // window force-kept (recent), top `heavy` from the scored region; ascending keep-list. The
+            // protected prefix (`--protected-prefix`, default 0) is force-kept in front — `heavy` is
+            // ranked over `prefix..recent_start`, so prefix/heavy never overlap and every head keeps an
+            // equal count (the single-`current_pos` invariant holds).
             compile_keep_top_k(
                 KeepTopK {
                     current,
-                    prefix: 0,
+                    prefix: protected,
                     recent: window,
                     heavy,
                 },
@@ -348,12 +352,21 @@ impl PyramidKv {
         if n_kept >= current {
             return None; // budget covers everything (incl. window == current) — nothing to evict.
         }
+        // `--protected-prefix`: force-KEEP the leading `protected_prefix` positions (the attention-sink /
+        // BOS guard, StreamingLLM). `0` = protect nothing = kvpress-faithful (the default); a non-zero
+        // value is ADDITIVE to the budget (mirrors h2o's `hh + recent + protected_prefix`), so it only
+        // ever KEEPS MORE — it can never over-evict. Dropping the sink collapses a sink-sensitive model's
+        // generation, so a caller that hits that sets `--protected-prefix 4` to trade a hair of budget
+        // faithfulness for coherence.
+        let protected = ctx.protected_prefix().min(current);
         if n_kept <= window {
             // At or below the observation window: keep the `n_kept` most-recent. At `n_kept == window`
             // this is kvpress's window-forced set (faithful); below it, only the COUNT is faithful —
             // the SET is the recency resolution of the max-score tie (see the comment above). Layer-wide
-            // (identical across heads) — valid on any cache layout.
-            let keep: Vec<usize> = (current - n_kept..current).collect();
+            // (identical across heads) — valid on any cache layout. Union the protected prefix in front
+            // (dropping any recent positions that fall inside it, so the list stays ascending + unique).
+            let mut keep: Vec<usize> = (0..protected).collect();
+            keep.extend((current - n_kept..current).filter(|&p| p >= protected));
             return Some(KeepSpec::LayerWide(keep));
         }
         let heavy = n_kept - window;
@@ -375,6 +388,7 @@ impl PyramidKv {
                     window,
                     self.cfg.kernel_size,
                     heavy,
+                    protected,
                 );
                 return Some(KeepSpec::PerHead(heads));
             }
@@ -389,7 +403,7 @@ impl PyramidKv {
             Some(imp) => compile_keep_top_k(
                 KeepTopK {
                     current,
-                    prefix: 0,
+                    prefix: protected,
                     recent: window,
                     heavy,
                 },
@@ -398,7 +412,7 @@ impl PyramidKv {
             None => compile_keep_top_k(
                 KeepTopK {
                     current,
-                    prefix: 0,
+                    prefix: protected,
                     recent: n_kept, // recency: keep the most-recent n_kept
                     heavy: 0,
                 },

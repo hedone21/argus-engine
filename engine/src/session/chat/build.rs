@@ -121,6 +121,7 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
                 ks.cell,
                 ks.n_heads_q,
                 ks.target_ratio,
+                ks.protected_prefix,
             ),
         ));
     }

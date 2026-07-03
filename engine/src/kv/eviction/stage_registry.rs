@@ -483,6 +483,10 @@ pub struct PrefillKeepsetArming {
     /// The observation window the producer must SUM over (the stage's `window_size`, else
     /// [`PFA_Q_WINDOW_DEFAULT`]). A mismatched window ranks different heavy hitters (the D1 divergence).
     pub q_window: usize,
+    /// The stage's default `--protected-prefix` (attention-sink guard) when the user omits it. `0` for a
+    /// kvpress-faithful sink-unaware stage (pyramidkv); a sink-aware keep-set stage may declare more.
+    /// Each loop resolves the effective value as `args.protected_prefix().unwrap_or(this)`.
+    pub default_protected_prefix: usize,
 }
 
 /// Resolve the caps-driven prefill-keepset arming (see [`PrefillKeepsetArming`]). `None` when no
@@ -490,9 +494,11 @@ pub struct PrefillKeepsetArming {
 pub fn resolve_prefill_keepset_arming() -> Option<PrefillKeepsetArming> {
     let stage_name = find_prefill_attn_stage_name()?;
     let q_window = find_prefill_attn_window().unwrap_or(PFA_Q_WINDOW_DEFAULT);
+    let default_protected_prefix = stage_default_protected_prefix(&stage_name);
     Some(PrefillKeepsetArming {
         stage_name,
         q_window,
+        default_protected_prefix,
     })
 }
 
