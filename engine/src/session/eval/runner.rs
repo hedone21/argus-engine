@@ -91,6 +91,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
             &out_path,
             args.answer_attention_steps_per_head,
             args.answer_attention_steps_full(),
+            args.answer_attention_steps_predict_row,
         )?;
     }
 
