@@ -68,6 +68,7 @@ struct Ctx {
     n_kv_heads: usize,
     pfa: Option<PfaHandle>,
     importance: Option<Vec<f32>>,
+    protected: usize,
 }
 impl Default for Ctx {
     fn default() -> Self {
@@ -79,6 +80,7 @@ impl Default for Ctx {
             n_kv_heads: 1,
             pfa: None,
             importance: None,
+            protected: 0,
         }
     }
 }
@@ -94,6 +96,9 @@ impl StageCtx for Ctx {
     }
     fn n_layers(&self) -> usize {
         self.n_layers
+    }
+    fn protected_prefix(&self) -> usize {
+        self.protected
     }
     fn importance(&self) -> Option<&[f32]> {
         self.importance.as_deref()
@@ -245,6 +250,7 @@ fn per_head_selection_matches_kvpress_fixture() {
             window,
             kernel,
             n_kept - window,
+            0, // protected_prefix (sink guard) off — faithful selection
         );
         assert_eq!(
             got, expected,
@@ -265,7 +271,17 @@ fn per_head_keep_hand_traced() {
     // heavy region [0,4) scores ∝ attn (÷window is monotone): attn=[10,50,30,40].
     // ranking 1(50)>3(40)>2(30)>0(10) → top-2 = {1,3}; window=[4,5]. keep={1,3,4,5}.
     let attn = [10.0f32, 50.0, 30.0, 40.0, 7.0, 9.0];
-    let got = per_head_keep(|_qh, out| out.copy_from_slice(&attn), 1, 1, 6, 6, 2, 1, 2);
+    let got = per_head_keep(
+        |_qh, out| out.copy_from_slice(&attn),
+        1,
+        1,
+        6,
+        6,
+        2,
+        1,
+        2,
+        0,
+    );
     assert_eq!(got, vec![vec![1usize, 3, 4, 5]]);
 }
 
@@ -370,6 +386,7 @@ fn v3_native_per_head_decision() {
         window,
         kernel,
         n_kept - window,
+        0, // protected_prefix (sink guard) off — faithful selection
     );
 
     // v3 decision via a concrete PyramidKv built from the same config.
@@ -411,6 +428,7 @@ fn v3_native_layerwide_and_noop_arms() {
         n_kv_heads: 4,
         pfa: None,
         importance: Some((0..64).map(|i| (i % 11) as f32).collect()),
+        protected: 0,
     };
     let expected_lw = match keep_spec_for(&blob_args, &lw_ctx).unwrap() {
         KeepSpec::LayerWide(k) => k,
@@ -435,6 +453,7 @@ fn v3_native_layerwide_and_noop_arms() {
         n_kv_heads: 4,
         pfa: None,
         importance: None,
+        protected: 0,
     };
     assert!(keep_spec_for(&[], &noop_ctx).is_none(), "cr==0 → no-op");
     let mut h2 = CaptureHandle {
@@ -550,6 +569,72 @@ fn recency_fallback_without_any_scores() {
     match keep_spec_for(&cr_args("0.5", 8, 5, 20), &ctx).expect("keep Some") {
         KeepSpec::LayerWide(k) => assert_eq!(k, (64..128).collect::<Vec<_>>()),
         KeepSpec::PerHead(_) => panic!("expected LayerWide recency"),
+    }
+}
+
+#[test]
+fn protected_prefix_keeps_sink_in_subwindow_recency() {
+    // `--protected-prefix` (attention-sink guard). Short-prompt regime: window (64) >= current (40)
+    // forces the layer-wide recency path (n_kept <= window). WITHOUT protection this drops the sink
+    // (pos 0..k) → garbage on a sink-sensitive model. WITH protected=4, pos 0..4 survive, ADDITIVE to
+    // the recency window (mirrors h2o's additive protected_prefix). Default 0 is unchanged (faithful).
+    let ctx = Ctx {
+        current: 40,
+        n_layers: 1,
+        n_kv_heads: 2,
+        pfa: None,
+        protected: 4,
+        ..Default::default()
+    };
+    // cr 0.5 → uniform n_kept = round(40*0.5) = 20 <= window 40 → recency path.
+    match keep_spec_for(&cr_args("0.5", 64, 5, 20), &ctx).expect("keep Some") {
+        KeepSpec::LayerWide(k) => {
+            for p in 0..4 {
+                assert!(k.contains(&p), "protected sink pos {p} must survive");
+            }
+            assert!(k.contains(&39), "most-recent token still kept");
+            // additive: the 20-token recency window plus the 4 protected sinks (disjoint here).
+            assert_eq!(k.len(), 24);
+        }
+        KeepSpec::PerHead(_) => panic!("sub-window recency is layer-wide"),
+    }
+}
+
+#[test]
+fn protected_prefix_keeps_sink_per_head_equal_length() {
+    // Per-head SnapKV path (n_kept > window). The protected prefix is force-kept in EVERY head, and
+    // because `compile_keep_top_k` ranks heavy hitters over `prefix..recent_start` (disjoint from the
+    // prefix) every head keeps an equal count — the single-`current_pos` invariant `keep_per_head`
+    // enforces. current=200, target=120, window=8 → n_kept=120 > window → per-head.
+    let ctx = Ctx {
+        current: 200,
+        target: 120,
+        n_layers: 1,
+        n_kv_heads: 2,
+        pfa: Some(PfaHandle {
+            data: synth_attn(2, 200, 3),
+            rows: 2,
+            cols: 200,
+        }),
+        protected: 4,
+        ..Default::default()
+    };
+    match keep_spec_for(&[("window_size".to_string(), "8".to_string())], &ctx).expect("keep Some") {
+        KeepSpec::PerHead(heads) => {
+            let len0 = heads[0].len();
+            for (h, keep) in heads.iter().enumerate() {
+                assert_eq!(keep.len(), len0, "head {h} must keep an equal count");
+                for p in 0..4 {
+                    assert!(
+                        keep.contains(&p),
+                        "head {h} protected sink pos {p} must survive"
+                    );
+                }
+            }
+            // additive: base per-head budget 120 + 4 protected sinks.
+            assert_eq!(len0, 124);
+        }
+        KeepSpec::LayerWide(_) => panic!("expected PerHead"),
     }
 }
 

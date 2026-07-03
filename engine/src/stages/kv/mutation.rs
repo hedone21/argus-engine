@@ -317,6 +317,9 @@ pub struct SnapshotStageCtx<'a> {
     n_kv_heads: usize,
     head_dim: usize,
     on_device: bool,
+    /// Leading positions to force-KEEP (`--protected-prefix`, the attention-sink guard). `0` on the
+    /// score-free / test ctx; the keep-set seam ([`Self::for_prefill_attn`]) injects the resolved value.
+    protected_prefix: usize,
     importance: Option<&'a [f32]>,
     score_handle: Option<ScalarSnapHandle<'a>>,
     attn_handle: Option<ScalarSnapHandle<'a>>,
@@ -351,6 +354,7 @@ impl<'a> SnapshotStageCtx<'a> {
             n_kv_heads: cache.kv_heads(),
             head_dim: cache.head_dim(),
             on_device: cache.k_buffer.buffer().is_gpu_buffer(),
+            protected_prefix: 0,
             importance: None,
             score_handle: None,
             attn_handle: None,
@@ -375,6 +379,7 @@ impl<'a> SnapshotStageCtx<'a> {
         n_layers: usize,
         pfa: &'a [f32],
         n_heads_q: usize,
+        protected_prefix: usize,
     ) -> Self {
         Self {
             prefill_attn_handle: Some(PfaSnapHandle {
@@ -382,6 +387,7 @@ impl<'a> SnapshotStageCtx<'a> {
                 rows: n_heads_q,
                 cols: cache.current_pos(),
             }),
+            protected_prefix,
             ..Self::from_cache(cache, target_len, layer_idx, n_layers)
         }
     }
@@ -433,6 +439,9 @@ impl StageCtx for SnapshotStageCtx<'_> {
     }
     fn n_layers(&self) -> usize {
         self.n_layers
+    }
+    fn protected_prefix(&self) -> usize {
+        self.protected_prefix
     }
     fn n_kv_heads(&self) -> usize {
         self.n_kv_heads
@@ -533,6 +542,10 @@ pub(crate) fn drive_mutation_layer(
         n_kv_heads,
         head_dim,
         on_device,
+        // Decode-time mutation seam: the managed `EvictionHandler` applies `--protected-prefix`
+        // upstream (score-based path), so this ctx surfaces `0` (behavior-0). The keep-set seam
+        // ([`SnapshotStageCtx::for_prefill_attn`]) is the path that injects the resolved value.
+        protected_prefix: 0,
         importance,
         score_handle: head_scores.map(|data| ScalarSnapHandle {
             data,

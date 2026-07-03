@@ -209,6 +209,8 @@ pub struct PrefillKeepsetState {
     q_window: usize,
     n_heads_q: usize,
     target_ratio: f32,
+    /// Resolved `--protected-prefix` (attention-sink guard). `0` = protect nothing (kvpress-faithful).
+    protected_prefix: usize,
     /// Filled by [`StepHook::stage_prefill_attn`] right after the prefill forward; consumed once at
     /// `post_prefill`.
     staged_pfa: Option<Vec<Vec<f32>>>,
@@ -318,12 +320,14 @@ impl EvictionHook {
         q_window: usize,
         n_heads_q: usize,
         target_ratio: f32,
+        protected_prefix: usize,
     ) -> Self {
         self.prefill_keepset = Some(PrefillKeepsetState {
             stage,
             q_window,
             n_heads_q,
             target_ratio,
+            protected_prefix,
             staged_pfa: None,
         });
         self
@@ -576,6 +580,7 @@ impl StepHook<KVCache> for EvictionHook {
                 &pfa,
                 k.n_heads_q,
                 k.target_ratio,
+                k.protected_prefix,
             ) {
                 eprintln!("[prefill-keepset] eval keep-set failed: {e}");
             }
@@ -1113,7 +1118,7 @@ mod tests {
 
         let stage =
             crate::kv::eviction::stage_registry::make_prefill_keepset_stage("pyramidkv").unwrap();
-        let mut hook = make_hook(0, false).with_prefill_keepset(stage, 64, 1, 0.5);
+        let mut hook = make_hook(0, false).with_prefill_keepset(stage, 64, 1, 0.5, 0);
 
         // (1) The hook arms the PFA producer at the caps-driven window (NOT the unarmed default).
         assert_eq!(

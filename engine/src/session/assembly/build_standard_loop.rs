@@ -127,6 +127,9 @@ pub fn build_standard_loop(
     mutation_driver: Option<MutationDriverSelection>,
     // force_evict target ratio(CLI `--eviction-target-ratio`). `cache_manager=None` 이면 무시.
     eviction_target_ratio: f32,
+    // CLI `--protected-prefix` (attention-sink guard for the keep-set path). `None` = user omitted →
+    // resolve to the keep-set stage's `default_protected_prefix` (0 for kvpress-faithful pyramidkv).
+    protected_prefix: Option<usize>,
     // argus-cli per-token streaming subscriber. `Some(slot)` submits a DecodeEnd `ChatStreamStage`
     // (and forces a registry to exist); `None` = no streaming = byte-identical to before (bench/eval).
     stream_slot: Option<Arc<ChatStreamSlot>>,
@@ -367,6 +370,7 @@ pub fn build_standard_loop(
             pfa_cell.clone(),
             n_heads_q,
             eviction_target_ratio,
+            protected_prefix.unwrap_or(arming.default_protected_prefix),
         )));
     }
 

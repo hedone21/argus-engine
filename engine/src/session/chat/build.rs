@@ -83,6 +83,7 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
         kv_handle,
         quant_handle,
         eviction_policy,
+        keepset,
         kv_mode,
     } = built;
 
@@ -102,6 +103,34 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
     // step; the server overwrites it per OpenAI request.
     let sampling: SharedSamplingConfig = Arc::new(Mutex::new(sampling_config));
     let (registry, stop_slot, stream_slot) = make_chat_registry();
+    // Submit the caps-driven PFA keep-set consumer (PrefillEnd) to the chat registry, mirroring
+    // build_standard_loop. DecodeLoop::prefill dispatches PrefillEnd each turn, so the keep-set prunes
+    // each turn's prefill. Present only when build_chat_standard_forward armed it (a PFA-reading stage
+    // is registered and no score-based policy owns the cache); otherwise byte-identical.
+    if let Some(ks) = keepset
+        && let Some(stage) =
+            crate::kv::eviction::stage_registry::make_prefill_keepset_stage(&ks.stage_name)
+    {
+        registry.submit(Arc::new(
+            // Persistent: chat reuses one registry across turns, so a OneShot keep-set would be GC'd
+            // after turn 1 and stop pruning turns 2..N. The persistent variant survives and prunes
+            // every turn's prefill.
+            crate::stages::kv::prefill_keepset::PrefillKeepSetStage::persistent(
+                kv_handles.clone(),
+                stage,
+                ks.cell,
+                ks.n_heads_q,
+                ks.target_ratio,
+                ks.protected_prefix,
+            ),
+        ));
+    }
+    // Layer-0 physical KV handle for chat's keep-set capacity accounting (ChatSession::occupancy reads
+    // its current_pos on the keep-set path, where the PrefillEnd prune shrinks the cache without
+    // bumping evicted_total). Derived before kv_handles moves into finish_chat_loop.
+    let kv_pos_handle = kv_handles
+        .first()
+        .map(|f| Arc::clone(f) as Arc<dyn crate::format::KVCacheFormat>);
     let builder: DecodeLoopBuilder<HasForward> = DecodeLoopBuilder::new()
         .with_forward_boxed(forward)
         .with_kv_capacity(max_seq_len)
@@ -112,6 +141,7 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
         decode_loop,
         kv_mode,
         max_seq_len,
+        kv_pos_handle,
         stop_slot,
         stream_slot,
         Some(sampling),

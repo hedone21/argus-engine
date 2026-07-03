@@ -43,6 +43,7 @@ pub fn apply_prefill_keepset(
     pfa: &[Vec<f32>],
     n_heads_q: usize,
     target_ratio: f32,
+    protected_prefix: usize,
 ) -> anyhow::Result<()> {
     let n_layers = caches.len();
     for (layer_idx, cache) in caches.iter_mut().enumerate() {
@@ -53,7 +54,8 @@ pub fn apply_prefill_keepset(
         let target_len = ((prefix_len as f32) * target_ratio) as usize;
         // Read ctx with the per-layer PFA slice injected. `for_prefill_attn` copies the cache scalars
         // and borrows ONLY `pfa` (outside the cache), so it coexists with the `&mut` handle below — the
-        // read view and the write view never alias.
+        // read view and the write view never alias. `protected_prefix` (the `--protected-prefix`
+        // attention-sink guard) is surfaced to the stage via `ctx.protected_prefix()`.
         let sctx = SnapshotStageCtx::for_prefill_attn(
             cache,
             target_len,
@@ -61,6 +63,7 @@ pub fn apply_prefill_keepset(
             n_layers,
             &pfa[layer_idx],
             n_heads_q,
+            protected_prefix,
         );
         let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
         // catch_unwind (mirror of `KVMutationDriverStage`, P0-5a): a panic in an untrusted plugin's
@@ -99,17 +102,26 @@ pub struct PrefillKeepSetStage {
     n_heads_q: usize,
     /// keep budget ratio (`target_len = prefix_len * ratio`).
     target_ratio: f32,
+    /// leading positions to force-KEEP (`--protected-prefix`, the attention-sink guard). `0` =
+    /// protect nothing (byte-faithful default); surfaced to the stage via `ctx.protected_prefix()`.
+    protected_prefix: usize,
+    /// `OneShot` for the single-prefill loops (cli/bench/eval — GC'd after the first `PrefillEnd`);
+    /// `Persistent` for chat's re-entrant per-turn prefill loop, where one registry is reused across
+    /// turns and the stage must survive to prune every turn's prefill.
+    lifecycle: StageLifecycle,
 }
 
 impl PrefillKeepSetStage {
     /// 무장된 PFA producer cell + keep-set plugin 으로 stage 를 만든다(assembly 가 PFA-reading stage
-    /// 발견 시 submit). `handles` enumerate 순서는 layer idx 와 일치해야 한다.
+    /// 발견 시 submit). `handles` enumerate 순서는 layer idx 와 일치해야 한다. `OneShot` — a single
+    /// prefill per process (cli/bench/eval); the dispatcher GCs it after the first `PrefillEnd`.
     pub fn new(
         handles: Vec<Arc<StandardFormat>>,
         stage: Box<dyn KVMutationStage>,
         prefill_attn_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
         n_heads_q: usize,
         target_ratio: f32,
+        protected_prefix: usize,
     ) -> Self {
         Self {
             handles,
@@ -117,6 +129,32 @@ impl PrefillKeepSetStage {
             prefill_attn_cell,
             n_heads_q,
             target_ratio,
+            protected_prefix,
+            lifecycle: StageLifecycle::OneShot,
+        }
+    }
+
+    /// `Persistent` variant for chat's multi-turn loop: chat builds one registry and reuses the single
+    /// `DecodeLoop` across turns, so a `OneShot` keep-set would be GC'd after turn 1 and silently stop
+    /// pruning turns 2..N. This variant returns [`StageOutcome::Continue`] at `PrefillEnd` (a
+    /// `Persistent` stage returning `Consumed` trips a `PipelineRegistry::dispatch` debug_assert) so it
+    /// survives and prunes every turn's prefill.
+    pub fn persistent(
+        handles: Vec<Arc<StandardFormat>>,
+        stage: Box<dyn KVMutationStage>,
+        prefill_attn_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+        n_heads_q: usize,
+        target_ratio: f32,
+        protected_prefix: usize,
+    ) -> Self {
+        Self {
+            handles,
+            stage,
+            prefill_attn_cell,
+            n_heads_q,
+            target_ratio,
+            protected_prefix,
+            lifecycle: StageLifecycle::Persistent,
         }
     }
 }
@@ -127,7 +165,7 @@ impl PipelineStage for PrefillKeepSetStage {
     }
 
     fn lifecycle(&self) -> StageLifecycle {
-        StageLifecycle::OneShot
+        self.lifecycle
     }
 
     fn on_phase(
@@ -139,14 +177,21 @@ impl PipelineStage for PrefillKeepSetStage {
         if *phase != LifecyclePhase::PrefillEnd {
             return Ok(StageOutcome::Continue);
         }
-        // PFA cell read. 미무장/미산출(None)이면 no-op Consumed.
+        // "done for this prefill" outcome: OneShot (cli/bench/eval) → Consumed so the dispatcher GCs
+        // the single-use stage; Persistent (chat's re-entrant loop) → Continue so it survives to prune
+        // the next turn's prefill (a Persistent stage returning Consumed trips a dispatch debug_assert).
+        let done = match self.lifecycle {
+            StageLifecycle::OneShot => StageOutcome::Consumed,
+            StageLifecycle::Persistent => StageOutcome::Continue,
+        };
+        // PFA cell read. 미무장/미산출(None)이면 no-op.
         let pfa_guard = self
             .prefill_attn_cell
             .lock()
             .expect("PrefillKeepSetStage PFA cell Mutex poisoned");
         let pfa = match pfa_guard.as_ref() {
             Some(v) => v,
-            None => return Ok(StageOutcome::Consumed),
+            None => return Ok(done),
         };
 
         // UER (Unwrap-Evict-Rewrap, EvictionStage 미러): take_inner → shared per-layer executor
@@ -159,13 +204,14 @@ impl PipelineStage for PrefillKeepSetStage {
             pfa,
             self.n_heads_q,
             self.target_ratio,
+            self.protected_prefix,
         );
         for (f, c) in self.handles.iter().zip(temp) {
             f.put_inner(c);
         }
         result?;
         drop(pfa_guard);
-        Ok(StageOutcome::Consumed)
+        Ok(done)
     }
 }
 
@@ -261,6 +307,50 @@ mod tests {
         }
     }
 
+    /// Records the `ctx.protected_prefix()` the executor surfaced (one slot per layer it drove), so a
+    /// test can assert the `--protected-prefix` value threads all the way into the stage's `StageCtx`.
+    struct ProtectedPrefixProbe(Arc<Mutex<Vec<usize>>>);
+    impl KVMutationStage for ProtectedPrefixProbe {
+        fn name(&self) -> &str {
+            "test.protected_prefix_probe"
+        }
+        fn on_phase(
+            &self,
+            ctx: &dyn StageCtx,
+            _cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            self.0.lock().unwrap().push(ctx.protected_prefix());
+            Ok(()) // no keep — this probe only observes the ctx.
+        }
+    }
+
+    #[test]
+    fn apply_prefill_keepset_threads_protected_prefix_into_ctx() {
+        // The executor must surface its `protected_prefix` argument to the stage via
+        // `ctx.protected_prefix()` for EVERY driven layer (the `--protected-prefix` seam). Default `0`
+        // (byte-faithful) vs an opt-in value both flow through unchanged.
+        let n_heads_q = 2;
+        for pp in [0usize, 4] {
+            let mut caches = vec![make_cache(8), make_cache(8)];
+            let pfa: Vec<Vec<f32>> = (0..2).map(|_| vec![0.0f32; n_heads_q * 8]).collect();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            apply_prefill_keepset(
+                &mut caches,
+                &ProtectedPrefixProbe(seen.clone()),
+                &pfa,
+                n_heads_q,
+                0.5,
+                pp,
+            )
+            .unwrap();
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![pp, pp],
+                "protected_prefix={pp} must reach ctx for every layer"
+            );
+        }
+    }
+
     fn make_ctx(profiler: &mut OpProfiler) -> StageContext<'_> {
         StageContext {
             step: StepInfo {
@@ -298,6 +388,7 @@ mod tests {
             cell,
             n_heads_q,
             0.5,
+            0,
         );
 
         let mut profiler = OpProfiler::new();
@@ -321,12 +412,93 @@ mod tests {
     }
 
     #[test]
+    fn persistent_variant_survives_repeated_prefill_ends() {
+        // Regression (chat multi-turn): a OneShot keep-set returns Consumed at PrefillEnd, so the
+        // dispatcher GCs it and chat's reused registry would prune only turn 1. The persistent()
+        // variant must return Continue (so it is NOT GC'd) and prune EVERY turn's prefill.
+        let n_heads_q = 2;
+        let handle = Arc::new(StandardFormat::new(0, make_cache(8)));
+        let cell = odd_favoring_pfa(n_heads_q, 8);
+        let stage = PrefillKeepSetStage::persistent(
+            vec![handle.clone()],
+            Box::new(TopKPfaStage),
+            cell.clone(),
+            n_heads_q,
+            0.5,
+            0,
+        );
+        assert!(matches!(stage.lifecycle(), StageLifecycle::Persistent));
+
+        let mut profiler = OpProfiler::new();
+
+        // Turn 1: prefix 8 → keep 4. Outcome MUST be Continue (Consumed would trip GC → turn-2 skip).
+        {
+            let mut ctx = make_ctx(&mut profiler);
+            let outcome = stage
+                .on_phase(&LifecyclePhase::PrefillEnd, &mut ctx)
+                .unwrap();
+            assert!(
+                matches!(outcome, StageOutcome::Continue),
+                "persistent keep-set must return Continue so the dispatcher does not GC it"
+            );
+        }
+        assert_eq!(handle.current_pos(), 4, "turn 1 keep = 8 * 0.5");
+
+        // Turn 2: simulate the next turn's prefill (cache refilled to pos 8, PFA cell re-armed) and
+        // dispatch PrefillEnd AGAIN on the same instance. A GC'd OneShot would be gone; persistent
+        // prunes again → current_pos back to 4.
+        handle.put_inner(make_cache(8));
+        *cell.lock().unwrap() = odd_favoring_pfa(n_heads_q, 8).lock().unwrap().take();
+        {
+            let mut ctx = make_ctx(&mut profiler);
+            let outcome = stage
+                .on_phase(&LifecyclePhase::PrefillEnd, &mut ctx)
+                .unwrap();
+            assert!(matches!(outcome, StageOutcome::Continue));
+        }
+        assert_eq!(
+            handle.current_pos(),
+            4,
+            "turn 2 keep-set must fire again (persistent), not be skipped after turn 1"
+        );
+    }
+
+    #[test]
+    fn oneshot_new_returns_consumed_at_prefill_end() {
+        // The single-prefill loops (cli/bench/eval) keep OneShot semantics: Consumed at PrefillEnd so
+        // the dispatcher GCs the single-use stage. Guards the persistent/oneshot split.
+        let handle = Arc::new(StandardFormat::new(0, make_cache(8)));
+        let cell = odd_favoring_pfa(2, 8);
+        let stage = PrefillKeepSetStage::new(
+            vec![handle.clone()],
+            Box::new(TopKPfaStage),
+            cell,
+            2,
+            0.5,
+            0,
+        );
+        assert!(matches!(stage.lifecycle(), StageLifecycle::OneShot));
+        let mut profiler = OpProfiler::new();
+        let mut ctx = make_ctx(&mut profiler);
+        let outcome = stage
+            .on_phase(&LifecyclePhase::PrefillEnd, &mut ctx)
+            .unwrap();
+        assert!(matches!(outcome, StageOutcome::Consumed));
+    }
+
+    #[test]
     fn non_prefill_end_phase_is_noop() {
         // self-filter: PrefillEnd 외 phase → Continue + cache 불변.
         let handle = Arc::new(StandardFormat::new(0, make_cache(8)));
         let cell = odd_favoring_pfa(2, 8);
-        let stage =
-            PrefillKeepSetStage::new(vec![handle.clone()], Box::new(TopKPfaStage), cell, 2, 0.5);
+        let stage = PrefillKeepSetStage::new(
+            vec![handle.clone()],
+            Box::new(TopKPfaStage),
+            cell,
+            2,
+            0.5,
+            0,
+        );
         let mut profiler = OpProfiler::new();
         let mut ctx = make_ctx(&mut profiler);
         let outcome = stage
@@ -341,8 +513,14 @@ mod tests {
         // PFA cell None(미무장/미산출) → Consumed + cache 불변.
         let handle = Arc::new(StandardFormat::new(0, make_cache(8)));
         let cell: Arc<Mutex<Option<Vec<Vec<f32>>>>> = Arc::new(Mutex::new(None));
-        let stage =
-            PrefillKeepSetStage::new(vec![handle.clone()], Box::new(TopKPfaStage), cell, 2, 0.5);
+        let stage = PrefillKeepSetStage::new(
+            vec![handle.clone()],
+            Box::new(TopKPfaStage),
+            cell,
+            2,
+            0.5,
+            0,
+        );
         let mut profiler = OpProfiler::new();
         let mut ctx = make_ctx(&mut profiler);
         let outcome = stage
@@ -475,6 +653,7 @@ mod tests {
             cell,
             n_heads_q,
             0.5,
+            0,
         );
 
         let mut profiler = OpProfiler::new();
@@ -516,7 +695,7 @@ mod tests {
         let mut caches = vec![make_head_major_cache(n_kv_heads, prefix_len)];
         let pfa = vec![divergent_pfa(n_heads_q, n_kv_heads, prefix_len)];
 
-        apply_prefill_keepset(&mut caches, &PerHeadTopKStage, &pfa, n_heads_q, 0.5).unwrap();
+        apply_prefill_keepset(&mut caches, &PerHeadTopKStage, &pfa, n_heads_q, 0.5, 0).unwrap();
 
         assert_eq!(caches[0].current_pos(), target, "per-head keep len");
         // kv0 keeps even {0,2,4,6}, kv1 odd {1,3,5,7} — same divergent result as the registry path.
@@ -608,7 +787,7 @@ mod tests {
             .expect("pyramidkv v3 stage registered (engine dev-dep force-link)");
         let plugin = (reg.make)(argus_extension_api::StageParams::default(), &blob);
 
-        let stage = PrefillKeepSetStage::new(handles.clone(), plugin, cell, N_Q, 1.0);
+        let stage = PrefillKeepSetStage::new(handles.clone(), plugin, cell, N_Q, 1.0, 0);
         let mut profiler = OpProfiler::new();
         let mut ctx = make_ctx(&mut profiler);
         let outcome = stage

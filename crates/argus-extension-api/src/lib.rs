@@ -223,6 +223,17 @@ pub trait StageCtx {
         0
     }
 
+    /// Number of leading positions (`[0, protected_prefix)`) the technique should force-KEEP — the
+    /// attention-sink / BOS / system-prompt guard (StreamingLLM). A drop-only technique that evicts the
+    /// sink can collapse a sink-sensitive model's generation, so a technique that computes a keep-set
+    /// should union `[0, protected_prefix)` into it. This mirrors the score-based path's
+    /// `--protected-prefix` (which the managed `EvictionHandler` already honors). Default `0` — protect
+    /// nothing (byte-faithful to kvpress-style sink-unaware techniques); the engine overrides it from
+    /// the resolved `--protected-prefix` in the keep-set path.
+    fn protected_prefix(&self) -> usize {
+        0
+    }
+
     /// Whether the KV buffers live device-only (no CPU-accessible pointer), e.g. a discrete GPU.
     /// When `true`, a technique MUST NOT read raw K/V (`dequant_k`/`dequant_v` would fault) or emit
     /// [`WeightedMerge`]s (the engine merge executor is CPU-only); it should degrade to a keep-only plan.

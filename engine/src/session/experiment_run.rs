@@ -224,6 +224,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         cache_manager,
         pressure_source,
         args.eviction_target_ratio(),
+        args.protected_prefix(),
         None, // γ-3b: argus-bench 는 schedule 없음 (IPC resilience 만)
         // AB-6: swap dispatch 설정. `--swap` 미지정 시 Incremental(LISWAP-6 production winner).
         SwapWiringConfig {
@@ -554,6 +555,7 @@ pub fn run_experiment_schedule_path(
         cache_manager,
         pressure_source,
         args.eviction_target_ratio(),
+        args.protected_prefix(),
         Some(schedule_source),
         // AB-6: swap dispatch 설정 (schedule 모드도 secondary 보유 시 swap 활성).
         SwapWiringConfig {

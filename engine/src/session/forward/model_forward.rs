@@ -532,13 +532,24 @@ impl Forward for ModelForward {
             let is_final_chunk = chunk_end == seq_len;
             let q_window = self.q_window;
             let mut pfa_buf: Option<Vec<Vec<f32>>> = if self.wants_prefill_attn && is_final_chunk {
-                let cfg = &self.model.config;
-                let n_heads_q = cfg.num_attention_heads;
-                let n_layers = cfg.num_hidden_layers;
-                let prefix_len = start_pos + seq_len;
+                let n_heads_q = self.model.config.num_attention_heads;
+                let chunk_len = chunk_end - chunk_start;
+                // Size each layer's PFA SUM buffer on THAT layer's PHYSICAL prefix (current_pos after
+                // this chunk's write = current_pos-before + chunk_len), which is exactly what the
+                // attention writer indexes and asserts against (`standard_format.rs`
+                // `prefix_len = cache_seq_len = current_pos`). A chat keep-set prunes each layer to a
+                // DIFFERENT physical size (e.g. pyramidkv's per-layer budgets), so the previous single
+                // cumulative `start_pos + seq_len` width mismatched on turn 2+ (physical < cumulative,
+                // and divergent per layer) → PFA-writer assert panic. For a fresh/uniform cache
+                // (cli/bench/turn-1/plain chat, physical == cumulative for every layer) this is
+                // byte-identical: `current_pos + chunk_len == start_pos + seq_len`.
+                let fmts = self
+                    .fmt_caches
+                    .as_ref()
+                    .expect("fmt_caches Some after ensure_fmt_wrapped");
                 Some(
-                    (0..n_layers)
-                        .map(|_| vec![0.0f32; n_heads_q * prefix_len])
+                    fmts.iter()
+                        .map(|f| vec![0.0f32; n_heads_q * (f.current_pos() + chunk_len)])
                         .collect(),
                 )
             } else {

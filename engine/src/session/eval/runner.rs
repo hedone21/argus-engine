@@ -316,6 +316,8 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
             arming.q_window,
             model.config.num_attention_heads,
             args.eviction_target_ratio(),
+            args.protected_prefix()
+                .unwrap_or(arming.default_protected_prefix),
         );
     }
 

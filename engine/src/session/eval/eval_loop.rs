@@ -762,15 +762,12 @@ fn run_prefill<C: EvalCacheKind>(
     // the BATCHED `seed_prefill_importance_dual`, so on an ACTIVE GPU score path a token-by-token
     // faithful run would under-seed on-device and silently mis-rank. Keep the clean reject for THAT
     // combo only — GPU incremental seeding is a documented follow-up; the CPU path (the lab's) is
-    // fully supported. On a CPU-only build this `cfg` block is compiled out entirely (INV-147).
-    #[cfg(feature = "opencl")]
+    // fully supported. `gpu_score_acc_active` returns false on a CPU-only build and on cuda-embedded
+    // (no GPU score accumulator) so the reject never fires there; it now also covers the discrete
+    // `cuda` backend, which the previous opencl-only guard silently missed (INV-147).
     if eval_config.faithful_h2o
         && token_by_token
-        && backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            .and_then(|ocl| ocl.gpu_score_acc())
-            .is_some_and(|gpu_acc| gpu_acc.is_active())
+        && crate::kv::eviction::score_fed::gpu_score_acc_active(&**backend)
     {
         anyhow::bail!(
             "faithful h2o + token-by-token prefill (--evict-timing prefill_end/prefill_streaming) is \
