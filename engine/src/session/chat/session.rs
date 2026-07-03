@@ -21,6 +21,7 @@ use crate::capability::quant_attn::QuantAttnBackend;
 use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::SamplingConfig;
+use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::standard_format::StandardFormat;
 use crate::resilience::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
@@ -76,7 +77,7 @@ pub struct ChatKeepsetArming {
 /// 비대해지는 것을 막기 위해 별도 struct로 추출하고 `Box`로 wrap한다.
 pub struct ChatKvModeStandard {
     pub cache_manager: Option<CacheManager>,
-    pub score_accumulator: Option<AttentionScoreAccumulator>,
+    pub score_accumulator: Option<SignalRuntime>,
     /// score-based policy (h2o, h2o_plus, d2o)인지 여부.
     pub score_based: bool,
     pub policy_name: String,
@@ -264,18 +265,13 @@ impl ChatSession {
                     .map(|buf| (buf, fp.n_heads_q, fp.n_kv_heads, fp.backend.clone()))
             });
             if let Some((buf, n_heads_q, n_kv_heads, backend)) = seed
-                && let Some(acc) = s.score_accumulator.as_mut()
+                && let Some(rt) = s.score_accumulator.as_mut()
             {
                 let prompt_len = buf.first().map(|l| l.len() / n_heads_q.max(1)).unwrap_or(0);
-                acc.reset();
-                crate::inference::attention_scores::seed_prefill_importance_dual(
-                    acc,
-                    backend.as_ref(),
-                    &buf,
-                    prompt_len,
-                    n_heads_q,
-                    n_kv_heads,
-                );
+                // CPU-only reset of the prior turn's accumulation, then dual-seed this turn's prompt
+                // (the seed OVERWRITES the GPU cumulative, so no device reset is needed here).
+                rt.reset_host_only();
+                rt.seed(backend.as_ref(), &buf, prompt_len, n_heads_q, n_kv_heads);
             }
         }
         self.pos = self.decode_loop.pos_snapshot();
@@ -322,16 +318,20 @@ impl ChatSession {
             .backend()
             .map(|b| b as *const dyn crate::backend::Backend);
         if let ChatKvMode::Standard(s) = &mut self.kv_mode {
-            if let Some(acc) = s.score_accumulator.as_mut() {
-                acc.reset();
+            if let Some(rt) = s.score_accumulator.as_mut() {
+                // Reset the CPU accumulator, and the GPU cumulative-importance buffers in lockstep
+                // when a backend is available (no-op on CPU/unarmed), so the next conversation does
+                // not inherit this one's scores. On a CPU-only / cuda-embedded build there is no GPU
+                // score path, so only the host reset runs (byte-identical to the prior `acc.reset()`).
                 #[cfg(any(feature = "opencl", feature = "cuda"))]
-                if let Some(bp) = backend_ptr {
-                    // SAFETY: `bp` points at the backend owned by `decode_loop`; `acc` is in the
+                match backend_ptr {
+                    // SAFETY: `bp` points at the backend owned by `decode_loop`; `rt` is in the
                     // disjoint `kv_mode` field. The raw pointer is not retained past this call.
-                    unsafe {
-                        crate::kv::eviction::score_fed::reset_gpu_scores(acc, &*bp);
-                    }
+                    Some(bp) => unsafe { rt.reset(&*bp) },
+                    None => rt.reset_host_only(),
                 }
+                #[cfg(not(any(feature = "opencl", feature = "cuda")))]
+                rt.reset_host_only();
             }
             s.evicted_total = 0;
         }
@@ -401,7 +401,7 @@ impl ChatSession {
                         // disjoint `kv_mode` field. The raw pointer is not retained past this call
                         // and `decode_loop` is not mutated here.
                         unsafe {
-                            crate::kv::eviction::score_fed::sync_gpu_scores_to_cpu(acc, &*bp);
+                            acc.ensure_coherent(&*bp);
                         }
                     }
                 }
@@ -410,9 +410,7 @@ impl ChatSession {
                     // Shared score-fed extract (gated on score-based; per-layer FLAT = faithful-H2O b).
                     let extracted = if let ChatKvMode::Standard(s) = &self.kv_mode {
                         if score_based {
-                            s.score_accumulator
-                                .as_ref()
-                                .and_then(crate::kv::eviction::score_fed::extract_scores)
+                            s.score_accumulator.as_ref().and_then(|rt| rt.extract())
                         } else {
                             None
                         }
@@ -522,7 +520,7 @@ impl ChatSession {
                 // SAFETY: `bp` points at the backend owned by `decode_loop`; `acc` is in the
                 // disjoint `kv_mode` field. The raw pointer is not retained past this call.
                 unsafe {
-                    crate::kv::eviction::score_fed::sync_gpu_scores_to_cpu(acc, &*bp);
+                    acc.ensure_coherent(&*bp);
                 }
             }
         }
@@ -530,9 +528,7 @@ impl ChatSession {
         // Shared score-fed extract (gated on score-based; per-layer FLAT = faithful-H2O b).
         let extracted = if let ChatKvMode::Standard(s) = &self.kv_mode {
             if score_based {
-                s.score_accumulator
-                    .as_ref()
-                    .and_then(crate::kv::eviction::score_fed::extract_scores)
+                s.score_accumulator.as_ref().and_then(|rt| rt.extract())
             } else {
                 None
             }
@@ -713,9 +709,8 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
         Arc::new(Mutex::new(None));
     // §5.9.1 Track A: chat 경로는 v1 EvictionHook 기반 score 처리 유지(eval_loop 동형) →
     // ModelForward 의 score_cell 은 더미 None (chat 측 score acc 는 별도 ChatKvMode 안).
-    let score_cell: Arc<
-        Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>,
-    > = Arc::new(Mutex::new(None));
+    let score_cell: Arc<Mutex<Option<crate::inference::signal_runtime::SignalRuntime>>> =
+        Arc::new(Mutex::new(None));
     // Faithful-H2O (c): capture head geometry before `ctx.model` is moved into ModelForward.
     let faithful_h2o = policy_name == "h2o";
     let fp_n_heads_q = ctx.model.config.num_attention_heads;
@@ -947,12 +942,7 @@ fn parse_kv_type(s: &str) -> Result<DType> {
 fn build_chat_eviction_internal(
     ctx: &ModeBuildCtx<'_>,
     max_seq_len: usize,
-) -> Result<(
-    Option<CacheManager>,
-    Option<AttentionScoreAccumulator>,
-    bool,
-    String,
-)> {
+) -> Result<(Option<CacheManager>, Option<SignalRuntime>, bool, String)> {
     let args = ctx.args;
     let eviction_policy = args.eviction_policy().to_string();
     if eviction_policy == "none" {
@@ -1069,7 +1059,14 @@ fn build_chat_eviction_internal(
         );
     }
 
-    Ok((Some(cache_manager), Some(acc), score_based, eviction_policy))
+    Ok((
+        Some(cache_manager),
+        // Route the chat score signal through the coherence conduit (P1). The GPU half is already
+        // armed above; the runtime only wraps the CPU accumulator.
+        Some(SignalRuntime::new(Some(acc))),
+        score_based,
+        eviction_policy,
+    ))
 }
 
 #[cfg(test)]

@@ -10,8 +10,8 @@ use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::DType;
 use crate::capability::quant_attn::QuantAttnBackend;
-use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::sampling::{self};
+use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
@@ -126,8 +126,8 @@ pub fn run_ppl_dispatch(ctx: PplRunCtx) -> Result<()> {
             cache.current_pos = 0;
             cache.high_water_pos = 0;
         }
-        if let Some(acc) = score_accumulator.as_mut() {
-            acc.reset();
+        if let Some(rt) = score_accumulator.as_mut() {
+            rt.reset_host_only();
         }
         eprintln!("[PPL-Swap] === Pass 2: measurement (swap disabled, fresh KV cache) ===");
     }
@@ -613,7 +613,7 @@ pub fn run_ppl(
     memory: &dyn Memory,
     kv_caches: &mut Vec<KVCache>,
     cache_manager: &mut CacheManager,
-    score_accumulator: &mut Option<AttentionScoreAccumulator>,
+    score_accumulator: &mut Option<SignalRuntime>,
     vocab_size: usize,
     hidden_size: usize,
     max_seq_len: usize,
@@ -801,7 +801,7 @@ pub fn run_ppl(
             backend.clone(),
         );
 
-        if let Some(acc) = score_accumulator.as_mut() {
+        if let Some(acc) = score_accumulator.as_mut().and_then(|rt| rt.acc_mut()) {
             acc.begin_step();
         }
 
@@ -818,7 +818,7 @@ pub fn run_ppl(
                 x_gen: None,
                 workspace: None,
                 logits_last_only: false,
-                score_accumulator: score_accumulator.as_mut(),
+                score_accumulator: score_accumulator.as_mut().and_then(|rt| rt.acc_mut()),
                 query_stats_accumulator: None,
                 skip_config,
                 importance_collector: None,
@@ -959,7 +959,7 @@ pub fn run_ppl(
         }
 
         // Score accumulator begin step
-        if let Some(acc) = score_accumulator.as_mut() {
+        if let Some(acc) = score_accumulator.as_mut().and_then(|rt| rt.acc_mut()) {
             acc.begin_step();
         }
 
@@ -985,7 +985,7 @@ pub fn run_ppl(
                 x_gen: Some(&mut x_gen),
                 workspace: Some(&mut gen_ws),
                 logits_last_only: false,
-                score_accumulator: score_accumulator.as_mut(),
+                score_accumulator: score_accumulator.as_mut().and_then(|rt| rt.acc_mut()),
                 query_stats_accumulator: None,
                 skip_config,
                 importance_collector: None,
@@ -1034,13 +1034,13 @@ pub fn run_ppl(
                 // is stale until synced — this fixes BOTH the a2sf snapshot below AND the
                 // score-based eviction ranking (`extract_scores` further down), keeping the dump
                 // from perturbing the measurement.
-                if let Some(acc) = score_accumulator.as_mut() {
-                    crate::kv::eviction::score_fed::sync_gpu_scores_to_cpu(acc, backend.as_ref());
+                if let Some(rt) = score_accumulator.as_mut() {
+                    rt.ensure_coherent(backend.as_ref());
                 }
 
                 // score-decay 측정: eviction(+ acc.reset) 직전 importance 스냅샷(읽기 전용). budget=top-k.
                 if args.dump_a2sf.is_some()
-                    && let Some(acc) = score_accumulator.as_ref()
+                    && let Some(acc) = score_accumulator.as_ref().and_then(|rt| rt.view())
                     && acc.is_active()
                 {
                     score_decay_snapshots.push(
@@ -1079,9 +1079,7 @@ pub fn run_ppl(
                 // reads real importance on both CPU and GPU backends.
                 use crate::kv::eviction::score_fed;
                 let extracted = if score_based_eviction {
-                    score_accumulator
-                        .as_ref()
-                        .and_then(score_fed::extract_scores)
+                    score_accumulator.as_ref().and_then(|rt| rt.extract())
                 } else {
                     None
                 };
@@ -1106,7 +1104,7 @@ pub fn run_ppl(
                     let ppl_at_event = (total_nll / nll_count as f64).exp();
 
                     let qcf_value_aware_value = if can_compute_qcf
-                        && let Some(acc) = score_accumulator.as_ref()
+                        && let Some(acc) = score_accumulator.as_ref().and_then(|rt| rt.view())
                         && let Some(head_attn) = acc.last_step_head_attn()
                     {
                         use crate::qcf::{QcfKvParams, VDataSource, compute_qcf_kv};
@@ -1184,13 +1182,12 @@ pub fn run_ppl(
                     // (compacted) creates a RoPE discontinuity where cached tokens appear
                     // as "future" tokens, causing severe NLL degradation.
                     // start_pos continues via `start_pos += 1` in the main loop.
-                    if let Some(acc) = score_accumulator.as_mut() {
-                        acc.reset();
-                        // Reset the GPU accumulator in lockstep (mirrors eval-ll/bench). Without this
-                        // the GPU importance keeps accumulating since prefill while the CPU twin above
-                        // starts fresh, so a 2nd eviction's synced scores (and the a2sf dump) would
-                        // diverge from the CPU oracle. No-op on CPU / when unarmed.
-                        score_fed::reset_gpu_scores(acc, backend.as_ref());
+                    if let Some(rt) = score_accumulator.as_mut() {
+                        // Reset the CPU accumulator AND the GPU accumulator in lockstep (mirrors
+                        // eval-ll/bench). Without this the GPU importance keeps accumulating since
+                        // prefill while the CPU twin starts fresh, so a 2nd eviction's synced scores
+                        // (and the a2sf dump) would diverge from the CPU oracle. No-op on CPU / unarmed.
+                        rt.reset(backend.as_ref());
                     }
                     eprintln!(
                         "[PPL] Eviction at step {}: {} → {} tokens (removed {})",
@@ -1219,10 +1216,10 @@ pub fn run_ppl(
         // Sync GPU scores into the CPU accumulator before the final snapshot reads them
         // (no-op on CPU / when the GPU accumulator is unarmed). This is a dump-only,
         // post-run read, so it never touches the measured eviction path.
-        if let Some(acc) = score_accumulator.as_mut() {
-            crate::kv::eviction::score_fed::sync_gpu_scores_to_cpu(acc, backend.as_ref());
+        if let Some(rt) = score_accumulator.as_mut() {
+            rt.ensure_coherent(backend.as_ref());
         }
-        if let Some(acc) = score_accumulator.as_ref()
+        if let Some(acc) = score_accumulator.as_ref().and_then(|rt| rt.view())
             && acc.is_active()
         {
             let pos = kv_caches[0].current_pos;

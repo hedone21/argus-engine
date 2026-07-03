@@ -55,7 +55,7 @@ impl ExtractedScores {
 /// Extract the `(importance, value-aware a_i, per-layer FLAT)` triple from an accumulator.
 /// Returns `None` when the accumulator is inactive — the caller then routes score-free
 /// (degrade to recency). Identical at all three sites (only the way each obtains `acc` differs).
-pub fn extract_scores(acc: &AttentionScoreAccumulator) -> Option<ExtractedScores> {
+pub(crate) fn extract_scores(acc: &AttentionScoreAccumulator) -> Option<ExtractedScores> {
     if !acc.is_active() {
         return None;
     }
@@ -103,7 +103,7 @@ pub fn route_evict(
 /// accumulator before a score-based eviction reads them. No-op on CPU backends / when the GPU
 /// accumulator is inactive, so the host path is byte-identical. Used by `eval` (always) and `chat`
 /// (closing the chat-on-GPU sync gap); `bench` uses the CPU accumulate path and never calls this.
-pub fn sync_gpu_scores_to_cpu(acc: &mut AttentionScoreAccumulator, backend: &dyn Backend) {
+pub(crate) fn sync_gpu_scores_to_cpu(acc: &mut AttentionScoreAccumulator, backend: &dyn Backend) {
     #[cfg(feature = "opencl")]
     if acc.is_active()
         && let Some(ocl_be) = backend
@@ -157,7 +157,7 @@ pub fn sync_gpu_scores_to_cpu(acc: &mut AttentionScoreAccumulator, backend: &dyn
 /// both the score-based eviction ranking AND the `a2sf` / `evict_importance` dumps that read the
 /// accumulator. The GPU reduce accumulates on-device and is otherwise never reset. Mirrors the full
 /// CPU `acc.reset()` (not just the per-layer buffer). No-op on CPU backends / when unarmed.
-pub fn reset_gpu_scores(acc: &AttentionScoreAccumulator, backend: &dyn Backend) {
+pub(crate) fn reset_gpu_scores(acc: &AttentionScoreAccumulator, backend: &dyn Backend) {
     #[cfg(feature = "opencl")]
     if acc.is_active()
         && let Some(ocl_be) = backend
@@ -261,4 +261,38 @@ pub fn gpu_score_acc_active(backend: &dyn Backend) -> bool {
 
     let _ = backend;
     false
+}
+
+/// The GPU score accumulator's on-device step counter (`steps_accumulated`), or `None` when no
+/// active GPU accumulator exists (CPU build / CPU backend / cuda-embedded). Used by
+/// [`crate::inference::signal_runtime::SignalRuntime::ensure_coherent`] as the coherence watermark:
+/// the counter advances once per decode step's on-device reduce, so a value greater than the last
+/// synced watermark means the device buffer has fresh scores the CPU accumulator has not imported
+/// yet. Mirrors [`gpu_score_acc_active`]'s cfg-gated downcast; the returned count is a monotone
+/// dirty source, never an absolute the caller acts on directly.
+pub(crate) fn gpu_score_watermark(backend: &dyn Backend) -> Option<u64> {
+    #[cfg(feature = "opencl")]
+    if let Some(ocl_be) = backend
+        .as_any()
+        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+    {
+        return ocl_be
+            .gpu_score_acc()
+            .filter(|g| g.is_active())
+            .map(|g| g.steps_accumulated() as u64);
+    }
+
+    #[cfg(feature = "cuda")]
+    if let Some(cuda_be) = backend
+        .as_any()
+        .downcast_ref::<crate::backend::cuda_pc::CudaBackend>()
+    {
+        return cuda_be
+            .gpu_score_acc()
+            .filter(|g| g.is_active())
+            .map(|g| g.steps_accumulated() as u64);
+    }
+
+    let _ = backend;
+    None
 }

@@ -285,7 +285,7 @@ pub fn seed_prefill_importance(
 /// into the GPU buffers; the subsequent decode `end_step`s accumulate on top. On a CPU backend (or with
 /// the `opencl` feature off / GPU score path unarmed) this is exactly `seed_prefill_importance` — the
 /// host path stays byte-identical.
-pub fn seed_prefill_importance_dual(
+pub(in crate::inference) fn seed_prefill_importance_dual(
     acc: &mut AttentionScoreAccumulator,
     backend: &dyn crate::backend::Backend,
     pfa: &[Vec<f32>],

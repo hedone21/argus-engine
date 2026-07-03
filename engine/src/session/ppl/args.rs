@@ -7,7 +7,7 @@ use std::time::Instant;
 use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
-use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::signal_runtime::SignalRuntime;
 use crate::inference::skip_config::SkipConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::KVCache;
@@ -29,7 +29,7 @@ pub struct PplRunCtx {
     // KV / 상태 객체
     pub kv_caches: Vec<KVCache>,
     pub cache_manager: CacheManager,
-    pub score_accumulator: Option<AttentionScoreAccumulator>,
+    pub score_accumulator: Option<SignalRuntime>,
     pub skip_config: Option<SkipConfig>,
 
     // 파생 상태

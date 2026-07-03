@@ -983,17 +983,14 @@ fn run_full_prefill<C: EvalCacheKind>(
     // apply its per-head keep-set at `post_prefill`.
     if let Some(buf) = pfa_buf {
         if eval_config.faithful_h2o {
-            if let Some(acc) = hook.score_accumulator() {
-                let c = &model.config;
-                crate::inference::attention_scores::seed_prefill_importance_dual(
-                    acc,
-                    backend.as_ref(),
-                    &buf,
-                    prompt_len,
-                    c.num_attention_heads,
-                    c.num_key_value_heads,
-                );
-            }
+            let c = &model.config;
+            hook.seed_prefill(
+                backend.as_ref(),
+                &buf,
+                prompt_len,
+                c.num_attention_heads,
+                c.num_key_value_heads,
+            );
         } else {
             hook.stage_prefill_attn(buf);
         }

@@ -4,6 +4,7 @@
 //! policy. Each implementation encapsulates its own eviction/flush logic and
 //! QCF metric collection.
 
+use crate::backend::Backend;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 
 /// Result of a post-decode-step hook invocation.
@@ -59,6 +60,19 @@ pub trait StepHook<C> {
     /// Provide mutable access to the score accumulator (if any).
     /// EvictionHook returns Some; QuantWindowFlushHook returns None.
     fn score_accumulator(&mut self) -> Option<&mut AttentionScoreAccumulator>;
+
+    /// Seed prefill importance into the score signal through the coherence conduit (P1). Default
+    /// no-op (only `EvictionHook` with a score accumulator seeds); routes through `SignalRuntime::seed`
+    /// so the runtime marks itself dirty for the next coherence pull. Called once, post-prefill.
+    fn seed_prefill(
+        &mut self,
+        _backend: &dyn Backend,
+        _pfa: &[Vec<f32>],
+        _prompt_len: usize,
+        _n_heads_q: usize,
+        _n_kv_heads: usize,
+    ) {
+    }
 
     /// Update the effective budget (used by ratio-mode per-question budget).
     /// Default is no-op (e.g., QuantWindowFlushHook ignores budget).

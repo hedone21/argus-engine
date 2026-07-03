@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 
+use crate::inference::signal_runtime::SignalRuntime;
 use crate::session::cli::parse_qcf_sample_layers;
 use crate::session::eval::args::EvalLlRunCtx;
 use crate::session::eval::helpers::{
@@ -278,7 +279,9 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
 
     let mut hook = crate::session::eval::EvictionHook::new(
         cache_manager,
-        score_accumulator,
+        // Route the eval-ll score signal through the coherence conduit (P1). The GPU half is already
+        // armed inside `build_eval_score_accumulator`; the runtime only wraps the CPU accumulator.
+        score_accumulator.map(|acc| SignalRuntime::new(Some(acc))),
         qcf_config,
         hook_budget,
         actual_protected_prefix,

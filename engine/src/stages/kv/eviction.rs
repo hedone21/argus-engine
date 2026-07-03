@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use argus_shared::Level;
 
-use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
@@ -60,7 +60,7 @@ pub struct EvictionStage {
     /// §5.9.1 Track A: score-aware eviction 용 accumulator cell. `Some` 이면 run_eviction 이
     /// acc.importance_scores() 를 추출해 force_evict_with_scores 로 heavy-hitter/weighted-merge 정밀 선택, 직후 acc.reset().
     /// `None`(score-free = sliding/streaming 또는 더미) 이면 기존 score-free force_evict 유지.
-    score_cell: Option<Arc<Mutex<Option<AttentionScoreAccumulator>>>>,
+    score_cell: Option<Arc<Mutex<Option<SignalRuntime>>>>,
     /// bench GPU-score 경로용 backend. `Some`(OpenCL + score-fed dispatcher) 이면 run_eviction 이
     /// score 를 읽기 직전 GPU 누적 score 를 CPU accumulator 로 sync 한다(`gpu_score_active=true` 시
     /// decode 가 CPU accumulate 를 건너뛰어 score 가 on-device 에만 쌓이므로 — eval/chat 동형 갭).
@@ -103,7 +103,7 @@ impl EvictionStage {
         handles: Vec<Arc<StandardFormat>>,
         cache_manager: Arc<Mutex<CacheManager>>,
         target_ratio: f32,
-        score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
+        score_cell: Arc<Mutex<Option<SignalRuntime>>>,
         // bench GPU-score 경로: `Some`(OpenCL) 이면 run_eviction 이 score 읽기 직전 GPU→CPU sync.
         // CPU/non-opencl 또는 dispatcher 가 backend 미보유면 `None`(기존 CPU accumulate 경로 무변).
         backend: Option<Arc<dyn crate::backend::Backend>>,
@@ -165,8 +165,8 @@ impl EvictionStage {
             let mut guard = cell
                 .lock()
                 .expect("EvictionStage score_cell Mutex poisoned");
-            if let Some(acc) = guard.as_mut() {
-                score_fed::sync_gpu_scores_to_cpu(acc, be.as_ref());
+            if let Some(rt) = guard.as_mut() {
+                rt.ensure_coherent(be.as_ref());
             }
         }
         // Extract under the lock and release before routing.
@@ -174,7 +174,7 @@ impl EvictionStage {
             let guard = cell
                 .lock()
                 .expect("EvictionStage score_cell Mutex poisoned");
-            guard.as_ref().and_then(score_fed::extract_scores)
+            guard.as_ref().and_then(|rt| rt.extract())
         });
 
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
@@ -210,23 +210,18 @@ impl EvictionStage {
         // 가 `Ok(evicted:false)`(cache_manager.rs:515/530/546)면 geometry 불변 → 누적 score 유지(주석
         // "성공 후"의 본래 의도). 무조건 reset 은 no-op directive 가 score 를 날려 다음 eviction 의
         // keep-set 을 eval 과 발산시키는 잠재 버그였다 — CPU·GPU 양쪽을 evicted 게이트로 묶어 해소.
-        if evicted {
-            if let Some(cell) = self.score_cell.as_ref() {
-                let mut guard = cell
-                    .lock()
-                    .expect("EvictionStage score_cell Mutex poisoned");
-                if let Some(ref mut acc) = *guard {
-                    acc.reset();
-                }
-            }
-            // Reset the GPU accumulator in lockstep with the CPU acc.reset above.
-            // No-op when `backend` is None / unarmed / non-opencl stub.
-            if let (Some(be), Some(cell)) = (self.backend.as_ref(), self.score_cell.as_ref()) {
-                let guard = cell
-                    .lock()
-                    .expect("EvictionStage score_cell Mutex poisoned");
-                if let Some(acc) = guard.as_ref() {
-                    score_fed::reset_gpu_scores(acc, be.as_ref());
+        if evicted && let Some(cell) = self.score_cell.as_ref() {
+            let mut guard = cell
+                .lock()
+                .expect("EvictionStage score_cell Mutex poisoned");
+            if let Some(rt) = guard.as_mut() {
+                // `rt.reset` resets the CPU accumulator AND the GPU accumulator in lockstep when a
+                // backend is present (no-op on CPU/unarmed); with no backend handle, only the CPU
+                // reset runs — byte-identical to the prior split (CPU reset ungated + GPU reset
+                // gated on `backend`).
+                match self.backend.as_ref() {
+                    Some(be) => rt.reset(be.as_ref()),
+                    None => rt.reset_host_only(),
                 }
             }
         }
@@ -547,7 +542,7 @@ mod tests {
         // importance 값이 0이 아닌지 확인하기 위해 accept_scores 호출(단, API 없으면 skip).
         // reset 후에는 모두 0이어야 한다.
 
-        let score_cell = Arc::new(Mutex::new(Some(acc)));
+        let score_cell = Arc::new(Mutex::new(Some(SignalRuntime::new(Some(acc)))));
 
         let stage = EvictionStage::one_shot_scored(
             vec![handle.clone()],
@@ -563,7 +558,10 @@ mod tests {
 
         // eviction 완료 후 score_cell.importance_scores()가 all-zero여야 한다.
         let guard = score_cell.lock().unwrap();
-        let acc_ref = guard.as_ref().expect("acc still in cell");
+        let acc_ref = guard
+            .as_ref()
+            .and_then(|rt| rt.view())
+            .expect("acc still in cell");
         let all_zero = acc_ref.importance_scores().iter().all(|&s| s == 0.0);
         assert!(all_zero, "reset() 후 importance_scores 는 all-zero");
     }
@@ -573,9 +571,7 @@ mod tests {
     fn one_shot_scored_without_score_cell_behaves_as_one_shot() {
         // score_cell 미주입 경우에도 정상 eviction 동작.
         let h_scored = Arc::new(StandardFormat::new(0, make_cache(N_TOKENS)));
-        let empty_cell: Arc<
-            Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>,
-        > = Arc::new(Mutex::new(None));
+        let empty_cell: Arc<Mutex<Option<SignalRuntime>>> = Arc::new(Mutex::new(None));
         let stage = EvictionStage::one_shot_scored(
             vec![h_scored.clone()],
             make_cache_manager(),
@@ -608,7 +604,7 @@ mod tests {
         let mut acc = AttentionScoreAccumulator::new(MAX_SEQ, KV_HEADS, 1, 0, 0.0);
         acc.set_active(true);
         acc.begin_step();
-        let score_cell = Arc::new(Mutex::new(Some(acc)));
+        let score_cell = Arc::new(Mutex::new(Some(SignalRuntime::new(Some(acc)))));
 
         // CPU backend 주입 — run_eviction 의 sync 블록이 진입하지만 OpenCLBackend downcast-miss 로 no-op.
         let cpu_backend: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
@@ -631,7 +627,10 @@ mod tests {
             handle.current_pos()
         );
         let guard = score_cell.lock().unwrap();
-        let acc_ref = guard.as_ref().expect("acc still in cell");
+        let acc_ref = guard
+            .as_ref()
+            .and_then(|rt| rt.view())
+            .expect("acc still in cell");
         assert!(
             acc_ref.importance_scores().iter().all(|&s| s == 0.0),
             "CPU backend sync no-op 후에도 reset() → all-zero (byte-identical)"
