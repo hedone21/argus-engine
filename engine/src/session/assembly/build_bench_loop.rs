@@ -241,7 +241,7 @@ pub fn build_bench_loop(
     swap_config: SwapWiringConfig,
     // §5.9.1 Track A: score-based policy(h2o/h2o_plus/d2o) 시 호출자가 생성한 accumulator cell.
     // 비-score 조립처는 `Arc::new(Mutex::new(None))` 더미를 넘긴다.
-    score_cell: Arc<Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>>,
+    score_cell: Arc<Mutex<Option<crate::inference::signal_runtime::SignalRuntime>>>,
     // Faithful-H2O `(c)`: when true (eviction == "h2o"), arm a full-prompt-window PFA producer + the
     // prefill seed so the score accumulator reflects prefill attention, not just decode.
     faithful_h2o: bool,

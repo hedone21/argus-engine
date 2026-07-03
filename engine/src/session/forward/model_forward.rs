@@ -35,6 +35,7 @@ use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::query_stats::QueryStatsAccumulator;
 use crate::inference::sampling::StepCtx;
+use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
 use crate::kv_cache_ops::KVLayout;
@@ -74,7 +75,7 @@ pub struct ModelForward {
     // score cell. score-based policy(h2o/h2o_plus/d2o) 구성 시에만 Some(acc) — 그 외 더미 None.
     // `step` 이 lock-read 후 acc.is_active()면 begin_step() 호출 + forward args 에 주입(decode only).
     // end_step() 은 forward_into 내부 자동 호출(transformer.rs:1671) — caller 호출 금지.
-    score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
+    score_cell: Arc<Mutex<Option<SignalRuntime>>>,
 
     // 선택적 read stage(Quest 류). `--read-stage` 지정 시 Some, 미지정(production
     // 기본)은 None. `step`(decode)이 `as_deref()` 로 forward args 에 대여 주입한다 — None 이면
@@ -163,7 +164,7 @@ impl ModelForward {
         hook_cell: Arc<Mutex<Option<Arc<dyn LayerBoundaryHook>>>>,
         // §5.9.1 Track A: score-based eviction(h2o/h2o_plus/d2o) 공유 score cell.
         // 비-score 조립처는 `Arc::new(Mutex::new(None))` 더미를 넘긴다(항상 None).
-        score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
+        score_cell: Arc<Mutex<Option<SignalRuntime>>>,
     ) -> Result<Self> {
         let hidden_size = model.config.hidden_size;
         let vocab_size = model.config.vocab_size;
@@ -586,11 +587,10 @@ impl Forward for ModelForward {
                 // prefill attention, not just decode. Armed only on the faithful-h2o path
                 // (`arm_faithful_prefill_seed`); otherwise this branch is skipped (byte-identical).
                 if self.seed_prefill_scores
-                    && let Some(acc) = self.score_cell.lock().unwrap().as_mut()
+                    && let Some(rt) = self.score_cell.lock().unwrap().as_mut()
                 {
                     let cfg = &self.model.config;
-                    crate::inference::attention_scores::seed_prefill_importance_dual(
-                        acc,
+                    rt.seed(
                         self.backend.as_ref(),
                         &buf,
                         start_pos + seq_len,
@@ -698,15 +698,18 @@ impl Forward for ModelForward {
         // `&mut acc` lifetime 을 보장한다(forward 완료 = end_step 자동 호출 후 guard 해제).
         // cell None 또는 acc 비활성이면 score_accumulator: None (거동-0).
         let mut score_guard = self.score_cell.lock().expect("score_cell mutex poisoned");
-        if let Some(ref mut acc) = *score_guard
+        if let Some(acc) = score_guard.as_mut().and_then(|rt| rt.acc_mut())
             && acc.is_active()
         {
             acc.begin_step();
         }
 
-        // score_guard 를 유지한 채로 &mut acc 참조를 forward_into 에 주입.
-        let acc_slot: Option<&mut AttentionScoreAccumulator> =
-            score_guard.as_mut().filter(|acc| acc.is_active());
+        // score_guard 를 유지한 채로 &mut acc 참조를 forward_into 에 주입. `acc_mut` 은 sync-free 한
+        // 원시 field 재대여라 forward-time hot path 는 불변(coherence 는 forward 경계 연산).
+        let acc_slot: Option<&mut AttentionScoreAccumulator> = score_guard
+            .as_mut()
+            .and_then(|rt| rt.acc_mut())
+            .filter(|acc| acc.is_active());
 
         // read stage 대여(없으면 None). transformer.rs:1628 seam 이 layer 당 1회
         // read_plan 을 호출한다. self.model 은 Arc(별도 필드) 라 self.read_stage 동시 immutable borrow 무충돌.
@@ -945,11 +948,11 @@ fn read_hook_cell(
 /// §5.9.1 Track A: score cell 의 active 여부 — `Some(acc)` 이고 `acc.is_active()` 면 `true`.
 /// plan path 우회 판단 + step 로직에서 사용. ModelForward fixture 없이 host 단위테스트 가능하도록
 /// 자유 함수로 추출(read_hook_cell 패턴 동형).
-fn read_score_cell_active(cell: &Arc<Mutex<Option<AttentionScoreAccumulator>>>) -> bool {
+fn read_score_cell_active(cell: &Arc<Mutex<Option<SignalRuntime>>>) -> bool {
     cell.lock()
         .expect("score_cell mutex poisoned")
         .as_ref()
-        .is_some_and(|acc| acc.is_active())
+        .is_some_and(|rt| rt.is_active())
 }
 
 /// `Vec<KVCache>` → `Vec<Arc<StandardFormat>>` wrap (by-value move, 단일 물리 캐시).
@@ -1157,7 +1160,7 @@ mod tests {
     /// §5.9.1 Track A: score_cell None → read_score_cell_active = false (더미 셀, happy/chat 거동-0).
     #[test]
     fn score_cell_none_is_inactive() {
-        let cell: Arc<Mutex<Option<AttentionScoreAccumulator>>> = Arc::new(Mutex::new(None));
+        let cell: Arc<Mutex<Option<SignalRuntime>>> = Arc::new(Mutex::new(None));
         assert!(!read_score_cell_active(&cell), "None 셀 → inactive");
     }
 
@@ -1166,7 +1169,7 @@ mod tests {
     fn score_cell_some_inactive_is_false() {
         let acc = AttentionScoreAccumulator::new(64, 8, 1, 0, 0.0);
         // active 기본값은 false
-        let cell = Arc::new(Mutex::new(Some(acc)));
+        let cell = Arc::new(Mutex::new(Some(SignalRuntime::new(Some(acc)))));
         assert!(!read_score_cell_active(&cell), "active=false 셀 → inactive");
     }
 
@@ -1175,7 +1178,7 @@ mod tests {
     fn score_cell_some_active_is_true() {
         let mut acc = AttentionScoreAccumulator::new(64, 8, 1, 0, 0.0);
         acc.set_active(true);
-        let cell = Arc::new(Mutex::new(Some(acc)));
+        let cell = Arc::new(Mutex::new(Some(SignalRuntime::new(Some(acc)))));
         assert!(read_score_cell_active(&cell), "active=true 셀 → active");
     }
 }

@@ -36,7 +36,9 @@ use argus_extension_api::{
 };
 use argus_shared::Level;
 
+#[cfg(test)]
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_handle::{EngineCacheHandle, EngineModelCacheHandle};
 use crate::kv::dequant::{dequantize_k, dequantize_v};
 use crate::kv::eviction_handler::MIN_EVICT_TOKENS;
@@ -854,7 +856,7 @@ pub struct KVMutationDriverStage {
     /// head attn) ONCE per fire into owned snapshots fed to the read ctx, then `reset()`s the
     /// accumulator after a successful commit (stale-score guard: the KV geometry just changed). `None`
     /// = score-free (sliding/streaming/no-eviction): the ctx exposes no signals.
-    score_cell: Option<Arc<Mutex<Option<AttentionScoreAccumulator>>>>,
+    score_cell: Option<Arc<Mutex<Option<SignalRuntime>>>>,
     /// Shared plan-invalidation cell (T-6). Set `true` when a commit mutated any layer so the decode
     /// loop invalidates the fused decode plan. `None` until wired (P0-5c) — the test-driven driver and
     /// score-free positional stages that only shrink keeps are already covered by the pos-shrink reflux.
@@ -918,10 +920,7 @@ impl KVMutationDriverStage {
 
     /// Attach a score accumulator cell so score-based stages receive importance / per-head scores /
     /// last-step attention through the read ctx (mirror of `EvictionStage::one_shot_scored`).
-    pub fn with_score_cell(
-        mut self,
-        score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
-    ) -> Self {
+    pub fn with_score_cell(mut self, score_cell: Arc<Mutex<Option<SignalRuntime>>>) -> Self {
         self.score_cell = Some(score_cell);
         self
     }
@@ -953,7 +952,11 @@ impl KVMutationDriverStage {
         match self.score_cell.as_ref() {
             Some(cell) => {
                 let guard = cell.lock().unwrap_or_else(|e| e.into_inner());
-                match guard.as_ref().filter(|acc| acc.is_active()) {
+                match guard
+                    .as_ref()
+                    .and_then(|rt| rt.view())
+                    .filter(|acc| acc.is_active())
+                {
                     Some(acc) => (
                         Some(acc.importance_scores().to_vec()),
                         acc.head_importance_scores().map(|s| s.to_vec()),
@@ -971,8 +974,8 @@ impl KVMutationDriverStage {
     fn reset_scores(&self) {
         if let Some(cell) = self.score_cell.as_ref() {
             let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(acc) = guard.as_mut() {
-                acc.reset();
+            if let Some(rt) = guard.as_mut() {
+                rt.reset_host_only();
             }
         }
     }
@@ -1452,7 +1455,7 @@ mod tests {
         flat[2] = 10.0;
         flat[5] = 9.0;
         acc.import_gpu_scores(&flat, &[]);
-        let cell = Arc::new(Mutex::new(Some(acc)));
+        let cell = Arc::new(Mutex::new(Some(SignalRuntime::new(Some(acc)))));
 
         let driver = KVMutationDriverStage::new(
             vec![handle.clone()],
@@ -1478,6 +1481,7 @@ mod tests {
         let g = cell.lock().unwrap();
         assert!(
             g.as_ref()
+                .and_then(|rt| rt.view())
                 .unwrap()
                 .importance_scores()
                 .iter()

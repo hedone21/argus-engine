@@ -159,9 +159,8 @@ pub fn build_standard_loop(
     let hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>> =
         Arc::new(Mutex::new(None));
     // §5.9.1 Track A: happy/standard 경로는 score-based eviction 미구성 → 더미 None cell.
-    let score_cell: Arc<
-        Mutex<Option<crate::inference::attention_scores::AttentionScoreAccumulator>>,
-    > = Arc::new(Mutex::new(None));
+    let score_cell: Arc<Mutex<Option<crate::inference::signal_runtime::SignalRuntime>>> =
+        Arc::new(Mutex::new(None));
     // R-P1-1 PFA producer arming(caps-driven): 등록 stage 중 PrefillAttention 을 읽는 게 있으면 무장한다.
     // PR1 은 그런 builtin 0개 → `arm_prefill_keepset=false` → set_prefill_attn/submit 미진입 = 기존과
     // byte-identical. cell 은 producer(ModelForward)와 consumer(PrefillKeepSetStage)가 공유한다.

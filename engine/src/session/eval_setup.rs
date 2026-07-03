@@ -30,6 +30,7 @@ use crate::backend::Backend;
 use crate::buffer::DType;
 use crate::hardware::DeviceTarget;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::signal_runtime::SignalRuntime;
 use crate::inference::skip_config::SkipConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::eviction::EvictionPolicy;
@@ -571,7 +572,9 @@ pub fn build_ppl_ctx(args: Args) -> Result<PplRunCtx> {
         tokenizer,
         kv_caches,
         cache_manager,
-        score_accumulator,
+        // ppl routes the score signal through the coherence conduit (P1). The GPU half is already
+        // armed inside `build_eval_score_accumulator`; the runtime only wraps the CPU accumulator.
+        score_accumulator: score_accumulator.map(|acc| SignalRuntime::new(Some(acc))),
         skip_config,
         hidden_size,
         vocab_size,

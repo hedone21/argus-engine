@@ -24,7 +24,7 @@ use argus_extension_api::FormatId;
 use argus_shared::{EngineCapability, EngineCommand, EngineMessage, QcfEstimate, WeightSwapReport};
 
 use crate::hardware::Hardware;
-use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::quant_window_format::QuantWindowFormat;
 use crate::kv::standard_format::StandardFormat;
@@ -148,7 +148,7 @@ pub struct CommandDispatcher {
     /// `compute_and_send_qcf` 에서 active acc 의 `importance_scores()` 를 QCF `token_scores` 로 전달.
     /// `submit_evict` 에서 EvictionStage 생성 시 score_cell 전달(scored 경로 선택).
     /// score-based 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미(QCF uniform fallback 유지).
-    score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
+    score_cell: Arc<Mutex<Option<SignalRuntime>>>,
     /// ① QuantWindowBitTransitionStage 가 transition 할 quant-window handle (register 시점 보유, AB-2 §5.7.8). 비어 있으면
     /// KvQuantDynamic directive 가 와도 submit 안 함(미구성 — non-quant-window: Standard/Offload).
     quant_window_handles: Vec<Arc<QuantWindowFormat>>,
@@ -220,7 +220,7 @@ impl CommandDispatcher {
         hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>>,
         // §5.9.1 Track A: score-based eviction 의 accumulator cell (ModelForward 공유).
         // score-based 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미.
-        score_cell: Arc<Mutex<Option<AttentionScoreAccumulator>>>,
+        score_cell: Arc<Mutex<Option<SignalRuntime>>>,
     ) -> Self {
         Self {
             registry,
@@ -566,6 +566,7 @@ impl CommandDispatcher {
             let guard = self.score_cell.lock().expect("score_cell mutex poisoned");
             guard
                 .as_ref()
+                .and_then(|rt| rt.view())
                 .filter(|acc| acc.is_active())
                 .map(|acc| acc.importance_scores().to_vec())
         };

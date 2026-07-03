@@ -4,4 +4,5 @@
 pub mod attention_scores;
 pub mod query_stats;
 pub mod sampling;
+pub mod signal_runtime;
 pub mod skip_config;

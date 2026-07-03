@@ -5,7 +5,9 @@
 //! and collects QCF/value-aware metrics at each eviction event.
 
 use super::hook::{CacheSnapshot, StepHook};
+use crate::backend::Backend;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::{KVCache, max_cache_pos};
 use crate::qcf::{QcfKvParams, VDataSource, compute_c1, compute_d7, compute_qcf_kv};
@@ -138,7 +140,7 @@ pub struct EvictionHook {
     /// KV cache manager (wraps the eviction policy).
     pub cache_manager: CacheManager,
     /// Attention score accumulator for heavy-hitter scoring (Some iff score-based).
-    pub score_accumulator: Option<AttentionScoreAccumulator>,
+    pub score_accumulator: Option<SignalRuntime>,
     /// QCF metric collection config.
     pub qcf_config: QcfConfig,
     /// Maximum KV cache tokens before eviction triggers.
@@ -268,7 +270,7 @@ impl EvictionHook {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cache_manager: CacheManager,
-        score_accumulator: Option<AttentionScoreAccumulator>,
+        score_accumulator: Option<SignalRuntime>,
         qcf_config: QcfConfig,
         effective_budget: usize,
         protected_prefix: usize,
@@ -346,7 +348,7 @@ impl EvictionHook {
         use crate::session::eval::dump;
 
         let captured = crate::kv::eviction::keepset_dump::drain_capture();
-        let acc = self.score_accumulator.as_ref()?;
+        let acc = self.score_accumulator.as_ref().and_then(|rt| rt.view())?;
         let layer_head = acc.layer_head_importance()?; // None unless GQA + dump enabled
         let max_seq_len = acc.importance_scores().len();
         let n_kv_heads = acc.n_kv_heads();
@@ -385,21 +387,11 @@ impl EvictionHook {
     /// Sync GPU-accumulated attention scores into the CPU accumulator before an
     /// eviction reads them. No-op on CPU backends / without the `opencl` feature, so
     /// the host path is unchanged. Shared by `post_prefill` and the streaming path.
-    fn sync_gpu_scores_to_cpu(&mut self) {
-        // Shared score-fed body (disjoint field borrows: `score_accumulator` mut, `backend` shared).
-        if let Some(acc) = self.score_accumulator.as_mut() {
-            crate::kv::eviction::score_fed::sync_gpu_scores_to_cpu(acc, self.backend.as_ref());
-        }
-    }
-
-    /// Reset the GPU cumulative importance buffers (collapsed + per-KV-head + per-layer FLAT + step
-    /// counters) at an eviction boundary, in lockstep with the CPU `acc.reset()`. The GPU reduce
-    /// accumulates on-device and is otherwise never reset, so without this a 2nd eviction would rank
-    /// GPU importance monotonically accumulated since prefill (misaligned with the compacted cache)
-    /// while the CPU twin starts fresh — they would diverge. No-op on CPU backends / when unarmed.
-    fn reset_gpu_scores(&self) {
-        if let Some(acc) = self.score_accumulator.as_ref() {
-            crate::kv::eviction::score_fed::reset_gpu_scores(acc, self.backend.as_ref());
+    fn ensure_scores_coherent(&mut self) {
+        // Route through the coherence conduit (disjoint field borrows: `score_accumulator` mut,
+        // `backend` shared). `ensure_coherent` pulls the device scores only when they advanced.
+        if let Some(rt) = self.score_accumulator.as_mut() {
+            rt.ensure_coherent(self.backend.as_ref());
         }
     }
 
@@ -426,14 +418,12 @@ impl EvictionHook {
             crate::kv::eviction::keepset_dump::arm_capture();
         }
         // GPU score sync before a score-based eviction reads importance (no-op on CPU).
-        self.sync_gpu_scores_to_cpu();
+        self.ensure_scores_coherent();
 
         // Shared score-fed body: extract (only when score-based + active) → route (force, ratio).
         use crate::kv::eviction::score_fed;
         let extracted = if self.score_based_eviction {
-            self.score_accumulator
-                .as_ref()
-                .and_then(score_fed::extract_scores)
+            self.score_accumulator.as_ref().and_then(|rt| rt.extract())
         } else {
             None
         };
@@ -476,12 +466,10 @@ impl EvictionHook {
             // Reset the accumulator so the next event ranks on a fresh, slot-aligned
             // window of importance over the compacted cache (mirrors the single-shot
             // hook's post-evict reset; avoids stale pre-compaction slot importance).
-            if let Some(acc) = self.score_accumulator.as_mut() {
-                acc.reset();
+            if let Some(rt) = self.score_accumulator.as_mut() {
+                // Reset the CPU accumulator AND the GPU accumulator in lockstep (no-op on CPU/unarmed).
+                rt.reset(self.backend.as_ref());
             }
-            // Reset the GPU accumulator in lockstep (CPU acc.reset above zeroed the CPU twin; the GPU
-            // reduce accumulates on-device and is otherwise never reset).
-            self.reset_gpu_scores();
         } else if self.dump_evict_importance {
             // No eviction fired — drop the armed capture so it can't leak forward.
             crate::kv::eviction::keepset_dump::disarm_capture();
@@ -525,7 +513,7 @@ impl EvictionHook {
         // Importance payload (slot-indexed). Absent per-(layer,head) buffer → no record
         // (matches the single-shot path); the map above is still compacted so later
         // events stay consistent.
-        let acc = self.score_accumulator.as_ref()?;
+        let acc = self.score_accumulator.as_ref().and_then(|rt| rt.view())?;
         let layer_head = acc.layer_head_importance()?;
         let max_seq_len = acc.importance_scores().len();
         let n_kv_heads = acc.n_kv_heads();
@@ -626,7 +614,7 @@ impl StepHook<KVCache> for EvictionHook {
         // (2) head importance as proxy for last_layer_head_attn (the GPU path
         // doesn't have raw per-step attention weights, but cumulative head
         // importance is proportional and sufficient for QCF computation).
-        self.sync_gpu_scores_to_cpu();
+        self.ensure_scores_coherent();
 
         // can_compute_qcf: true when V data is CPU-accessible (CPU backend) or
         // successfully read back (GPU backend). Supports F32, F16, and Q4_0 dtypes.
@@ -664,12 +652,14 @@ impl StepHook<KVCache> for EvictionHook {
             let attention_scores: Vec<f32> = self
                 .score_accumulator
                 .as_ref()
+                .and_then(|rt| rt.view())
                 .filter(|acc| acc.is_active())
                 .map(|acc| acc.importance_scores().to_vec())
                 .unwrap_or_default();
             let head_attn_opt = self
                 .score_accumulator
                 .as_ref()
+                .and_then(|rt| rt.view())
                 .and_then(|acc| acc.last_step_head_attn());
             // The merge simulator (cosine-nearest matching) needs K for nearest-neighbour matching; other techniques
             // ignore `k_source` (their estimators never call read_k).
@@ -831,9 +821,7 @@ impl StepHook<KVCache> for EvictionHook {
         // Perform eviction — shared score-fed body: extract (score-based + active) → route.
         use crate::kv::eviction::score_fed;
         let extracted = if self.score_based_eviction {
-            self.score_accumulator
-                .as_ref()
-                .and_then(score_fed::extract_scores)
+            self.score_accumulator.as_ref().and_then(|rt| rt.extract())
         } else {
             None
         };
@@ -865,11 +853,10 @@ impl StepHook<KVCache> for EvictionHook {
                 self.last_evict_dump = self.assemble_evict_importance(before_len, n_layers);
             }
 
-            if let Some(acc) = self.score_accumulator.as_mut() {
-                acc.reset();
+            if let Some(rt) = self.score_accumulator.as_mut() {
+                // Reset the CPU accumulator AND the GPU accumulator in lockstep (no-op on CPU/unarmed).
+                rt.reset(self.backend.as_ref());
             }
-            // Reset the GPU accumulator in lockstep with the CPU reset above.
-            self.reset_gpu_scores();
 
             // Store QCF result for extra_question_fields
             self.eviction_qcf = Some(EvictionQcfResult {
@@ -889,11 +876,10 @@ impl StepHook<KVCache> for EvictionHook {
             cache.current_pos = 0;
             cache.high_water_pos = 0;
         }
-        if let Some(acc) = self.score_accumulator.as_mut() {
-            acc.reset();
+        if let Some(rt) = self.score_accumulator.as_mut() {
+            // Reset the CPU accumulator AND the GPU accumulator in lockstep (no-op on CPU/unarmed).
+            rt.reset(self.backend.as_ref());
         }
-        // Reset the GPU accumulator in lockstep with the CPU reset above.
-        self.reset_gpu_scores();
         self.eviction_count = 0;
         self.evicted_total = 0;
         self.eviction_qcf = None;
@@ -974,7 +960,20 @@ impl StepHook<KVCache> for EvictionHook {
     }
 
     fn score_accumulator(&mut self) -> Option<&mut AttentionScoreAccumulator> {
-        self.score_accumulator.as_mut()
+        self.score_accumulator.as_mut().and_then(|rt| rt.acc_mut())
+    }
+
+    fn seed_prefill(
+        &mut self,
+        backend: &dyn Backend,
+        pfa: &[Vec<f32>],
+        prompt_len: usize,
+        n_heads_q: usize,
+        n_kv_heads: usize,
+    ) {
+        if let Some(rt) = self.score_accumulator.as_mut() {
+            rt.seed(backend, pfa, prompt_len, n_heads_q, n_kv_heads);
+        }
     }
 
     fn needs_score_probe(&self, caches: &[KVCache]) -> bool {

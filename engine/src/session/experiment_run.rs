@@ -16,6 +16,7 @@ use tokenizers::Tokenizer;
 
 use crate::experiment::{JsonlWriter, SummaryRecord, SystemSampler, TokenRecord};
 use crate::inference::sampling::{self, SamplingConfig};
+use crate::inference::signal_runtime::SignalRuntime;
 use crate::session::DecodeLoop;
 use crate::session::assembly::{
     SwapWiringConfig, build_bench_loop, build_bench_quant_window_loop, build_local_pressure_source,
@@ -192,7 +193,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
                     eprintln!("[GPU Score] Failed to initialize (falling back to CPU path): {e}");
                 }
             }
-            Arc::new(Mutex::new(Some(acc)))
+            Arc::new(Mutex::new(Some(SignalRuntime::new(Some(acc)))))
         } else {
             Arc::new(Mutex::new(None))
         }
@@ -535,7 +536,7 @@ pub fn run_experiment_schedule_path(
                     eprintln!("[GPU Score] Failed to initialize (falling back to CPU path): {e}");
                 }
             }
-            Arc::new(Mutex::new(Some(acc)))
+            Arc::new(Mutex::new(Some(SignalRuntime::new(Some(acc)))))
         } else {
             Arc::new(Mutex::new(None))
         }
