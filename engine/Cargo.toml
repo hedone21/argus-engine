@@ -128,6 +128,11 @@ pyramidkv = { path = "../crates/techniques/pyramidkv", optional = true }
 # `triattention` feature, force-linked so its `caps.reads ∋ Key` registration is visible to
 # `find_mutation_stage("triattention")`. Default OFF (the caote/rkv/pyramidkv precedent).
 triattention = { path = "../crates/techniques/triattention", optional = true }
+# TOVA (Token Omission Via Attention, Oren et al. 2023). The P3 litmus of the signal-axis inversion:
+# a new signal-consuming eviction technique added crate-only. Gated by the `tova` feature, force-linked
+# so its `caps.reads_signals ∋ attn.last_step` registration is visible to `find_mutation_stage("tova")`.
+# Default OFF (the caote/rkv/pyramidkv/triattention precedent).
+tova = { path = "../crates/techniques/tova", optional = true }
 # KIVI (Q2/Q4/Q8 quantized-KV fused attention, ATTENTION backend-cap). On OpenCL it is a dlopen
 # `.so` plugin (NOT depended on here). On CUDA the axis is static-linkme only (no cdylib vtable), so
 # the engine force-links this crate under its own `cuda`/`cuda-embedded` feature to register the
@@ -238,6 +243,10 @@ pyramidkv = ["dep:pyramidkv"]
 # Links + force-links the `triattention` technique crate (trigonometric frequency-domain KV
 # eviction). Registers "triattention" with `caps.reads ∋ Key`. Default OFF (build-time opt-in).
 triattention = ["dep:triattention"]
+# Links + force-links the `tova` technique crate (last-step-attention KV eviction, the P3 litmus).
+# Registers "tova" with `caps.reads_signals ∋ attn.last_step` (a DIFFERENT signal than h2o's
+# cum_importance). Default OFF (build-time opt-in).
+tova = ["dep:tova"]
 # CUDA backends forward `attn-score/cuda` (GPU score-reduce half) + `kivi/cuda` (CUDA quantized-KV
 # attention cap, force-linked because the CUDA axis is static-linkme only) — the CUDA twins of the
 # OpenCL forward above and the dlopen KIVI plugin.

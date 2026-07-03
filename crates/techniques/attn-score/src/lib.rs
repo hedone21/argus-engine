@@ -19,9 +19,15 @@ use argus_extension_api::{
 use linkme::distributed_slice;
 
 /// The signals this producer makes available — single source of truth for both the [`SignalProducer`]
-/// impl and the [`SIGNAL_PRODUCERS`] registration. `"attn.cum_importance"` bridges to
-/// [`TensorKind::Scores`] (the decode-time cumulative importance).
-const ATTN_SCORE_SIGNALS: &[SignalId] = &[SignalId("attn.cum_importance")];
+/// impl and the [`SIGNAL_PRODUCERS`] registration. Both are derived from the `DecodeAttn` tap:
+/// `"attn.cum_importance"` bridges to [`TensorKind::Scores`] (the cross-step cumulative importance the
+/// eviction policy ranks on), and `"attn.last_step"` bridges to [`TensorKind::AttnWeights`] (the
+/// most-recent decode step's per-head attention — the CAOTE `last_layer_head_attn` overwrite this
+/// producer already tracks). Declaring the latter lets a consumer name it in `reads_signals` and have
+/// the boot `validate_signal_occupancy` handshake cover the read (the first such consumer is the P3
+/// `tova` litmus crate).
+const ATTN_SCORE_SIGNALS: &[SignalId] =
+    &[SignalId("attn.cum_importance"), SignalId("attn.last_step")];
 
 /// The taps this producer observes. P2: only `DecodeAttn`, armed every forward (per-decode-step
 /// accumulation). The PrefillAttn/LayerHidden/RopeQuery taps are not observed by this producer.

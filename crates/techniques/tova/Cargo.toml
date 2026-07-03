@@ -1,0 +1,16 @@
+[package]
+name = "tova"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# TOVA (Token Omission Via Attention, Oren et al. 2023) technique crate — last-step-attention KV
+# eviction. The P3 litmus of the signal-axis inversion: a NEW signal-consuming eviction technique
+# added as a stage crate ONLY (depends on `argus-extension-api` + `linkme`, like h2o/caote), reading a
+# DIFFERENT signal (`attn.last_step`) than h2o's `attn.cum_importance`. Force-linked via
+# `use tova as _;` under the `tova` feature. The engine core is untouched but for that one line.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"
