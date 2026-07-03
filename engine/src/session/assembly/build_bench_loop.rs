@@ -231,6 +231,9 @@ pub fn build_bench_loop(
     // β-5: pressure-driven Persistent EvictionStage 의 force_evict target ratio
     // (CLI `--eviction-target-ratio` — CM 내부 값과 동일 출처를 호출자가 보장).
     pressure_evict_ratio: f32,
+    // CLI `--protected-prefix` (keep-set attention-sink guard). `None` = user omitted → resolve to the
+    // keep-set stage's `default_protected_prefix` (0 for kvpress-faithful pyramidkv).
+    protected_prefix: Option<usize>,
     // γ-3b: 정적 directive schedule source. None → 무주입(bench/happy-path).
     schedule_source: Option<ScheduleCommandSource>,
     // AB-6 §5.6.7: WeightSwapStage 의 swap dispatch 설정 (CLI `--swap`/`--swap-phase-aware-*`
@@ -356,6 +359,7 @@ pub fn build_bench_loop(
                 pfa_cell.clone(),
                 n_heads_q,
                 pressure_evict_ratio,
+                protected_prefix.unwrap_or(arming.default_protected_prefix),
             ),
         ));
     }

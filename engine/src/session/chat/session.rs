@@ -65,6 +65,9 @@ pub struct ChatKeepsetArming {
     pub stage_name: String,
     pub n_heads_q: usize,
     pub target_ratio: f32,
+    /// Resolved `--protected-prefix` (attention-sink guard) for the keep-set. `0` = protect nothing
+    /// (kvpress-faithful default for pyramidkv); surfaced to the stage via `ctx.protected_prefix()`.
+    pub protected_prefix: usize,
 }
 
 /// `ChatKvMode::Standard` variant inner payload.
@@ -766,9 +769,12 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
         mf.set_prefill_attn(cell.clone(), arming.q_window);
         Some(ChatKeepsetArming {
             cell,
-            stage_name: arming.stage_name,
             n_heads_q: fp_n_heads_q,
             target_ratio,
+            protected_prefix: args
+                .protected_prefix()
+                .unwrap_or(arming.default_protected_prefix),
+            stage_name: arming.stage_name,
         })
     } else {
         None
