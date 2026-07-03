@@ -92,6 +92,14 @@ use pyramidkv as _;
 #[cfg(feature = "triattention")]
 use triattention as _;
 
+// TOVA force-link (feature `tova`). The P3 litmus of the signal-axis inversion: a new signal-consuming
+// eviction technique (Oren et al. 2023) added as a stage crate ONLY. Registers "tova" with
+// `caps.reads_signals ∋ attn.last_step` — a DIFFERENT signal than h2o's `attn.cum_importance`, proving
+// the inversion lets a technique subscribe to a distinct signal with the engine core untouched but for
+// this line. Feature OFF = unlinked = `find_mutation_stage("tova")` returns None (byte-identical).
+#[cfg(feature = "tova")]
+use tova as _;
+
 /// (dormant) Pre-make compatibility check: reject a stage whose declared capabilities the current
 /// container cannot execute, BEFORE instantiation — surfacing the expressible-vs-executable boundary
 /// at make time instead of as a runtime executor reject (the channel-axis honest-reject precedent).
