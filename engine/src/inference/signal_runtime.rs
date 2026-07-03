@@ -10,10 +10,13 @@
 //! coherence contract holds by construction and the three free functions have zero out-of-runtime
 //! callers (the P1 grep gate).
 //!
-//! **P1 is transitional.** The runtime wraps the one concrete producer (the
-//! [`AttentionScoreAccumulator`]); P2 replaces `acc: Option<_>` with `Vec<Box<dyn SignalProducer>>`
-//! and `synced_watermark: Option<u64>` with a per-producer `Vec<u64>`, keeping this method contract.
-//! No new signal vocabulary is introduced here.
+//! **Transitional storage.** The runtime wraps the one concrete producer (the
+//! [`AttentionScoreAccumulator`]). P2 (L1 signal-axis inversion) inverts the `DecodeAttn` tap — the
+//! decode driver now dispatches through `SignalProducer::on_decode_attn` instead of naming
+//! `accumulate_layer*` — but keeps this `Option<AttentionScoreAccumulator>` storage and the method
+//! contract below unchanged: a `Vec<Box<dyn SignalProducer>>` would be a length-≤1 speculative
+//! abstraction while `attn_score` is the sole producer, so that storage swap is deferred to the
+//! multi-producer step.
 //!
 //! **Ownership is single-window, not single-owner** (§4.4): bench shares one instance as
 //! `Arc<Mutex<Option<SignalRuntime>>>` (ModelForward holds the lock across `forward_into`, the

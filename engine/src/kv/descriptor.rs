@@ -166,17 +166,43 @@ pub fn validate_occupancy(
     Ok(())
 }
 
+/// SIGNAL OCCUPANCY invariant (the signal-axis sibling of [`validate_occupancy`]): every registered
+/// mutation stage's [`argus_extension_api::StageCaps::reads_signals`] is produced by some registered
+/// [`argus_extension_api::SignalProducer`] (`SIGNAL_PRODUCERS[].produces`) — no stage declares a
+/// signal read, by its open name, that nothing produces. Iterates the LIVE registry, so it validates
+/// exactly the linked technique crates (h2o's `"attn.cum_importance"` against `attn_score`). Returns
+/// the first orphan as an `Err` (the stage + the unsatisfied signal).
+pub fn validate_signal_occupancy() -> Result<(), String> {
+    use argus_extension_api::{KV_MUTATION_STAGES, SIGNAL_PRODUCERS};
+    for stage in KV_MUTATION_STAGES {
+        for &sig in stage.caps.reads_signals {
+            let produced = SIGNAL_PRODUCERS.iter().any(|p| p.produces.contains(&sig));
+            if !produced {
+                return Err(format!(
+                    "mutation stage '{}' reads_signals {sig:?} which no SignalProducer produces \
+                     (orphan signal read)",
+                    stage.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// CARDINALITY invariant: the built-in coordinate map is exactly 6 techniques, regardless of which
 /// feature-gated crates are linked (a fixed matrix). A compile-time assert — adding/removing a
 /// descriptor without updating this fails the build.
 const _: () = assert!(KV_TECHNIQUE_DESCRIPTORS.len() == 6);
 
 /// Boot self-test: the live coordinate map satisfies OCCUPANCY over the engine-intrinsic producer
-/// set. Panics with the offending orphan on violation. Callable at engine startup; exercised by the
-/// invariant tests.
+/// set, and every stage's signal-name reads are produced (SIGNAL OCCUPANCY). Panics with the
+/// offending orphan on violation. Callable at engine startup; exercised by the invariant tests.
 pub fn descriptor_self_test() {
     if let Err(e) = validate_occupancy(KV_TECHNIQUE_DESCRIPTORS, ENGINE_INTRINSIC) {
         panic!("KV technique coordinate-map OCCUPANCY violation: {e}");
+    }
+    if let Err(e) = validate_signal_occupancy() {
+        panic!("KV signal-axis SIGNAL OCCUPANCY violation: {e}");
     }
 }
 
@@ -229,6 +255,53 @@ mod tests {
             Ok(())
         );
         descriptor_self_test();
+    }
+
+    /// SIGNAL OCCUPANCY holds over the LIVE registry: every stage's `reads_signals` is produced by a
+    /// registered SignalProducer. Non-vacuous: asserts at least one stage actually declares a signal
+    /// read (h2o's `"attn.cum_importance"`), so a validator that skipped the check — or a registry that
+    /// silently dropped the declaration — is caught here instead of passing vacuously.
+    #[test]
+    fn live_map_satisfies_signal_occupancy() {
+        use argus_extension_api::{KV_MUTATION_STAGES, SignalId};
+        assert_eq!(validate_signal_occupancy(), Ok(()));
+        let declared: Vec<_> = KV_MUTATION_STAGES
+            .iter()
+            .flat_map(|s| s.caps.reads_signals.iter().copied())
+            .collect();
+        assert!(
+            declared.contains(&SignalId("attn.cum_importance")),
+            "expected a stage to declare reads_signals=[attn.cum_importance] (h2o); the SIGNAL \
+             OCCUPANCY check would otherwise pass vacuously. Got: {declared:?}"
+        );
+    }
+
+    /// DEAD-SEAM gate (§9): `LayerHidden`/`RopeQuery` are DEFINITION-ONLY taps in P2 — no registered
+    /// SignalProducer may declare a tap on them, so the engine has no path to arm them. A live-registry
+    /// check (stronger than a source grep): registering a producer that taps a dormant point fails
+    /// here. Also asserts DecodeAttn IS tapped, so the gate is not vacuous.
+    #[test]
+    fn dormant_taps_have_no_producer() {
+        use argus_extension_api::{SIGNAL_PRODUCERS, TapPoint};
+        let mut saw_decode_attn = false;
+        for reg in SIGNAL_PRODUCERS {
+            for &(tap, _) in reg.taps {
+                assert!(
+                    !matches!(tap, TapPoint::LayerHidden | TapPoint::RopeQuery),
+                    "producer '{}' declares a tap on {tap:?}, but LayerHidden/RopeQuery are \
+                     definition-only in P2 (no arming path, §9)",
+                    reg.name
+                );
+                if tap == TapPoint::DecodeAttn {
+                    saw_decode_attn = true;
+                }
+            }
+        }
+        assert!(
+            saw_decode_attn,
+            "expected the built-in attn_score producer to tap DecodeAttn; the dead-seam gate would \
+             otherwise pass vacuously"
+        );
     }
 
     /// OCCUPANCY rejects an orphan read (a signal neither produced nor intrinsic), and accepts it once

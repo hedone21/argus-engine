@@ -165,6 +165,14 @@ pub trait StageCtx {
 
     // ── default sugar below (all delegate to `tensor()`). The engine need not override ──
 
+    /// Read a signal by its open [`SignalId`] name — the signal-axis sibling of [`tensor`](Self::tensor)
+    /// (§4.2, L1 signal-axis inversion). Bridges through the well-known [`signal_kind`] map to the same
+    /// [`TensorHandle`] the ctx already assembled, so it is byte-identical to `tensor(signal_kind(id))`
+    /// and needs no engine override. `None` for an unknown name or an unavailable kind.
+    fn signal(&self, id: SignalId) -> Option<&dyn TensorHandle> {
+        self.tensor(signal_kind(id)?)
+    }
+
     /// Fills raw K(`pos`,`head`) into `out` as f32 (for d2o cosine-nearest). Sugar over `tensor(Key)`.
     /// Contract: `out.len() == head_dim`. no-op if the kind is unavailable (out unchanged).
     fn dequant_k(&self, pos: usize, head: usize, out: &mut [f32]) {
@@ -387,6 +395,13 @@ pub struct StageCaps {
     /// handshake match a stage's `reads` against a [`ScoreProducer::produces`], instead of a single
     /// flag. It also replaces the scattered `matches!(name, "h2o" | "d2o" | ...)` capability checks.
     pub reads: &'static [TensorKind],
+    /// The signals `plan()` consumes by their open [`SignalId`] name (the signal-axis sibling of
+    /// [`reads`](Self::reads); L1 signal-axis inversion, P2). Every entry must be produced by some
+    /// registered [`SignalProducer`] (`SIGNAL_PRODUCERS[].produces`) — the boot occupancy self-test
+    /// enforces this. `&[]` (the common case) = declares no signal reads. Additive over `reads`: a
+    /// stage may keep reading via [`StageCtx::tensor`] and leave this empty, or declare the signal it
+    /// depends on here so the producer↔consumer handshake is checked by name.
+    pub reads_signals: &'static [SignalId],
     /// The default `--protected-prefix` to apply when the user omits it. Score-based stages use `4`
     /// (attention sinks — protecting the whole prompt would defeat heavy-hitter selection); `0` means
     /// "no stage-declared default — the engine applies its own fallback" (sliding/streaming/none let
@@ -427,6 +442,7 @@ impl StageCaps {
     /// whole-model / declares a PFA window declares it via a direct-literal [`MutationStageReg`].
     pub const SCORE_FREE: StageCaps = StageCaps {
         reads: &[],
+        reads_signals: &[],
         default_protected_prefix: 0,
         produces_merge_plan: false,
         whole_model: false,
@@ -2739,6 +2755,16 @@ pub trait ScoreProducer: Send + Sync {
     /// max_seq_len]` (the GPU per-layer reduce accumulates on-device; this is its eviction-time
     /// readback, the per-layer twin of [`Self::import_gpu_scores`]). Default no-op.
     fn import_gpu_layer_flat(&mut self, _layer_flat: &[f32]) {}
+
+    // ── signal-axis upcast (L1 signal-axis inversion, P2) ──
+
+    /// Upcast to the general [`SignalProducer`] view so the engine's `DecodeAttn` tap dispatches
+    /// through [`SignalProducer::on_decode_attn`] without the engine core branching on `n_kv_heads` or
+    /// naming `accumulate_layer*`. Every `ScoreProducer` is a `SignalProducer`; the built-in impl
+    /// returns `self`. Required (no default) so the one implementor writes the one-line `self` — this
+    /// bridge (rather than a `SignalProducer` supertrait) keeps the two `produces()` methods, whose
+    /// return types differ (`&[TensorKind]` vs `&[SignalId]`), from clashing.
+    fn as_signal_producer(&mut self) -> &mut dyn SignalProducer;
 }
 
 /// Registration entry for one score producer — a mirror of [`LayerScorerReg`], static-linkme only.
@@ -2766,6 +2792,151 @@ pub fn find_score_producer(name: &str) -> Option<&'static ScoreProducerReg> {
 /// Names of all registered score producers (self-test / diagnostics).
 pub fn registered_score_producer_names() -> Vec<&'static str> {
     SCORE_PRODUCERS.iter().map(|r| r.name).collect()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Signal axis — TapPoint × SignalProducer (L1 signal-axis inversion, P2)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The general form of the score axis above. The engine owns a CLOSED set of observation points
+// (`TapPoint`) — "where you can observe"; a plugin (`SignalProducer`, open registry) owns "what it
+// computes and under what name" (`SignalId`). P2 wires ONE tap live — `DecodeAttn`, driven from the
+// decode loop's per-layer post-softmax scores — with the built-in `attn_score` producer as its sole
+// implementor (reached via `ScoreProducer::as_signal_producer`). The other taps are DEFINED but carry
+// no arming path (§9 dead-seam prohibition): `PrefillAttn`'s engine implementation stays the P1
+// prefill-attention cell + `SignalRuntime` seed; `LayerHidden`/`RopeQuery` have no v1 consumer.
+//
+// Static-linkme only (same rationale as the score axis): every consumer is in-tree and every payload
+// is host `f32`. `SignalProducer` and `ScoreProducer` COEXIST — the score axis keeps driving the
+// per-decode-step lifecycle through the delegating shell; this axis inverts only the tap dispatch.
+
+/// Engine-owned observation points — a CLOSED set. A new variant is a deliberate engine change
+/// (adding a tap is not a plugin concern). `#[repr(u32)]` keeps a future `.so` C-ABI open (the
+/// fieldless enum crosses as a u32 discriminant), mirroring [`TensorKind`].
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TapPoint {
+    /// Per-layer post-softmax attention row during decode. LIVE in P2: the engine assembles a
+    /// [`DecodeAttnCtx`] per tracked layer and dispatches [`SignalProducer::on_decode_attn`].
+    DecodeAttn,
+    /// Prefill-end trailing-window attention (PFA). DEFINED ONLY in P2 — the engine-side implementation
+    /// remains the `SignalRuntime` prefill seed + the prefill-attention cell; no `SignalProducer` PFA
+    /// dispatch yet.
+    PrefillAttn,
+    /// Per-layer sublayer hidden states. DEFINITION ONLY — no v1 consumer, no arming path (§9).
+    LayerHidden,
+    /// Current-step RoPE-applied query. DEFINITION ONLY — no v1 consumer, no arming path (§9).
+    RopeQuery,
+}
+
+/// TapPoint cardinality / discriminant pins (§8-2, the [`TensorKind`] precedent): the closed set is
+/// exactly these four, and `#[repr(u32)]` makes the discriminants the wire values for a future `.so`
+/// C-ABI. Adding or reordering a tap fails these const-asserts — a new tap is a deliberate change.
+const _: () = assert!(TapPoint::DecodeAttn as u32 == 0);
+const _: () = assert!(TapPoint::PrefillAttn as u32 == 1);
+const _: () = assert!(TapPoint::LayerHidden as u32 == 2);
+const _: () = assert!(TapPoint::RopeQuery as u32 == 3);
+
+/// When a tap is live during a forward. A producer declares, per tap, the window in which the engine
+/// must keep it armed. P2 uses only `EveryForward` (the `DecodeAttn` producer accumulates every decode
+/// step); the others are carried for the deferred taps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArmWindow {
+    /// Armed on every forward (decode-time accumulation).
+    EveryForward,
+    /// Armed only during prefill.
+    PrefillOnly,
+    /// Armed only during a warmup / diagnostic forward.
+    WarmupOnly,
+}
+
+/// An OPEN signal name (the `FormatId` precedent: identity by name, meaning by registration).
+/// Convention `<domain>.<meaning>` (e.g. `"attn.cum_importance"`, `"attn.prefill_window"`). Static
+/// linkme only, so the `&'static str` needs no interning (§8-1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SignalId(pub &'static str);
+
+/// The well-known bridge from a [`SignalId`] to the [`TensorKind`] a consumer reads it through
+/// (§4.2). Five signal-ish kinds are named; `Key`/`Value` are cache views, not signals, and have no
+/// SignalId. Used by [`StageCtx::signal`] so a stage can read via the open signal name while the
+/// engine keeps supplying the value through the existing `tensor()` handle (assembly-time fixed, not a
+/// live per-call delegation — §4.5(1)).
+pub fn signal_kind(id: SignalId) -> Option<TensorKind> {
+    Some(match id.0 {
+        "attn.cum_importance" => TensorKind::Scores,
+        "attn.last_step" => TensorKind::AttnWeights,
+        "attn.prefill_window" => TensorKind::PrefillAttention,
+        "query.current" => TensorKind::Query,
+        "query.stats" => TensorKind::QueryStats,
+        _ => return None,
+    })
+}
+
+/// The `DecodeAttn` tap payload — a structification of the [`ScoreProducer::accumulate_layer_gqa`]
+/// signature plus the layer index (§4.1). Every field is what the engine computes at the decode
+/// scoring seam today; `scores` is borrowed for the call only. No enum-payload boxing.
+pub struct DecodeAttnCtx<'a> {
+    /// `[n_heads_q * stride]` post-softmax scores for this layer (`&ws.scores`).
+    pub scores: &'a [f32],
+    /// `scores.len() / n_heads_q`.
+    pub stride: usize,
+    /// `current_pos - score_offset` (the `cache_seq_len` the accumulate call takes).
+    pub effective_len: usize,
+    /// Total query heads.
+    pub n_heads_q: usize,
+    /// Model KV heads (the producer decides flat-vs-GQA from its OWN construction mode).
+    pub n_kv_heads: usize,
+    /// Cache position of `scores[t = 0]` (`0` global, `kv_start_pos` for sliding-window layers).
+    pub score_offset: usize,
+    /// The decode layer this row belongs to (for the optional per-(layer, head) importance dump).
+    pub layer: usize,
+}
+
+/// A forward-time signal producer — the general form of [`ScoreProducer`]. P2 wires only the
+/// `DecodeAttn` tap; the built-in `attn_score` producer is the sole implementor. A producer a stage
+/// does not need is never armed, so a defaulted callback that is never called costs nothing.
+/// `SignalProducer` and `ScoreProducer` COEXIST (the score axis still drives the per-step lifecycle
+/// through the delegating shell) — this trait carries only the tap dispatch the axis inversion needs.
+pub trait SignalProducer: Send + Sync {
+    /// Producer name (the registry key, e.g. `"attn_score"`).
+    fn name(&self) -> &str;
+    /// The signals this producer makes available (the producer half of the
+    /// [`StageCaps::reads_signals`] handshake).
+    fn produces(&self) -> &'static [SignalId];
+    /// The taps this producer observes, each with the window it must stay armed in.
+    fn taps(&self) -> &'static [(TapPoint, ArmWindow)];
+    /// The `DecodeAttn` tap. Default no-op — a producer that does not observe decode attention is
+    /// unaffected. The built-in `attn_score` producer folds this layer's scores into its cumulative
+    /// importance (the accumulation policy the engine core used to hold inline).
+    fn on_decode_attn(&mut self, _ctx: &DecodeAttnCtx) {}
+}
+
+/// Registration entry for one [`SignalProducer`] — a mirror of [`ScoreProducerReg`], static-linkme
+/// only. No `make`: P2 instantiates producers through the existing [`SCORE_PRODUCERS`] `make` (the
+/// `attn_score` producer is one object registered on both axes), so a `make` here would be a dead
+/// function pointer. This reg carries the tap/signal declarations the engine reads pre-arming.
+pub struct SignalProducerReg {
+    /// Producer name (the registry key). Unique within the slice.
+    pub name: &'static str,
+    /// The signals the producer makes available (mirrors [`SignalProducer::produces`]).
+    pub produces: &'static [SignalId],
+    /// The taps the producer observes (mirrors [`SignalProducer::taps`]).
+    pub taps: &'static [(TapPoint, ArmWindow)],
+}
+
+/// Global signal-producer registration slice. The built-in `attn_score` producer registers here in
+/// addition to [`SCORE_PRODUCERS`].
+#[distributed_slice]
+pub static SIGNAL_PRODUCERS: [SignalProducerReg] = [..];
+
+/// Find a registered signal producer by name.
+pub fn find_signal_producer(name: &str) -> Option<&'static SignalProducerReg> {
+    SIGNAL_PRODUCERS.iter().find(|r| r.name == name)
+}
+
+/// Names of all registered signal producers (self-test / diagnostics).
+pub fn registered_signal_producer_names() -> Vec<&'static str> {
+    SIGNAL_PRODUCERS.iter().map(|r| r.name).collect()
 }
 
 // ════════════════════════════════════════════════════════════════════════════

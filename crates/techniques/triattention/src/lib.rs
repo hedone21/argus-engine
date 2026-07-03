@@ -41,6 +41,7 @@ use argus_extension_api::{
 /// run-supplied `prefix_length` (not a small attention-sink), so the cap-level default prefix is 0.
 const TRIATTENTION_CAPS: StageCaps = StageCaps {
     reads: &[TensorKind::Key],
+    reads_signals: &[],
     default_protected_prefix: 0,
     produces_merge_plan: false,
     // TriAttention's DEFAULT mode is a cross-layer GLOBAL keep-set: score every layer's resident keys,

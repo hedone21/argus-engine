@@ -12,9 +12,21 @@
 //! produces are bit-identical to the pre-extraction engine.
 
 use argus_extension_api::{
-    SCORE_PRODUCERS, ScoreProducer, ScoreProducerParams, ScoreProducerReg, TensorKind,
+    ArmWindow, DecodeAttnCtx, SCORE_PRODUCERS, SIGNAL_PRODUCERS, ScoreProducer,
+    ScoreProducerParams, ScoreProducerReg, SignalId, SignalProducer, SignalProducerReg, TapPoint,
+    TensorKind,
 };
 use linkme::distributed_slice;
+
+/// The signals this producer makes available — single source of truth for both the [`SignalProducer`]
+/// impl and the [`SIGNAL_PRODUCERS`] registration. `"attn.cum_importance"` bridges to
+/// [`TensorKind::Scores`] (the decode-time cumulative importance).
+const ATTN_SCORE_SIGNALS: &[SignalId] = &[SignalId("attn.cum_importance")];
+
+/// The taps this producer observes. P2: only `DecodeAttn`, armed every forward (per-decode-step
+/// accumulation). The PrefillAttn/LayerHidden/RopeQuery taps are not observed by this producer.
+const ATTN_SCORE_TAPS: &[(TapPoint, ArmWindow)] =
+    &[(TapPoint::DecodeAttn, ArmWindow::EveryForward)];
 
 // GPU half of the observer/score axis (EPIC 2 Stage E): the `ScoreReduceBackend` that owns
 // `score_reduce.cl`. Compiled into the same crate (force-linked alongside the CPU producer) and
@@ -494,6 +506,55 @@ impl ScoreProducer for AttnScoreProducer {
         let n = layer_flat.len().min(self.layer_flat_cum.len());
         self.layer_flat_cum[..n].copy_from_slice(&layer_flat[..n]);
     }
+
+    fn as_signal_producer(&mut self) -> &mut dyn SignalProducer {
+        self
+    }
+}
+
+/// The general signal-axis view (L1 signal-axis inversion, P2). The engine's `DecodeAttn` tap
+/// dispatches [`SignalProducer::on_decode_attn`] here instead of naming `accumulate_layer*` — so the
+/// flat-vs-GQA branch and the per-layer attribution that the engine core used to hold now live in the
+/// plugin. `ScoreProducer` (above) still drives the per-decode-step lifecycle through the engine's
+/// delegating shell; the two traits coexist (§8-3).
+impl SignalProducer for AttnScoreProducer {
+    fn name(&self) -> &str {
+        "attn_score"
+    }
+
+    fn produces(&self) -> &'static [SignalId] {
+        ATTN_SCORE_SIGNALS
+    }
+
+    fn taps(&self) -> &'static [(TapPoint, ArmWindow)] {
+        ATTN_SCORE_TAPS
+    }
+
+    fn on_decode_attn(&mut self, ctx: &DecodeAttnCtx) {
+        // Verbatim of the engine's former decode-scoring branch (transformer.rs:1763-1783): attribute
+        // this accumulate to its layer (for the optional per-(layer, head) dump) then fold the layer's
+        // scores by GQA-vs-flat mode. All static dispatch on the concrete producer, identical
+        // arguments to the pre-inversion engine → byte-identical scoring.
+        self.set_current_layer(ctx.layer);
+        if self.n_kv_heads > 0 {
+            self.accumulate_layer_gqa(
+                ctx.scores,
+                ctx.stride,
+                ctx.effective_len,
+                ctx.n_heads_q,
+                ctx.n_kv_heads,
+                ctx.score_offset,
+            );
+        } else {
+            self.accumulate_layer(
+                ctx.scores,
+                ctx.stride,
+                ctx.effective_len,
+                ctx.n_heads_q,
+                ctx.score_offset,
+            );
+        }
+    }
 }
 
 /// Registration — the engine resolves this via `find_score_producer("attn_score")`. The default
@@ -503,6 +564,16 @@ static ATTN_SCORE: ScoreProducerReg = ScoreProducerReg {
     name: "attn_score",
     produces: &[TensorKind::Scores],
     make: |p| Box::new(AttnScoreProducer::new(p)),
+};
+
+/// Signal-axis registration (L1). The same `attn_score` object registered on both axes: instantiation
+/// stays via the [`SCORE_PRODUCERS`] `make` above (so this reg carries no `make`), and the engine reads
+/// the tap/signal declarations here pre-arming.
+#[distributed_slice(SIGNAL_PRODUCERS)]
+static ATTN_SCORE_SIGNAL: SignalProducerReg = SignalProducerReg {
+    name: "attn_score",
+    produces: ATTN_SCORE_SIGNALS,
+    taps: ATTN_SCORE_TAPS,
 };
 
 #[cfg(test)]

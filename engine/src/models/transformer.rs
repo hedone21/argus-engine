@@ -1745,42 +1745,27 @@ impl TransformerModel {
                 );
             }
 
-            // CPU attention-score 누적 (forward_into:1893-1922 미러). workspace Some(decode)에서만 —
-            // prefill 은 owned_prefill_ws 라 args.workspace=None → 자연 skip. cache_seq_len 은
-            // fmts[i].current_pos() 로 취득(base trait, kv_caches[i] 대체).
+            // CPU attention-score DecodeAttn tap — the sole production decode-score driver. workspace
+            // Some(decode) 에서만 — prefill 은 owned_prefill_ws 라 args.workspace=None → 자연 skip. cache_seq_len 은
+            // fmts[i].current_pos() 로 취득(base trait, kv_caches[i] 대체). 엔진은 tap ctx 조립 + dispatch
+            // 만: n_kv_heads 분기 + set_current_layer + accumulate_layer(_gqa) 정책은 producer 의
+            // SignalProducer::on_decode_attn 소유(L1 신호 축 반전, P2). vtable 호출 수(2 hops/tracked-layer)
+            // 오늘과 동일, 동일 인자 → byte-identical; unarmed(score_accumulator=None)은 Option 분기 1회.
             if let (Some(acc), Some(ws)) = (&mut score_accumulator, &workspace)
                 && acc.should_track_layer(i)
             {
                 let cache_seq_len = fmts[i].current_pos();
                 let score_offset = ws.score_offset;
-                let effective_len = cache_seq_len - score_offset;
                 let n_heads_q = self.config.num_attention_heads;
-                let stride = ws.scores.len() / n_heads_q;
-
-                // Attribute this accumulate to layer `i` for the optional per-(layer,
-                // KV-head) importance dump (IMP-1). No-op unless the dump is armed
-                // (the producer only reads it under `dump_layer_head`) → INV-147.
-                acc.set_current_layer(i);
-
-                if acc.n_kv_heads() > 0 {
-                    let n_kv_heads = self.config.num_key_value_heads;
-                    acc.accumulate_layer_gqa(
-                        &ws.scores,
-                        stride,
-                        effective_len,
-                        n_heads_q,
-                        n_kv_heads,
-                        score_offset,
-                    );
-                } else {
-                    acc.accumulate_layer(
-                        &ws.scores,
-                        stride,
-                        effective_len,
-                        n_heads_q,
-                        score_offset,
-                    );
-                }
+                acc.on_decode_attn(&argus_extension_api::DecodeAttnCtx {
+                    scores: &ws.scores,
+                    stride: ws.scores.len() / n_heads_q,
+                    effective_len: cache_seq_len - score_offset,
+                    n_heads_q,
+                    n_kv_heads: self.config.num_key_value_heads,
+                    score_offset,
+                    layer: i,
+                });
             }
 
             // QueryStats 캡처 1지점 — score 누적 seam 인접. score-active

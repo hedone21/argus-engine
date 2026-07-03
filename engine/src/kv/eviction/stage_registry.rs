@@ -136,6 +136,7 @@ mod constraint_validator_tests {
     fn merge_stage_requires_host_residency() {
         let merge_caps = StageCaps {
             reads: &[TensorKind::Scores],
+            reads_signals: &[],
             default_protected_prefix: 4,
             produces_merge_plan: true,
             whole_model: false,
