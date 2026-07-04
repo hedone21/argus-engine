@@ -738,6 +738,29 @@ pub struct Args {
     #[arg(long)]
     pub mask_heads_means: Option<String>,
 
+    // ── DuoAttention streaming-head ablation (output-fidelity probe; argus-cli free-generation only) ──
+    /// Path to a DuoAttention `full_attention_heads` gate/label file (`n_layers` rows × `n_heads_kv`
+    /// whitespace/comma-separated floats). A KV head is *retrieval* (full attention) iff its gate
+    /// `>= --duo-threshold`, else *streaming* (attends only to the first `--duo-sink-size` ∪ last
+    /// `--duo-recent-size` tokens). Streaming heads' attention output is recomputed over that
+    /// Λ-window in BOTH prefill and decode. NOTE: output-fidelity probe only — full KV stays
+    /// allocated (ZERO memory saving) and it ADDS compute; it reproduces DuoAttention's streaming
+    /// LOGITS, not its system benefit. Backend: cpu, cuda, or opencl. argus-eval rejects it.
+    #[arg(long)]
+    pub duo_heads: Option<String>,
+
+    /// `--duo-heads` retrieval/streaming threshold (gate `>= threshold` → retrieval head).
+    #[arg(long, default_value_t = 0.5)]
+    pub duo_threshold: f32,
+
+    /// `--duo-heads` streaming attention-sink prefix length (first-N tokens always attended).
+    #[arg(long, default_value_t = 64)]
+    pub duo_sink_size: usize,
+
+    /// `--duo-heads` streaming recent sliding-window length (last-N tokens attended).
+    #[arg(long, default_value_t = 256)]
+    pub duo_recent_size: usize,
+
     /// Disable GPU kernel plan for decode (fallback to forward_into every token)
     #[arg(long, default_value_t = false)]
     pub no_gpu_plan: bool,

@@ -2,6 +2,7 @@
 // 각 모듈은 추론 path에서 직접 사용되는 연산/구성 단위로,
 // L3-inference layer에 속한다 (LAYER_RULES `("inference", "L3-inference")`).
 pub mod attention_scores;
+pub mod duo_heads;
 pub mod head_mask;
 pub mod query_stats;
 pub mod sampling;

@@ -286,6 +286,7 @@ impl TransformerModel {
                     read_routing,
                     // Head-masking (spec §4): out of scope for the offload format — always None.
                     head_mask: None,
+                    duo_heads: None,
                 })?;
             } else {
                 // prefill(seq_len>1) 또는 **발산 A**(seq_len==1 + workspace=None). 후자는 BOS-only
@@ -331,6 +332,7 @@ impl TransformerModel {
                         layer_idx: i,
                         // Head-masking (spec §4): out of scope for the offload format — always None.
                         head_mask: None,
+                        duo_heads: None,
                     },
                 )?;
             }

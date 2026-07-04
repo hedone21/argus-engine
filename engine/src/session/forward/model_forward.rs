@@ -33,6 +33,7 @@ use crate::backend::opencl::plan::FullKernelPlan;
 use crate::buffer::DType;
 use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::duo_heads::DuoHeads;
 use crate::inference::head_mask::HeadMask;
 use crate::inference::query_stats::QueryStatsAccumulator;
 use crate::inference::sampling::StepCtx;
@@ -110,6 +111,13 @@ pub struct ModelForward {
     // assembly) → forward arg `None` → per-layer `is_some` gate skips it (byte-identical). Mirrors the
     // `read_stage` threading idiom (CLI-derived, resolved once, lent as an `Option<&_>` forward arg).
     head_mask: Option<HeadMask>,
+
+    // DuoAttention streaming-head classification (argus-cli `--duo-heads` free-gen probe). `Some` iff
+    // requested (resolved once against model dims in `build_standard_loop`); `prefill`/`step` lend
+    // `self.duo_heads.as_ref()` so streaming heads are windowed in BOTH prefill and decode. `None`
+    // (production / every other assembly) → forward arg `None` → per-layer `is_some` gate skips it
+    // (byte-identical). Mirrors the `head_mask` threading idiom.
+    duo_heads: Option<DuoHeads>,
 
     decode_workspace: LayerWorkspace,
     // Phase 4-4.5: paradigm equivalence requires `prefill_workspace: None`
@@ -212,6 +220,7 @@ impl ModelForward {
             q_window: 0,
             seed_prefill_scores: false,
             head_mask: None,
+            duo_heads: None,
             decode_workspace,
             prefill_workspace: None,
             max_seq_len,
@@ -265,6 +274,13 @@ impl ModelForward {
     /// `head_mask = None` → `prefill`/`step` lend `None` → byte-identical. Mirrors [`set_read_stage`].
     pub fn set_head_mask(&mut self, mask: HeadMask) {
         self.head_mask = Some(mask);
+    }
+
+    /// Install a resolved DuoAttention streaming-head classification (argus-cli `--duo-heads` free-gen
+    /// probe). Only the standard happy-path assembly calls this; every other path leaves
+    /// `duo_heads = None` → `prefill`/`step` lend `None` → byte-identical. Mirrors [`Self::set_head_mask`].
+    pub fn set_duo_heads(&mut self, duo: DuoHeads) {
+        self.duo_heads = Some(duo);
     }
 
     /// R-P1-1: prefill-end PFA producer 무장(`set_read_stage` 미러). assembly 가 PrefillKeepSetStage 와
@@ -599,6 +615,7 @@ impl Forward for ModelForward {
                 // Head-masking ablation: lend the resolved mask (if any) so this forward overwrites
                 // the masked heads' attention-output slices; None (production) = byte-identical.
                 head_mask: self.head_mask.as_ref(),
+                duo_heads: self.duo_heads.as_ref(),
             })?;
             // R-P1-1: forward 산출된 PFA buffer 를 공유 cell 에 적재(stage 가 PrefillEnd 에서 read).
             if let Some(buf) = pfa_buf {
@@ -668,11 +685,20 @@ impl Forward for ModelForward {
         // an opencl build ever reaches here — defensive, matches the score_active/read_stage_active gates.)
         #[cfg_attr(not(feature = "opencl"), allow(unused_variables))]
         let head_mask_active = self.head_mask.is_some();
+        // DuoAttention streaming recompute also lives in the forward_into layer loop, not the fused
+        // plan path → bypass the plan when armed (same reason as head-masking).
+        #[cfg_attr(not(feature = "opencl"), allow(unused_variables))]
+        let duo_heads_active = self.duo_heads.is_some();
 
         // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan.
         // hook 설치 중 또는 score accumulator active 또는 read stage active 이면 우회.
         #[cfg(feature = "opencl")]
-        if hook.is_none() && !score_active && !read_stage_active && !head_mask_active {
+        if hook.is_none()
+            && !score_active
+            && !read_stage_active
+            && !head_mask_active
+            && !duo_heads_active
+        {
             if self.gpu_plan.is_none() && !self.sticky_disabled {
                 self.gpu_plan = self.try_build_plan();
             }
@@ -782,6 +808,9 @@ impl Forward for ModelForward {
             // Head-masking ablation: lend the resolved mask (if any) so decode overwrites the masked
             // heads' attention-output slices; None (production) = byte-identical.
             head_mask: self.head_mask.as_ref(),
+            // DuoAttention streaming: lend the resolved classification (if any) so decode windows the
+            // streaming heads; None (production) = byte-identical.
+            duo_heads: self.duo_heads.as_ref(),
         })?;
         drop(score_guard); // guard 명시 해제 (end_step 이미 완료)
         self.read_logits(&self.logits_decode)

@@ -359,6 +359,12 @@ pub struct TransformerModelForwardArgs<'a> {
     /// (`ModelForward`, argus-cli); every other `forward_into` caller passes `None` (byte-identical,
     /// per-layer `is_some` branch). See [`crate::inference::head_mask`].
     pub head_mask: Option<&'a crate::inference::head_mask::HeadMask>,
+    /// DuoAttention streaming-head classification (output-fidelity probe). `Some` → every layer's
+    /// streaming query heads have their attention output recomputed over the sink∪recent Λ-window in
+    /// BOTH prefill and decode. Wired only by the free-generation assembly (`ModelForward`,
+    /// argus-cli); every other `forward_into` caller passes `None` (byte-identical). See
+    /// [`crate::inference::duo_heads`].
+    pub duo_heads: Option<&'a crate::inference::duo_heads::DuoHeads>,
 }
 
 impl TransformerModel {
@@ -1496,6 +1502,10 @@ impl TransformerModel {
         // Head-masking ablation set (argus-cli free-gen only; None everywhere else = byte-identical).
         // Threaded into both fork call sites below so the mask holds across prefill + decode.
         let head_mask = args.head_mask;
+        // DuoAttention streaming-head classification (argus-cli free-gen only; None elsewhere =
+        // byte-identical). Threaded into all fork call sites so streaming heads are windowed across
+        // prefill + decode.
+        let duo_heads = args.duo_heads;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -1653,6 +1663,7 @@ impl TransformerModel {
                         pfa_per_row_target: None,
                         layer_idx: i,
                         head_mask,
+                        duo_heads,
                     },
                 )?;
             } else if is_decode {
@@ -1698,6 +1709,7 @@ impl TransformerModel {
                     layer_idx: i,
                     read_routing,
                     head_mask,
+                    duo_heads,
                 })?;
             } else {
                 let pws = owned_prefill_ws
@@ -1735,6 +1747,7 @@ impl TransformerModel {
                         pfa_per_row_target,
                         layer_idx: i,
                         head_mask,
+                        duo_heads,
                     },
                 )?;
             }

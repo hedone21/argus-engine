@@ -26,6 +26,7 @@ use argus_shared::Level;
 
 use crate::backend::Backend;
 use crate::format::KVCacheFormat;
+use crate::inference::duo_heads::DuoHeads;
 use crate::inference::head_mask::HeadMask;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
@@ -142,6 +143,10 @@ pub fn build_standard_loop(
     // `resolve_head_mask`. `Some` → installed on `ModelForward` so both prefill and decode overwrite
     // the masked heads' attention-output slices; `None` (production) → byte-identical.
     head_mask: Option<HeadMask>,
+    // DuoAttention streaming-head classification (argus-cli `--duo-heads` free-gen probe), pre-resolved
+    // by `resolve_duo_heads`. `Some` → installed on `ModelForward` so both prefill and decode window
+    // the streaming heads; `None` (production) → byte-identical.
+    duo_heads: Option<DuoHeads>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고한다.
@@ -206,6 +211,17 @@ pub fn build_standard_loop(
             hm.describe(),
         );
         mf.set_head_mask(hm);
+    }
+
+    // DuoAttention streaming-head recompute (argus-cli `--duo-heads`): install the pre-resolved
+    // classification so both prefill and decode window the streaming heads. None → byte-identical.
+    if let Some(duo) = duo_heads {
+        eprintln!(
+            "[duo-heads] active — {} streaming head(s), {}",
+            duo.streaming_head_count(),
+            duo.window_desc(),
+        );
+        mf.set_duo_heads(duo);
     }
 
     // 선택적 read stage 주입. 미지정(None)이면 미진입 = read_stage 슬롯 None 유지
@@ -484,6 +500,34 @@ pub fn resolve_head_mask(
         cfg.num_hidden_layers,
         cfg.num_attention_heads,
         cfg.head_dim,
+    )
+}
+
+/// Resolve the DuoAttention streaming-head classification (argus-cli `--duo-heads`) once, against
+/// the loaded model's dims. `Ok(None)` when `--duo-heads` is unset (byte-identical). Same backend
+/// gate as head-masking (cpu/cuda/opencl; the GPU streaming recompute round-trips through host). Call
+/// from the standard happy path before `build_standard_loop` consumes `model`.
+pub fn resolve_duo_heads(
+    args: &Args,
+    model: &TransformerModel,
+    backend: &dyn Backend,
+) -> Result<Option<DuoHeads>> {
+    if args.duo_heads.is_none() {
+        return Ok(None);
+    }
+    let bname = backend.name();
+    if !(bname.contains("CPU") || bname.contains("CUDA") || bname.contains("OpenCL")) {
+        anyhow::bail!("--duo-heads supports --backend cpu, cuda, or opencl (got '{bname}')");
+    }
+    let cfg = &model.config;
+    DuoHeads::resolve(
+        args.duo_heads.as_deref(),
+        args.duo_threshold,
+        args.duo_sink_size,
+        args.duo_recent_size,
+        cfg.num_hidden_layers,
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
     )
 }
 

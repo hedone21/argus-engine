@@ -226,6 +226,13 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         &model,
         backend.as_ref(),
     )?;
+    // DuoAttention streaming-head classification (argus-cli `--duo-heads` output-fidelity probe).
+    // Resolved once against model dims before `model` is moved into the loop. None → byte-identical.
+    let duo_heads = crate::session::assembly::build_standard_loop::resolve_duo_heads(
+        &args,
+        &model,
+        backend.as_ref(),
+    )?;
 
     let mut decode_loop = build_standard_loop(
         backend.clone(),
@@ -245,6 +252,7 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         Some(Arc::clone(&stream_slot)),
         args.kv_format.as_deref(),
         head_mask,
+        duo_heads,
     )?;
 
     // ── prefill / restore 분기 ────────────────────────────────────────────────
