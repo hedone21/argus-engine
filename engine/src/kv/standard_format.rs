@@ -2183,6 +2183,122 @@ impl SelectiveRead for StandardFormat {
         }
     }
 
+    /// DuoAttention streaming-head recompute — see [`crate::inference::duo_heads`]. Gathers the whole
+    /// cache to host F32 (via `host_snapshot` on a GPU cache), reads the query to host, and
+    /// overwrites ONLY the `streaming_heads`' slices in `out` with their Λ-windowed attention,
+    /// leaving retrieval heads' full-attention output intact. Numerics live in
+    /// [`compute_streaming_attention`](crate::inference::duo_heads::compute_streaming_attention).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_into_streaming(
+        &self,
+        q: &Tensor,
+        backend: &dyn Backend,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        streaming_heads: &[usize],
+        sink_size: usize,
+        recent_size: usize,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        use crate::inference::duo_heads::compute_streaming_attention;
+
+        if streaming_heads.is_empty() {
+            return Ok(());
+        }
+        let guard = self.inner.lock().unwrap();
+        let cache = &guard.cache;
+        let n = cache.current_pos();
+        if n == 0 {
+            return Ok(());
+        }
+        let kv_heads = cache.kv_heads();
+        let head_dim = cache.head_dim();
+
+        // Gather ALL cache positions to host F32 (HeadMajor [kv_heads, n, head_dim]). A GPU cache is
+        // snapshotted device→host first (W-DEVKV; `is_gpu_buffer()` = the `gather_selected_kv`
+        // guard's predicate, so rpcmem/mapped-UMA don't leak to the direct path). O(n) per call — the
+        // accepted probe cost (same whole-cache host mirror `attention_into_selected` uses).
+        let needs_snapshot = cache.k_buffer.buffer().is_gpu_buffer();
+        let snapshot = if needs_snapshot {
+            Some(cache.host_snapshot()?)
+        } else {
+            None
+        };
+        let gather_cache = snapshot.as_ref().unwrap_or(cache);
+        let positions: Vec<usize> = (0..n).collect();
+        let (k_all, v_all) = gather_selected_kv(gather_cache, &positions)?;
+        drop(snapshot);
+        drop(guard);
+
+        // Host F32 copy of the query. On a GPU backend the `q` buffer is device-only (host ptr may be
+        // null on Adreno) → `read_buffer`, never `as_slice` (INV-191); on CPU, read directly.
+        let q_host: Vec<f32> = if backend.is_gpu() {
+            let mut b = vec![0u8; q.size()];
+            backend.read_buffer(q, &mut b)?;
+            let mut f = vec![0.0f32; b.len() / 4];
+            // SAFETY: `f` is a fresh f32 Vec; copy the read f32 bytes into it (len matches).
+            unsafe {
+                std::ptr::copy_nonoverlapping(b.as_ptr(), f.as_mut_ptr() as *mut u8, b.len());
+            }
+            f
+        } else {
+            q.as_slice::<f32>().to_vec()
+        };
+
+        let row = n_heads_q * head_dim;
+        let n_rows = out.numel() / row;
+        if backend.is_gpu() {
+            // Round-trip the attention-output buffer through host (head-mask / W-DEVKV recipe): read
+            // the full-attention values, overwrite streaming heads, push the whole buffer back so the
+            // subsequent `wo` matmul (which reads the device buffer) sees the windowed output.
+            let mut bytes = vec![0u8; out.size()];
+            backend.read_buffer(out, &mut bytes)?;
+            {
+                // SAFETY: `bytes` is a freshly-allocated, 4-byte-aligned image of the f32 out buffer;
+                // reinterpreting as &mut [f32] of len bytes/4 is in-bounds and unaliased in this block.
+                let floats = unsafe {
+                    std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut f32, bytes.len() / 4)
+                };
+                compute_streaming_attention(
+                    &q_host,
+                    &k_all,
+                    &v_all,
+                    floats,
+                    n_rows,
+                    n_heads_q,
+                    kv_heads,
+                    head_dim,
+                    n,
+                    streaming_heads,
+                    sink_size,
+                    recent_size,
+                    start_pos,
+                    seq_len,
+                );
+            }
+            backend.write_buffer(out, &bytes)?;
+        } else {
+            compute_streaming_attention(
+                &q_host,
+                &k_all,
+                &v_all,
+                out.as_mut_slice::<f32>(),
+                n_rows,
+                n_heads_q,
+                kv_heads,
+                head_dim,
+                n,
+                streaming_heads,
+                sink_size,
+                recent_size,
+                start_pos,
+                seq_len,
+            );
+        }
+        Ok(())
+    }
+
     /// read stage 를 자기 `Mutex<KVCache>` 위에서 호출. ctx 구성·borrow 가
     /// 이 메서드에 갇혀 `attention_into_selected`(다시 lock) 와 충돌하지 않는다 — owned `KVReadPlan`
     /// 을 반환해 lock guard 가 함수 종료 시 drop 된다.

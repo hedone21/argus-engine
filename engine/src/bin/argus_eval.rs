@@ -214,6 +214,17 @@ fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
              test). Use argus-cli --mask-heads ..."
         );
     }
+    if args.duo_heads.is_some() {
+        // DuoAttention streaming is a FREE-GENERATION output-fidelity probe. argus-eval is
+        // teacher-forced (NLL-ranks a fixed continuation, never re-samples), so windowing streaming
+        // heads here would perturb a scored continuation, not the behavior under study. Reject loudly
+        // rather than silently no-op the (shared) flag.
+        bail!(
+            "argus-eval: --duo-heads is an argus-cli free-generation probe; argus-eval scoring is \
+             teacher-forced (windowing a fixed continuation is not the DuoAttention behavior under \
+             study). Use argus-cli --duo-heads ..."
+        );
+    }
     if args.chat {
         bail!("argus-eval: --chat moved to argus-chat (planned)");
     }

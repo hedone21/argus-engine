@@ -204,6 +204,7 @@ impl Forward for QuantWindowForward {
             prefill_attn: None,
             prefill_attn_per_row: None,
             head_mask: None,
+            duo_heads: None,
         });
 
         fwd_result?;
@@ -254,6 +255,7 @@ impl Forward for QuantWindowForward {
             prefill_attn: None,
             prefill_attn_per_row: None,
             head_mask: None,
+            duo_heads: None,
         });
 
         fwd_result?;

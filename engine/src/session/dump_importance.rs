@@ -107,6 +107,7 @@ pub fn run_dump_importance(mut ctx: DumpImportanceCtx) -> anyhow::Result<()> {
             prefill_attn: None,
             prefill_attn_per_row: None,
             head_mask: None,
+            duo_heads: None,
         })
     })?;
 
@@ -283,6 +284,7 @@ fn run_head_concentration_decode(
                 prefill_attn: None,
                 prefill_attn_per_row: None,
                 head_mask: None,
+                duo_heads: None,
             })
         })?;
 

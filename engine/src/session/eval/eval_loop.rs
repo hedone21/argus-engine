@@ -298,6 +298,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
                     prefill_attn: None,
                     prefill_attn_per_row: None,
                     head_mask: None,
+                    duo_heads: None,
                 })
             })?;
 
@@ -422,6 +423,7 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
                             prefill_attn: None,
                             prefill_attn_per_row: None,
                             head_mask: None,
+                            duo_heads: None,
                         })
                     })?;
 
@@ -645,6 +647,7 @@ fn run_importance_pass<C: EvalCacheKind>(
             prefill_attn: None,
             prefill_attn_per_row: None,
             head_mask: None,
+            duo_heads: None,
         })
     })?;
 
@@ -879,6 +882,7 @@ fn run_token_by_token_prefill<C: EvalCacheKind>(
                 prefill_attn: None,
                 prefill_attn_per_row: None,
                 head_mask: None,
+                duo_heads: None,
             })
         })?;
 
@@ -980,6 +984,7 @@ fn run_full_prefill<C: EvalCacheKind>(
             prefill_attn: pfa_buf.as_mut().zip(pfa_window),
             prefill_attn_per_row: None,
             head_mask: None,
+            duo_heads: None,
         })
     })?;
 
@@ -1093,6 +1098,7 @@ fn run_chunked_prefill<C: EvalCacheKind>(
             prefill_attn: None,
             prefill_attn_per_row: None,
             head_mask: None,
+            duo_heads: None,
         })
     })?;
 
@@ -1154,6 +1160,7 @@ fn run_chunked_prefill<C: EvalCacheKind>(
                 prefill_attn: None,
                 prefill_attn_per_row: None,
                 head_mask: None,
+                duo_heads: None,
             })
         })?;
         start_pos += 1;

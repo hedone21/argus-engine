@@ -24,6 +24,7 @@
 
 use super::*;
 use crate::format::{AttnDims, KVCacheFormat};
+use crate::inference::duo_heads::DuoHeads;
 use crate::inference::head_mask::HeadMask;
 
 /// decode read-plan 라우팅. 활성 read stage 가 어디서 `read_plan` 을 산출했는지 구분한다.
@@ -81,6 +82,11 @@ pub(crate) struct ForwardGenFmtArgs<'a> {
     /// or mean) after `attention_into` and before the `wo` projection. `None` (production) =
     /// byte-identical (one `is_some` branch per layer). See [`crate::inference::head_mask`].
     pub head_mask: Option<&'a HeadMask>,
+    /// DuoAttention streaming-head classification (output-fidelity probe). `Some` → this layer's
+    /// streaming query heads have their attention-output slices in `ws.out_attn` recomputed over the
+    /// sink∪recent Λ-window after `attention_into` and before `wo`. `None` (production) =
+    /// byte-identical (one `is_some` branch per layer). See [`crate::inference::duo_heads`].
+    pub duo_heads: Option<&'a DuoHeads>,
 }
 
 impl TransformerLayer {
@@ -103,6 +109,7 @@ impl TransformerLayer {
         let head_dim = args.head_dim;
         let layer_idx = args.layer_idx;
         let head_mask = args.head_mask;
+        let duo_heads = args.duo_heads;
         let batch_size = x.shape().dims()[0];
         let is_gpu = backend.is_gpu();
 
@@ -289,6 +296,22 @@ impl TransformerLayer {
         // masked so the ablation holds across the whole forward (spec §2).
         if let Some(hm) = head_mask {
             hm.apply(layer_idx, &mut ws.out_attn, backend.as_ref())?;
+        }
+
+        // 5.6 DuoAttention streaming-head recompute — overwrite this layer's streaming query heads'
+        // attention-output slices with their sink∪recent Λ-windowed attention (retrieval heads keep
+        // the full attention just computed). Decode = 1 query row at `start_pos`. `None` (production)
+        // = byte-identical. Independent of head-masking. See [`crate::inference::duo_heads`].
+        if let Some(duo) = duo_heads {
+            duo.apply(
+                layer_idx,
+                &q_rope,
+                fmt,
+                &mut ws.out_attn,
+                backend.as_ref(),
+                start_pos,
+                1,
+            )?;
         }
 
         // 6. Output projection.

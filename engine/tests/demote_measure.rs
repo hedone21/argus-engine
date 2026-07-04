@@ -701,6 +701,7 @@ fn test_demote_vs_sliding_real_model_ppl() {
                     prefill_attn: None,
                     prefill_attn_per_row: None,
                     head_mask: None,
+                    duo_heads: None,
                 })
             })
             .expect("sliding prefill");
@@ -750,6 +751,7 @@ fn test_demote_vs_sliding_real_model_ppl() {
                     prefill_attn: None,
                     prefill_attn_per_row: None,
                     head_mask: None,
+                    duo_heads: None,
                 })
             })
             .expect("sliding decode");
@@ -848,6 +850,7 @@ fn test_demote_vs_sliding_real_model_ppl() {
                     prefill_attn: None,
                     prefill_attn_per_row: None,
                     head_mask: None,
+                    duo_heads: None,
                 })
             })
             .expect("demote prefill");
@@ -907,6 +910,7 @@ fn test_demote_vs_sliding_real_model_ppl() {
                     prefill_attn: None,
                     prefill_attn_per_row: None,
                     head_mask: None,
+                    duo_heads: None,
                 })
             })
             .expect("demote decode");

@@ -43,6 +43,30 @@ pub trait SelectiveRead {
         scores: Option<&mut [f32]>,
     ) -> Result<()>;
 
+    /// DuoAttention streaming-head recompute (see [`crate::inference::duo_heads`]).
+    ///
+    /// Recomputes ONLY the given `streaming_heads` (query-head indices) over a Λ-window
+    /// (`sink` prefix ∪ `recent` tail, per query-row causal) and overwrites their `head_dim`-wide
+    /// slices in `out`, leaving retrieval heads' full-attention output (already written by
+    /// `attention_into`) intact. Softmax is renormalized over the windowed subset — the exact
+    /// DuoAttention streaming primitive. `q` is `[batch, seq_len, n_heads_q, head_dim]`; `start_pos`
+    /// is the absolute position of the first query row; `seq_len == 1` for decode. Host-computed
+    /// (GPU cache/query/out are round-tripped through host, mirroring `attention_into_selected`);
+    /// full KV stays resident → no memory saving (output-fidelity probe only).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_into_streaming(
+        &self,
+        q: &Tensor,
+        backend: &dyn Backend,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        streaming_heads: &[usize],
+        sink_size: usize,
+        recent_size: usize,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<()>;
+
     /// layer `i` attention 직전에 read stage 의 `read_plan` 을 자기 캐시 위에서 호출
     /// A1.1d/A1.3).
     ///

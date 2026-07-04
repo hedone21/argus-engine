@@ -278,6 +278,7 @@ pub fn run_answer_attention_dump(
                 prefill_attn: Some((&mut pfa_buf, q_window)),
                 prefill_attn_per_row: None,
                 head_mask: None,
+                duo_heads: None,
             })
         })?;
 
