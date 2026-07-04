@@ -26,6 +26,7 @@ use argus_shared::Level;
 
 use crate::backend::Backend;
 use crate::format::KVCacheFormat;
+use crate::inference::head_mask::HeadMask;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::KVCache;
@@ -137,6 +138,10 @@ pub fn build_standard_loop(
     // a `PrefillEnd` `FormatReencodeStage` is armed; a single format name (f16/q4_0/...) or `None`
     // arms nothing (byte-identical).
     kv_format_policy: Option<&str>,
+    // Head-masking ablation set (argus-cli `--mask-heads` free-gen test), pre-resolved by
+    // `resolve_head_mask`. `Some` → installed on `ModelForward` so both prefill and decode overwrite
+    // the masked heads' attention-output slices; `None` (production) → byte-identical.
+    head_mask: Option<HeadMask>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // decode loop가 실제로 쥐는 KV 저장 형태를 진입 시점에 보고한다.
@@ -187,6 +192,21 @@ pub fn build_standard_loop(
         Arc::clone(&hook_cell),
         score_cell,
     )?;
+
+    // Head-masking ablation (argus-cli `--mask-heads`): install the pre-resolved mask so both prefill
+    // and decode overwrite the named heads' attention-output slices. None (production) → byte-identical.
+    if let Some(hm) = head_mask {
+        eprintln!(
+            "[mask-heads] active — {} head(s) masked ({} mode): {}",
+            hm.masked_head_count(),
+            match hm.mode() {
+                crate::inference::head_mask::MaskMode::Zero => "zero",
+                crate::inference::head_mask::MaskMode::Mean => "mean",
+            },
+            hm.describe(),
+        );
+        mf.set_head_mask(hm);
+    }
 
     // 선택적 read stage 주입. 미지정(None)이면 미진입 = read_stage 슬롯 None 유지
     // (full read, INV-147 byte-identical). 모르는 이름이면 등록 목록과 함께 에러.
@@ -432,6 +452,39 @@ pub fn build_standard_loop(
         }
     }
     Ok(builder.build())
+}
+
+/// Resolve the head-masking ablation set (argus-cli `--mask-heads` / `--mask-heads-random`) once,
+/// against the loaded model's layer/head dimensions. `Ok(None)` when neither flag is set — a
+/// byte-identical run. Supported on the `cpu`, `cuda`, and `opencl` (Adreno) backends — the GPU path
+/// round-trips `ws.out_attn` through host (`read_buffer → modify → write_buffer`), which the OpenCL
+/// backend enqueues blocking on its in-order compute queue, so the subsequent `wo` kernel sees the
+/// masked buffer. Call from the standard happy path before `build_standard_loop` consumes `model`.
+pub fn resolve_head_mask(
+    args: &Args,
+    model: &TransformerModel,
+    backend: &dyn Backend,
+) -> Result<Option<HeadMask>> {
+    if args.mask_heads.is_none() && args.mask_heads_random.is_none() {
+        return Ok(None);
+    }
+    let bname = backend.name();
+    if !(bname.contains("CPU") || bname.contains("CUDA") || bname.contains("OpenCL")) {
+        anyhow::bail!(
+            "--mask-heads / --mask-heads-random support --backend cpu, cuda, or opencl (got '{bname}')"
+        );
+    }
+    let cfg = &model.config;
+    HeadMask::resolve(
+        args.mask_heads.as_deref(),
+        args.mask_heads_random,
+        args.mask_seed,
+        &args.mask_heads_mode,
+        args.mask_heads_means.as_deref(),
+        cfg.num_hidden_layers,
+        cfg.num_attention_heads,
+        cfg.head_dim,
+    )
 }
 
 #[cfg(test)]

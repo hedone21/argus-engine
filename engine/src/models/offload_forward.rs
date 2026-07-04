@@ -284,6 +284,8 @@ impl TransformerModel {
                     local_attn_window: self.config.sliding_window,
                     layer_idx: i,
                     read_routing,
+                    // Head-masking (spec §4): out of scope for the offload format — always None.
+                    head_mask: None,
                 })?;
             } else {
                 // prefill(seq_len>1) 또는 **발산 A**(seq_len==1 + workspace=None). 후자는 BOS-only
@@ -326,6 +328,9 @@ impl TransformerModel {
                         // R-P1-1: offload forward 경로는 PFA 미산출(StandardFormat producer 전용).
                         pfa_target: None,
                         pfa_per_row_target: None,
+                        layer_idx: i,
+                        // Head-masking (spec §4): out of scope for the offload format — always None.
+                        head_mask: None,
                     },
                 )?;
             }

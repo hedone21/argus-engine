@@ -33,6 +33,7 @@ use crate::backend::opencl::plan::FullKernelPlan;
 use crate::buffer::DType;
 use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::head_mask::HeadMask;
 use crate::inference::query_stats::QueryStatsAccumulator;
 use crate::inference::sampling::StepCtx;
 use crate::inference::signal_runtime::SignalRuntime;
@@ -101,6 +102,14 @@ pub struct ModelForward {
     // importance the eviction stage ranks on reflects prefill attention, not just decode. Armed only
     // on the faithful-h2o path (`arm_faithful_prefill_seed`); false → prefill byte-identical.
     seed_prefill_scores: bool,
+
+    // Head-masking ablation set (argus-cli `--mask-heads` / `--mask-heads-random` free-gen test).
+    // `Some` iff a mask was requested (resolved once against model dims in `build_standard_loop`);
+    // `prefill`/`step` then lend `self.head_mask.as_ref()` to the forward so BOTH prefill and decode
+    // overwrite the masked heads' attention-output slices (spec §2). `None` (production / every other
+    // assembly) → forward arg `None` → per-layer `is_some` gate skips it (byte-identical). Mirrors the
+    // `read_stage` threading idiom (CLI-derived, resolved once, lent as an `Option<&_>` forward arg).
+    head_mask: Option<HeadMask>,
 
     decode_workspace: LayerWorkspace,
     // Phase 4-4.5: paradigm equivalence requires `prefill_workspace: None`
@@ -202,6 +211,7 @@ impl ModelForward {
             wants_prefill_attn: false,
             q_window: 0,
             seed_prefill_scores: false,
+            head_mask: None,
             decode_workspace,
             prefill_workspace: None,
             max_seq_len,
@@ -248,6 +258,13 @@ impl ModelForward {
             acc.set_active(true);
             self.query_stats_accumulator = Some(acc);
         }
+    }
+
+    /// Install a resolved head-mask set (argus-cli `--mask-heads` / `--mask-heads-random` free-gen
+    /// ablation). Only the standard happy-path assembly calls this; every other path leaves
+    /// `head_mask = None` → `prefill`/`step` lend `None` → byte-identical. Mirrors [`set_read_stage`].
+    pub fn set_head_mask(&mut self, mask: HeadMask) {
+        self.head_mask = Some(mask);
     }
 
     /// R-P1-1: prefill-end PFA producer 무장(`set_read_stage` 미러). assembly 가 PrefillKeepSetStage 와
@@ -579,6 +596,9 @@ impl Forward for ModelForward {
                 // R-P1-1: 최종 청크 무장 시에만 Some — layer loop 가 buf[i] 슬라이스에 PFA 누적.
                 prefill_attn: pfa_buf.as_mut().map(|b| (b, q_window)),
                 prefill_attn_per_row: None,
+                // Head-masking ablation: lend the resolved mask (if any) so this forward overwrites
+                // the masked heads' attention-output slices; None (production) = byte-identical.
+                head_mask: self.head_mask.as_ref(),
             })?;
             // R-P1-1: forward 산출된 PFA buffer 를 공유 cell 에 적재(stage 가 PrefillEnd 에서 read).
             if let Some(buf) = pfa_buf {
@@ -642,10 +662,17 @@ impl Forward for ModelForward {
         #[cfg_attr(not(feature = "opencl"), allow(unused_variables))]
         let read_stage_active = self.read_stage.is_some();
 
+        // Head-masking active → bypass the OpenCL plan path (like score/read-stage), because the plan
+        // path skips the forward_into layer loop where the mask is applied. (Masking requires cpu/cuda
+        // per §3.1, so on those backends the plan path is already absent; this keeps the invariant if
+        // an opencl build ever reaches here — defensive, matches the score_active/read_stage_active gates.)
+        #[cfg_attr(not(feature = "opencl"), allow(unused_variables))]
+        let head_mask_active = self.head_mask.is_some();
+
         // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan.
         // hook 설치 중 또는 score accumulator active 또는 read stage active 이면 우회.
         #[cfg(feature = "opencl")]
-        if hook.is_none() && !score_active && !read_stage_active {
+        if hook.is_none() && !score_active && !read_stage_active && !head_mask_active {
             if self.gpu_plan.is_none() && !self.sticky_disabled {
                 self.gpu_plan = self.try_build_plan();
             }
@@ -752,6 +779,9 @@ impl Forward for ModelForward {
             // R-P1-1: decode 는 PFA 미산출(prefill-only producer).
             prefill_attn: None,
             prefill_attn_per_row: None,
+            // Head-masking ablation: lend the resolved mask (if any) so decode overwrites the masked
+            // heads' attention-output slices; None (production) = byte-identical.
+            head_mask: self.head_mask.as_ref(),
         })?;
         drop(score_guard); // guard 명시 해제 (end_step 이미 완료)
         self.read_logits(&self.logits_decode)

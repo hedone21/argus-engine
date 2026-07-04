@@ -24,6 +24,7 @@
 
 use super::*;
 use crate::format::{AttnDims, KVCacheFormat};
+use crate::inference::head_mask::HeadMask;
 
 /// decode read-plan 라우팅. 활성 read stage 가 어디서 `read_plan` 을 산출했는지 구분한다.
 ///
@@ -75,6 +76,11 @@ pub(crate) struct ForwardGenFmtArgs<'a> {
     /// 비용 0(INV-147 동형). [`ReadRouting::Faithful`] 은 현재 Q 를 host 로 1회 읽어(opt-in) read_plan 을
     /// 내부 산출, [`ReadRouting::Precomputed`] 는 호출 측이 넘긴 select 를 그대로 쓴다.
     pub read_routing: Option<ReadRouting<'a>>,
+    /// Head-masking ablation set (causal recall-head test). `Some` → this layer's masked query
+    /// heads have their `head_dim`-wide attention-output slices in `ws.out_attn` overwritten (zero
+    /// or mean) after `attention_into` and before the `wo` projection. `None` (production) =
+    /// byte-identical (one `is_some` branch per layer). See [`crate::inference::head_mask`].
+    pub head_mask: Option<&'a HeadMask>,
 }
 
 impl TransformerLayer {
@@ -96,6 +102,7 @@ impl TransformerLayer {
         let use_gelu_tanh = args.use_gelu_tanh;
         let head_dim = args.head_dim;
         let layer_idx = args.layer_idx;
+        let head_mask = args.head_mask;
         let batch_size = x.shape().dims()[0];
         let is_gpu = backend.is_gpu();
 
@@ -275,6 +282,14 @@ impl TransformerLayer {
             }
         }
         // set_attn_scores(forward_gen.rs:1071) 는 StandardKVCache no-op(quant-window AWQE 전용) → 생략.
+
+        // 5.5 Head-masking ablation — overwrite masked query heads' attention-output slices before
+        // the `wo` projection removes their contribution to this step's residual write. `None`
+        // (production) = byte-identical (per-layer `is_some` branch). Both prefill and decode are
+        // masked so the ablation holds across the whole forward (spec §2).
+        if let Some(hm) = head_mask {
+            hm.apply(layer_idx, &mut ws.out_attn, backend.as_ref())?;
+        }
 
         // 6. Output projection.
         backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;

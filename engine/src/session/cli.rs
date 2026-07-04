@@ -707,6 +707,37 @@ pub struct Args {
     #[arg(long, default_value_t = 64)]
     pub repetition_window: usize,
 
+    // ── head-masking ablation (causal recall-head test; argus-cli free-generation only) ──
+    /// Zero out named `layer:head` attention-output contributions during real generation, to
+    /// causally test whether candidate "recall heads" are necessary for needle-recall. Comma-
+    /// separated, e.g. `--mask-heads 14:3,19:3`. Applied in BOTH prefill and decode. Mutually
+    /// exclusive with `--mask-heads-random`. Backend: `cpu`, `cuda`, or `opencl` (Adreno).
+    #[arg(long)]
+    pub mask_heads: Option<String>,
+
+    /// Control variant for `--mask-heads`: mask `N` randomly chosen `(layer,head)` pairs instead of
+    /// a named list (seeded by `--mask-seed` for reproducibility). Mutually exclusive with
+    /// `--mask-heads`.
+    #[arg(long)]
+    pub mask_heads_random: Option<usize>,
+
+    /// Seed for `--mask-heads-random`'s draw (only affects which pairs are chosen; sampling is
+    /// unaffected). Re-running a larger `N` with the same seed nests the smaller draw.
+    #[arg(long, default_value_t = 0)]
+    pub mask_seed: u64,
+
+    /// Head-masking substitution mode: `zero` (default; Wu et al. hard zero) or `mean` (substitute
+    /// each masked head's slice with a supplied per-head mean vector — an off-distribution-bias
+    /// control per the IOI critique). `mean` requires `--mask-heads-means`.
+    #[arg(long, default_value = "zero")]
+    pub mask_heads_mode: String,
+
+    /// Required iff `--mask-heads-mode mean`: a JSON file of per-head mean vectors,
+    /// `{"14:3": [head_dim floats], ...}`, computed lab-side over a reference batch. The engine only
+    /// substitutes the slice — it never computes means itself.
+    #[arg(long)]
+    pub mask_heads_means: Option<String>,
+
     /// Disable GPU kernel plan for decode (fallback to forward_into every token)
     #[arg(long, default_value_t = false)]
     pub no_gpu_plan: bool,
