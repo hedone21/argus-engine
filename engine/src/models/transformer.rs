@@ -353,6 +353,12 @@ pub struct TransformerModelForwardArgs<'a> {
     /// `[q_window * n_heads_q * prefix_len]`), caller pre-zeroed. `None` everywhere except the
     /// `answer_attention_steps` dump = byte-identical (per-layer `as_mut` branch once, INV-147).
     pub prefill_attn_per_row: Option<(&'a mut Vec<Vec<f32>>, usize, bool)>,
+    /// Head-masking ablation set (causal recall-head test). `Some` → every layer's masked query
+    /// heads have their attention-output slices overwritten (zero/mean) before the `wo` projection,
+    /// in BOTH prefill and decode (spec §2). Wired only by the free-generation assembly
+    /// (`ModelForward`, argus-cli); every other `forward_into` caller passes `None` (byte-identical,
+    /// per-layer `is_some` branch). See [`crate::inference::head_mask`].
+    pub head_mask: Option<&'a crate::inference::head_mask::HeadMask>,
 }
 
 impl TransformerModel {
@@ -1487,6 +1493,9 @@ impl TransformerModel {
         let mut prefill_attn = args.prefill_attn;
         // IMP-4 per-step PFA target (answer_attention_steps dump 에서만 Some). None=byte-identical.
         let mut prefill_attn_per_row = args.prefill_attn_per_row;
+        // Head-masking ablation set (argus-cli free-gen only; None everywhere else = byte-identical).
+        // Threaded into both fork call sites below so the mask holds across prefill + decode.
+        let head_mask = args.head_mask;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -1642,6 +1651,8 @@ impl TransformerModel {
                         // R-P1-1: degenerate 1-token fall-through(warmup/qcf decode-X)는 PFA 미산출.
                         pfa_target: None,
                         pfa_per_row_target: None,
+                        layer_idx: i,
+                        head_mask,
                     },
                 )?;
             } else if is_decode {
@@ -1686,6 +1697,7 @@ impl TransformerModel {
                     local_attn_window: self.config.sliding_window,
                     layer_idx: i,
                     read_routing,
+                    head_mask,
                 })?;
             } else {
                 let pws = owned_prefill_ws
@@ -1721,6 +1733,8 @@ impl TransformerModel {
                         local_attn_window: self.config.sliding_window,
                         pfa_target,
                         pfa_per_row_target,
+                        layer_idx: i,
+                        head_mask,
                     },
                 )?;
             }

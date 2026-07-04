@@ -203,6 +203,17 @@ fn eval_supported(args: &Args) -> bool {
 /// eviction/qcf/skip/swap/quant-window 는 `eval_supported` 가 통과시키므로 reject 하지
 /// 않는다.
 fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
+    if args.mask_heads.is_some() || args.mask_heads_random.is_some() {
+        // Head-masking is a FREE-GENERATION ablation (spec §3.3). Every argus-eval path is
+        // teacher-forced (NLL-ranks a fixed prompt++gold continuation, never re-samples), so masking
+        // here would perturb a scored continuation, not real generation — not a causal test. Reject
+        // loudly rather than silently no-op the (shared) flag.
+        bail!(
+            "argus-eval: --mask-heads / --mask-heads-random is an argus-cli free-generation flag; \
+             argus-eval scoring is teacher-forced (masking a fixed continuation is not a causal \
+             test). Use argus-cli --mask-heads ..."
+        );
+    }
     if args.chat {
         bail!("argus-eval: --chat moved to argus-chat (planned)");
     }

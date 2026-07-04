@@ -22,6 +22,7 @@
 
 use super::*;
 use crate::format::{AttnDims, KVCacheFormat};
+use crate::inference::head_mask::HeadMask;
 
 /// `forward_prefill_fmt` 인자 — `forward_prefill` 의 `kv_cache: &mut C` 를 `fmt: &Arc<dyn KVCacheFormat>`
 /// 로 교체하고, partition/variance/profiler 인자는 라이브 미진입이라 드롭. `pws` = PrefillWorkspace
@@ -56,6 +57,14 @@ pub(crate) struct ForwardPrefillFmtArgs<'a> {
     /// q_window 의 각 row 를 자기 step 슬롯에 기록(per_head 면 head-keep, 아니면 head-mean) →
     /// 이 layer 슬라이스 `out`(caller pre-zeroed). `None`(미무장) = byte-identical.
     pub pfa_per_row_target: Option<(&'a mut [f32], usize, bool)>,
+    /// This layer's index — needed to look up its masked heads in [`Self::head_mask`]. (The decode
+    /// twin carries `layer_idx` already; prefill previously did not need it.)
+    pub layer_idx: usize,
+    /// Head-masking ablation set (causal recall-head test). `Some` → this layer's masked query
+    /// heads have their `head_dim`-wide attention-output slices in `ws.out_attn` overwritten (zero
+    /// or mean) for EVERY prefill step after `attention_into` and before the `wo` projection.
+    /// `None` (production) = byte-identical. See [`crate::inference::head_mask`].
+    pub head_mask: Option<&'a HeadMask>,
 }
 
 impl TransformerLayer {
@@ -79,6 +88,8 @@ impl TransformerLayer {
         let batch_size = args.batch_size;
         let seq_len = args.seq_len;
         let dim = args.dim;
+        let head_mask = args.head_mask;
+        let layer_idx = args.layer_idx;
 
         let q_dim = self.wq.shape().dims()[0];
         let k_dim = self.wk.shape().dims()[0];
@@ -184,6 +195,14 @@ impl TransformerLayer {
             None,
             prefill_scores,
         )?;
+
+        // 5.5 Head-masking ablation — overwrite masked query heads' attention-output slices for
+        // EVERY step of this prefill chunk (all seq_len steps sit in `ws.out_attn` before the one
+        // shared `wo` matmul below), so the needle's contribution never enters the residual stream
+        // any downstream layer reads. `None` (production) = byte-identical. See spec §2.
+        if let Some(hm) = head_mask {
+            hm.apply(layer_idx, &mut ws.out_attn, backend.as_ref())?;
+        }
 
         // 6. Output projection.
         ws.attn_out_proj

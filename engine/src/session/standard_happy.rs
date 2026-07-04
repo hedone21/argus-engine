@@ -218,6 +218,15 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
     // bin_setup이 --kv-format/--kv-type dispatch로 할당한 kv_caches를
     // 그대로 소비한다(과거엔 drop 후 build_standard_loop이 typed로 재할당 →
     // --kv-format opaque 선택이 decode 경로에 도달 못 했다).
+    // Head-masking ablation (argus-cli `--mask-heads` / `--mask-heads-random` free-gen test).
+    // Resolved once against the model's layer/head dims before `model` is moved into the loop;
+    // requires cpu/cuda backend. None (neither flag) → byte-identical. See spec §3.
+    let head_mask = crate::session::assembly::build_standard_loop::resolve_head_mask(
+        &args,
+        &model,
+        backend.as_ref(),
+    )?;
+
     let mut decode_loop = build_standard_loop(
         backend.clone(),
         memory.clone(),
@@ -235,6 +244,7 @@ pub fn run_standard_happy_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         args.protected_prefix(),
         Some(Arc::clone(&stream_slot)),
         args.kv_format.as_deref(),
+        head_mask,
     )?;
 
     // ── prefill / restore 분기 ────────────────────────────────────────────────
