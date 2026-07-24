@@ -2,7 +2,7 @@
 """Diff two generated token streams (argus pyramidkv vs kvpress PyramidKVPress).
 
 Each input is a JSON with a `generated_token_ids` list (the format `run_kvpress.py` writes;
-the argus side must emit the same — see ../E2E.md for how to dump argus token IDs). Falls back
+the argus side must emit the same — see README.md, Tier 3, for how to dump argus token IDs). Falls back
 to comparing `generated_text` when token IDs are absent. Exit 0 iff the streams are identical
 (the acceptance criterion: "출력 토큰이 동일하면 돼"), else 1 with the first divergence.
 """

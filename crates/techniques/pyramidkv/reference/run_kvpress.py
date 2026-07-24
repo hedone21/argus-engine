@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run NVIDIA kvpress `PyramidKVPress` on a HF model and dump the generated token IDs.
 
-This is the REFERENCE side of the end-to-end token-parity check (see ../E2E.md). It greedily
+This is the REFERENCE side of the end-to-end token-parity check (Tier 3 in README.md). It greedily
 generates `--max-new-tokens` from `--prompt` with PyramidKV compression applied to the prompt
 cache, and writes a JSON of {prompt_token_ids, generated_token_ids, generated_text} that
 `compare_tokens.py` diffs against the argus-engine run.
@@ -10,7 +10,7 @@ Requires a torch-capable Python (<= 3.12 for current torch wheels) + a CUDA GPU:
     python3 -m venv .venv && . .venv/bin/activate
     pip install "torch" "transformers>=4.44" "kvpress" accelerate
     # kvpress: https://github.com/NVIDIA/kvpress  (pin the version you cross-checked the
-    # get_layer_budget arithmetic against — see ../reference/README.md).
+    # get_layer_budget arithmetic against — see README.md).
 
 The argus `pyramidkv` knobs map 1:1 to PyramidKVPress:
     --set compression_ratio=R  ->  compression_ratio=R

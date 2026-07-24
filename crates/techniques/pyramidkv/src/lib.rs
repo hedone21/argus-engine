@@ -39,9 +39,10 @@
 //! * **Sub-window budgets** (`n_kept < window_size`, only the degenerate SnapKV-uniform fallback at
 //!   very high compression): only the kept COUNT is faithful. kvpress keeps `n_kept` of the max-tied
 //!   window positions in torch.topk's non-deterministic tie order (arbitrary mid-window indices); we
-//!   keep the `n_kept` most-recent, so the kept SET is near-disjoint from kvpress's (measured ~0
-//!   overlap). No canonical target set exists — the tie order is platform/dtype/version-dependent —
-//!   so recency is the principled choice. See [`PyramidKv::keep_spec`].
+//!   keep the `n_kept` most-recent, so the kept SET is NOT kvpress's (its overlap with recency
+//!   varies with `n_kept/window` — measured ~0 for tiny `n_kept`, higher as `n_kept → window`). No
+//!   canonical target set exists — the tie order is platform/dtype/version-dependent — so recency is
+//!   the principled choice. See [`PyramidKv::keep_spec`].
 //! * **Exact score ties** (n_kept ≥ window): [`compile_keep_top_k`] breaks ties STABLE-desc/
 //!   ascending-resort, which is NOT torch.topk's tie order (torch.topk's is implementation-defined,
 //!   *not* lower-index-first — verified live). Real f32 attention scores tie with measure zero, so
@@ -54,12 +55,16 @@
 //!
 //! ## Where the faithful path runs
 //!
-//! The faithful per-head SnapKV selection needs a [`TensorKind::PrefillAttention`] producer, which is
-//! armed only on the **standard generate/chat loop** (`build_standard_loop`, e.g. `argus-cli`) — there
-//! the producer's observation window and this stage's `window_size` are BOTH the kvpress default 64
-//! (the standard loop builds the stage from default config; `--set window_size` is not threaded into
-//! that path), so they always agree and the per-head keep-set is faithful. Eval/bench paths that do
-//! not arm a PFA producer take the degraded layer-wide fallback below (not byte-identical to kvpress).
+//! The faithful per-head SnapKV selection needs a [`TensorKind::PrefillAttention`] producer, armed on
+//! **all four loops** (cli/chat/eval/bench) via the single caps-driven decision
+//! `stage_registry::resolve_prefill_keepset_arming` (the direction-B fix: previously only
+//! `build_standard_loop`/argus-cli armed it, so a per-head keep-set was faithful there alone; each loop
+//! now arms the producer from that one source). The producer's observation window and this stage's
+//! `window_size` are BOTH the kvpress default 64 (the loops build the stage from default config;
+//! `--set window_size` is not threaded through, so the const default is what both use), so they always
+//! agree and the per-head keep-set is faithful **including the eval/bench benchmark paths**. The
+//! degraded layer-wide fallback below only runs when NO PFA producer is registered/armed (e.g. a build
+//! without `--features pyramidkv`, or a cache layout that is not HeadMajor).
 //!
 //! Each kv-head keeps the SAME NUMBER of tokens (the per-layer budget) at DIFFERENT positions, so a
 //! [`KeepSpec::PerHead`] plan satisfies the engine's single-`current_pos` invariant (equal-length
@@ -340,9 +345,9 @@ impl PyramidKv {
         //   * `n_kept >= window`: the whole window + `n_kept − window` heavy hitters (per-head path);
         //   * `n_kept < window`: `n_kept` of the window positions (they all tie at the max score, so
         //     torch.topk's tie order is non-deterministic — we keep the `n_kept` MOST RECENT. Only the
-        //     COUNT is faithful: torch.topk picks arbitrary mid-window indices, so the kept SET is
-        //     near-disjoint from kvpress's (measured ~0 overlap) — but no canonical target set exists
-        //     (the tie order is platform/dtype/version-dependent), so recency is the principled choice.
+        //     COUNT is faithful: torch.topk picks arbitrary mid-window indices, so the kept SET is NOT
+        //     kvpress's (overlap with recency varies with n_kept/window) — but no canonical target set
+        //     exists (the tie order is platform/dtype/version-dependent), so recency is the principled choice.
         // (The pyramid branch already guarantees budget ≥ window via the `min_num ≥ window_size`
         // admission check, so the sub-window case only arises in the degenerate SnapKV-uniform
         // fallback — very high compression / tiny prompt.) Floor to 1, NOT to the window: flooring to
