@@ -90,13 +90,17 @@ accumulation-order differences — well above the Gate 1 threshold of 0.98. (Rec
 argus-labs ledger: `experiment=pyramidkv-pfa-parity`,
 run `2026-07-24T021928Z_pyramidkv-realforward-parity`.)
 
-> ⚠ **Footgun — the paper MUST use the faithful invocation.** The faithful per-head SnapKV path is
-> armed **only when `eviction_policy == "none"`** (`engine/src/session/eval/runner.rs`), where the
-> caps-driven `resolve_prefill_keepset_arming` auto-detects the registered pyramidkv stage and arms
-> the PFA producer. Invoking **`eviction plugin --name pyramidkv`** routes to the generic
-> score-fed eviction path, which does NOT arm the PFA producer, so pyramidkv silently falls back to
-> the **degraded layer-wide `importance()` selection** (per-head 0/28, H2O-style) — a different,
-> weaker technique. The pyramid *budget* is correct either way; only the *selection* degrades.
+> ⚠ **Invocation footgun (fixed for eval-ll).** Originally the faithful per-head SnapKV path was
+> armed **only when `eviction_policy == "none"`** (`engine/src/session/eval/runner.rs`), so invoking
+> **`eviction plugin --name pyramidkv`** fell through to the generic score-fed eviction path — which
+> never arms the PFA producer, so pyramidkv silently degraded to the **layer-wide `importance()`
+> selection** (per-head 0/28, H2O-style; correct pyramid *budget*, wrong *selection*). This is now
+> fixed on the **eval-ll** path: `routes_to_prefill_keepset` sends any registered PFA-reading stage
+> to the faithful executor whether named explicitly or via the happy path (budget from
+> `--kv-budget-ratio`), so **both** invocations now match kvpress (per-head Jaccard 0.999). The
+> **bench/chat** loops still gate the same arming on `cache_manager.is_none()`, so
+> `eviction plugin --name pyramidkv` there still runs degraded — those are the throughput/interactive
+> paths, not the quality path; **use `--eval-ll` for pyramidkv quality numbers.**
 
 Reproduce (engine side via the labs harness so it lands in the ledger; kvpress side in the venv):
 

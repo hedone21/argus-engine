@@ -16,6 +16,18 @@ use crate::session::qcf_runtime::{
     QcfWarmupConfig, QcfWarmupCtx, run_layer_swap, run_qcf_warmup_workflow,
 };
 
+/// Whether the eval eviction path routes `policy` to the faithful per-head prefill-keepset (PFA)
+/// executor instead of the generic score-fed eviction. True for the happy path (`"none"`) AND for an
+/// explicit `eviction plugin --name <pfa_stage>` — the registered `TensorKind::PrefillAttention`
+/// -reading stage. The second case is the footgun fix: without it, `eviction plugin --name pyramidkv`
+/// falls through to the generic path, which only ever hands the stage a flat `importance()` signal,
+/// so pyramidkv silently degrades to the layer-wide fallback (the pyramid BUDGET stays correct, but
+/// the SELECTION becomes H2O-style, not SnapKV per-head). Any other policy keeps its own score-fed
+/// path. `pfa_stage` = `resolve_prefill_keepset_arming().stage_name`.
+fn routes_to_prefill_keepset(policy: &str, pfa_stage: &str) -> bool {
+    policy == "none" || policy == pfa_stage
+}
+
 pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     let EvalLlRunCtx {
         args,
@@ -299,30 +311,45 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         args.evict_timing().evicts_on_overflow(),
     );
 
-    // Direction-B unification: wire the per-head prefill keep-set (pyramidkv) on the happy path
-    // (eviction policy "none"), so a `TensorKind::PrefillAttention`-reading stage runs faithfully in
-    // eval too — the SAME caps-driven decision cli/bench consult (`resolve_prefill_keepset_arming`). The
-    // hook then arms the PFA producer during prefill and applies the per-head keep-set at post_prefill
-    // via the shared `apply_prefill_keepset` executor. `None`/non-"none" policy → unchanged
-    // (byte-identical). An explicit `eviction <policy>` keeps its own budget/score-fed path.
-    if args.eviction_policy() == "none"
-        && let Some(arming) = crate::kv::eviction::stage_registry::resolve_prefill_keepset_arming()
-        && let Some(stage) =
-            crate::kv::eviction::stage_registry::make_prefill_keepset_stage(&arming.stage_name)
-    {
-        eprintln!(
-            "[prefill-keepset] '{}' active — PFA producer arms q_window={} \
-             (SnapKV per-head keep-set applied at post_prefill)",
-            arming.stage_name, arming.q_window
-        );
-        hook = hook.with_prefill_keepset(
-            stage,
-            arming.q_window,
-            model.config.num_attention_heads,
-            args.eviction_target_ratio(),
-            args.protected_prefix()
-                .unwrap_or(arming.default_protected_prefix),
-        );
+    // Direction-B unification: a `TensorKind::PrefillAttention`-reading stage (pyramidkv) MUST run
+    // through its faithful per-head PFA path, never the generic score-fed eviction path — the latter
+    // only ever hands the stage a flat `importance()` signal, so pyramidkv silently degrades to a
+    // layer-wide keep-set (the pyramid BUDGET stays correct, but the SELECTION is H2O-style, not
+    // SnapKV per-head). Arm the prefill keep-set when the policy is EITHER the happy path ("none") OR
+    // an explicit `eviction plugin --name <that same stage>` (which previously fell through to the
+    // degraded generic path — the "faithful vs degraded invocation" footgun). `post_prefill` applies
+    // the per-head keep-set and RETURNS before the generic eviction, so there is no double eviction;
+    // any other policy is unchanged (byte-identical).
+    if let Some(arming) = crate::kv::eviction::stage_registry::resolve_prefill_keepset_arming() {
+        let policy = args.eviction_policy();
+        // `eviction plugin --name pyramidkv` — the explicit invocation of the registered PFA stage.
+        let explicit_pfa_plugin = policy == arming.stage_name;
+        if routes_to_prefill_keepset(&policy, &arming.stage_name)
+            && let Some(stage) =
+                crate::kv::eviction::stage_registry::make_prefill_keepset_stage(&arming.stage_name)
+        {
+            // Keep budget: on the happy path it is `--eviction-target-ratio`; for an explicit plugin
+            // the user sets the budget via `--kv-budget-ratio`, so honor that (else the target-ratio
+            // default). pyramidkv derives its per-layer pyramid cr from this keep fraction.
+            let target_ratio = if explicit_pfa_plugin && args.kv_budget_ratio() > 0.0 {
+                args.kv_budget_ratio()
+            } else {
+                args.eviction_target_ratio()
+            };
+            eprintln!(
+                "[prefill-keepset] '{}' active — PFA producer arms q_window={} \
+                 (SnapKV per-head keep-set applied at post_prefill, keep_ratio={target_ratio:.3})",
+                arming.stage_name, arming.q_window
+            );
+            hook = hook.with_prefill_keepset(
+                stage,
+                arming.q_window,
+                model.config.num_attention_heads,
+                target_ratio,
+                args.protected_prefix()
+                    .unwrap_or(arming.default_protected_prefix),
+            );
+        }
     }
 
     // ── Trajectory mode dispatch ──────────────────────────────────────────
@@ -563,4 +590,24 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
     });
     println!("{}", serde_json::to_string_pretty(&json_val)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::routes_to_prefill_keepset;
+
+    /// The footgun fix: an explicit `eviction plugin --name pyramidkv` (policy == the registered PFA
+    /// stage) MUST route to the faithful per-head prefill-keepset path, same as the "none" happy path
+    /// — otherwise it silently ran the degraded layer-wide `importance()` fallback. A non-PFA policy
+    /// (h2o/streaming) keeps its own score-fed path.
+    #[test]
+    fn routes_pfa_stage_and_happy_path_but_not_other_policies() {
+        assert!(routes_to_prefill_keepset("none", "pyramidkv"), "happy path arms the keep-set");
+        assert!(
+            routes_to_prefill_keepset("pyramidkv", "pyramidkv"),
+            "explicit `eviction plugin --name pyramidkv` must route to faithful, not degrade"
+        );
+        assert!(!routes_to_prefill_keepset("h2o", "pyramidkv"), "h2o keeps its own score-fed path");
+        assert!(!routes_to_prefill_keepset("streaming", "pyramidkv"), "streaming keeps its own path");
+    }
 }
