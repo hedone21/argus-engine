@@ -208,7 +208,13 @@ mod tests {
             Ok(())
         }
         // Rotate
-        fn rope_inplace(&self, _x: &mut Tensor, _start_pos: usize, _theta: f32) -> Result<()> {
+        fn rope_inplace(
+            &self,
+            _x: &mut Tensor,
+            _start_pos: usize,
+            _theta: f32,
+            _freq_scaling: crate::rope::RopeFreqScaling,
+        ) -> Result<()> {
             Ok(())
         }
         // Memory Ops
@@ -309,7 +315,13 @@ mod tests {
             Ok(())
         }
         // Rotate
-        fn rope_inplace(&self, _x: &mut Tensor, _start_pos: usize, _theta: f32) -> Result<()> {
+        fn rope_inplace(
+            &self,
+            _x: &mut Tensor,
+            _start_pos: usize,
+            _theta: f32,
+            _freq_scaling: crate::rope::RopeFreqScaling,
+        ) -> Result<()> {
             Ok(())
         }
         // Memory Ops
@@ -422,7 +434,13 @@ mod tests {
             fn softmax(&self, _x: &mut Tensor) -> Result<()> {
                 Ok(())
             }
-            fn rope_inplace(&self, _x: &mut Tensor, _s: usize, _t: f32) -> Result<()> {
+            fn rope_inplace(
+                &self,
+                _x: &mut Tensor,
+                _s: usize,
+                _t: f32,
+                _fs: crate::rope::RopeFreqScaling,
+            ) -> Result<()> {
                 Ok(())
             }
             fn copy_from(&self, _source: &Tensor) -> Result<Tensor> {

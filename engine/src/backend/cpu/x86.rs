@@ -148,8 +148,14 @@ impl Backend for CpuBackendAVX2 {
         Ok(())
     }
 
-    fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()> {
-        CpuBackendCommon::new().rope_inplace(x, start_pos, theta)
+    fn rope_inplace(
+        &self,
+        x: &mut Tensor,
+        start_pos: usize,
+        theta: f32,
+        freq_scaling: crate::rope::RopeFreqScaling,
+    ) -> Result<()> {
+        CpuBackendCommon::new().rope_inplace(x, start_pos, theta, freq_scaling)
     }
 
     fn copy_from(&self, t: &Tensor) -> Result<Tensor> {

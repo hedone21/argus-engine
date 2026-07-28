@@ -58,6 +58,9 @@ pub(crate) struct ForwardGenFmtArgs<'a> {
     pub ws: &'a mut crate::layers::workspace::LayerWorkspace,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// Per-dimension frequency rescaling that goes with `rope_theta`
+    /// ([`RopeFreqScaling::NONE`] = plain RoPE). See [`crate::rope`].
+    pub rope_freq_scaling: crate::rope::RopeFreqScaling,
     /// heavy-hitter/weighted-merge score 누적이 필요하면 attention_into 에 scores 버퍼 전달.
     pub need_scores: bool,
     pub head_dim: usize,
@@ -104,6 +107,7 @@ impl TransformerLayer {
         let ws = args.ws;
         let rms_norm_eps = args.rms_norm_eps;
         let rope_theta = args.rope_theta;
+        let rope_freq_scaling = args.rope_freq_scaling;
         let rms_norm_add_unit = args.rms_norm_add_unit;
         let use_gelu_tanh = args.use_gelu_tanh;
         let head_dim = args.head_dim;
@@ -171,8 +175,8 @@ impl TransformerLayer {
             ws.k.buffer().clone(),
             backend.clone(),
         );
-        backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
-        backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
+        backend.rope_inplace(&mut q_rope, start_pos, rope_theta, rope_freq_scaling)?;
+        backend.rope_inplace(&mut k_rope, start_pos, rope_theta, rope_freq_scaling)?;
 
         // 3.5 faithful read-plan seam (Quest 정본 current-Q). KV write *이전*에 산출 → read_plan 이 보는
         // 캐시 뷰(current_pos=P, 현재 토큰 미반영)와 검증 상한이 기존 seam(transformer.rs:1650)과 동일.

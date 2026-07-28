@@ -123,6 +123,7 @@ fn build_secondary() -> argus_engine::models::weights::SecondaryMmap {
         vocab_size: 2,
         rms_norm_eps: 1e-5,
         rope_theta: 10000.0,
+        rope_freq_scaling: argus_engine::rope::RopeFreqScaling::NONE,
         has_qkv_bias: false,
         tie_word_embeddings: false,
         eos_token_ids: vec![1],

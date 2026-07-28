@@ -164,7 +164,8 @@ extern "C" __global__ void rms_norm_f32(
 // Pair layout: (x[i], x[i + head_dim/2]) — matches CPU/OpenCL neox style.
 extern "C" __global__ void rope_inplace_f32(
     float * x, int head_dim, int n_heads, int seq_len,
-    int start_pos, float theta_base)
+    int start_pos, float theta_base,
+    float rs_factor, float rs_low, float rs_high, float rs_orig)
 {
     int block_id = blockIdx.x;          // 0 .. seq_len*n_heads - 1
     int t = block_id / n_heads;         // sequence position within batch
@@ -176,6 +177,22 @@ extern "C" __global__ void rope_inplace_f32(
     // freq = theta_base^(-2i/head_dim) = exp(-2i/head_dim * log(theta_base))
     // Using exp+log matches CPU's floating point behavior better than powf.
     float freq = expf(-2.0f * (float)i / (float)head_dim * logf(theta_base));
+    // llama3 `rope_scaling` — mirrors `crate::rope::RopeFreqScaling::scale_freq`. rs_factor == 1
+    // is the exact identity, so models without rope_scaling take this path unchanged.
+    if (rs_factor != 1.0f) {
+        const float wavelen = 6.28318530717958647692f / freq;
+        const float low_wl  = rs_orig / rs_low;
+        const float high_wl = rs_orig / rs_high;
+        if (wavelen > low_wl) {
+            freq /= rs_factor;
+        } else if (wavelen >= high_wl) {
+            const float span = rs_high - rs_low;
+            if (span != 0.0f) {
+                const float smooth = (rs_orig / wavelen - rs_low) / span;
+                freq = (1.0f - smooth) * freq / rs_factor + smooth * freq;
+            }
+        }
+    }
     float theta = (float)(start_pos + t) * freq;
     float cos_t = cosf(theta);
     float sin_t = sinf(theta);

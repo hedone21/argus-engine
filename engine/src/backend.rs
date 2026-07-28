@@ -30,6 +30,7 @@ pub mod opencl;
 // ============================================================================
 
 use crate::buffer::DType;
+use crate::rope::RopeFreqScaling;
 use crate::tensor::Tensor;
 use anyhow::Result;
 
@@ -272,7 +273,13 @@ pub trait Backend: Send + Sync {
     fn softmax(&self, x: &mut Tensor) -> Result<()>;
 
     // Rotate
-    fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()>;
+    fn rope_inplace(
+        &self,
+        x: &mut Tensor,
+        start_pos: usize,
+        theta: f32,
+        freq_scaling: RopeFreqScaling,
+    ) -> Result<()>;
 
     // Single-query attention for generation (GQA-aware)
     // Q: [num_heads_q, head_dim]

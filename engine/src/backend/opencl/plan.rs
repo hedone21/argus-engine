@@ -1627,6 +1627,8 @@ pub struct LayerPlanConfig<'a> {
     pub n_v: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// llama3 `rope_scaling` (identity when `factor == 1`) — see [`crate::rope`].
+    pub rope_freq_scaling: crate::rope::RopeFreqScaling,
     pub kv_capacity: usize,
     // Attention layout info
     pub kv_pos_stride: i32,
@@ -2458,6 +2460,15 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&seq_len_i32))?;
             ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&start_pos_init))?;
             ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&config.rope_theta))?;
+            let fs = &config.rope_freq_scaling;
+            ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::scalar(&fs.factor))?;
+            ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&fs.low_freq_factor))?;
+            ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&fs.high_freq_factor))?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                9,
+                ocl::core::ArgVal::scalar(&fs.original_max_position_embeddings),
+            )?;
         }
         let work_size = config.n_heads_q * (config.head_dim / 2);
         steps_pre_kv.push(KernelStep {
@@ -2495,6 +2506,15 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&seq_len_i32))?;
             ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&start_pos_init))?;
             ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&config.rope_theta))?;
+            let fs = &config.rope_freq_scaling;
+            ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::scalar(&fs.factor))?;
+            ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&fs.low_freq_factor))?;
+            ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&fs.high_freq_factor))?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                9,
+                ocl::core::ArgVal::scalar(&fs.original_max_position_embeddings),
+            )?;
         }
         let work_size = config.n_kv_heads * (config.head_dim / 2);
         steps_pre_kv.push(KernelStep {
@@ -3333,6 +3353,8 @@ pub struct FullPlanConfig<'a> {
     pub vocab_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// llama3 `rope_scaling` (identity when `factor == 1`) — see [`crate::rope`].
+    pub rope_freq_scaling: crate::rope::RopeFreqScaling,
     pub kv_capacity: usize,
     pub kv_pos_stride: i32,
     pub kv_head_stride: i32,
@@ -3496,6 +3518,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             n_v,
             rms_norm_eps: config.rms_norm_eps,
             rope_theta: config.rope_theta,
+            rope_freq_scaling: config.rope_freq_scaling,
             kv_capacity: config.kv_capacity,
             kv_pos_stride: config.kv_pos_stride,
             kv_head_stride: config.kv_head_stride,

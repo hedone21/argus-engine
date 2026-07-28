@@ -495,7 +495,12 @@ fn perform_matmul_test(
                 } else {
                     r_tensor
                 };
-                backend.rope_inplace(&mut r_gpu, 0, 10000.0)?;
+                backend.rope_inplace(
+                    &mut r_gpu,
+                    0,
+                    10000.0,
+                    argus_engine::rope::RopeFreqScaling::NONE,
+                )?;
             }
         }
         backend.synchronize()?;

@@ -1348,7 +1348,13 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
-    fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()> {
+    fn rope_inplace(
+        &self,
+        x: &mut Tensor,
+        start_pos: usize,
+        theta: f32,
+        freq_scaling: crate::rope::RopeFreqScaling,
+    ) -> Result<()> {
         let dims = x.shape().dims().to_vec();
         let rank = dims.len();
         if rank < 3 {
@@ -1380,6 +1386,10 @@ impl Backend for CudaBackend {
                 .arg(&sl)
                 .arg(&sp)
                 .arg(&theta)
+                .arg(&freq_scaling.factor)
+                .arg(&freq_scaling.low_freq_factor)
+                .arg(&freq_scaling.high_freq_factor)
+                .arg(&freq_scaling.original_max_position_embeddings)
                 .launch(cfg)
                 .map_err(|e| anyhow!("rope_inplace kernel launch failed: {e}"))?;
         }

@@ -73,6 +73,7 @@ fn minimal_config(n_layers: usize) -> ModelConfig {
         intermediate_size: 4,
         rms_norm_eps: 1e-5,
         rope_theta: 500_000.0,
+        rope_freq_scaling: argus_engine::rope::RopeFreqScaling::NONE,
         head_dim: 4,
         has_qkv_bias: false,
         tie_word_embeddings: false,

@@ -724,6 +724,10 @@ pub fn parse_model_config(gguf: &GgufFile) -> Result<ModelConfig> {
         vocab_size,
         rms_norm_eps,
         rope_theta,
+        // GGUF spells rope scaling with its own keys (`rope.scaling.*`) rather than the HF
+        // `rope_scaling` object; until those are read this path stays unscaled. A GGUF Llama 3.1
+        // therefore still diverges from the reference — see `crate::rope`.
+        rope_freq_scaling: crate::rope::RopeFreqScaling::NONE,
         has_qkv_bias,
         tie_word_embeddings,
         eos_token_ids: vec![eos_token_id],
@@ -1317,6 +1321,7 @@ mod tests {
                 vocab_size: 128256,
                 rms_norm_eps: 1e-5,
                 rope_theta: 500000.0,
+                rope_freq_scaling: crate::rope::RopeFreqScaling::NONE,
                 has_qkv_bias: false,
                 tie_word_embeddings: true,
                 eos_token_ids: vec![128009],

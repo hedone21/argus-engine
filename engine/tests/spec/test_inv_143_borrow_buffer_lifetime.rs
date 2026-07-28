@@ -92,6 +92,7 @@ fn make_model_config(n_layers: usize) -> ModelConfig {
         vocab_size: m.vocab_size as usize,
         rms_norm_eps: m.rms_norm_epsilon,
         rope_theta: m.rope_theta,
+        rope_freq_scaling: argus_engine::rope::RopeFreqScaling::NONE,
         has_qkv_bias: false,
         tie_word_embeddings: false,
         eos_token_ids: vec![2],

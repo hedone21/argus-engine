@@ -515,6 +515,7 @@ fn make_dummy_model_config(num_layers: usize) -> argus_engine::model_config::Mod
         vocab_size: 10,
         rms_norm_eps: 1e-5,
         rope_theta: 10000.0,
+        rope_freq_scaling: argus_engine::rope::RopeFreqScaling::NONE,
         has_qkv_bias: false,
         tie_word_embeddings: false,
         eos_token_ids: vec![1],

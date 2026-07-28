@@ -1,3 +1,4 @@
+use crate::rope::RopeFreqScaling;
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use std::fs::File;
@@ -25,6 +26,10 @@ pub struct ModelConfig {
     pub vocab_size: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
+    /// Per-dimension frequency rescaling from `config.json`'s `rope_scaling`
+    /// ([`RopeFreqScaling::NONE`] when the model declares none). Every Llama 3.1/3.2 checkpoint
+    /// sets this; dropping it silently runs a different model — see [`crate::rope`].
+    pub rope_freq_scaling: RopeFreqScaling,
     pub has_qkv_bias: bool,
     pub tie_word_embeddings: bool,
     /// Every id that terminates generation, in the order the config listed them. NEVER empty —
@@ -47,6 +52,7 @@ pub struct ModelConfig {
     pub query_pre_attn_scalar: Option<usize>,
     pub embed_scale: Option<f32>,
 }
+
 /// `eos_token_id` as HuggingFace writes it: a scalar for base checkpoints, an ARRAY for the
 /// Instruct variants of Llama 3.1/3.2. Accepting only the scalar made every Instruct checkpoint
 /// unloadable — `invalid type: sequence, expected u32`, thrown while parsing `config.json`, so the
@@ -58,6 +64,18 @@ enum RawEosTokenIds {
     Many(Vec<u32>),
 }
 
+/// `rope_scaling` as HuggingFace writes it. `rope_type` was spelled `type` before transformers
+/// 4.44, and checkpoints with the old key are still in circulation, so both are accepted.
+#[derive(Deserialize, Clone)]
+struct RawRopeScaling {
+    rope_type: Option<String>,
+    #[serde(rename = "type")]
+    legacy_type: Option<String>,
+    factor: Option<f64>,
+    low_freq_factor: Option<f64>,
+    high_freq_factor: Option<f64>,
+    original_max_position_embeddings: Option<usize>,
+}
 
 /// Raw HuggingFace config.json — supports Llama, Qwen2, and Gemma3 via Option fields.
 /// 필수처럼 보이는 숫자 필드도 Option으로 선언하여 multimodal wrapper JSON
@@ -76,6 +94,7 @@ struct RawHfConfig {
     vocab_size: Option<usize>,
     rms_norm_eps: Option<f64>,
     rope_theta: Option<f64>,
+    rope_scaling: Option<RawRopeScaling>,
     tie_word_embeddings: Option<bool>,
     eos_token_id: Option<RawEosTokenIds>,
     // Gemma 3 specific
@@ -200,6 +219,7 @@ impl ModelConfig {
             vocab_size,
             rms_norm_eps: raw.rms_norm_eps.unwrap_or(1e-5),
             rope_theta: raw.rope_theta.unwrap_or(10000.0),
+            rope_freq_scaling: Self::parse_rope_scaling(raw.rope_scaling.as_ref()),
             has_qkv_bias,
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(false),
             eos_token_ids: match raw.eos_token_id {
@@ -217,6 +237,44 @@ impl ModelConfig {
             weight_prefix,
         })
     }
+
+    /// `rope_scaling` -> [`RopeFreqScaling`].
+    ///
+    /// Only `rope_type: "llama3"` is implemented. Any OTHER type is reported LOUDLY rather than
+    /// ignored in silence: an unapplied rescaling does not fail, it quietly changes what the model
+    /// computes, which is the hardest class of bug to notice from the outside.
+    fn parse_rope_scaling(raw: Option<&RawRopeScaling>) -> RopeFreqScaling {
+        let Some(rs) = raw else {
+            return RopeFreqScaling::NONE;
+        };
+        let kind = rs
+            .rope_type
+            .as_deref()
+            .or(rs.legacy_type.as_deref())
+            .unwrap_or("default");
+        match kind {
+            "llama3" => RopeFreqScaling {
+                factor: rs.factor.unwrap_or(1.0) as f32,
+                low_freq_factor: rs.low_freq_factor.unwrap_or(1.0) as f32,
+                high_freq_factor: rs.high_freq_factor.unwrap_or(4.0) as f32,
+                original_max_position_embeddings: rs
+                    .original_max_position_embeddings
+                    .unwrap_or(8192) as f32,
+            },
+            "default" => RopeFreqScaling::NONE,
+            other => {
+                eprintln!(
+                    "[rope] config.json declares rope_scaling type '{other}', which this engine \
+                     does not implement — position encoding will NOT match the reference \
+                     implementation for this model. Only 'llama3' is supported."
+                );
+                RopeFreqScaling::NONE
+            }
+        }
+    }
+
+    /// Does `id` end generation? This is the check every stop condition should use — the config may
+    /// name several terminators and only one of them typically ends a chat turn.
     pub fn is_eos(&self, id: u32) -> bool {
         self.eos_token_ids.contains(&id)
     }
@@ -231,7 +289,6 @@ impl ModelConfig {
     pub fn primary_eos(&self) -> u32 {
         self.eos_token_ids.first().copied().unwrap_or(u32::MAX)
     }
-
 
     fn detect_arch(raw: &RawHfConfig) -> Result<ModelArch> {
         // Try architectures field first

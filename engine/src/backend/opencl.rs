@@ -5699,7 +5699,13 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
-    fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()> {
+    fn rope_inplace(
+        &self,
+        x: &mut Tensor,
+        start_pos: usize,
+        theta: f32,
+        freq_scaling: crate::rope::RopeFreqScaling,
+    ) -> Result<()> {
         let dims = x.shape().dims();
         let (seq_len, num_heads, head_dim) = if dims.len() == 4 {
             (dims[1], dims[2], dims[3])
@@ -5721,6 +5727,23 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&(seq_len as i32)))?;
             ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&(start_pos as i32)))?;
             ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&theta))?;
+            // llama3 rope_scaling (identity when factor == 1) — see `crate::rope`.
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&freq_scaling.factor))?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                7,
+                ocl::core::ArgVal::scalar(&freq_scaling.low_freq_factor),
+            )?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                8,
+                ocl::core::ArgVal::scalar(&freq_scaling.high_freq_factor),
+            )?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                9,
+                ocl::core::ArgVal::scalar(&freq_scaling.original_max_position_embeddings),
+            )?;
 
             let work_size = seq_len * num_heads * (head_dim / 2);
             self.enqueue_kernel_labeled(kernel, "rope", 1, &[work_size, 1, 1], None)?;

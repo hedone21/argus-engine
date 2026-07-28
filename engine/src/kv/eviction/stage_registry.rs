@@ -643,7 +643,8 @@ mod tests {
             let buf = Arc::new(SharedBuffer::new(PHD * 4, DType::F32));
             let mut t = Tensor::new(Shape::new(vec![1, 1, 1, PHD]), buf, be.clone());
             t.as_mut_slice::<f32>().copy_from_slice(&base);
-            be.rope_inplace(&mut t, p, theta).unwrap();
+            be.rope_inplace(&mut t, p, theta, crate::rope::RopeFreqScaling::NONE)
+                .unwrap();
             t.as_slice::<f32>().to_vec()
         };
 

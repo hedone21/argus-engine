@@ -225,6 +225,14 @@ impl TransformerModel {
             } else {
                 self.config.rope_theta as f32
             };
+            let rope_freq_scaling_i =
+                if is_gemma3 && is_local_layer(i, self.config.sliding_window_pattern) {
+                    // Gemma 3's local layers use a separate positional regime; the HF `rope_scaling`
+                    // object describes the GLOBAL one, so it must not travel with `rope_local_theta`.
+                    crate::rope::RopeFreqScaling::NONE
+                } else {
+                    self.config.rope_freq_scaling
+                };
             let is_local_i = if is_gemma3 {
                 Some(is_local_layer(i, self.config.sliding_window_pattern))
             } else {
@@ -274,6 +282,7 @@ impl TransformerModel {
                     ws,
                     rms_norm_eps: self.config.rms_norm_eps as f32,
                     rope_theta: rope_theta_i,
+                    rope_freq_scaling: rope_freq_scaling_i,
                     need_scores: false,
                     head_dim: self.config.head_dim,
                     skip_attn: false,
@@ -316,6 +325,7 @@ impl TransformerModel {
                         pws,
                         rms_norm_eps: self.config.rms_norm_eps as f32,
                         rope_theta: rope_theta_i,
+                        rope_freq_scaling: rope_freq_scaling_i,
                         head_dim: self.config.head_dim,
                         batch_size,
                         seq_len,

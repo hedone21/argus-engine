@@ -205,7 +205,13 @@ impl Backend for CpuBackendCommon {
         Ok(())
     }
 
-    fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()> {
+    fn rope_inplace(
+        &self,
+        x: &mut Tensor,
+        start_pos: usize,
+        theta: f32,
+        freq_scaling: crate::rope::RopeFreqScaling,
+    ) -> Result<()> {
         let dims = x.shape().dims();
         if dims.len() < 3 {
             return Err(anyhow!(
@@ -227,7 +233,12 @@ impl Backend for CpuBackendCommon {
         // This eliminates repeated powf() calls in the inner loop.
         let half_dim = head_dim / 2;
         let freqs: Vec<f32> = (0..half_dim)
-            .map(|i| theta.powf(-2.0 * (i as f32) / (head_dim as f32)))
+            .map(|i| {
+                let base = theta.powf(-2.0 * (i as f32) / (head_dim as f32));
+                // `rope_scaling` stretches the slowest dimensions back inside the trained range.
+                // Identity when the model declares none — see `crate::rope`.
+                freq_scaling.scale_freq(base)
+            })
             .collect();
 
         let x_data = x.as_mut_slice::<f32>();
@@ -1750,8 +1761,11 @@ mod tests {
         let mut x_s = make_f32_tensor(&scalar, vec![batch, seq, heads, dim], &x_data);
         let mut x_a = make_f32_tensor(&auto, vec![batch, seq, heads, dim], &x_data);
 
-        scalar.rope_inplace(&mut x_s, 0, 10000.0).unwrap();
-        auto.rope_inplace(&mut x_a, 0, 10000.0).unwrap();
+        scalar
+            .rope_inplace(&mut x_s, 0, 10000.0, crate::rope::RopeFreqScaling::NONE)
+            .unwrap();
+        auto.rope_inplace(&mut x_a, 0, 10000.0, crate::rope::RopeFreqScaling::NONE)
+            .unwrap();
 
         assert_close(
             x_s.as_slice::<f32>(),

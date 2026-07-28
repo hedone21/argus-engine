@@ -156,8 +156,14 @@ impl Backend for OrderingMockBackend {
     fn softmax(&self, x: &mut Tensor) -> Result<()> {
         self.inner.softmax(x)
     }
-    fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()> {
-        self.inner.rope_inplace(x, start_pos, theta)
+    fn rope_inplace(
+        &self,
+        x: &mut Tensor,
+        start_pos: usize,
+        theta: f32,
+        fs: argus_engine::rope::RopeFreqScaling,
+    ) -> Result<()> {
+        self.inner.rope_inplace(x, start_pos, theta, fs)
     }
     fn copy_from(&self, t: &Tensor) -> Result<Tensor> {
         self.inner.copy_from(t)
@@ -184,6 +190,7 @@ fn minimal_config() -> ModelConfig {
         vocab_size: 256,
         rms_norm_eps: 1e-5,
         rope_theta: 10000.0,
+        rope_freq_scaling: argus_engine::rope::RopeFreqScaling::NONE,
         has_qkv_bias: false,
         tie_word_embeddings: false,
         eos_token_ids: vec![1],

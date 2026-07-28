@@ -31,6 +31,7 @@ pub mod qcf_collector;
 pub mod qcf_computer;
 pub mod qcf_types;
 pub mod quant;
+pub mod rope;
 pub mod runtime_resources_access;
 pub mod shape;
 pub mod stages;

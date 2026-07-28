@@ -877,7 +877,11 @@ kernel void kernel_rope_simple(
     int num_heads,
     int seq_len,
     int start_pos,
-    float theta
+    float theta,
+    float rs_factor,
+    float rs_low,
+    float rs_high,
+    float rs_orig
 ) {
     // x is [batch, seq, num_heads, head_dim]
     // Each work item processes one (i, i+head_dim/2) pair
@@ -897,6 +901,22 @@ kernel void kernel_rope_simple(
 
     // Calculate frequency for this pair
     float freq = 1.0f / pow(theta, (float)(pair_idx * 2) / (float)head_dim);
+    // llama3 `rope_scaling` — mirrors `crate::rope::RopeFreqScaling::scale_freq`. rs_factor == 1
+    // is the exact identity, so models without rope_scaling behave exactly as before.
+    if (rs_factor != 1.0f) {
+        float wavelen = 6.28318530717958647692f / freq;
+        float low_wl  = rs_orig / rs_low;
+        float high_wl = rs_orig / rs_high;
+        if (wavelen > low_wl) {
+            freq /= rs_factor;
+        } else if (wavelen >= high_wl) {
+            float span = rs_high - rs_low;
+            if (span != 0.0f) {
+                float smooth = (rs_orig / wavelen - rs_low) / span;
+                freq = (1.0f - smooth) * freq / rs_factor + smooth * freq;
+            }
+        }
+    }
     float angle = (float)pos * freq;
 
     float cos_val = cos(angle);
@@ -935,7 +955,11 @@ kernel void kernel_rope_simple_oop(
     int head_dim,
     int num_heads,
     int seq_len,
-    float theta
+    float theta,
+    float rs_factor,
+    float rs_low,
+    float rs_high,
+    float rs_orig
 ) {
     int gid = get_global_id(0);
 
@@ -952,6 +976,22 @@ kernel void kernel_rope_simple_oop(
     int pos = start_pos + seq_idx;
 
     float freq = 1.0f / pow(theta, (float)(pair_idx * 2) / (float)head_dim);
+    // llama3 `rope_scaling` — mirrors `crate::rope::RopeFreqScaling::scale_freq`. rs_factor == 1
+    // is the exact identity, so models without rope_scaling behave exactly as before.
+    if (rs_factor != 1.0f) {
+        float wavelen = 6.28318530717958647692f / freq;
+        float low_wl  = rs_orig / rs_low;
+        float high_wl = rs_orig / rs_high;
+        if (wavelen > low_wl) {
+            freq /= rs_factor;
+        } else if (wavelen >= high_wl) {
+            float span = rs_high - rs_low;
+            if (span != 0.0f) {
+                float smooth = (rs_orig / wavelen - rs_low) / span;
+                freq = (1.0f - smooth) * freq / rs_factor + smooth * freq;
+            }
+        }
+    }
     float angle = (float)pos * freq;
 
     float cos_val = cos(angle);

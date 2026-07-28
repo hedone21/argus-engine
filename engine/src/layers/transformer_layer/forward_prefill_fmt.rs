@@ -36,6 +36,9 @@ pub(crate) struct ForwardPrefillFmtArgs<'a> {
     pub pws: &'a mut crate::layers::workspace::PrefillWorkspace,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// Per-dimension frequency rescaling that goes with `rope_theta`
+    /// ([`RopeFreqScaling::NONE`] = plain RoPE). See [`crate::rope`].
+    pub rope_freq_scaling: crate::rope::RopeFreqScaling,
     pub head_dim: usize,
     pub batch_size: usize,
     pub seq_len: usize,
@@ -88,6 +91,7 @@ impl TransformerLayer {
         let ws = args.pws;
         let rms_norm_eps = args.rms_norm_eps;
         let rope_theta = args.rope_theta;
+        let rope_freq_scaling = args.rope_freq_scaling;
         let rms_norm_add_unit = args.rms_norm_add_unit;
         let use_gelu_tanh = args.use_gelu_tanh;
         let head_dim = args.head_dim;
@@ -158,8 +162,8 @@ impl TransformerLayer {
             ws.k.buffer().clone(),
             backend.clone(),
         );
-        backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
-        backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
+        backend.rope_inplace(&mut q_rope, start_pos, rope_theta, rope_freq_scaling)?;
+        backend.rope_inplace(&mut k_rope, start_pos, rope_theta, rope_freq_scaling)?;
 
         // 4. KV cache update (multi-token) → fmt.write_kv_batch (C3).
         fmt.write_kv_batch(&k_rope, &ws.v, backend.as_ref())?;

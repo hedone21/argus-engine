@@ -536,6 +536,7 @@ pub fn load_model(
         vocab_size: config.vocab_size,
         rms_norm_eps: config.rms_norm_eps,
         rope_theta: config.rope_theta,
+        rope_freq_scaling: config.rope_freq_scaling,
         has_qkv_bias: config.has_qkv_bias,
         tie_word_embeddings: config.tie_word_embeddings,
         eos_token_ids: config.eos_token_ids.clone(),

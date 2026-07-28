@@ -1608,6 +1608,14 @@ impl TransformerModel {
             } else {
                 self.config.rope_theta as f32
             };
+            let rope_freq_scaling =
+                if is_gemma3 && is_local_layer(i, self.config.sliding_window_pattern) {
+                    // Gemma 3's local layers use a separate positional regime; the HF `rope_scaling`
+                    // object describes the GLOBAL one, so it must not travel with `rope_local_theta`.
+                    crate::rope::RopeFreqScaling::NONE
+                } else {
+                    self.config.rope_freq_scaling
+                };
             let is_local = if is_gemma3 {
                 Some(is_local_layer(i, self.config.sliding_window_pattern))
             } else {
@@ -1648,6 +1656,7 @@ impl TransformerModel {
                         pws,
                         rms_norm_eps: self.config.rms_norm_eps as f32,
                         rope_theta,
+                        rope_freq_scaling,
                         head_dim: self.config.head_dim,
                         batch_size,
                         seq_len,
@@ -1698,6 +1707,7 @@ impl TransformerModel {
                     ws,
                     rms_norm_eps: self.config.rms_norm_eps as f32,
                     rope_theta,
+                    rope_freq_scaling,
                     need_scores,
                     head_dim: self.config.head_dim,
                     skip_attn: s_attn,
@@ -1733,6 +1743,7 @@ impl TransformerModel {
                         pws,
                         rms_norm_eps: self.config.rms_norm_eps as f32,
                         rope_theta,
+                        rope_freq_scaling,
                         head_dim: self.config.head_dim,
                         batch_size,
                         seq_len,
@@ -2259,6 +2270,7 @@ impl TransformerModel {
             vocab_size: self.config.vocab_size,
             rms_norm_eps: self.config.rms_norm_eps as f32,
             rope_theta: self.config.rope_theta as f32,
+            rope_freq_scaling: self.config.rope_freq_scaling,
             kv_capacity: capacity,
             kv_pos_stride,
             kv_head_stride,
@@ -2578,6 +2590,7 @@ mod tests {
             intermediate_size: dim,
             rms_norm_eps: 1e-5,
             rope_theta: 500_000.0,
+            rope_freq_scaling: crate::rope::RopeFreqScaling::NONE,
             head_dim: dim,
             has_qkv_bias: false,
             tie_word_embeddings: false,
@@ -2737,6 +2750,7 @@ mod tests {
             intermediate_size: dim,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
+            rope_freq_scaling: crate::rope::RopeFreqScaling::NONE,
             head_dim: dim,
             has_qkv_bias: false,
             tie_word_embeddings: false,
@@ -2851,6 +2865,7 @@ mod tests {
             intermediate_size: dim,
             rms_norm_eps: 1e-5,
             rope_theta: 500_000.0,
+            rope_freq_scaling: crate::rope::RopeFreqScaling::NONE,
             head_dim: dim,
             has_qkv_bias: false,
             tie_word_embeddings: true,
@@ -2954,6 +2969,7 @@ mod tests {
             intermediate_size: dim,
             rms_norm_eps: 1e-5,
             rope_theta: 500_000.0,
+            rope_freq_scaling: crate::rope::RopeFreqScaling::NONE,
             head_dim: dim,
             has_qkv_bias: false,
             tie_word_embeddings: true,
@@ -3033,6 +3049,7 @@ mod tests {
             intermediate_size: hidden,
             rms_norm_eps: 1e-5,
             rope_theta: 500_000.0,
+            rope_freq_scaling: crate::rope::RopeFreqScaling::NONE,
             head_dim: hidden,
             has_qkv_bias: false,
             tie_word_embeddings: false,
