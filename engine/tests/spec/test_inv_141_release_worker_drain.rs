@@ -225,7 +225,7 @@ fn inv_141_swap_executor_rejects_on_drain_timeout() {
             rope_theta: 10000.0,
             has_qkv_bias: false,
             tie_word_embeddings: false,
-            eos_token_id: 1,
+            eos_token_ids: vec![1],
             rope_local_theta: None,
             sliding_window: None,
             sliding_window_pattern: None,

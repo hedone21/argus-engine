@@ -138,7 +138,7 @@ fn make_model_config() -> argus_engine::model_config::ModelConfig {
         rope_theta: 10000.0,
         has_qkv_bias: false,
         tie_word_embeddings: false,
-        eos_token_id: 2,
+        eos_token_ids: vec![2],
         weight_prefix: String::new(),
         rope_local_theta: None,
         sliding_window: None,

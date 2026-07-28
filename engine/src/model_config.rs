@@ -27,7 +27,15 @@ pub struct ModelConfig {
     pub rope_theta: f64,
     pub has_qkv_bias: bool,
     pub tie_word_embeddings: bool,
-    pub eos_token_id: u32,
+    /// Every id that terminates generation, in the order the config listed them. NEVER empty —
+    /// an absent config value yields `[u32::MAX]` (an id no tokenizer emits), matching the old
+    /// scalar fallback.
+    ///
+    /// A set, not a scalar, because the Instruct variants of Llama 3.1/3.2 ship three:
+    /// `<|end_of_text|>`, `<|eom_id|>` (end of a tool/multi-step message) and `<|eot_id|>` (end of
+    /// turn — the one that actually ends an assistant reply). Generation must stop on ANY of them.
+    /// Test [`ModelConfig::is_eos`] rather than comparing against [`ModelConfig::primary_eos`].
+    pub eos_token_ids: Vec<u32>,
     /// Safetensors tensor name prefix (e.g., "language_model." for Gemma3 multimodal wrappers).
     /// Empty string for standard flat layouts (Llama, Qwen2, Gemma3 1B).
     pub weight_prefix: String,
@@ -39,6 +47,17 @@ pub struct ModelConfig {
     pub query_pre_attn_scalar: Option<usize>,
     pub embed_scale: Option<f32>,
 }
+/// `eos_token_id` as HuggingFace writes it: a scalar for base checkpoints, an ARRAY for the
+/// Instruct variants of Llama 3.1/3.2. Accepting only the scalar made every Instruct checkpoint
+/// unloadable — `invalid type: sequence, expected u32`, thrown while parsing `config.json`, so the
+/// model never reached the loader at all.
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum RawEosTokenIds {
+    One(u32),
+    Many(Vec<u32>),
+}
+
 
 /// Raw HuggingFace config.json — supports Llama, Qwen2, and Gemma3 via Option fields.
 /// 필수처럼 보이는 숫자 필드도 Option으로 선언하여 multimodal wrapper JSON
@@ -58,7 +77,7 @@ struct RawHfConfig {
     rms_norm_eps: Option<f64>,
     rope_theta: Option<f64>,
     tie_word_embeddings: Option<bool>,
-    eos_token_id: Option<u32>,
+    eos_token_id: Option<RawEosTokenIds>,
     // Gemma 3 specific
     rope_local_base_freq: Option<f64>,
     sliding_window: Option<usize>,
@@ -183,7 +202,13 @@ impl ModelConfig {
             rope_theta: raw.rope_theta.unwrap_or(10000.0),
             has_qkv_bias,
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(false),
-            eos_token_id: raw.eos_token_id.unwrap_or(u32::MAX),
+            eos_token_ids: match raw.eos_token_id {
+                Some(RawEosTokenIds::One(v)) => vec![v],
+                // An empty array carries no more information than an absent key, so it takes the
+                // same fallback rather than breaking the non-empty invariant.
+                Some(RawEosTokenIds::Many(v)) if !v.is_empty() => v,
+                _ => vec![u32::MAX],
+            },
             rope_local_theta,
             sliding_window,
             sliding_window_pattern,
@@ -192,6 +217,21 @@ impl ModelConfig {
             weight_prefix,
         })
     }
+    pub fn is_eos(&self, id: u32) -> bool {
+        self.eos_token_ids.contains(&id)
+    }
+
+    /// A single representative id, for the few interfaces that cannot carry a set (AUF metadata,
+    /// the `--eos-token-id` default).
+    ///
+    /// **Lossy on purpose.** HuggingFace lists the ids in ascending numeric order, not priority
+    /// order, so for Llama 3.1 Instruct this returns `<|end_of_text|>` and NOT the `<|eot_id|>` that
+    /// actually terminates an assistant turn. Anything that stops generation must use
+    /// [`Self::is_eos`]; reach for this only where a set genuinely does not fit.
+    pub fn primary_eos(&self) -> u32 {
+        self.eos_token_ids.first().copied().unwrap_or(u32::MAX)
+    }
+
 
     fn detect_arch(raw: &RawHfConfig) -> Result<ModelArch> {
         // Try architectures field first
@@ -245,7 +285,7 @@ mod tests {
         assert_eq!(config.num_hidden_layers, 16);
         assert_eq!(config.num_attention_heads, 32);
         assert_eq!(config.num_key_value_heads, 8);
-        assert_eq!(config.eos_token_id, 128001);
+        assert_eq!(config.primary_eos(), 128001);
     }
 
     #[test]
@@ -291,7 +331,7 @@ mod tests {
         assert!((config.rms_norm_eps - 1e-6).abs() < 1e-10);
         assert!((config.rope_theta - 1_000_000.0).abs() < 1.0);
         assert!(config.tie_word_embeddings);
-        assert_eq!(config.eos_token_id, 1);
+        assert_eq!(config.primary_eos(), 1);
 
         // Gemma3 specific fields
         let local_theta = config
@@ -456,6 +496,41 @@ mod tests {
         assert_eq!(config.num_attention_heads, 12);
         assert_eq!(config.num_key_value_heads, 2);
         assert!(config.tie_word_embeddings);
-        assert_eq!(config.eos_token_id, 151643);
+        assert_eq!(config.primary_eos(), 151643);
+    }
+
+    /// `eos_token_id` arrives as a scalar OR an array, and the array form is what every Llama 3.1/3.2
+    /// Instruct checkpoint ships. Rejecting it failed at `serde_json::from_reader`, i.e. the model
+    /// was unloadable — not degraded, unusable.
+    #[test]
+    fn eos_token_id_parses_as_either_a_scalar_or_an_array() {
+        use std::io::Write;
+        let write = |name: &str, eos: &str| {
+            let dir = std::env::temp_dir().join(format!("argus_eos_{name}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let json = format!(
+                r#"{{"architectures":["LlamaForCausalLM"],"hidden_size":16,
+                   "num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":1,
+                   "intermediate_size":32,"vocab_size":64,"eos_token_id":{eos}}}"#
+            );
+            std::fs::File::create(dir.join("config.json"))
+                .unwrap()
+                .write_all(json.as_bytes())
+                .unwrap();
+            ModelConfig::from_json(&dir).unwrap()
+        };
+
+        assert_eq!(write("scalar", "128001").eos_token_ids, vec![128001]);
+
+        // Llama 3.1 Instruct: <|end_of_text|>, <|eom_id|>, <|eot_id|>.
+        let many = write("array", "[128001, 128008, 128009]");
+        assert_eq!(many.eos_token_ids, vec![128001, 128008, 128009]);
+        // `<|eot_id|>` ends an assistant turn but is NOT the first entry — the whole reason a stop
+        // condition has to test membership instead of comparing against `primary_eos`.
+        assert!(many.is_eos(128009));
+        assert_ne!(many.primary_eos(), 128009);
+
+        // Absent and empty both fall back to the sentinel, keeping the non-empty invariant.
+        assert_eq!(write("empty", "[]").eos_token_ids, vec![u32::MAX]);
     }
 }

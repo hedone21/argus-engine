@@ -76,7 +76,7 @@ fn minimal_config(n_layers: usize) -> ModelConfig {
         head_dim: 4,
         has_qkv_bias: false,
         tie_word_embeddings: false,
-        eos_token_id: 2,
+        eos_token_ids: vec![2],
         arch: ModelArch::Llama,
         rope_local_theta: None,
         sliding_window: None,

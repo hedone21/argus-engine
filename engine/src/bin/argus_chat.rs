@@ -36,7 +36,12 @@ fn main() -> anyhow::Result<()> {
     } = build_inference_prelude(&args)?;
 
     let arch = init.model.config.arch;
-    let eos = args.eos_token_id.unwrap_or(init.model.config.eos_token_id);
+    // `--eos-token-id` 는 단일값 탈출구다: 주어지면 config 집합을 REPLACE 한다
+    // (config 가 잘못된 checkpoint 를 강제 교정하는 용도라 합집합이면 의미가 없다).
+    let eos: Vec<u32> = match args.eos_token_id {
+        Some(id) => vec![id],
+        None => init.model.config.eos_token_ids.clone(),
+    };
     let vocab = init.model.config.vocab_size;
     let base_sampling = init.sampling_config.clone();
     let max_seq_len = args.max_seq_len;
@@ -50,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         let repl_args = ChatReplArgs {
             model_arch: arch,
             tokenizer: &tokenizer,
-            eos_token_id: eos,
+            eos_token_ids: eos,
             vocab_size: vocab,
             sampling_config: &base_sampling,
             max_seq_len,
@@ -67,7 +72,7 @@ fn main() -> anyhow::Result<()> {
         };
         run_chat_repl_v2(&repl_args, &mut session)
     } else {
-        serve(&args, session, tokenizer, arch, eos, vocab, base_sampling)
+        serve(&args, session, tokenizer, arch, &eos, vocab, base_sampling)
     }
 }
 

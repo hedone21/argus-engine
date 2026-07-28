@@ -202,14 +202,16 @@ pub fn resolve_token_ids(
 
 /// Chat stop_ids 빌드 헬퍼.
 ///
-/// `template.stop_token_literals()` + `eos_token_id`를 합산하여
-/// sorted dedup Vec<u32>를 반환한다.
+/// `template.stop_token_literals()` + `eos_token_ids`(전부)를 합산하여
+/// sorted dedup Vec<u32>를 반환한다. EOS 가 복수인 이유는 [`ModelConfig::eos_token_ids`] 참조 —
+/// Llama 3.1/3.2 Instruct 는 `<|eot_id|>` 로 턴을 끝내지만 config 의 첫 원소는 `<|end_of_text|>`
+/// 라서, 하나만 골라 넣으면 답변이 끝나도 멈추지 않는다.
 ///
 /// generate.rs:9870~9881의 stop_ids 빌드 로직을 이관.
 pub fn build_chat_stop_ids(
     template: &ChatTemplate,
     tokenizer: &Tokenizer,
-    eos_token_id: u32,
+    eos_token_ids: &[u32],
 ) -> anyhow::Result<Vec<u32>> {
     let lits = template.stop_token_literals();
     if lits.is_empty() {
@@ -217,7 +219,7 @@ pub fn build_chat_stop_ids(
     }
     let mut ids = resolve_token_ids(tokenizer, &lits[..1], true)?;
     ids.extend(resolve_token_ids(tokenizer, &lits[1..], false)?);
-    ids.push(eos_token_id);
+    ids.extend_from_slice(eos_token_ids);
     ids.sort_unstable();
     ids.dedup();
     Ok(ids)

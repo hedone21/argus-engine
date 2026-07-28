@@ -32,7 +32,7 @@ use crate::session::chat_template::ChatTemplate;
 pub struct ChatReplArgs<'a> {
     pub model_arch: ModelArch,
     pub tokenizer: &'a Tokenizer,
-    pub eos_token_id: u32,
+    pub eos_token_ids: Vec<u32>,
     pub vocab_size: usize,
     pub sampling_config: &'a SamplingConfig,
     pub max_seq_len: usize,
@@ -64,7 +64,7 @@ fn push_recent(recent: &mut VecDeque<u32>, tok: u32, window: usize) {
 /// `session`은 caller가 미리 build해서 전달한다 (R1: turn 사이 drop 금지).
 pub fn run_chat_repl_v2(args: &ChatReplArgs<'_>, session: &mut ChatSession) -> Result<()> {
     let template = ChatTemplate::new(args.model_arch)?;
-    let stop_ids = build_chat_stop_ids(&template, args.tokenizer, args.eos_token_id)?;
+    let stop_ids = build_chat_stop_ids(&template, args.tokenizer, &args.eos_token_ids)?;
     let assistant_eot_ids: Vec<u32> = args
         .tokenizer
         .encode(template.assistant_eot(), false)

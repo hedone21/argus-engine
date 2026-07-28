@@ -538,7 +538,7 @@ pub fn load_model(
         rope_theta: config.rope_theta,
         has_qkv_bias: config.has_qkv_bias,
         tie_word_embeddings: config.tie_word_embeddings,
-        eos_token_id: config.eos_token_id,
+        eos_token_ids: config.eos_token_ids.clone(),
         rope_local_theta: config.rope_local_theta,
         sliding_window: config.sliding_window,
         sliding_window_pattern: config.sliding_window_pattern,

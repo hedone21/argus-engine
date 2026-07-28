@@ -55,12 +55,12 @@ pub fn serve(
     mut session: ChatSession,
     tokenizer: Tokenizer,
     arch: ModelArch,
-    eos_token_id: u32,
+    eos_token_ids: &[u32],
     vocab_size: usize,
     base_sampling: SamplingConfig,
 ) -> Result<()> {
     let template = ChatTemplate::new(arch)?;
-    let base_stop_ids = build_chat_stop_ids(&template, &tokenizer, eos_token_id)?;
+    let base_stop_ids = build_chat_stop_ids(&template, &tokenizer, eos_token_ids)?;
     let model_id = std::path::Path::new(&args.model_path)
         .file_stem()
         .and_then(|s| s.to_str())
