@@ -38,7 +38,7 @@ use serde::Serialize;
 use crate::aperturb::{self, Config, Geom, KeepSets, LayerSource, OutputBasis, Readout};
 use crate::backend::Backend;
 use crate::backend::cpu::CpuBackend;
-use crate::buffer::DType;
+use crate::buffer::{Buffer, DType};
 use crate::kv::kv_cache::{KVCache, KVLayout};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
@@ -191,7 +191,10 @@ fn read_layer_kv(
 ///
 /// A device-resident weight has no host pointer, and a quantized one goes through the shared
 /// dequantize floor so the factors see exactly the values the projection itself would apply.
-fn read_output_projections(model: &TransformerModel) -> Result<(Vec<Vec<f32>>, usize, usize)> {
+fn read_output_projections(
+    model: &TransformerModel,
+    backend: &Arc<dyn Backend>,
+) -> Result<(Vec<Vec<f32>>, usize, usize)> {
     let mut out = Vec::with_capacity(model.layers.len());
     let (mut d_out, mut d_in) = (0usize, 0usize);
     for (l, slot) in model.layers.iter().enumerate() {
@@ -204,20 +207,29 @@ fn read_output_projections(model: &TransformerModel) -> Result<(Vec<Vec<f32>>, u
         } else if (o, i) != (d_out, d_in) {
             anyhow::bail!("output projection layer {l} is {o}x{i}, layer 0 was {d_out}x{d_in}");
         }
-        // `is_gpu_buffer` answers "is this reachable from the GPU", not "is this unreachable
-        // from the host". A zero-copy weight (the `ALLOC_HOST_PTR` migration a CPU-primary run
-        // with a GPU secondary performs) is both, and on that configuration the device readback
-        // comes back ALL ZEROS while the host pointer holds the real weight. Reading a zero
-        // projection would not fail — it would produce a perfectly well-formed ranking of
-        // candidates that all score zero. So the predicate is the host pointer, and the mirror is
-        // the fallback for a buffer that genuinely has none.
-        let mirrored;
-        let host = if wo.buffer().as_ptr().is_null() {
-            mirrored = crate::kv::kv_cache::read_device_tensor_to_host(wo)?;
-            &mirrored
-        } else {
-            wo
-        };
+        // A weight's own `Tensor::backend()` is not the session's. On OpenCL the weight carries a
+        // `cl_mem` whose host pointer is null, and dispatching the readback through the tensor lands
+        // on `Backend::read_buffer`'s default host memcpy, which bails on that null — the OpenCL
+        // override that would have done the device→host copy is never reached. The session backend
+        // knows how to reach its own memory; `dump_layer_weights_to_dir` reads weights the same way
+        // for the same reason. On CPU this is the memcpy the host pointer would have given anyway,
+        // including for the zero-copy `ALLOC_HOST_PTR` buffer a CPU-primary run with a GPU secondary
+        // holds — which a `is_gpu_buffer` test would have wrongly sent to the device and read as
+        // all zeros.
+        let nbytes = wo.size();
+        let host_buf = crate::memory::host::shared::SharedBuffer::new(nbytes, wo.dtype());
+        // SAFETY: `host_buf` was just allocated with exactly `nbytes` bytes; `read_buffer` writes
+        // exactly that many and does not retain the pointer past the call.
+        let dst = unsafe { std::slice::from_raw_parts_mut(host_buf.as_mut_ptr(), nbytes) };
+        backend
+            .read_buffer(wo, dst)
+            .with_context(|| format!("output projection layer {l}: read to host"))?;
+        let host = Tensor::new(
+            wo.shape().clone(),
+            Arc::new(host_buf),
+            Arc::new(CpuBackend::new()),
+        );
+        let host = &host;
         let owned;
         let f32_t = if host.dtype() == DType::F32 {
             host
@@ -232,10 +244,9 @@ fn read_output_projections(model: &TransformerModel) -> Result<(Vec<Vec<f32>>, u
         // the first, which looks like a result.
         anyhow::ensure!(
             v.iter().any(|x| *x != 0.0),
-            "output projection for layer {l} reads as all zeros ({:?}, gpu-visible {}) — the weight \
-             could not be reached, so any score built from it would be meaningless",
-            wo.dtype(),
-            wo.buffer().is_gpu_buffer()
+            "output projection for layer {l} reads as all zeros ({:?}) — the weight could not be \
+             reached, so any score built from it would be meaningless",
+            wo.dtype()
         );
         out.push(v);
     }
@@ -297,7 +308,7 @@ pub fn run_aperturb_dump(
     // and building them lazily would charge the whole cost to whichever question happened to be
     // first and report it as that question's measurement.
     let t0 = std::time::Instant::now();
-    let (wo, d_out, d_in) = read_output_projections(model)?;
+    let (wo, d_out, d_in) = read_output_projections(model, backend)?;
     anyhow::ensure!(
         d_in == q_dim,
         "the output projection takes {d_in} inputs but the query rows are {q_dim} wide"
