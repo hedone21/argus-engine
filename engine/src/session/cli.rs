@@ -1222,6 +1222,14 @@ pub struct Args {
     #[arg(long)]
     pub answer_attention_steps_predict_row: bool,
 
+    /// `--dump aperturb`: also write, per question, the exact `(query rows, K, V)` the metric
+    /// measured, as one little-endian f32 file per question in this directory. Large (the whole
+    /// resident cache), and the only way to tell "the metric disagrees" from "the forward produced
+    /// different tensors" when checking against an external implementation. No effect unless
+    /// `aperturb` is requested.
+    #[arg(long)]
+    pub aperturb_tensor_dir: Option<std::path::PathBuf>,
+
     /// eval-LL KV eviction timing (when eviction fires and which importance drives
     /// it). `post_prefill_probe` (default) = today's behavior: full prefill, a
     /// post-question probe, one eviction — the importance is query-informed.

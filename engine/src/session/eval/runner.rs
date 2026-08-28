@@ -107,6 +107,26 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         )?;
     }
 
+    // ── Output-perturbation candidate scoring (read-only; INV-147) ────────
+    // Standalone pass on its own uncompressed cache: prefill, then score the candidate pool at the
+    // decision point immediately after it. Decoupled from scoring → NLL/MC byte-identical.
+    if args.dump_enabled(crate::session::eval::dump::DUMP_APERTURB) {
+        let out_path = args
+            .dump_path(crate::session::eval::dump::DUMP_APERTURB)
+            .ok_or_else(|| anyhow::anyhow!("--dump <kind> requires --dump-dir"))?;
+        crate::session::eval::run_aperturb_dump(
+            &model,
+            &tokenizer,
+            &backend,
+            memory.clone(),
+            &questions,
+            max_seq_len,
+            vocab_size,
+            &out_path,
+            args.aperturb_tensor_dir.as_deref(),
+        )?;
+    }
+
     // ── QCF-dump prelude: --eval-ll + --qcf-dump + --force-swap-ratio ────
     // When all three flags are active we run warmup prefill → ImportanceTable
     // → WeightSwapDecider → SwapExecutor before the eval loop.  This mirrors

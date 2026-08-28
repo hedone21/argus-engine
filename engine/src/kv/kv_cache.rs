@@ -63,7 +63,14 @@ pub struct KVCache {
 /// W-DEVKV helper: copy a (possibly device-only) tensor's bytes to a fresh host-backed Tensor of
 /// identical shape/dtype via `read_buffer` (INV-191 device→host). CpuBackend wrapper → `as_slice`
 /// (used by `dequantize_*`/gather) reads the host bytes directly.
-fn read_device_tensor_to_host(t: &Tensor) -> Result<Tensor> {
+///
+/// Also used for MODEL WEIGHTS, not just KV: the mechanism is the same device→host readback, and a
+/// weight mirrored once is far cheaper than a per-step KV mirror.
+///
+/// ⚠ Only for a tensor with NO host pointer. `Buffer::is_gpu_buffer` is not that test — it answers
+/// "is this reachable from the GPU", and a zero-copy buffer is reachable from both. Routing a
+/// host-mapped buffer through here has been observed to return all zeros.
+pub(crate) fn read_device_tensor_to_host(t: &Tensor) -> Result<Tensor> {
     use crate::backend::cpu::CpuBackend;
     use crate::memory::host::shared::SharedBuffer;
     let bytes = t.size();

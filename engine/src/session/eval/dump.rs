@@ -33,12 +33,17 @@ pub const DUMP_ANSWER_ATTENTION_STEPS: &str = "answer_attention_steps";
 /// IMP-1 — compression-time per-(token × layer × KV-head) importance (technique-side).
 pub const DUMP_EVICT_IMPORTANCE: &str = "evict_importance";
 
+/// Output-perturbation candidate scoring — how far each compression candidate would move the
+/// model's own attention output, at the decision point right after prefill.
+pub const DUMP_APERTURB: &str = "aperturb";
+
 /// Dump kinds this build knows how to produce. Validated at runtime (NOT a clap
 /// closed value-set) so registering a new kind never touches the CLI surface.
 pub const KNOWN_DUMP_KINDS: &[&str] = &[
     DUMP_ANSWER_ATTENTION,
     DUMP_ANSWER_ATTENTION_STEPS,
     DUMP_EVICT_IMPORTANCE,
+    DUMP_APERTURB,
 ];
 
 /// True if `kind` is a dump this build can produce.

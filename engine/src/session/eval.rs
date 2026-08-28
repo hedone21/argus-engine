@@ -9,6 +9,7 @@
 
 pub mod answer_attention_dump;
 pub mod answer_attention_steps_dump;
+pub mod aperturb_dump;
 pub mod args;
 pub mod dump;
 pub mod eval_loop;
@@ -24,6 +25,7 @@ pub mod runner;
 
 pub use answer_attention_dump::run_answer_attention_dump;
 pub use answer_attention_steps_dump::run_answer_attention_steps_dump;
+pub use aperturb_dump::run_aperturb_dump;
 pub use args::EvalLlRunCtx;
 pub use eval_loop::run_eval_ll_generic;
 pub use evict_timing::EvictTiming;
