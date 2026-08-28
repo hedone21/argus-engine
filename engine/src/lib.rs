@@ -5,6 +5,7 @@ compile_error!("Features 'opencl' and 'cuda-embedded' are mutually exclusive. En
 
 pub mod action_diag_helper;
 pub mod action_result;
+pub mod aperturb;
 pub mod auf;
 pub mod backend;
 pub mod buffer;
