@@ -342,6 +342,20 @@ pub fn run_aperturb_dump(
         KVLayout::SeqMajor,
     )?;
 
+    // The metric is defined on an uncompressed F32 cache, so this pass allocates one — and the
+    // OpenCL F32 KV path is measurably unsound. `argus-eval --kv-type f32 -b opencl`, with no part
+    // of this feature involved and on a binary that predates it, returns a different NLL on every
+    // run for the same prompt (up to 1e-2 relative) and drifts from the CPU answer by up to 40%,
+    // while the same run at the default F16 is bit-identical across runs. Scored here that came out
+    // as ~3% wrong candidate scores that still looked like a result. A measurement that cannot be
+    // trusted is worse than no measurement, so refuse rather than emit one.
+    anyhow::ensure!(
+        !backend.is_gpu(),
+        "--dump aperturb needs an uncompressed F32 KV cache, and the GPU F32 cache path is not \
+         sound: `--kv-type f32 -b opencl` is nondeterministic run to run and diverges from the CPU \
+         result. Run this dump with `-b cpu`."
+    );
+
     let mut writer = JsonlDumpWriter::create(out_path)?;
     let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
     let cfg = Config {
