@@ -86,6 +86,10 @@ name = "test_cuda_quant_attn_device"
 path = "src/bin/test_cuda_quant_attn_device.rs"
 required-features = ["cuda"]
 
+[[bin]]
+name = "test_aperturb_wo_factors"
+path = "src/bin/test_aperturb_wo_factors.rs"
+
 [dependencies]
 # Shared IPC protocol types (manager <-> engine). Separate repo.
 argus-shared = { git = "https://github.com/hedone21/argus-shared.git", branch = "main" }
