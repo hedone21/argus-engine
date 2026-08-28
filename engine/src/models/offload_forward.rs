@@ -296,6 +296,8 @@ impl TransformerModel {
                     // Head-masking (spec §4): out of scope for the offload format — always None.
                     head_mask: None,
                     duo_heads: None,
+                    // The query-row capture likewise does not span offloaded layers.
+                    q_rows: None,
                 })?;
             } else {
                 // prefill(seq_len>1) 또는 **발산 A**(seq_len==1 + workspace=None). 후자는 BOS-only
@@ -343,6 +345,7 @@ impl TransformerModel {
                         // Head-masking (spec §4): out of scope for the offload format — always None.
                         head_mask: None,
                         duo_heads: None,
+                        q_rows: None,
                     },
                 )?;
             }

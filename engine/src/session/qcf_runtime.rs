@@ -273,6 +273,7 @@ pub fn run_qcf_warmup_workflow(
                 prefill_attn_per_row: None,
                 head_mask: None,
                 duo_heads: None,
+                q_rows: None,
             })
         })?;
         backend.synchronize()?;
@@ -368,6 +369,7 @@ pub fn run_qcf_warmup_workflow(
                         prefill_attn_per_row: None,
                         head_mask: None,
                         duo_heads: None,
+                        q_rows: None,
                     })
                 })?;
                 backend.synchronize()?;

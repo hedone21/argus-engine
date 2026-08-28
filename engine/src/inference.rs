@@ -4,6 +4,7 @@
 pub mod attention_scores;
 pub mod duo_heads;
 pub mod head_mask;
+pub mod q_rows;
 pub mod query_stats;
 pub mod sampling;
 pub mod signal_runtime;

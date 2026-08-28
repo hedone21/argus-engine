@@ -35,6 +35,7 @@ use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::duo_heads::DuoHeads;
 use crate::inference::head_mask::HeadMask;
+use crate::inference::q_rows::QRowCapture;
 use crate::inference::query_stats::QueryStatsAccumulator;
 use crate::inference::sampling::StepCtx;
 use crate::inference::signal_runtime::SignalRuntime;
@@ -118,6 +119,13 @@ pub struct ModelForward {
     // (production / every other assembly) → forward arg `None` → per-layer `is_some` gate skips it
     // (byte-identical). Mirrors the `head_mask` threading idiom.
     duo_heads: Option<DuoHeads>,
+
+    // Trailing post-RoPE query-row capture for the output-perturbation metric. Shared with
+    // whoever consumes it (the metric drains the same `Arc` at its decision point), so it is a
+    // cell rather than a plain field — the `score_cell` idiom. `None` inside (production /
+    // every other assembly) → forward arg `None` → per-layer `is_some` gate skips it
+    // (byte-identical).
+    q_rows: Arc<Mutex<Option<QRowCapture>>>,
 
     decode_workspace: LayerWorkspace,
     // Phase 4-4.5: paradigm equivalence requires `prefill_workspace: None`
@@ -221,6 +229,7 @@ impl ModelForward {
             seed_prefill_scores: false,
             head_mask: None,
             duo_heads: None,
+            q_rows: Arc::new(Mutex::new(None)),
             decode_workspace,
             prefill_workspace: None,
             max_seq_len,
@@ -281,6 +290,15 @@ impl ModelForward {
     /// `duo_heads = None` → `prefill`/`step` lend `None` → byte-identical. Mirrors [`Self::set_head_mask`].
     pub fn set_duo_heads(&mut self, duo: DuoHeads) {
         self.duo_heads = Some(duo);
+    }
+
+    /// Arm the trailing query-row capture, sharing the cell with the metric that drains it.
+    ///
+    /// Only an assembly that scores compression candidates calls this; every other path leaves
+    /// the cell empty, so both forks lend `None` and the forward is byte-identical. Mirrors
+    /// [`Self::set_prefill_attn`], which likewise shares an `Arc` with its consumer.
+    pub fn set_q_rows(&mut self, cell: Arc<Mutex<Option<QRowCapture>>>) {
+        self.q_rows = cell;
     }
 
     /// R-P1-1: prefill-end PFA producer 무장(`set_read_stage` 미러). assembly 가 PrefillKeepSetStage 와
@@ -589,6 +607,7 @@ impl Forward for ModelForward {
             } else {
                 None
             };
+            let mut q_guard = self.q_rows.lock().unwrap_or_else(|e| e.into_inner());
             self.model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &input_tensor,
                 start_pos: start_pos + chunk_start,
@@ -616,6 +635,7 @@ impl Forward for ModelForward {
                 // the masked heads' attention-output slices; None (production) = byte-identical.
                 head_mask: self.head_mask.as_ref(),
                 duo_heads: self.duo_heads.as_ref(),
+                q_rows: q_guard.as_mut(),
             })?;
             // R-P1-1: forward 산출된 PFA buffer 를 공유 cell 에 적재(stage 가 PrefillEnd 에서 read).
             if let Some(buf) = pfa_buf {
@@ -689,6 +709,15 @@ impl Forward for ModelForward {
         // plan path → bypass the plan when armed (same reason as head-masking).
         #[cfg_attr(not(feature = "opencl"), allow(unused_variables))]
         let duo_heads_active = self.duo_heads.is_some();
+        // The query-row capture lives in the `forward_into` layer loop; the fused plan path
+        // bypasses that loop entirely and overwrites `ws.q` layer to layer, so a plan step would
+        // capture nothing at all. Bypass it when armed — the same reason as head-masking.
+        #[cfg_attr(not(feature = "opencl"), allow(unused_variables))]
+        let q_rows_active = self
+            .q_rows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
 
         // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan.
         // hook 설치 중 또는 score accumulator active 또는 read stage active 이면 우회.
@@ -698,6 +727,7 @@ impl Forward for ModelForward {
             && !read_stage_active
             && !head_mask_active
             && !duo_heads_active
+            && !q_rows_active
         {
             if self.gpu_plan.is_none() && !self.sticky_disabled {
                 self.gpu_plan = self.try_build_plan();
@@ -776,6 +806,9 @@ impl Forward for ModelForward {
             .as_mut()
             .filter(|a| a.is_active());
 
+        // The ring is written per layer during the forward; the metric drains the same
+        // cell later, at its own decision point.
+        let mut q_guard = self.q_rows.lock().unwrap_or_else(|e| e.into_inner());
         self.model.forward_into(TransformerModelForwardArgs {
             input_tokens: &self.decode_input,
             start_pos: ctx.pos,
@@ -811,6 +844,7 @@ impl Forward for ModelForward {
             // DuoAttention streaming: lend the resolved classification (if any) so decode windows the
             // streaming heads; None (production) = byte-identical.
             duo_heads: self.duo_heads.as_ref(),
+            q_rows: q_guard.as_mut(),
         })?;
         drop(score_guard); // guard 명시 해제 (end_step 이미 완료)
         self.read_logits(&self.logits_decode)

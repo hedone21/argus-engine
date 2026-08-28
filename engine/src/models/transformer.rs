@@ -365,6 +365,11 @@ pub struct TransformerModelForwardArgs<'a> {
     /// argus-cli); every other `forward_into` caller passes `None` (byte-identical). See
     /// [`crate::inference::duo_heads`].
     pub duo_heads: Option<&'a crate::inference::duo_heads::DuoHeads>,
+    /// Trailing post-RoPE query-row capture for the output-perturbation metric. `Some` → every
+    /// layer copies this chunk's or step's trailing rows into the ring, in BOTH prefill and decode.
+    /// Wired only where a consumer of that metric is armed; every other caller passes `None`
+    /// (byte-identical). See [`crate::inference::q_rows`].
+    pub q_rows: Option<&'a mut crate::inference::q_rows::QRowCapture>,
 }
 
 impl TransformerModel {
@@ -1506,6 +1511,7 @@ impl TransformerModel {
         // byte-identical). Threaded into all fork call sites so streaming heads are windowed across
         // prefill + decode.
         let duo_heads = args.duo_heads;
+        let mut q_rows = args.q_rows;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -1673,6 +1679,7 @@ impl TransformerModel {
                         layer_idx: i,
                         head_mask,
                         duo_heads,
+                        q_rows: q_rows.as_deref_mut(),
                     },
                 )?;
             } else if is_decode {
@@ -1720,6 +1727,7 @@ impl TransformerModel {
                     read_routing,
                     head_mask,
                     duo_heads,
+                    q_rows: q_rows.as_deref_mut(),
                 })?;
             } else {
                 let pws = owned_prefill_ws
@@ -1759,6 +1767,7 @@ impl TransformerModel {
                         layer_idx: i,
                         head_mask,
                         duo_heads,
+                        q_rows: q_rows.as_deref_mut(),
                     },
                 )?;
             }

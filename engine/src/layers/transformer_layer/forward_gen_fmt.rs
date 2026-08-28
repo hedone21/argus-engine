@@ -90,11 +90,17 @@ pub(crate) struct ForwardGenFmtArgs<'a> {
     /// sink∪recent Λ-window after `attention_into` and before `wo`. `None` (production) =
     /// byte-identical (one `is_some` branch per layer). See [`crate::inference::duo_heads`].
     pub duo_heads: Option<&'a DuoHeads>,
+    /// Trailing post-RoPE query-row capture for the output-perturbation metric. `Some` → this
+    /// layer's rows are copied into the ring immediately after RoPE, before the KV write. `None`
+    /// (production) = byte-identical (one `is_some` branch per layer).
+    /// See [`crate::inference::q_rows`].
+    pub q_rows: Option<&'a mut crate::inference::q_rows::QRowCapture>,
 }
 
 impl TransformerLayer {
     /// `forward_gen` 의 trait-object fork (decode, seq_len=1). KV write + attention 만 fmt 위임.
     pub(crate) fn forward_gen_fmt(&self, args: ForwardGenFmtArgs) -> Result<()> {
+        let mut args = args;
         // layer-skip: 두 sub-layer 모두 skip 이면 identity (forward_gen.rs:26 동치).
         if args.skip_attn && args.skip_mlp {
             return Ok(());
@@ -114,6 +120,7 @@ impl TransformerLayer {
         let layer_idx = args.layer_idx;
         let head_mask = args.head_mask;
         let duo_heads = args.duo_heads;
+        let mut q_rows = args.q_rows.take();
         let batch_size = x.shape().dims()[0];
         let is_gpu = backend.is_gpu();
 
@@ -177,6 +184,20 @@ impl TransformerLayer {
         );
         backend.rope_inplace(&mut q_rope, start_pos, rope_theta, rope_freq_scaling)?;
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta, rope_freq_scaling)?;
+
+        // 3.4 Output-perturbation query-row capture — one device-side copy of this step's rotated
+        // query row into the trailing-R ring, before the KV write and before anything can overwrite
+        // `ws.q`. `None` (production) = byte-identical. See [`crate::inference::q_rows`].
+        if let Some(cap) = q_rows.as_mut() {
+            cap.capture(
+                layer_idx,
+                &q_rope,
+                backend.as_ref(),
+                start_pos,
+                1,
+                n_heads_q * head_dim,
+            )?;
+        }
 
         // 3.5 faithful read-plan seam (Quest 정본 current-Q). KV write *이전*에 산출 → read_plan 이 보는
         // 캐시 뷰(current_pos=P, 현재 토큰 미반영)와 검증 상한이 기존 seam(transformer.rs:1650)과 동일.

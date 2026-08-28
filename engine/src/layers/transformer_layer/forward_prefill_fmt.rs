@@ -74,11 +74,17 @@ pub(crate) struct ForwardPrefillFmtArgs<'a> {
     /// Λ-window for EVERY prefill step after `attention_into` and before `wo`. `None` (production) =
     /// byte-identical. See [`crate::inference::duo_heads`].
     pub duo_heads: Option<&'a DuoHeads>,
+    /// Trailing post-RoPE query-row capture for the output-perturbation metric. `Some` → this
+    /// layer's rows are copied into the ring immediately after RoPE, before the KV write. `None`
+    /// (production) = byte-identical (one `is_some` branch per layer).
+    /// See [`crate::inference::q_rows`].
+    pub q_rows: Option<&'a mut crate::inference::q_rows::QRowCapture>,
 }
 
 impl TransformerLayer {
     /// `forward_prefill` 의 trait-object fork (prefill, seq_len>1). KV write + attention 만 fmt 위임.
     pub(crate) fn forward_prefill_fmt(&self, args: ForwardPrefillFmtArgs) -> Result<()> {
+        let mut args = args;
         // layer-skip: 두 sub-layer 모두 skip 이면 identity (forward_gen_fmt:59 동치).
         if args.skip_attn && args.skip_mlp {
             return Ok(());
@@ -164,6 +170,21 @@ impl TransformerLayer {
         );
         backend.rope_inplace(&mut q_rope, start_pos, rope_theta, rope_freq_scaling)?;
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta, rope_freq_scaling)?;
+
+        // 3.4 Output-perturbation query-row capture — the trailing rows of THIS chunk go into the
+        // ring, keyed by absolute position, so a window that straddles a chunk boundary reassembles
+        // itself without the caller knowing the chunk size. `None` (production) = byte-identical.
+        // See [`crate::inference::q_rows`].
+        if let Some(cap) = args.q_rows.as_deref_mut() {
+            cap.capture(
+                args.layer_idx,
+                &q_rope,
+                backend.as_ref(),
+                start_pos,
+                seq_len,
+                n_heads_q * head_dim,
+            )?;
+        }
 
         // 4. KV cache update (multi-token) → fmt.write_kv_batch (C3).
         fmt.write_kv_batch(&k_rope, &ws.v, backend.as_ref())?;

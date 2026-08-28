@@ -396,6 +396,7 @@ pub fn run_quant_window_ppl(
                 prefill_attn_per_row: None,
                 head_mask: None,
                 duo_heads: None,
+                q_rows: None,
             })
         })?;
 
@@ -485,6 +486,7 @@ pub fn run_quant_window_ppl(
                 prefill_attn_per_row: None,
                 head_mask: None,
                 duo_heads: None,
+                q_rows: None,
             })
         })?;
 
@@ -833,6 +835,7 @@ pub fn run_ppl(
                 prefill_attn_per_row: None,
                 head_mask: None,
                 duo_heads: None,
+                q_rows: None,
             })
         })?;
 
@@ -1002,6 +1005,7 @@ pub fn run_ppl(
                 prefill_attn_per_row: None,
                 head_mask: None,
                 duo_heads: None,
+                q_rows: None,
             })
         })?;
 

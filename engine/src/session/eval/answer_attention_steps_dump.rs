@@ -489,6 +489,7 @@ pub fn run_answer_attention_steps_dump(
                 prefill_attn_per_row: Some((&mut per_row_buf, cap, per_head)),
                 head_mask: None,
                 duo_heads: None,
+                q_rows: None,
             })
         })?;
 
