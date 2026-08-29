@@ -121,11 +121,18 @@ __kernel void flash_attn_f16(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        if (my_query_row >= n_q) {
-            continue;
-        }
+        // Idle lanes must not `continue` out of the tile loop: that walks them straight into the
+        // NEXT iteration's l_k/l_v stores while the active lanes are still reading the CURRENT
+        // tile — a write-after-read race on local memory. It hides wherever a work-group is one
+        // wave (Adreno, WG_SIZE == BLOCK_M == 64: every lane advances in lockstep) and bites where
+        // a work-group spans several. On an RTX 3090 Ti a work-group is two 32-lane warps, so
+        // whenever `n_q % BLOCK_M` falls in [1, BLOCK_M/2] the whole upper warp goes idle and runs
+        // ahead: measured as a 4e-2 run-to-run swing in eval NLL, on exactly those prompt lengths
+        // and no others. Skipping the work with a guard instead keeps every lane on the same
+        // barriers, which the trailing barrier below then relies on.
+        const int q_row_active = (my_query_row < n_q);
 
-        for (int j = 0; j < BLOCK_N; j += 2) {
+        for (int j = 0; q_row_active && j < BLOCK_N; j += 2) {
             const int k_row0 = k_start + j;
             const int k_row1 = k_start + j + 1;
 
@@ -170,6 +177,10 @@ __kernel void flash_attn_f16(
             l_i = l_i * scale_prev + p0 + p1;
             m_i = m_new;
         }
+
+        // Every lane has finished reading l_k/l_v for this tile; only now may the next
+        // iteration overwrite it.
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     if (my_query_row < n_q) {
