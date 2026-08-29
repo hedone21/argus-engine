@@ -438,6 +438,7 @@ pub fn run_aperturb_dump(
             })
         })?;
 
+        let t_read = std::time::Instant::now();
         let q_snap = capture.snapshot(n)?;
         let mut snap = Snapshot {
             q: Vec::with_capacity(n_layers),
@@ -450,6 +451,7 @@ pub fn run_aperturb_dump(
             snap.k.push(k);
             snap.v.push(v);
         }
+        let read_s = t_read.elapsed().as_secs_f64();
 
         let g = Geom {
             n_layers,
@@ -466,6 +468,25 @@ pub fn run_aperturb_dump(
         let pool = build_pool(n_layers, n_kv_heads, n);
         let dec = aperturb::decide(&snap, &basis, &pool, g, &cfg)
             .map_err(|e| anyhow::anyhow!("{}: {e}", question.id))?;
+
+        // The cost line. `decide` is the algorithm; `read` is what it costs to put the cache
+        // where the algorithm can reach it, which is free on CPU and a device round trip plus a
+        // dequantize everywhere else. They are reported apart because only the first is what the
+        // closed-form cost model predicts.
+        let t = dec.times;
+        eprintln!(
+            "[dump:aperturb] {} n={n} rows={} |C|={} decide={:.3}s (logits {:.3} keypos {:.3} \
+             attend {:.3} project {:.3} readout {:.3}) read={read_s:.3}s",
+            question.id,
+            q_snap.rows,
+            pool.len(),
+            t.total_s(),
+            t.logits_s,
+            t.keypos_s,
+            t.attend_s,
+            t.project_s,
+            t.readout_s,
+        );
 
         let arms = dec
             .scored

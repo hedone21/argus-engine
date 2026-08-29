@@ -63,6 +63,7 @@ pub mod subspace;
 mod tests;
 
 use std::fmt;
+use std::time::Instant;
 
 pub use keep::{KeepError, KeepSets, KeyPos};
 pub use kernel::{Geom, KernelError};
@@ -283,12 +284,41 @@ pub struct Scored {
     pub cells: Option<CellGrid>,
 }
 
+/// Wall-clock split of one decision.
+///
+/// The closed-form cost model charges a decision one attention pass and one projection per
+/// `(candidate, layer)`. These buckets are what it takes to check that against a clock: `logits_s`
+/// and `attend_s` are the two halves of the attention term — split because only the second is paid
+/// per candidate — and `keypos_s` is the per-candidate bookkeeping the model does not charge at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PhaseTimes {
+    /// Shared `Q K^T` over the whole resident cache. Once per layer, **not** once per candidate.
+    pub logits_s: f64,
+    /// Per-head admitted-prefix bookkeeping, once per `(candidate, layer)` plus the baseline.
+    pub keypos_s: f64,
+    /// Softmax over the admitted columns and the `V` contraction. Baseline and every candidate.
+    pub attend_s: f64,
+    /// The rank-`r` projection, same coverage as `attend_s`.
+    pub project_s: f64,
+    /// Per-cell relative change, plus the closing RMS aggregate.
+    pub readout_s: f64,
+}
+
+impl PhaseTimes {
+    /// Everything [`decide`] spent, in seconds.
+    pub fn total_s(&self) -> f64 {
+        self.logits_s + self.keypos_s + self.attend_s + self.project_s + self.readout_s
+    }
+}
+
 /// What one decision produced.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Decision {
     pub scored: Vec<Scored>,
     /// Index into `scored` of the smallest score under [`Config::readout`].
     pub winner: usize,
+    /// Where the time went. Carried on every decision; reading it is the caller's business.
+    pub times: PhaseTimes,
 }
 
 impl Decision {
@@ -410,25 +440,43 @@ pub fn decide(
     let mut w_base = vec![0.0f32; g.rows * r];
     let mut w_cand = vec![0.0f32; g.rows * r];
 
+    let mut times = PhaseTimes::default();
     for l in 0..g.n_layers {
         let (q, k, v) = (src.query_rows(l), src.keys(l), src.values(l));
+        let t = Instant::now();
         kernel::logits_into(q, k, &mut z, g)?;
+        times.logits_s += t.elapsed().as_secs_f64();
 
         // The reference: the same operator over the untouched cache, so common-mode rounding
         // cancels and an identity candidate lands on exactly zero.
+        let t = Instant::now();
         let kp_base = KeyPos::for_layer(&identity, l, g.current_pos, g.rows);
+        times.keypos_s += t.elapsed().as_secs_f64();
+        let t = Instant::now();
         kernel::attend_into(&z, &identity, l, &kp_base, v, &mut x, g)?;
+        times.attend_s += t.elapsed().as_secs_f64();
+        let t = Instant::now();
         kernel::project_into(&x, basis.layer(l), &mut w_base, g.rows, d, r);
+        times.project_s += t.elapsed().as_secs_f64();
 
         for (c, (_, keep)) in pool.iter().enumerate() {
+            let t = Instant::now();
             let kp = KeyPos::for_layer(keep, l, g.current_pos, g.rows);
+            times.keypos_s += t.elapsed().as_secs_f64();
             visible[c] &= kp.visible_rows();
+            let t = Instant::now();
             kernel::attend_into(&z, keep, l, &kp, v, &mut x, g)?;
+            times.attend_s += t.elapsed().as_secs_f64();
+            let t = Instant::now();
             kernel::project_into(&x, basis.layer(l), &mut w_cand, g.rows, d, r);
+            times.project_s += t.elapsed().as_secs_f64();
+            let t = Instant::now();
             grids[c].fill_layer(l, &w_base, &w_cand, r)?;
+            times.readout_s += t.elapsed().as_secs_f64();
         }
     }
 
+    let t_agg = Instant::now();
     let mut scored = Vec::with_capacity(n_c);
     for (c, (name, keep)) in pool.iter().enumerate() {
         let s = grids[c].aggregate(visible[c])?;
@@ -450,5 +498,10 @@ pub fn decide(
             best
         }
     });
-    Ok(Decision { scored, winner })
+    times.readout_s += t_agg.elapsed().as_secs_f64();
+    Ok(Decision {
+        scored,
+        winner,
+        times,
+    })
 }
