@@ -111,7 +111,11 @@ kernel void kernel_rope_simple(
     int num_heads,
     int seq_len,
     int start_pos,
-    float theta
+    float theta,
+    float rs_factor,
+    float rs_low,
+    float rs_high,
+    float rs_orig
 ) {
     int gid = get_global_id(0);
 
@@ -127,6 +131,22 @@ kernel void kernel_rope_simple(
     int pos = start_pos + seq_idx;
 
     float freq = 1.0f / pow(theta, (float)(pair_idx * 2) / (float)head_dim);
+    // llama3 `rope_scaling` — mirrors `crate::rope::RopeFreqScaling::scale_freq`. rs_factor == 1
+    // is the exact identity, so models without rope_scaling behave exactly as before.
+    if (rs_factor != 1.0f) {
+        float wavelen = 6.28318530717958647692f / freq;
+        float low_wl  = rs_orig / rs_low;
+        float high_wl = rs_orig / rs_high;
+        if (wavelen > low_wl) {
+            freq /= rs_factor;
+        } else if (wavelen >= high_wl) {
+            float span = rs_high - rs_low;
+            if (span != 0.0f) {
+                float smooth = (rs_orig / wavelen - rs_low) / span;
+                freq = (1.0f - smooth) * freq / rs_factor + smooth * freq;
+            }
+        }
+    }
     float angle = (float)pos * freq;
 
     float cos_val = cos(angle);
@@ -143,18 +163,21 @@ kernel void kernel_rope_simple(
     x[i1] = x0 * sin_val + x1 * cos_val;
 }
 
-// Vectorized float4 versions — must match dispatch which passes size4 = size/4
+// Scalar, like the primary: `Backend::scale` passes the element count and launches that many
+// work-items (opencl.rs `fn scale`). The float4 form this file used to carry read `size` as a
+// float4 count and wrote 4x past the end of the buffer.
 kernel void kernel_scale_simple(
-    global float4 * x,
+    global float * x,
     float scale,
-    int size4
+    int size
 ) {
     int i = get_global_id(0);
-    if (i < size4) {
+    if (i < size) {
         x[i] *= scale;
     }
 }
 
+// Vectorized float4 version — must match dispatch which passes size4 = size/4
 kernel void kernel_add_assign_simple(
     global float4 * x,
     global float4 * y,
