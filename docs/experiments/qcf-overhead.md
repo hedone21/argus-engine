@@ -46,6 +46,11 @@ trailing rows, truncation rank `r`, and a pool of `|C|` candidates, the paper gi
 and states four properties: linear in `R`, linear in `S`, independent of vocabulary size and FFN
 width, with hyperparameters `R = 16` and `r = d/128`.
 
+> **The rank has since moved to `r = d/256`.** Everything measured here was run at `d/128`, which is
+> what the tables below report; the engine's `APERTURB_WO_FRAC` now says `1/256`. Only the
+> projection term scales with `r`, and §6.1 measures it flat and negligible either way, so the shape
+> results are unaffected. What halves is the one-time factorization (§9).
+
 The same section argues that the `W_o` matmul is `O(R d²)` — a fixed cost independent of cache
 length, which therefore exceeds the `O(R S d)` attention term at short context — and that a rank-`r`
 truncated SVD lowers it to `O(R d r)`, the factors being computed once per model online and stored,
@@ -117,7 +122,8 @@ so F32 KV scores moved between runs of the same binary.
 | `llama3.2-1b` | 16 | 32 | 8 | 64 | 2048 | 16 |
 | `llama3.1-8b` | 32 | 32 | 8 | 128 | 4096 | 32 |
 
-`r = d/128` in both cases, as the paper specifies, and the dump records it (`wo_rank`).
+`r = d/128` in both cases — the value in force when these runs were taken — and the dump records
+it (`wo_rank`). The canonical fraction is now `d/256`; see the note in §2.
 
 ### 4.4 Candidate pool
 
@@ -184,6 +190,23 @@ let aperturb_rows: usize = std::env::var("ARGUS_APERTURB_ROWS")
 
 used in place of `APERTURB_ROWS` at the `QRowCapture::new` call and the short-prompt skip. `decide`
 already accepts any `rows` in `1..=32`.
+
+### 5.3 The stored basis (§9.1)
+
+```bash
+# factor once, write the table
+argus-eval --model-path models/llama3.2-1b -b cpu --kv-type f32 --max-seq-len 4096 \
+  --eval-ll --eval-batch batch.json --dump aperturb --dump-dir out_compute/ \
+  --aperturb-basis-out wo_1b.basis
+
+# every run after that
+argus-eval ... --dump-dir out_load/ --aperturb-basis wo_1b.basis
+
+diff out_compute/aperturb.jsonl out_load/aperturb.jsonl   # must be empty
+```
+
+Pointing `--aperturb-basis wo_1b.basis` at `models/llama3.2-1b-instruct` is the negative control:
+same `L`, same `d`, same rank, and it must still be refused.
 
 ---
 
@@ -360,26 +383,45 @@ decision needs to run where the cache already lives.
 
 ---
 
-## 9. The one-time factorization is not stored
+## 9. The one-time factorization, and what it cost before it was stored
 
 The paper says the rank-`r` factors are computed once per model, online, and the values stored, so
 that no offline step is needed and no overhead is incurred after the first run.
 
-The first half is implemented. The second is not. `OutputBasis::from_factors` — the entry point that
-would load stored factors — has no caller outside the test suite, and there is no on-disk cache, so
-`OutputBasis::from_weights` runs at every process start:
+At the time of these measurements only the first half was implemented. There was no on-disk form and
+no caller of a load path, so `OutputBasis::from_weights` ran at every process start:
 
 | model | factorization |
 |---|---:|
 | `llama3.2-1b` (rank 16 of 2048, 16 layers) | 28.4 s, 29.0 s, 28.9 s over three runs |
 | `llama3.1-8b` (rank 32 of 4096, 32 layers) | **717.5 s** |
 
-Twelve minutes is not a rounding error against decisions that cost about a second. As shipped, "once
-per model" is really "once per process", and the claim that no overhead is incurred after the first
-run does not hold for this code. Persisting the factors keyed on the checkpoint would close it; the
-load path already exists.
+Twelve minutes is not a rounding error against decisions that cost about a second. As measured,
+"once per model" was really "once per process".
 
----
+### 9.1 Closed since
+
+`aperturb::basis_file` gives the table an on-disk form and two flags carry it:
+`--aperturb-basis-out <file>` factors and writes, `--aperturb-basis <file>` loads. Measured on
+`llama3.2-1b` at the current `r = d/256` (rank 8), same host, CPU backend:
+
+| | wall |
+|---|---:|
+| factor (`--aperturb-basis-out`) | 10.6 s |
+| load (`--aperturb-basis`) | **0.2 s** |
+
+The two runs' `aperturb.jsonl` are byte-identical, so the load changes the cost and nothing else.
+The file is 1 048 624 bytes for this model (48-byte header + `16 × 2048 × 8` f32) and 8 MiB for an
+8B model; both are small enough to ship with an application.
+
+The load path is deliberately load-only — a missing file or a header that disagrees is an error, not
+a fall back to factoring — because the deployment target is Android, where the numbers above become
+minutes to hours and a silent recompute would look like a hang. What the header carries is a digest
+of the output projections themselves, not just the shapes: a basis built from `llama3.2-1b` offered
+to `llama3.2-1b-instruct` has every dimension right and is refused on the digest.
+
+The load path still pays one read and dequantize of `W_o`, which is what the digest is computed
+over. That is the whole of what remains: 0.2 s here against the 10.6 s it removes.
 
 ## 10. What this says for the paper
 
@@ -392,7 +434,9 @@ load path already exists.
   decision is memory-bound.
 - Either add a data-movement term or scope the model to a host-resident cache; on GPU it is the
   larger cost below ~10k tokens.
-- Either persist the factors or drop the "no overhead after the first run" claim.
+- The "no overhead after the first run" claim now holds for this code, but only because the
+  factors are stored on disk and reloaded (§9.1); it did not hold for an in-memory-only
+  implementation, and the paper is worth one sentence on which of the two it means.
 
 ---
 
