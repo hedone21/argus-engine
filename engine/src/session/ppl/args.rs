@@ -2,7 +2,6 @@
 //! 살아있는 모든 outer-scope state. 4-A/4-B 패턴과 동일.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use tokenizers::Tokenizer;
 
@@ -13,9 +12,7 @@ use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::KVCache;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::qcf::ImportanceTable;
 use crate::session::cli::Args;
-use crate::weight::decider::SwapDecision;
 
 pub struct PplRunCtx {
     pub args: Args,
@@ -43,13 +40,9 @@ pub struct PplRunCtx {
     pub score_based_eviction: bool,
 
     // QCF prelude state (main()에서 ppl 진입 직전에 계산)
-    pub qcf_warmup_importance: Option<ImportanceTable>,
-    pub qcf_swap_decision: Option<SwapDecision>,
-    pub qcf_workflow_start: Instant,
 
     // 다른 outer state (ppl_main에서 직접 참조)
     pub auto_eviction: bool,
-    pub swap_algorithm: crate::weight::SwapAlgorithm,
 }
 
 /// Return value from `run_ppl` for use by the caller (e.g. `--qcf-dump`).

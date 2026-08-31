@@ -19,7 +19,7 @@ use crate::inference::sampling::{self, SamplingConfig};
 use crate::inference::signal_runtime::SignalRuntime;
 use crate::session::DecodeLoop;
 use crate::session::assembly::{
-    SwapWiringConfig, build_bench_loop, build_bench_quant_window_loop, build_local_pressure_source,
+    build_bench_loop, build_bench_quant_window_loop, build_local_pressure_source,
     build_resilience_cache_manager,
 };
 use crate::session::bin_setup::QuantWindowBenchCtx;
@@ -227,14 +227,6 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         args.eviction_target_ratio(),
         args.protected_prefix(),
         None, // γ-3b: argus-bench 는 schedule 없음 (IPC resilience 만)
-        // AB-6: swap dispatch 설정. `--swap` 미지정 시 Incremental(LISWAP-6 production winner).
-        SwapWiringConfig {
-            default_mode: args
-                .swap
-                .unwrap_or(crate::session::cli::SwapMode::Incremental),
-            phase_chunk_size_bytes: args.swap_phase_aware_chunk_mb * 1024 * 1024,
-            phase_max_chunks_per_token: args.swap_phase_aware_max_chunks_per_token,
-        },
         score_cell,
         // Faithful-H2O (c): arm the prefill seed when eviction == "h2o".
         args.eviction_policy() == "h2o",
@@ -558,14 +550,6 @@ pub fn run_experiment_schedule_path(
         args.eviction_target_ratio(),
         args.protected_prefix(),
         Some(schedule_source),
-        // AB-6: swap dispatch 설정 (schedule 모드도 secondary 보유 시 swap 활성).
-        SwapWiringConfig {
-            default_mode: args
-                .swap
-                .unwrap_or(crate::session::cli::SwapMode::Incremental),
-            phase_chunk_size_bytes: args.swap_phase_aware_chunk_mb * 1024 * 1024,
-            phase_max_chunks_per_token: args.swap_phase_aware_max_chunks_per_token,
-        },
         score_cell,
         // Faithful-H2O (c): arm the prefill seed when eviction == "h2o".
         args.eviction_policy() == "h2o",

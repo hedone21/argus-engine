@@ -24,9 +24,6 @@ use crate::session::cli::Args;
 use crate::session::eval::EvalCacheKind;
 use crate::session::ppl::args::PplResult;
 use crate::session::ppl::args::PplRunCtx;
-use crate::session::qcf_runtime::{
-    dispatch_swap_weights, dump_layer_weights_to_dir, run_layer_swap,
-};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -51,107 +48,15 @@ pub fn run_ppl_dispatch(ctx: PplRunCtx) -> Result<()> {
         head_dim: _head_dim,
         actual_protected_prefix,
         score_based_eviction,
-        qcf_warmup_importance,
-        qcf_swap_decision,
-        qcf_workflow_start,
         auto_eviction,
-        swap_algorithm,
     } = ctx;
 
     let ppl_path = args
         .ppl
         .as_deref()
         .expect("run_ppl_dispatch only called when args.ppl is Some");
-
-    // LISWAP-PPL diagnostic: dump weights immediately after model load
-    // (before any swap), useful for Q4-native baseline comparison.
-    if let Some(ref dump_dir) = args.dump_q4_after_load {
-        dump_layer_weights_to_dir(&model, &backend, dump_dir)?;
-    }
-
-    // LISWAP-PPL Scenario E (warmup-then-measure):
-    //   Pass 1: drive the weight swap to completion with no NLL logging.
-    //   Reset KV caches + score_accumulator so the measurement pass sees a
-    //   fresh cache, then run the measurement pass with the swap trigger
-    //   disabled. The cache reset isolates the "cache mismatch" hypothesis
-    //   from the "weight quantization-path mismatch" hypothesis.
-    if args.ppl_warmup_swap {
-        if args.ppl_swap_at_token.is_none() {
-            anyhow::bail!(
-                "--ppl-warmup-swap requires --ppl-swap-at-token (the warmup pass needs a swap trigger)"
-            );
-        }
-        if model.secondary_mmap.is_none() {
-            anyhow::bail!(
-                "--ppl-warmup-swap requires --secondary-gguf (weights must be available for swap)"
-            );
-        }
-
-        let mut warmup_args = args.clone();
-        // Suppress CSV/JSON outputs on the warmup pass.
-        warmup_args.ppl_nll_csv = None;
-        warmup_args.qcf_dump = None;
-        eprintln!("[PPL-Swap] === Pass 1: warmup (driving swap to completion) ===");
-        let _warmup_dummy = run_ppl(
-            &warmup_args,
-            &model,
-            &tokenizer,
-            &backend,
-            &*memory,
-            &mut kv_caches,
-            &mut cache_manager,
-            &mut score_accumulator,
-            vocab_size,
-            hidden_size,
-            max_seq_len,
-            ppl_path,
-            auto_eviction,
-            score_based_eviction,
-            actual_protected_prefix,
-            skip_config.as_ref(),
-            /* warmup_only */ true,
-        )?;
-
-        // LISWAP-PPL diagnostic: dump weights right after swap completion
-        // (before cache reset), so each layer's GPU buffer can be compared
-        // byte-for-byte against the Q4-native baseline dump.
-        if let Some(ref dump_dir) = args.dump_q4_after_swap {
-            dump_layer_weights_to_dir(&model, &backend, dump_dir)?;
-        }
-
-        // Reset KV cache positions. The underlying tensor buffers stay
-        // allocated; we only rewind the write head + high-water mark so
-        // the next prefill starts from pos 0.
-        for cache in kv_caches.iter_mut() {
-            cache.current_pos = 0;
-            cache.high_water_pos = 0;
-        }
-        if let Some(rt) = score_accumulator.as_mut() {
-            rt.reset_host_only();
-        }
-        eprintln!("[PPL-Swap] === Pass 2: measurement (swap disabled, fresh KV cache) ===");
-    }
-
-    // Measurement pass. When warmup_swap was active, disable further swap
-    // triggers and clear the warmup flag locally so this pass is a pure
-    // teacher-forcing PPL run on the already-swapped weights.
-    // When `--ppl-measure-prefill-tokens` is set, pass 2 uses that prefill
-    // length instead of `--ppl-prefill-tokens` (Scenario F: large prefill
-    // shrinks the decode loop, isolating batch vs single-step path).
-    let mut measure_args_owned;
-    let measure_args: &Args = if args.ppl_warmup_swap {
-        measure_args_owned = args.clone();
-        measure_args_owned.ppl_swap_at_token = None;
-        measure_args_owned.ppl_warmup_swap = false;
-        if let Some(measure_prefill) = args.ppl_measure_prefill_tokens {
-            measure_args_owned.ppl_prefill_tokens = Some(measure_prefill);
-        }
-        &measure_args_owned
-    } else {
-        &args
-    };
-    let ppl_result = run_ppl(
-        measure_args,
+    run_ppl(
+        &args,
         &model,
         &tokenizer,
         &backend,
@@ -167,69 +72,7 @@ pub fn run_ppl_dispatch(ctx: PplRunCtx) -> Result<()> {
         score_based_eviction,
         actual_protected_prefix,
         skip_config.as_ref(),
-        /* warmup_only */ false,
     )?;
-
-    // --qcf-dump: write JSON after PPL measurement completes.
-    if let Some(ref dump_path) = args.qcf_dump {
-        use crate::session::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
-
-        let empty_swap: Vec<usize> = Vec::new();
-        let (swap_set, qcf_predicted, fallback_used) = if let Some(ref dec) = qcf_swap_decision {
-            (
-                dec.selected_layers.as_slice(),
-                dec.qcf_swap_estimate,
-                dec.fallback_used,
-            )
-        } else {
-            (empty_swap.as_slice(), 0.0f32, false)
-        };
-
-        let secondary_path_str = args.secondary_gguf.as_ref().and_then(|p| p.to_str());
-        let model_arch = if args.model_path.to_lowercase().contains("qwen") {
-            "qwen2"
-        } else {
-            "llama"
-        };
-        let total_wall = qcf_workflow_start.elapsed().as_secs_f64() + ppl_result.wall_time_s;
-
-        let ctx = QcfSwapDumpContext {
-            model_arch,
-            model_path: &args.model_path,
-            secondary_path: secondary_path_str,
-            primary_dtype: "F16",
-            secondary_dtype: "Q4_0",
-            num_layers: model.layers.len(),
-            force_swap_ratio: args.force_swap_ratio,
-            swap_algorithm: args.force_swap_ratio.map(|_| swap_algorithm.short_name()),
-            swap_set,
-            qcf_swap_predicted: qcf_predicted,
-            fallback_used,
-            importance_table: qcf_warmup_importance.as_ref(),
-            noise_table: Some(model.quant_noise.as_ref()),
-            ppl: Some(ppl_result.ppl),
-            avg_nll: Some(ppl_result.avg_nll),
-            n_eval_tokens: ppl_result.n_eval_tokens,
-            wall_time_s: total_wall,
-            warmup_tokens: args.qcf_warmup_tokens,
-            backend: &args.backend,
-            kv_type: &args.kv_type,
-            ppl_corpus: Some(ppl_path),
-            eval_ll_output: None,
-            trajectory: None,
-            dpllm_epsilon: None,
-            dpllm_epsilon_multi: None,
-            dpllm_epsilon_abs: None,
-            dpllm_epsilon_qcf: None,
-            direct_attn_f4: None,
-            direct_attn_f5: None,
-            direct_attn_f5_decode_only: None,
-            direct_attn_f5_prefill_decode: None,
-        };
-
-        dump_qcf_swap_json(dump_path, &ctx)?;
-        eprintln!("[QCF-dump] JSON written to {}", dump_path.display());
-    }
 
     Ok(())
 }
@@ -338,8 +181,6 @@ pub fn run_quant_window_ppl(
 
     let mut total_nll: f64 = 0.0;
     let mut nll_count: usize = 0;
-    let mut qcf_metrics: Vec<serde_json::Value> = Vec::new();
-    let mut flush_count: usize = 0;
     let overall_start = std::time::Instant::now();
 
     // ── 4. Prefill phase ──
@@ -388,7 +229,6 @@ pub fn run_quant_window_ppl(
                 score_accumulator: None,
                 query_stats_accumulator: None,
                 skip_config: None,
-                importance_collector: None,
                 cache_self_need_scores,
                 layer_boundary_hook: None,
                 read_stage: None,
@@ -399,21 +239,6 @@ pub fn run_quant_window_ppl(
                 q_rows: None,
             })
         })?;
-
-        // Collect flush QCF metrics from prefill
-        for metric in kv_caches[0].take_flush_proxies() {
-            qcf_metrics.push(serde_json::json!({
-                "flush": flush_count,
-                "action": metric.action,
-                "raw_value": metric.raw_value,
-                "normalized_value": metric.normalized_value,
-                "tokens_quantized": metric.tokens_affected,
-            }));
-            flush_count += 1;
-        }
-        for cache in kv_caches[1..].iter_mut() {
-            cache.take_flush_proxies();
-        }
 
         // Read all prefill logits to CPU
         let mut all_logits = vec![0.0f32; prefill_len * vocab_size];
@@ -478,7 +303,6 @@ pub fn run_quant_window_ppl(
                 score_accumulator: None,
                 query_stats_accumulator: None,
                 skip_config: None,
-                importance_collector: None,
                 cache_self_need_scores,
                 layer_boundary_hook: None,
                 read_stage: None,
@@ -489,21 +313,6 @@ pub fn run_quant_window_ppl(
                 q_rows: None,
             })
         })?;
-
-        // Collect flush QCF from decode step
-        for metric in kv_caches[0].take_flush_proxies() {
-            qcf_metrics.push(serde_json::json!({
-                "flush": flush_count,
-                "action": metric.action,
-                "raw_value": metric.raw_value,
-                "normalized_value": metric.normalized_value,
-                "tokens_quantized": metric.tokens_affected,
-            }));
-            flush_count += 1;
-        }
-        for cache in kv_caches[1..].iter_mut() {
-            cache.take_flush_proxies();
-        }
 
         // Read logits and score target
         unsafe {
@@ -535,58 +344,12 @@ pub fn run_quant_window_ppl(
     let ppl = (total_nll / nll_count as f64).exp();
     let tok_per_sec = nll_count as f64 / wall_time;
 
-    // Separate QCF (NMSE) and OPR metrics from flush proxies
-    let qcf_quant_nmse_total: f64 = qcf_metrics
-        .iter()
-        .filter(|m| m["action"].as_str() != Some("kv.quant_flush_opr"))
-        .filter_map(|m| m["raw_value"].as_f64())
-        .sum();
-    let qcf_attn_normalized_total: f64 = qcf_metrics
-        .iter()
-        .filter(|m| m["action"].as_str() != Some("kv.quant_flush_opr"))
-        .filter_map(|m| m["normalized_value"].as_f64())
-        .sum();
-
-    // quant-window OPR: per-flush events and summary stats
-    let qcf_quant_events: Vec<&serde_json::Value> = qcf_metrics
-        .iter()
-        .filter(|m| m["action"].as_str() == Some("kv.quant_flush_opr"))
-        .collect();
-    let n_quant_flushes = qcf_quant_events.len();
-    let opr_raw_values: Vec<f64> = qcf_quant_events
-        .iter()
-        .filter_map(|m| m["raw_value"].as_f64())
-        .collect();
-    let qcf_quant_opr_sum: f64 = opr_raw_values.iter().sum();
-    let qcf_quant_opr_max: f64 = opr_raw_values.iter().cloned().fold(0.0f64, f64::max);
-    let qcf_quant_opr_total: Option<f64> = if opr_raw_values.is_empty() {
-        None
-    } else {
-        Some(qcf_quant_opr_sum / opr_raw_values.len() as f64)
-    };
-    let qcf_quant_opr_events: Option<usize> = if opr_raw_values.is_empty() {
-        None
-    } else {
-        Some(opr_raw_values.len())
-    };
-
     let output = serde_json::json!({
         "ppl": ppl,
         "total_nll": total_nll,
         "token_count": nll_count,
         "tokens_per_second": tok_per_sec,
         "wall_time_s": wall_time,
-        "qcf_metrics": qcf_metrics,
-        "flush_count": qcf_metrics.len(),
-        "n_quant_flushes": n_quant_flushes,
-        "qcf_quant_events": qcf_quant_events,
-        "qcf_quant_nmse_total": qcf_quant_nmse_total,
-        "qcf_attn_total": qcf_quant_nmse_total,
-        "qcf_attn_normalized_total": qcf_attn_normalized_total,
-        "qcf_quant_opr_sum": qcf_quant_opr_sum,
-        "qcf_quant_opr_max": qcf_quant_opr_max,
-        "qcf_quant_opr_total": qcf_quant_opr_total,
-        "qcf_quant_opr_events": qcf_quant_opr_events,
         "final_cache_pos": kv_caches[0].current_pos(),
         "quant_q2_tokens": kv_caches[0].q2_tokens,
         "quant_res_pos": kv_caches[0].res_pos,
@@ -631,7 +394,6 @@ pub fn run_ppl(
     // LISWAP-PPL Scenario E: when true, return early as soon as the swap plan
     // completes. NLL/CSV/JSON outputs are suppressed. Used by `--ppl-warmup-swap`
     // to drive the swap to completion before the actual measurement pass.
-    warmup_only: bool,
 ) -> anyhow::Result<PplResult> {
     // ── 1. Read and tokenize reference text ──
     let text = std::fs::read_to_string(text_file)
@@ -762,27 +524,16 @@ pub fn run_ppl(
     let mut total_nll: f64 = 0.0;
     let mut nll_count: usize = 0;
     // PPL v3: collect QCF for every eviction event
-    let mut qcf_events: Vec<serde_json::Value> = Vec::new();
+    let mut eviction_events: Vec<serde_json::Value> = Vec::new();
     // score-decay 측정(KV roadmap 항목 0 §4.2): --dump-a2sf 지정 시 eviction 직전 + run 종료 시 score
     // accumulator importance 에서 BOS/non-BOS ratio + HH(top-k) 집합 스냅샷을 누적(읽기 전용).
     let mut score_decay_snapshots: Vec<crate::session::score_decay_dump::ScoreDecaySnapshot> =
         Vec::new();
     let overall_start = std::time::Instant::now();
 
-    // LISWAP-PPL: per-token NLL log + token-index-triggered weight swap.
-    // (phase, token_idx, token_id, nll, swap_state, layers_swapped)
-    let mut per_token_log: Vec<(&'static str, usize, u32, f64, &'static str, usize)> = Vec::new();
+    // Per-token NLL log: (phase, token_idx, token_id, nll).
+    let mut per_token_log: Vec<(&'static str, usize, u32, f64)> = Vec::new();
     let log_per_token = args.ppl_nll_csv.is_some();
-    let mut ppl_swap_plan: Option<crate::weight::IncrementalSwapPlan> = None;
-    // dispatch_swap_weights 시그니처 호환용 (PPL 경로에서는 manager 보고 안 함).
-    let mut ppl_swap_report_unused: Option<(f32, usize, std::time::Instant, f32)> = None;
-    let mut layers_swapped_so_far: usize = 0;
-    let ppl_cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let ppl_swap_logged = std::sync::atomic::AtomicBool::new(false);
-
-    if args.ppl_swap_at_token.is_some() && model.secondary_mmap.is_none() {
-        anyhow::bail!("--ppl-swap-at-token requires --secondary-gguf to load secondary weights");
-    }
 
     // ── 4. Prefill phase ──
     let prefill_len = prefill_chunk.min(eval_tokens);
@@ -827,7 +578,6 @@ pub fn run_ppl(
                 score_accumulator: score_accumulator.as_mut().and_then(|rt| rt.acc_mut()),
                 query_stats_accumulator: None,
                 skip_config,
-                importance_collector: None,
                 cache_self_need_scores: false,
                 layer_boundary_hook: None,
                 read_stage: None,
@@ -858,7 +608,7 @@ pub fn run_ppl(
             total_nll -= lp;
             nll_count += 1;
             if log_per_token {
-                per_token_log.push(("prefill", i, token_ids[i + 1], -lp, "none", 0));
+                per_token_log.push(("prefill", i, token_ids[i + 1], -lp));
             }
         }
 
@@ -871,101 +621,9 @@ pub fn run_ppl(
     }
 
     // ── 5. Decode phase (teacher-forcing) ──
-    for (decode_idx, i) in (prefill_len..eval_tokens - 1).enumerate() {
+    for i in prefill_len..eval_tokens - 1 {
         let input_token = token_ids[i];
         let target_token = token_ids[i + 1];
-
-        // ── LISWAP-PPL: token-index-triggered weight swap ──────────────────
-        // dispatch_swap_weights 가 commit 한 IncrementalSwapPlan 을 매 decode
-        // step 마다 K=ppl_swap_per_tick 만큼 drain. dynamic-K controller 와
-        // async dispatcher 는 측정 결정론을 위해 사용하지 않는다.
-        if Some(decode_idx) == args.ppl_swap_at_token && ppl_swap_plan.is_none() {
-            dispatch_swap_weights(
-                model,
-                args.ppl_swap_ratio,
-                argus_shared::DtypeTag::Q4_0,
-                None, // importance None → fallback uniform
-                decode_idx,
-                &mut ppl_swap_plan,
-                &mut ppl_swap_report_unused,
-            );
-            if !ppl_swap_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "[PPL-Swap] triggered at decode_idx={}, ratio={}, per_tick={}",
-                    decode_idx, args.ppl_swap_ratio, args.ppl_swap_per_tick
-                );
-            }
-        }
-        let mut swap_state: &'static str = if layers_swapped_so_far > 0 {
-            "post_swap"
-        } else {
-            "none"
-        };
-        let plan_done = if let Some(plan) = ppl_swap_plan.as_mut() {
-            plan.set_per_tick(args.ppl_swap_per_tick);
-            let chunk = plan.drain_chunk();
-            if !chunk.is_empty() {
-                let t_swap = std::time::Instant::now();
-                match run_layer_swap(
-                    model,
-                    &chunk,
-                    Some(backend),
-                    &ppl_cpu_backend,
-                    None,
-                    #[cfg(feature = "opencl")]
-                    None,
-                    #[cfg(feature = "cuda-embedded")]
-                    None,
-                    #[cfg(feature = "cuda-embedded")]
-                    None,
-                ) {
-                    Ok(report) => {
-                        layers_swapped_so_far += report.swapped.len();
-                        swap_state = "swapping";
-                        eprintln!(
-                            "[PPL-Swap] tick decode_idx={} chunk={:?} swapped={} remaining={} latency={:.1}ms",
-                            decode_idx,
-                            &chunk,
-                            report.swapped.len(),
-                            plan.remaining_count(),
-                            t_swap.elapsed().as_secs_f64() * 1000.0,
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("[PPL-Swap] run_layer_swap error: {}", e);
-                    }
-                }
-            }
-            plan.is_done()
-        } else {
-            false
-        };
-        if plan_done {
-            eprintln!(
-                "[PPL-Swap] plan complete at decode_idx={}, total_swapped={}",
-                decode_idx, layers_swapped_so_far
-            );
-            ppl_swap_plan = None;
-            swap_state = "post_swap";
-
-            if warmup_only {
-                // LISWAP-PPL Scenario E (warmup pass): swap is complete, return
-                // before scoring the current token so the caller can reset KV
-                // caches and run the measurement pass from scratch with the
-                // already-swapped weights.
-                eprintln!(
-                    "[PPL-Swap] warmup_only=true → returning at decode_idx={} (no further scoring)",
-                    decode_idx
-                );
-                let wall_time = overall_start.elapsed().as_secs_f64();
-                return Ok(PplResult {
-                    ppl: 0.0,
-                    avg_nll: 0.0,
-                    n_eval_tokens: 0,
-                    wall_time_s: wall_time,
-                });
-            }
-        }
 
         // Score accumulator begin step
         if let Some(acc) = score_accumulator.as_mut().and_then(|rt| rt.acc_mut()) {
@@ -997,7 +655,6 @@ pub fn run_ppl(
                 score_accumulator: score_accumulator.as_mut().and_then(|rt| rt.acc_mut()),
                 query_stats_accumulator: None,
                 skip_config,
-                importance_collector: None,
                 cache_self_need_scores: false,
                 layer_boundary_hook: None,
                 read_stage: None,
@@ -1019,14 +676,7 @@ pub fn run_ppl(
         total_nll -= lp;
         nll_count += 1;
         if log_per_token {
-            per_token_log.push((
-                "decode",
-                i,
-                target_token,
-                -lp,
-                swap_state,
-                layers_swapped_so_far,
-            ));
+            per_token_log.push(("decode", i, target_token, -lp));
         }
 
         // ── Budget-based eviction (deterministic, experiment-reproducible) ──
@@ -1065,27 +715,6 @@ pub fn run_ppl(
                     );
                 }
 
-                // GPU V buffer readback for QCF-value-aware computation.
-                let v_cpu_data: Option<Vec<f32>> = if args.kv_type == "f32"
-                    && !kv_caches.is_empty()
-                    && kv_caches[0].v_buffer.buffer().as_ptr().is_null()
-                {
-                    let v_elems = kv_caches[0].v_buffer.buffer().size() / 4;
-                    let mut v_buf = vec![0.0f32; v_elems];
-                    let byte_slice = unsafe {
-                        std::slice::from_raw_parts_mut(v_buf.as_mut_ptr() as *mut u8, v_elems * 4)
-                    };
-                    match backend.read_buffer(&kv_caches[0].v_buffer, byte_slice) {
-                        Ok(()) => Some(v_buf),
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
-                let can_compute_qcf = args.kv_type == "f32"
-                    && !kv_caches.is_empty()
-                    && (v_cpu_data.is_some() || !kv_caches[0].v_buffer.buffer().as_ptr().is_null());
-
                 // Perform eviction — shared score-fed body (extract → route; force, ratio).
                 // GPU scores were synced into the CPU accumulator above, so `extract_scores`
                 // reads real importance on both CPU and GPU backends.
@@ -1115,75 +744,10 @@ pub fn run_ppl(
                     let eviction_ratio = result.tokens_removed as f32 / before_len as f32;
                     let ppl_at_event = (total_nll / nll_count as f64).exp();
 
-                    let qcf_value_aware_value = if can_compute_qcf
-                        && let Some(acc) = score_accumulator.as_ref().and_then(|rt| rt.view())
-                        && let Some(head_attn) = acc.last_step_head_attn()
-                    {
-                        use crate::qcf::{QcfKvParams, VDataSource, compute_qcf_kv};
-                        use crate::qcf_types::AggregationMode;
-                        use argus_extension_api::{StageParams, find_qcf_estimator};
-                        let target_len = ((before_len as f32) * ratio) as usize;
-                        let cache = &kv_caches[0];
-                        let v_cpu_bytes: Option<&[u8]> = v_cpu_data.as_deref().map(|s| {
-                            // Reinterpret &[f32] as &[u8] so the unified helper handles it.
-                            unsafe {
-                                std::slice::from_raw_parts(
-                                    s.as_ptr() as *const u8,
-                                    std::mem::size_of_val(s),
-                                )
-                            }
-                        });
-                        // Resolve the estimator (h2o when score-based, else sliding) by name; the
-                        // engine no longer enumerates techniques here. PPL eval only ever triggers
-                        // Sliding/heavy-hitter — never weighted-merge — so `k_source` stays None.
-                        let (est_name, est_params) = if score_based_eviction {
-                            (
-                                "h2o",
-                                StageParams {
-                                    keep_ratio: args.keep_ratio(),
-                                    protected_prefix,
-                                    ..Default::default()
-                                },
-                            )
-                        } else {
-                            ("sliding", StageParams::default())
-                        };
-                        let estimator = (find_qcf_estimator(est_name)
-                            .expect("h2o/sliding QCF estimator registered")
-                            .make)(est_params, &[]);
-                        match VDataSource::from_buffer(&cache.v_buffer, v_cpu_bytes) {
-                            Some(v_source) => {
-                                let params = QcfKvParams {
-                                    estimator: &*estimator,
-                                    target_len,
-                                    v_source,
-                                    // PPL eval site only triggers Sliding/heavy-hitter,
-                                    // never weighted-merge — `k_source` is unused.
-                                    k_source: None,
-                                    attention_scores: acc.importance_scores(),
-                                    head_attn: Some(head_attn),
-                                    n_kv_heads: cache.kv_heads(),
-                                    head_dim: cache.head_dim(),
-                                    current_pos: before_len,
-                                    capacity: cache.capacity(),
-                                    layout: cache.layout(),
-                                    aggregation: AggregationMode::Mean,
-                                    beta: 1.0,
-                                };
-                                let (qcf, _) = compute_qcf_kv(&params);
-                                qcf as f64
-                            }
-                            None => 0.0,
-                        }
-                    } else {
-                        0.0
-                    };
-
-                    qcf_events.push(serde_json::json!({
+                    eviction_events.push(serde_json::json!({
                         "step": i,
                         "tokens_evicted": result.tokens_removed,
                         "eviction_ratio": eviction_ratio,
-                        "qcf_value_aware": qcf_value_aware_value,
                         "ppl_at_step": ppl_at_event,
                     }));
 
@@ -1280,15 +844,7 @@ pub fn run_ppl(
     let tok_per_sec = nll_count as f64 / wall_time;
 
     // Compute summary stats from all eviction events (v3)
-    let n_evictions = qcf_events.len();
-    let qcf_sum_value_aware: f64 = qcf_events
-        .iter()
-        .filter_map(|e| e["qcf_value_aware"].as_f64())
-        .sum();
-    let qcf_max_value_aware: f64 = qcf_events
-        .iter()
-        .filter_map(|e| e["qcf_value_aware"].as_f64())
-        .fold(0.0f64, f64::max);
+    let n_evictions = eviction_events.len();
 
     let output = serde_json::json!({
         "ppl": ppl,
@@ -1297,9 +853,7 @@ pub fn run_ppl(
         "tokens_per_second": tok_per_sec,
         "wall_time_s": wall_time,
         "n_evictions": n_evictions,
-        "qcf_events": qcf_events,
-        "qcf_sum_value_aware": qcf_sum_value_aware,
-        "qcf_max_value_aware": qcf_max_value_aware,
+        "eviction_events": eviction_events,
         "config": {
             "model": args.model_path,
             "text_file": text_file,
@@ -1327,9 +881,9 @@ pub fn run_ppl(
     if let Some(csv_path) = args.ppl_nll_csv.as_ref() {
         use std::io::Write;
         let mut f = std::fs::File::create(csv_path)?;
-        writeln!(f, "phase,token_idx,token_id,nll,swap_state,layers_swapped")?;
-        for (phase, idx, id, nll, state, n) in &per_token_log {
-            writeln!(f, "{},{},{},{:.6},{},{}", phase, idx, id, nll, state, n)?;
+        writeln!(f, "phase,token_idx,token_id,nll")?;
+        for (phase, idx, id, nll) in &per_token_log {
+            writeln!(f, "{},{},{},{:.6}", phase, idx, id, nll)?;
         }
         f.flush()?;
         eprintln!(

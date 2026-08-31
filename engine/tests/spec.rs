@@ -2,8 +2,6 @@
 mod test_fsm_operating_mode;
 #[path = "spec/test_inv_003.rs"]
 mod test_inv_003;
-#[path = "spec/test_inv_004_017.rs"]
-mod test_inv_004_017;
 #[path = "spec/test_inv_081_082.rs"]
 mod test_inv_081_082;
 
@@ -14,8 +12,6 @@ mod test_eng_alg_010_012;
 mod test_eng_alg_020_022;
 #[path = "spec/test_eng_alg_030_048.rs"]
 mod test_eng_alg_030_048;
-#[path = "spec/test_eng_alg_051.rs"]
-mod test_eng_alg_051;
 #[path = "spec/test_eng_alg_060_092.rs"]
 mod test_eng_alg_060_092;
 #[path = "spec/test_eng_dat_012_031.rs"]
@@ -49,14 +45,10 @@ mod test_partition_split_backend_retag;
 // cleanup — replaced by flat fields directly on `TransformerModel`.
 #[path = "spec/test_eng_alg_210_initial_load.rs"]
 mod test_eng_alg_210_initial_load;
-#[path = "spec/test_eng_alg_211_weight_swap_handler.rs"]
-mod test_eng_alg_211_weight_swap_handler;
 #[path = "spec/test_eng_dat_092_layer_slot.rs"]
 mod test_eng_dat_092_layer_slot;
 #[path = "spec/test_eng_dat_094_secondary_mmap.rs"]
 mod test_eng_dat_094_secondary_mmap;
-#[path = "spec/test_inv_121_dynamic.rs"]
-mod test_inv_121_dynamic;
 #[path = "spec/test_inv_123_dynamic.rs"]
 mod test_inv_123_dynamic;
 #[path = "spec/test_inv_124_slot_dtype_consistency.rs"]
@@ -72,15 +64,9 @@ mod test_eng_alg_219_plan_invalidation;
 // ── Weight Swap Phase 3.6 — ENG-ALG-221 noshuffle SOA registry coherence ──
 // SwapExecutor invalidates OpenCLBackend noshuffle_soa_registry before the
 // ratio_generation bump so FullKernelPlan rebuild re-registers against new
-// cl_mem keys (INV-130).
-#[path = "spec/test_inv_130_noshuffle_soa_coherence.rs"]
-mod test_inv_130_noshuffle_soa_coherence;
 
 // ── Weight Swap Phase 3.7a — SOA Re-conversion safety net (INV-131) ──
 // ENG-ALG-222: clear → convert → register → ratio_generation bump 순서.
-// INV-131: swap 후 첫 GPU matmul 직전 새 cl_mem이 registry에 등록 완료.
-#[path = "spec/test_inv_131_soa_reconversion.rs"]
-mod test_inv_131_soa_reconversion;
 
 // ── Weight Swap Phase 3.7b — AUF v0.1 포맷 (INV-132~134, ENG-DAT-096, ENG-ALG-223) ──
 // AUF reader fail-fast (INV-132), required section (INV-133),
@@ -131,9 +117,6 @@ mod test_eng_alg_224_writer_multi_dtype;
 
 // ── AUF v0.2 Sprint D — ENG-ALG-225 reader dtype dispatch ──
 // reader lookup_tensor precedence (명시 > default_dtype > first-match).
-// Adreno SOA × F16 reject, 단방향 swap 정합성, SwapExecutor 시그니처 unchanged.
-#[path = "spec/test_eng_alg_225_reader_dispatch.rs"]
-mod test_eng_alg_225_reader_dispatch;
 
 // ── AUF v0.2 Sprint F — ISSUE-E-1 hotfix 회귀 격리 ──
 // multi-dtype writer가 1-D tensor (RMSNorm 등)에 대해 Q4_0 변환을 적용하지 않도록
@@ -155,40 +138,14 @@ mod test_g1e_lm_head_integration;
 #[path = "spec/test_inv_122_mixed_precision.rs"]
 mod test_inv_122_mixed_precision;
 
-// ── Weight Swap Phase 3 invariants (INV-126/127/128, WSWAP-3-TEST) ──
-// Stage C: LuaPolicy integration + Phase 3 invariant spec tests.
-#[path = "spec/test_inv_126_dtype_reserved.rs"]
-mod test_inv_126_dtype_reserved;
-#[path = "spec/test_inv_127_nan_epsilon.rs"]
-mod test_inv_127_nan_epsilon;
-#[path = "spec/test_inv_128_collector_leak_guard.rs"]
-mod test_inv_128_collector_leak_guard;
-#[path = "spec/test_wswap_e2e_phase3.rs"]
-mod test_wswap_e2e_phase3;
-
 // ── Layer-swap QCF dump 인프라 (zazzy-herding-bonbon Phase 1) ──
 // dump_qcf_swap_json + QcfSwapDumpContext JSON schema 계약 검증.
-// 외부 harness(pact2026/experiments/scripts/)가 소비하는 JSON 포맷 안정성 보장.
-#[path = "spec/test_qcf_swap_dump.rs"]
-mod test_qcf_swap_dump;
 
 // ── SEQ 통합 테스트 ──
 #[path = "spec/test_seq_020_035.rs"]
 mod test_seq_020_035;
 #[path = "spec/test_seq_070_093.rs"]
 mod test_seq_070_093;
-#[path = "spec/test_seq_095_098.rs"]
-mod test_seq_095_098;
-
-// ── ARGUS QCF 실험 인프라 spec 테스트 (Steps 1–6) ──
-// aggregation/retention/entropy invariant + β-amplified CAOTE 회귀 가드 +
-// β=1.0 fast path 비부식성 검증.
-#[path = "spec/test_qcf_backward_compat.rs"]
-mod test_qcf_backward_compat;
-#[path = "spec/test_qcf_beta_regression.rs"]
-mod test_qcf_beta_regression;
-#[path = "spec/test_qcf_experimental.rs"]
-mod test_qcf_experimental;
 
 // ── INV-141 PrimaryReleaseWorker drain contract (ENG-ALG-228 / ENG-DAT-100) ──
 #[path = "spec/test_inv_141_release_worker_drain.rs"]
@@ -217,33 +174,12 @@ mod test_eng_alg_232_eager_prefault;
 // ── ENG-ALG-230/231 + INV-142: async write_buffer + stage gate ordering ──
 // alloc_and_upload_soa_buffers blocking=false (ENG-ALG-230);
 // single backend.synchronize() gate before invalidate/restore/bump (ENG-ALG-231).
-// INV-142: queue idle before ratio_generation bump.
-#[path = "spec/test_inv_142_stage_gate_ordering.rs"]
-mod test_inv_142_stage_gate_ordering;
 
 // ── Layer-Incremental Swap Stage 1 MVP (LISWAP-1, ENG-ALG-232~234, INV-144~146) ──
-// IncrementalSwapPlan data structure (ENG-ALG-232, INV-145),
-// decode loop dispatch simulation (ENG-ALG-233, INV-146),
-// forward snapshot consistency under incremental swap (INV-144),
-// drain monotone property (INV-145),
-// tick/batch equivalence (INV-146).
-#[path = "spec/test_eng_alg_232_incremental_plan.rs"]
-mod test_eng_alg_232_incremental_plan;
-#[path = "spec/test_eng_alg_233_main_loop_dispatch.rs"]
-mod test_eng_alg_233_main_loop_dispatch;
-#[path = "spec/test_inv_144_forward_snapshot.rs"]
-mod test_inv_144_forward_snapshot;
-#[path = "spec/test_inv_145_drain_monotone.rs"]
-mod test_inv_145_drain_monotone;
-#[path = "spec/test_inv_146_tick_batch_equivalence.rs"]
-mod test_inv_146_tick_batch_equivalence;
 
 // ── LISWAP-2 Phase 3 — SwapExecutor async dispatch path (prototype) ──
 // `execute_on_slots`에 `async_dispatcher: Option<&AsyncSwapDispatcher>` 추가.
 // async path: `enqueue_write_async` + per-event `wait_event_blocking` (INV-142 대체).
-// sync path: backward-compat (기존 `backend.synchronize()` gate 유지).
-#[path = "spec/test_async_swap_executor.rs"]
-mod test_async_swap_executor;
 
 // ── LISWAP-3 — HostPtrPool slot lifecycle (Direction A, Stage 3 prototype) ──
 // `CL_MEM_ALLOC_HOST_PTR` 슬롯 풀 생성/획득/해제 + fill round-trip.
@@ -258,12 +194,6 @@ mod test_host_ptr_pool;
 // INV-150: plan run-to-completion finalize (drain → sync → bump → invalidate).
 #[path = "spec/test_inv_147_hook_zero_overhead.rs"]
 mod test_inv_147_hook_zero_overhead;
-#[path = "spec/test_inv_148_plan_dispatch_idempotent.rs"]
-mod test_inv_148_plan_dispatch_idempotent;
-#[path = "spec/test_inv_149_wait_gate_ordering.rs"]
-mod test_inv_149_wait_gate_ordering;
-#[path = "spec/test_inv_150_plan_run_to_completion.rs"]
-mod test_inv_150_plan_run_to_completion;
 
 // ── INV-LAYER-006 (DecodeLoop field abstraction) +
 //    INV-LAYER-007 (DecodeLoopBuilder typestate, trybuild) ──
@@ -355,5 +285,3 @@ mod test_inv_192_recall_explicit_trigger;
 mod test_inv_193_recall_candidate_selection;
 #[path = "spec/test_inv_194_recall_accuracy.rs"]
 mod test_inv_194_recall_accuracy;
-#[path = "spec/test_inv_195_recall_loud_noop.rs"]
-mod test_inv_195_recall_loud_noop;

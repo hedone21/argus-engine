@@ -21,26 +21,21 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use argus_extension_api::FormatId;
-use argus_shared::{EngineCapability, EngineCommand, EngineMessage, QcfEstimate, WeightSwapReport};
+use argus_shared::{EngineCapability, EngineCommand, QcfEstimate, WeightSwapReport};
 
 use crate::hardware::Hardware;
 use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::quant_window_format::QuantWindowFormat;
 use crate::kv::standard_format::StandardFormat;
-use crate::models::transformer::TransformerModel;
 use crate::models::weights::LayerSlot;
 use crate::pipeline::LifecyclePhase;
-use crate::qcf_collector::ImportanceLookup;
 use crate::session::pipeline_registry::PipelineRegistry;
-use crate::session::swap_runtime::EngineSwapRuntime;
 use crate::stages::kv::eviction::EvictionStage;
 use crate::stages::kv::format_reencode::{FixedFormatPolicy, FormatReencodeStage};
 use crate::stages::kv::offload::OffloadStage;
 use crate::stages::kv::quant_window_stage::QuantWindowBitTransitionStage;
 use crate::stages::weight::partition::PartitionStage;
-use crate::stages::weight::weight_recall::WeightRecallStage;
-use crate::stages::weight::weight_swap::WeightSwapStage;
 
 /// External command channel (manager IPC, schedule, stdin, ...).
 ///
@@ -131,18 +126,6 @@ pub struct CommandDispatcher {
     /// ① PartitionStage 의 companion backend resolve 용 (AB-4 §5.5.8). `None` 이면 partition
     /// directive 무시(model/hardware 미배선 — host 단위테스트 등).
     hardware: Option<Arc<Hardware>>,
-    /// ① WeightSwapStage 가 swap 할 model handle (register 시점 보유, AB-6 §5.6.3 model seam).
-    /// `None` 이면 swap directive 무시(미배선 — host 단위테스트 등).
-    model: Option<Arc<TransformerModel>>,
-    /// ① WeightSwapStage 의 swap 자원 묶음(AB-6 §5.6.7). `None` 이면 swap directive 무시
-    /// (secondary 부재 — happy/chat).
-    swap_runtime: Option<Arc<EngineSwapRuntime>>,
-    /// ① WeightSwapStage 의 decider importance 입력(AB-6 §5.6.1). `None` 이면 uniform fallback.
-    importance: Option<Arc<dyn ImportanceLookup>>,
-    /// §5.9.2 Track B: WeightSwapStage(IntraForward/LayerImmediate)가 hook 을 설치할 공유 cell.
-    /// ModelForward 와 동일 cell 을 assembly 가 만들어 양측에 `Arc` clone 으로 넘긴다. swap
-    /// 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미 — submit 자체가 안 일어나 무영향.
-    hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>>,
     /// §5.9.1 Track A: score-based eviction 의 attention score accumulator 공유 cell.
     /// ModelForward(begin_step + 주입) + EvictionStage(read + reset) 와 동일 cell 을 공유한다.
     /// `compute_and_send_qcf` 에서 active acc 의 `importance_scores()` 를 QCF `token_scores` 로 전달.
@@ -152,9 +135,6 @@ pub struct CommandDispatcher {
     /// ① QuantWindowBitTransitionStage 가 transition 할 quant-window handle (register 시점 보유, AB-2 §5.7.8). 비어 있으면
     /// KvQuantDynamic directive 가 와도 submit 안 함(미구성 — non-quant-window: Standard/Offload).
     quant_window_handles: Vec<Arc<QuantWindowFormat>>,
-    /// AB-5 §5.8.2: RequestQcf dispatch 시 QcfEstimate 를 manager 로 송출하는 채널.
-    /// `None` 이면 미배선(resilience-off / host 단위테스트) → RequestQcf 가 무송출(inert).
-    report_tx: Option<std::sync::mpsc::Sender<EngineMessage>>,
     /// ② 누적 루프 제어 상태 (sticky control — throttle/tbt 유지, evict 는 OneShot 으로 분리).
     control: LoopControl,
 
@@ -199,8 +179,6 @@ pub struct CommandDispatcher {
 impl CommandDispatcher {
     /// dispatcher 생성. `cache_manager` 가 `None` 이면 evict directive 는 무시되고(미구성),
     /// `layer_slots` 가 비었거나 `hardware` 가 `None` 이면 partition directive 는 무시된다.
-    /// `model`/`swap_runtime` 이 `None` 이면 swap directive 는 무시된다(AB-6 §5.6.4).
-    /// `report_tx` 가 `None` 이면 RequestQcf 무송출(inert — AB-5 §5.8.2).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Arc<PipelineRegistry>,
@@ -208,16 +186,9 @@ impl CommandDispatcher {
         cache_manager: Option<Arc<Mutex<CacheManager>>>,
         layer_slots: Vec<Arc<LayerSlot>>,
         hardware: Option<Arc<Hardware>>,
-        model: Option<Arc<TransformerModel>>,
-        swap_runtime: Option<Arc<EngineSwapRuntime>>,
-        importance: Option<Arc<dyn ImportanceLookup>>,
         // AB-2 §5.7.8: QuantWindowBitTransitionStage 가 transition 할 quant-window handle. Standard/Offload 경로는 빈 Vec
         // → KvQuantDynamic directive 무시 (inert — evict CM=None 동형).
         quant_window_handles: Vec<Arc<QuantWindowFormat>>,
-        // AB-5 §5.8.2: RequestQcf dispatch 시 QcfEstimate 를 송출할 채널. None → inert.
-        report_tx: Option<std::sync::mpsc::Sender<EngineMessage>>,
-        // §5.9.2 Track B: WeightSwapStage 에 넘길 layer-boundary hook cell (ModelForward 공유).
-        hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>>,
         // §5.9.1 Track A: score-based eviction 의 accumulator cell (ModelForward 공유).
         // score-based 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미.
         score_cell: Arc<Mutex<Option<SignalRuntime>>>,
@@ -228,12 +199,7 @@ impl CommandDispatcher {
             cache_manager,
             layer_slots,
             hardware,
-            model,
-            swap_runtime,
-            importance,
             quant_window_handles,
-            report_tx,
-            hook_cell,
             score_cell,
             control: LoopControl::default(),
             evict_armed: false,
@@ -355,10 +321,10 @@ impl CommandDispatcher {
                 // AB-3 §5.10.3: offload 가 적용됐으면 recall OneShot submit.
                 self.submit_offload_recall();
             }
-            // AB-5 §5.8.2: query directive — dispatcher 직결 compute+send. LoopControl 경유 0.
-            EngineCommand::RequestQcf => {
-                self.compute_and_send_qcf();
-            }
+            // The estimates this answered came from the QCF metric family and went with it. The
+            // query stays in the `argus-shared` protocol, so it is accepted and answered with
+            // nothing rather than treated as a protocol error.
+            EngineCommand::RequestQcf => {}
             // SetPrefillPolicy: DecodeLoop run() 미소비 (prefill 정책은 CLI Args 경로 전용 —
             // init.rs 가 args.prefill_* 를 직접 read). LoopControl.prefill_* 는 dead write 였어
             // 삭제됨(2026-06-13 census) → directive 수신 시 no-op (MSG 표면은 존속).
@@ -383,19 +349,11 @@ impl CommandDispatcher {
             EngineCommand::LayerSkip { skip_ratio } => {
                 self.control.layer_skip = Some(*skip_ratio);
             }
-            // ── ① swap → OneShot WeightSwapStage submit (AB-6 §5.6.4, transient) ──
-            EngineCommand::SwapWeights {
-                ratio,
-                target_dtype,
-            } => {
-                self.submit_swap(*ratio, *target_dtype);
-            }
-            // ── ① recall → OneShot WeightRecallStage submit (§5.6.8, ENG-ALG-240) ──
-            // RestoreDefaults 는 무발화(INV-192) — 이 arm 만 발화.
-            EngineCommand::RecallWeights { ratio } => {
-                self.submit_recall(*ratio);
-            }
-
+            // Precision swap and recall were driven by the QCF layer ranking (importance × ε) and
+            // went with it. The directives stay in the `argus-shared` protocol — it is an external
+            // crate and a manager may still send them — so they are accepted and ignored rather
+            // than treated as a protocol error.
+            EngineCommand::SwapWeights { .. } | EngineCommand::RecallWeights { .. } => {}
             // ── ③ Hardware resolve seam ──
             EngineCommand::SwitchHw { device } => {
                 self.control.switch_device = Some(device.clone());
@@ -549,95 +507,6 @@ impl CommandDispatcher {
         let stage = OffloadStage::recall(self.kv_handles.clone(), Arc::clone(cm));
         self.registry.submit(Arc::new(stage));
     }
-
-    /// AB-5 §5.8.2: RequestQcf 수신 시 dispatcher 직결 QcfEstimate 산출·송출.
-    ///
-    /// `report_tx` 가 `None` 이면 inert(미배선 — resilience-off / host 단위테스트).
-    /// `report_tx` 가 `Some` 이면 `compute_qcf_estimates` 로 dry-run 산출 후 `EngineMessage::QcfEstimate` 송출.
-    /// §5.9.1 Track A: score_cell 이 active 면 `importance_scores()` 를 `token_scores` 로 전달해
-    /// kv.evict_h2o / kv.merge_d2o 키를 산출한다. `&self` — query 이므로 mutation 없음(acc no-op).
-    fn compute_and_send_qcf(&self) {
-        let Some(tx) = self.report_tx.as_ref() else {
-            return; // 미배선 → inert (drop).
-        };
-        // §5.9.1 Track A: score_cell lock → active acc면 importance_scores() 복사 후 즉시 해제.
-        // 단일 스레드(INV-018) → lock contention 0. 복사 후 guard 해제로 forward 와 lock 충돌 없음.
-        let token_scores_owned: Option<Vec<f32>> = {
-            let guard = self.score_cell.lock().expect("score_cell mutex poisoned");
-            guard
-                .as_ref()
-                .and_then(|rt| rt.view())
-                .filter(|acc| acc.is_active())
-                .map(|acc| acc.importance_scores().to_vec())
-        };
-        let ctx = crate::session::qcf_runtime::QcfEstimateContext {
-            kv_handles: &self.kv_handles,
-            quant_window_handles: &self.quant_window_handles,
-            importance: self.importance.as_deref(),
-            streaming_config: None,
-            importance_table: None,
-            num_layers: self.kv_handles.len().max(self.quant_window_handles.len()),
-            // §5.9.1 Track A: active score 면 token_scores 전달(h2o/d2o QCF 언블록).
-            // None 이면 기존 uniform fallback 유지(QCF_kv ⊥ QCF_weight 분리 보존).
-            token_scores: token_scores_owned.as_deref(),
-        };
-        let est = crate::session::qcf_runtime::compute_qcf_estimates(&ctx);
-        let _ = tx.send(EngineMessage::QcfEstimate(argus_shared::QcfEstimate {
-            estimates: est,
-            layer_swap: None,
-        }));
-    }
-
-    /// ① RecallWeights directive 1건을 OneShot `WeightRecallStage` 로 submit (§5.6.8).
-    ///
-    /// submit_swap 과 동형이나 `target_dtype` 이 없다(방향 고정 = F16, ENG-ALG-240).
-    /// `model`/`swap_runtime` 이 `None` 이거나 `layer_slots` 가 비면 미구성 — directive 무시.
-    fn submit_recall(&mut self, ratio: f32) {
-        let Some(model) = self.model.as_ref() else {
-            return; // 미구성 (secondary 부재 — happy/chat).
-        };
-        let Some(rt) = self.swap_runtime.as_ref() else {
-            return; // 미구성 (swap 자원 미배선).
-        };
-        if self.layer_slots.is_empty() {
-            return; // 미구성.
-        }
-        let stage = WeightRecallStage::one_shot(
-            Arc::clone(model),
-            Arc::clone(rt),
-            ratio,
-            Arc::clone(&self.hook_cell),
-        );
-        self.registry.submit(Arc::new(stage));
-    }
-
-    /// ① SwapWeights directive 1건을 OneShot `WeightSwapStage` 로 submit (AB-6 §5.6.4).
-    ///
-    /// **transient 시맨틱**: partition 의 last-applied 게이트도 evict 의 armed 게이트도 **없다**
-    /// (landmine — partition 게이트 복사 금지, §5.6.4). 같은 directive 가 재도착하면 새 Stage 를
-    /// submit 하되, 그 Stage 의 commit §2 in-flight 가드(swap_runtime 공유 마커)가 미완 plan 이
-    /// 살아 있으면 reject 한다(R-1 동시 활성화 차단 = 정확한 게이트). `model`/`swap_runtime` 이
-    /// `None` 이거나 `layer_slots` 가 비면 미구성 — directive 무시(happy/chat).
-    fn submit_swap(&mut self, ratio: f32, target_dtype: argus_shared::DtypeTag) {
-        let Some(model) = self.model.as_ref() else {
-            return; // 미구성 (secondary 부재 — happy/chat).
-        };
-        let Some(rt) = self.swap_runtime.as_ref() else {
-            return; // 미구성 (swap 자원 미배선).
-        };
-        if self.layer_slots.is_empty() {
-            return; // 미구성.
-        }
-        let stage = WeightSwapStage::one_shot(
-            Arc::clone(model),
-            Arc::clone(rt),
-            self.importance.clone(),
-            ratio,
-            target_dtype,
-            Arc::clone(&self.hook_cell),
-        );
-        self.registry.submit(Arc::new(stage));
-    }
 }
 
 #[cfg(test)]
@@ -698,12 +567,7 @@ mod tests {
             Some(cm),
             Vec::new(),
             None,
-            None,
-            None,
-            None,
             Vec::new(),
-            None,                       // report_tx: AB-5
-            Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
             Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
         );
         (d, registry, handle)
@@ -756,132 +620,13 @@ mod tests {
             None,
             slots,
             Some(hw),
-            None,
-            None,
-            None,
             Vec::new(),
-            None,                       // report_tx: AB-5
-            Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
             Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
         );
         (d, registry)
     }
 
     // ── AB-6: swap handle(model + swap_runtime) 을 구성한 dispatcher helper ──
-
-    fn make_swap_model(be: &Arc<dyn Backend>, n_layers: usize) -> Arc<TransformerModel> {
-        use crate::memory::Memory;
-        use crate::model_config::{ModelArch, ModelConfig};
-        let mem = crate::memory::galloc::Galloc::new();
-        let (dim, vocab) = (4usize, 8usize);
-        let embed = Tensor::new(
-            Shape::new(vec![vocab, dim]),
-            mem.alloc(vocab * dim * 4, DType::F32).unwrap(),
-            be.clone(),
-        );
-        let norm = Tensor::new(
-            Shape::new(vec![dim]),
-            mem.alloc(dim * 4, DType::F32).unwrap(),
-            be.clone(),
-        );
-        let config = ModelConfig {
-            vocab_size: vocab,
-            hidden_size: dim,
-            num_hidden_layers: n_layers,
-            num_attention_heads: 1,
-            num_key_value_heads: 1,
-            intermediate_size: dim,
-            rms_norm_eps: 1e-5,
-            rope_theta: 500_000.0,
-            rope_freq_scaling: crate::rope::RopeFreqScaling::NONE,
-            head_dim: dim,
-            has_qkv_bias: false,
-            tie_word_embeddings: false,
-            eos_token_ids: vec![2],
-            arch: ModelArch::Llama,
-            rope_local_theta: None,
-            sliding_window: None,
-            sliding_window_pattern: None,
-            query_pre_attn_scalar: None,
-            embed_scale: None,
-            weight_prefix: String::new(),
-        };
-        let rr = crate::weight::setup_runtime_resources(be.clone());
-        Arc::new(TransformerModel {
-            config,
-            layers: (0..n_layers).map(|i| ffn_slot(be, i)).collect(),
-            embed_tokens: embed,
-            norm: norm.clone(),
-            lm_head: norm,
-            lm_head_on_cpu: false,
-            gpu_embed_tokens: None,
-            cpu_backend: None,
-            preload_pool: std::sync::OnceLock::new(),
-            secondary_mmap: None,
-            ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            quant_noise: rr.quant_noise.clone(),
-            release_worker: rr.release_worker.clone(),
-        })
-    }
-
-    fn make_swap_runtime(be: &Arc<dyn Backend>) -> Arc<EngineSwapRuntime> {
-        use crate::model_config::{ModelArch, ModelConfig};
-        let dispatcher = Arc::new(crate::weight::AsyncSwapDispatcher::new(be.clone()));
-        let rr = crate::weight::setup_runtime_resources(be.clone());
-        let config = Arc::new(ModelConfig {
-            vocab_size: 8,
-            hidden_size: 4,
-            num_hidden_layers: 0,
-            num_attention_heads: 1,
-            num_key_value_heads: 1,
-            intermediate_size: 4,
-            rms_norm_eps: 1e-5,
-            rope_theta: 500_000.0,
-            rope_freq_scaling: crate::rope::RopeFreqScaling::NONE,
-            head_dim: 4,
-            has_qkv_bias: false,
-            tie_word_embeddings: false,
-            eos_token_ids: vec![2],
-            arch: ModelArch::Llama,
-            rope_local_theta: None,
-            sliding_window: None,
-            sliding_window_pattern: None,
-            query_pre_attn_scalar: None,
-            embed_scale: None,
-            weight_prefix: String::new(),
-        });
-        Arc::new(EngineSwapRuntime::new(
-            be.clone(),
-            dispatcher,
-            config,
-            rr.release_worker.clone(),
-            crate::session::cli::SwapMode::Incremental,
-            1024 * 1024,
-            4,
-            None,
-        ))
-    }
-
-    fn make_swap_dispatcher() -> (CommandDispatcher, Arc<PipelineRegistry>) {
-        let registry = Arc::new(PipelineRegistry::new());
-        let be = cpu_be();
-        let slots: Vec<Arc<LayerSlot>> = (0..2).map(|i| ffn_slot(&be, i)).collect();
-        let d = CommandDispatcher::new(
-            Arc::clone(&registry),
-            Vec::new(),
-            None,
-            slots,
-            None,
-            Some(make_swap_model(&be, 2)),
-            Some(make_swap_runtime(&be)),
-            None,
-            Vec::new(),
-            None,                       // report_tx: AB-5
-            Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
-            Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
-        );
-        (d, registry)
-    }
 
     // ── AB-2: quant_window_handles 를 구성한 dispatcher helper (CPU QuantizedRecentWindowCache) ──
 
@@ -904,12 +649,7 @@ mod tests {
             None,
             Vec::new(),
             None,
-            None,
-            None,
-            None,
-            quant_window_handles,
-            None,                       // report_tx: AB-5
-            Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
+            quant_window_handles,       // report_tx: AB-5
             Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
         );
         (d, registry)
@@ -1156,12 +896,7 @@ mod tests {
             None,
             Vec::new(),
             None,
-            None,
-            None,
-            None,
             Vec::new(),
-            None,
-            Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
         );
         d.dispatch(vec![EngineCommand::KvReencodeFormat {
@@ -1262,12 +997,7 @@ mod tests {
             None,
             Vec::new(),
             None,
-            None,
-            None,
-            None,
             Vec::new(),
-            None,                       // report_tx: AB-5
-            Arc::new(Mutex::new(None)), // hook_cell: §5.9.2 (테스트 더미)
             Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
         );
         d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
@@ -1357,54 +1087,4 @@ mod tests {
     }
 
     // ── AB-6: swap OneShot submit + transient 시맨틱 (§5.6.4) ──
-
-    /// swap 미구성(model/swap_runtime=None) dispatcher 는 SwapWeights 를 무시.
-    #[test]
-    fn swap_unconfigured_ignores_directive() {
-        let (mut d, registry, _h) = make_dispatcher(); // model=None, swap_runtime=None
-        d.dispatch(vec![EngineCommand::SwapWeights {
-            ratio: 0.9,
-            target_dtype: argus_shared::DtypeTag::Q4_0,
-        }]);
-        assert_eq!(registry.len(), 0, "swap 미구성 → directive 무시");
-    }
-
-    /// SwapWeights arm → registry 에 WeightSwapStage 등록(첫 directive → 1 submit).
-    #[test]
-    fn swap_directive_submits_one_shot_stage() {
-        let (mut d, registry) = make_swap_dispatcher();
-        assert_eq!(registry.len(), 0);
-        d.dispatch(vec![EngineCommand::SwapWeights {
-            ratio: 0.9,
-            target_dtype: argus_shared::DtypeTag::Q4_0,
-        }]);
-        assert_eq!(registry.len(), 1, "swap directive → OneShot 1개 submit");
-    }
-
-    /// transient 시맨틱(§5.6.4): partition 의 last-applied 게이트도 evict 의 armed 게이트도 없다.
-    /// 같은 directive 재도착 → 새 submit (재submit 차단은 dispatcher 가 아니라 Stage in-flight
-    /// 가드 담당 — landmine: partition 게이트 복사 금지). 따라서 dispatcher 레벨에서는 매 directive
-    /// 가 submit 을 늘린다.
-    #[test]
-    fn swap_transient_resubmits_each_directive() {
-        let (mut d, registry) = make_swap_dispatcher();
-        d.dispatch(vec![EngineCommand::SwapWeights {
-            ratio: 0.9,
-            target_dtype: argus_shared::DtypeTag::Q4_0,
-        }]);
-        assert_eq!(registry.len(), 1);
-        // 같은 directive 재도착 → 새 submit (값 비교 게이트 없음).
-        d.dispatch(vec![EngineCommand::SwapWeights {
-            ratio: 0.9,
-            target_dtype: argus_shared::DtypeTag::Q4_0,
-        }]);
-        assert_eq!(
-            registry.len(),
-            2,
-            "transient: 같은 directive 재도착 → 새 submit (게이트 없음)"
-        );
-        // 빈 batch 는 carry 0 (swap_weights 필드 삭제 — sticky 아님).
-        d.dispatch(vec![]);
-        assert_eq!(registry.len(), 2, "빈 batch — carry 0 (transient)");
-    }
 }

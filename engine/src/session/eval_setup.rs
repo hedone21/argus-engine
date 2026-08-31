@@ -28,7 +28,6 @@ use tokenizers::Tokenizer;
 
 use crate::backend::Backend;
 use crate::buffer::DType;
-use crate::hardware::DeviceTarget;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::signal_runtime::SignalRuntime;
 use crate::inference::skip_config::SkipConfig;
@@ -41,7 +40,6 @@ use crate::session::bin_setup::{
     alloc_eval_kv_caches, check_vocab_compatibility, resolve_tokenizer_path,
 };
 use crate::session::cli::Args;
-use crate::session::dump_importance::DumpImportanceCtx;
 use crate::session::eval::args::EvalLlRunCtx;
 use crate::session::init::SessionInitCtx;
 use crate::session::ppl::PplRunCtx;
@@ -53,18 +51,12 @@ use crate::session::ppl::PplRunCtx;
 struct EvalBase {
     backend: Arc<dyn crate::backend::Backend>,
     memory: Arc<dyn crate::memory::Memory>,
-    cpu_backend_arc: Arc<dyn crate::backend::Backend>,
-    gpu_backend_arc: Option<Arc<dyn crate::backend::Backend>>,
     caps: Arc<crate::capability::CapabilityRegistry>,
     model: TransformerModel,
     tokenizer: Tokenizer,
     prompt: String,
     kv_type: DType,
     max_seq_len: usize,
-    swap_algorithm: crate::weight::SwapAlgorithm,
-    importance_formula: crate::qcf_types::ImportanceFormula,
-    importance_compare: bool,
-    swap_only_layers: Option<Vec<usize>>,
 }
 
 /// 플러그인 등록 → 내장 KV format self-test → `SessionInitCtx::build` →
@@ -82,16 +74,6 @@ fn build_eval_base(args: &Args) -> Result<EvalBase> {
     let init = SessionInitCtx::build(args)?;
 
     // legacy generate.rs:114-126 미러 — hardware resolver 에서 cpu/gpu backend arc 파생.
-    let cpu_backend_arc = init
-        .hardware
-        .resolve(DeviceTarget::Cpu)
-        .expect("Cpu always resolves")
-        .0
-        .clone();
-    let gpu_backend_arc: Option<Arc<dyn Backend>> = init
-        .hardware
-        .resolve(DeviceTarget::Gpu)
-        .map(|(b, _)| b.clone());
 
     let tokenizer_path = resolve_tokenizer_path(args, &init.model_path, init.is_gguf);
     eprintln!("[Tokenizer] {}", tokenizer_path);
@@ -117,18 +99,12 @@ fn build_eval_base(args: &Args) -> Result<EvalBase> {
     Ok(EvalBase {
         backend: init.backend,
         memory: init.memory,
-        cpu_backend_arc,
-        gpu_backend_arc,
         caps: init.caps,
         model: init.model,
         tokenizer,
         prompt,
         kv_type,
         max_seq_len: args.max_seq_len,
-        swap_algorithm: init.swap_algorithm,
-        importance_formula: init.importance_formula,
-        importance_compare: init.importance_compare,
-        swap_only_layers: init.swap_only_layers,
     })
 }
 
@@ -252,21 +228,15 @@ fn build_eval_score_accumulator(
     model: &TransformerModel,
     max_seq_len: usize,
 ) -> Option<AttentionScoreAccumulator> {
-    // `--qcf-mode caote|both` forces the score accumulator + GQA even with no eviction policy.
-    // The value-aware QcfMode variant was name-only residue (no distinct arithmetic), so gate on the CLI
-    // string directly (B1-2).
-    let needs_caote = matches!(args.qcf_mode.as_str(), "caote" | "both");
     let needs_score_based = stage_is_score_based(args.eviction_policy());
     let has_eviction_policy = args.eviction_policy() != "none";
-    let needs_accumulator =
-        needs_score_based || needs_caote || args.enable_resilience || has_eviction_policy;
+    let needs_accumulator = needs_score_based || args.enable_resilience || has_eviction_policy;
     if !needs_accumulator {
         return None;
     }
 
-    // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + value-aware) and for any per-head stage.
-    // Any non-none eviction policy already enables it (has_eviction_policy), so no per-name branch.
-    let use_gqa = needs_caote || has_eviction_policy;
+    // GQA mode is required by any per-head stage. Any non-none eviction policy enables it.
+    let use_gqa = has_eviction_policy;
     let mut acc = if use_gqa {
         AttentionScoreAccumulator::new_gqa(
             max_seq_len,
@@ -379,18 +349,12 @@ pub fn build_eval_ll_ctx(args: Args) -> Result<EvalLlRunCtx> {
     let EvalBase {
         backend,
         memory,
-        cpu_backend_arc,
-        gpu_backend_arc,
         caps: _caps, // Standard eval 은 caps 미소비 (quant-window 만 thread-through).
         model,
         tokenizer,
         prompt,
         kv_type,
         max_seq_len,
-        swap_algorithm,
-        importance_formula,
-        importance_compare,
-        swap_only_layers,
     } = base;
 
     // model move 전에 config 파생 값 캡처.
@@ -433,8 +397,6 @@ pub fn build_eval_ll_ctx(args: Args) -> Result<EvalLlRunCtx> {
         args,
         backend,
         memory,
-        cpu_backend_arc,
-        gpu_backend_arc,
         model,
         tokenizer,
         kv_caches,
@@ -451,10 +413,6 @@ pub fn build_eval_ll_ctx(args: Args) -> Result<EvalLlRunCtx> {
         kv_type,
         actual_protected_prefix,
         score_based_eviction,
-        swap_algorithm,
-        importance_formula,
-        importance_compare,
-        swap_only_layers,
     })
 }
 
@@ -467,18 +425,12 @@ pub fn build_ppl_ctx(args: Args) -> Result<PplRunCtx> {
     let EvalBase {
         backend,
         memory,
-        cpu_backend_arc,
-        gpu_backend_arc,
         caps: _caps,
         model,
         tokenizer,
         prompt,
         kv_type,
         max_seq_len,
-        swap_algorithm,
-        importance_formula,
-        importance_compare,
-        swap_only_layers,
     } = base;
 
     let hidden_size = model.config.hidden_size;
@@ -494,7 +446,7 @@ pub fn build_ppl_ctx(args: Args) -> Result<PplRunCtx> {
     // `--kv-format <policy>` 면 per-layer mixed precision, 아니면 uniform `kv_type` (alloc_eval_kv_caches).
     let kv_layout = crate::kv_cache_ops::KVLayout::from_cli(&args.kv_layout)
         .ok_or_else(|| anyhow::anyhow!("Unsupported --kv-layout: '{}'", args.kv_layout))?;
-    let mut kv_caches = alloc_eval_kv_caches(
+    let kv_caches = alloc_eval_kv_caches(
         &args,
         &backend,
         memory.clone(),
@@ -511,58 +463,6 @@ pub fn build_ppl_ctx(args: Args) -> Result<PplRunCtx> {
     crate::inference::attention_scores::ensure_score_producers_registered()?;
     let score_accumulator = build_eval_score_accumulator(&args, &backend, &model, max_seq_len);
     let skip_config = build_eval_skip_config(&args, &model)?;
-
-    // ── QCF dump warmup prelude (legacy generate.rs:1698-1747) ──
-    // --qcf-dump 시 ppl 진입 전 warmup prefill → ImportanceTable → swap 결정.
-    let qcf_workflow_start = std::time::Instant::now();
-    let mut qcf_warmup_importance: Option<crate::qcf::ImportanceTable> = None;
-    let mut qcf_swap_decision: Option<crate::weight::SwapDecision> = None;
-
-    if args.qcf_dump.is_some() && (args.ppl.is_some() || !prompt.is_empty()) {
-        let warmup_n = args.qcf_warmup_tokens.max(1);
-        let warmup_tokens: Vec<u32> = if let Some(ref ppl_path) = args.ppl {
-            let text = std::fs::read_to_string(ppl_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read PPL file for warmup: {e}"))?;
-            let enc = tokenizer
-                .encode(text.as_str(), true)
-                .map_err(|e| anyhow::anyhow!("Warmup tokenize error: {e}"))?;
-            enc.get_ids().iter().take(warmup_n).copied().collect()
-        } else {
-            let enc = tokenizer
-                .encode(prompt.as_str(), true)
-                .map_err(|e| anyhow::anyhow!("Warmup tokenize error: {e}"))?;
-            enc.get_ids().iter().take(warmup_n).copied().collect()
-        };
-        if warmup_tokens.is_empty() {
-            anyhow::bail!(
-                "--qcf-dump: warmup token sequence is empty (prompt or PPL text too short)"
-            );
-        }
-        let result = crate::session::qcf_runtime::run_qcf_warmup_workflow(
-            crate::session::qcf_runtime::QcfWarmupCtx {
-                model: &model,
-                backend: &backend,
-                memory: memory.as_ref(),
-                kv_caches: &mut kv_caches,
-                vocab_size,
-                warmup_ids: &warmup_tokens,
-                gpu_backend: gpu_backend_arc.as_ref(),
-                cpu_backend: &cpu_backend_arc,
-            },
-            crate::session::qcf_runtime::QcfWarmupConfig {
-                force_ratio: args.force_swap_ratio,
-                swap_algorithm,
-                execute_swap: true,
-                importance_formula,
-                importance_three_way: importance_compare,
-                swap_only_layers: swap_only_layers.as_deref(),
-                decode_x_steps: args.decode_x_steps,
-                log_prefix: "",
-            },
-        )?;
-        qcf_swap_decision = result.decision;
-        qcf_warmup_importance = Some(result.importance);
-    }
 
     Ok(PplRunCtx {
         args,
@@ -584,46 +484,7 @@ pub fn build_ppl_ctx(args: Args) -> Result<PplRunCtx> {
         head_dim,
         actual_protected_prefix,
         score_based_eviction,
-        qcf_warmup_importance,
-        qcf_swap_decision,
-        qcf_workflow_start,
         auto_eviction,
-        swap_algorithm,
-    })
-}
-
-/// `--dump-importance` 진입용 [`DumpImportanceCtx`] 를 조립한다 (8필드, 최소).
-///
-/// legacy generate.rs:1634-1647 등가. eviction/score/skip 상태 불필요.
-pub fn build_dump_importance_ctx(args: Args) -> Result<DumpImportanceCtx> {
-    let base = build_eval_base(&args)?;
-    let vocab_size = base.model.config.vocab_size;
-    let model_path = args.model_path.clone();
-    // KV capacity=max_seq_len 선할당 (eval 모드 일관 — grow 스파이크 회피).
-    // `--kv-format <policy>` 면 per-layer mixed precision, 아니면 uniform `kv_type` (alloc_eval_kv_caches).
-    let kv_layout = crate::kv_cache_ops::KVLayout::from_cli(&args.kv_layout)
-        .ok_or_else(|| anyhow::anyhow!("Unsupported --kv-layout: '{}'", args.kv_layout))?;
-    let kv_caches = alloc_eval_kv_caches(
-        &args,
-        &base.backend,
-        base.memory.clone(),
-        base.model.config.num_hidden_layers,
-        base.max_seq_len,
-        base.max_seq_len,
-        base.model.config.num_key_value_heads,
-        base.model.config.head_dim,
-        base.kv_type,
-        kv_layout,
-    )?;
-    Ok(DumpImportanceCtx {
-        backend: base.backend,
-        memory: base.memory,
-        model: base.model,
-        tokenizer: base.tokenizer,
-        kv_caches,
-        prompt: base.prompt,
-        vocab_size,
-        model_path,
     })
 }
 
@@ -638,7 +499,6 @@ pub fn build_dump_importance_ctx(args: Args) -> Result<DumpImportanceCtx> {
 pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
     use crate::backend::QuantAttnBackend;
     use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
-    use crate::session::cli::parse_qcf_sample_layers;
     use crate::session::eval::{EvalConfig, QuantWindowFlushHook, run_eval_ll_generic};
 
     let base = build_eval_base(&args)?;
@@ -666,14 +526,12 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
         kv_budget_ratio: 0.0,
         greedy: args.greedy,
         kv_type: format!("q{}+f32_residual", args.effective_quant_window_bits()),
-        qcf_mode: args.qcf_mode.clone(),
         vocab_size,
         hidden_size,
         // The quant-window path does not evict; eviction timing does not apply.
         evict_timing: crate::session::eval::EvictTiming::default(),
         faithful_h2o: false,
     };
-    let qcf_config = crate::qcf_types::QcfConfig::default();
     let quant_window_bits = args.effective_quant_window_bits();
 
     // quant-window native attention handle 을 caps 에서 1회 pull (closure 밖). OpenCL 면 Some.
@@ -704,35 +562,7 @@ pub fn run_eval_ll_quant_window(args: Args) -> Result<()> {
         eprintln!("[quant-window] AWQE + AW-VOPR enabled (LLMRS_KIVI_AWQE)");
     }
 
-    let kivi_n_layers = kv_caches.len();
-    let kivi_sample_layers = if args.enable_qcf_experimental {
-        parse_qcf_sample_layers(&args.qcf_sample_layers, kivi_n_layers)
-            .map_err(|e| anyhow::anyhow!("--qcf-sample-layers: {e}"))?
-    } else {
-        vec![0]
-    };
-    let kivi_score_acc = if args.enable_qcf_experimental {
-        crate::inference::attention_scores::ensure_score_producers_registered()?;
-        let mut acc = AttentionScoreAccumulator::new_gqa(
-            max_seq_len,
-            model.config.num_attention_heads,
-            model.config.num_key_value_heads,
-            kivi_n_layers,
-            0,
-            1.0,
-        );
-        acc.set_active(true);
-        Some(acc)
-    } else {
-        None
-    };
-
-    let mut hook = QuantWindowFlushHook::new(
-        qcf_config,
-        args.enable_qcf_experimental,
-        kivi_sample_layers,
-        kivi_score_acc,
-    );
+    let mut hook = QuantWindowFlushHook::new(None);
     let output = run_eval_ll_generic(
         &model,
         &tokenizer,

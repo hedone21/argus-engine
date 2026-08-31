@@ -25,7 +25,6 @@ fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
 
     // `--swap` shorthand → legacy 4 flag normalize (argus_cli 와 동일).
-    args.normalize_swap_shorthand();
     // resilience default-on. `--no-resilience` 명시 시 effective=false.
     args.enable_resilience = !args.no_resilience;
 
@@ -90,19 +89,7 @@ fn reject_unsupported_for_chat(args: &Args) -> anyhow::Result<()> {
     if args.eval_ll || args.eval_batch.is_some() || args.eval_continuation.is_some() {
         bail!("argus-chat: --eval-* belongs to argus-eval --eval-ll");
     }
-    if args.dump_importance {
-        bail!("argus-chat: --dump-importance belongs to argus-eval");
-    }
-    if args.qcf_dump.is_some() {
-        bail!("argus-chat: --qcf-dump belongs to argus-eval");
-    }
-    if args.secondary_gguf.is_some()
-        || args.force_swap_ratio.is_some()
-        || args.swap_incremental_per_tick > 0
-        || args.swap_intra_forward
-        || args.swap_layer_immediate
-        || args.swap_phase_aware
-    {
+    if args.secondary_gguf.is_some() {
         bail!("argus-chat: weight swap is not supported (use argus-bench)");
     }
     if args.profile || args.profile_events {

@@ -3,7 +3,7 @@
 //! SqueezeAttention assigns *different* KV-cache budgets to different decoder layers based on
 //! per-layer importance (more important layers keep more tokens). The per-layer importance signal
 //! is produced by the `layer-importance` plugin (`mean_pool` / `shortgpt_bi` = `1 − cos(h_in, h_out)`)
-//! and surfaced via `WeightStageCtx::layer_metric(Importance)` / the `ImportanceTable`.
+//! and surfaced via `WeightStageCtx::layer_metric(Importance)`.
 //!
 //! This module is the *budget allocation* policy: importance → per-layer `target_len`. The vector it
 //! returns is consumed by `CacheManager::run_policy_eviction`'s per-layer budget path

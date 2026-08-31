@@ -1,4 +1,4 @@
-//! Env-gated runtime overhead profiler for QCF/NLL quality metrics.
+//! Env-gated runtime overhead profiler for quality metrics.
 //!
 //! Enabled by setting `ARGUS_PROFILE_QUALITY=1` (or `true`) in the environment.
 //! When disabled, every instrumentation site costs only one branch on a cached
@@ -6,9 +6,9 @@
 //!
 //! Usage at a measurement site:
 //! ```ignore
-//! use crate::observability::profile::quality_metrics::{Timer, QCF_KV_UNIFIED};
-//! pub fn compute_qcf_kv(...) -> ... {
-//!     let _t = Timer::start(&QCF_KV_UNIFIED);
+//! use crate::observability::profile::quality_metrics::{Timer, NLL};
+//! pub fn log_softmax(...) -> ... {
+//!     let _t = Timer::start(&NLL);
 //!     // ... function body ...
 //! }
 //! ```
@@ -96,27 +96,12 @@ impl Drop for Timer<'_> {
 
 // ── Buckets (process-lifetime) ───────────────────────────────────
 
-/// Output-error QCF for KV cache eviction/merge actions.
-pub static QCF_KV_UNIFIED: Bucket = Bucket::new("qcf_kv_unified");
-/// quant-window dynamic-quantization dry-run estimate (residual NMSE or bits proxy).
-pub static QCF_KV_DRYRUN: Bucket = Bucket::new("qcf_kv_dryrun");
-/// Weight-swap QCF (per-ratio sweep + actual-swap measurement).
-pub static QCF_WEIGHT_SWAP: Bucket = Bucket::new("qcf_weight_swap");
-/// Layer-skip QCF (importance-table based).
-pub static QCF_LAYER_SKIP: Bucket = Bucket::new("qcf_layer_skip");
 /// Numerically stable log-softmax for eval-LL token scoring.
 pub static NLL: Bucket = Bucket::new("nll");
 /// Per-token decode (forward + sample) baseline.
 pub static DECODE_TOTAL: Bucket = Bucket::new("decode_total");
 
-const ALL_BUCKETS: &[&Bucket] = &[
-    &QCF_KV_UNIFIED,
-    &QCF_KV_DRYRUN,
-    &QCF_WEIGHT_SWAP,
-    &QCF_LAYER_SKIP,
-    &NLL,
-    &DECODE_TOTAL,
-];
+const ALL_BUCKETS: &[&Bucket] = &[&NLL, &DECODE_TOTAL];
 
 /// Print a stderr summary of all buckets. No-op when profiling is disabled.
 pub fn print_report() {

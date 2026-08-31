@@ -100,12 +100,7 @@ fn make_unconfigured_dispatcher(registry: &Arc<PipelineRegistry>) -> CommandDisp
         None,
         slots,
         Some(hw),
-        None, // model=None → recall 미구성
-        None,
-        None,
         Vec::new(),
-        None,
-        Arc::new(Mutex::new(None)),
         Arc::new(Mutex::new(None)),
     )
 }
@@ -181,12 +176,7 @@ fn recall_unconfigured_swap_runtime_none_ignores_directive() {
         None,
         slots,
         Some(hw),
-        None,
-        None, // swap_runtime=None
-        None,
         Vec::new(),
-        None,
-        Arc::new(Mutex::new(None)),
         Arc::new(Mutex::new(None)),
     );
     d.dispatch(vec![EngineCommand::RecallWeights { ratio: 1.0 }]);

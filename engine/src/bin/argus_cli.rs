@@ -33,7 +33,6 @@ fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
 
     // backlog P3 (2026-05-25): `--swap` shorthand → legacy 4 flag normalize.
-    args.normalize_swap_shorthand();
 
     // v1-1: resilience default-on. `--no-resilience` 가 명시되면 effective=false.
     args.enable_resilience = !args.no_resilience;
@@ -76,30 +75,18 @@ fn reject_unsupported_modes_v0(args: &Args) -> anyhow::Result<()> {
             "argus-cli v0: --eval-ll / --eval-batch / --eval-continuation moved to argus-eval --eval-ll"
         );
     }
-    if args.dump_importance {
-        bail!("argus-cli v0: --dump-importance moved to argus-eval --dump-importance");
-    }
     if !args.dump_kinds().is_empty() || args.dump_dir.is_some() {
         bail!(
             "argus-cli v0: --dump <kinds> / --dump-dir is an argus-eval diagnostic; \
              use argus-eval --eval-ll --dump <kind> --dump-dir <dir>"
         );
     }
-    if args.qcf_dump.is_some() {
-        bail!("argus-cli v0: --qcf-dump moved to argus-eval (--qcf-dump with --eval-ll or --ppl)");
-    }
     if args.effective_kv_mode() != "standard" {
         bail!(
             "argus-cli v0: only --kv-mode standard supported (quant-window/Offload planned for v1)"
         );
     }
-    if args.secondary_gguf.is_some()
-        || args.force_swap_ratio.is_some()
-        || args.swap_incremental_per_tick > 0
-        || args.swap_intra_forward
-        || args.swap_layer_immediate
-        || args.swap_phase_aware
-    {
+    if args.secondary_gguf.is_some() {
         bail!("argus-cli v0: weight swap options not yet supported (planned for v1)");
     }
     if args.profile || args.profile_events {

@@ -19,7 +19,6 @@ pub mod fmt_bridge;
 pub mod helpers;
 pub mod hook;
 pub mod output;
-pub mod qcf_helpers;
 pub mod quant_window_hook;
 pub mod runner;
 
@@ -34,6 +33,5 @@ pub use fmt_bridge::EvalCacheKind;
 pub use helpers::{build_eval_ll_warmup_text, load_eval_questions};
 pub use hook::{CacheSnapshot, PostStepResult, StepHook};
 pub use output::{EvalConfig, EvalOutput, EvalQuestion};
-pub use qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
 pub use quant_window_hook::QuantWindowFlushHook;
 pub use runner::run_eval_ll;

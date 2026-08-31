@@ -15,11 +15,10 @@
 //! engine (`seed_prefill_importance`); this crate only consumes `ctx.importance()` / `tensor(Scores)`.
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, EstimatorCtx, KVMutationStage, KeepSpec, KeepTopK, MutationPhase,
-    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, SignalId, StageArgs, StageCaps, StageCtx,
-    StageParams, TensorKind, compile_keep_top_k, redistribute_value, register_kv_mutation_stage,
+    CacheHandle, CacheOpError, KVMutationStage, KeepSpec, KeepTopK, MutationPhase, SignalId,
+    StageArgs, StageCaps, StageCtx, StageParams, TensorKind, compile_keep_top_k,
+    register_kv_mutation_stage,
 };
-use linkme::distributed_slice;
 
 /// The score-based caps for the v3 registration: H2O reads accumulated importance (Scores) and — to
 /// stay faithful to the reference, which has no attention sink — protects NO prefix by default.
@@ -194,9 +193,11 @@ register_kv_mutation_stage!(
 
 // ── QCF estimator (observer/score axis) ──────────────────────────
 
-/// Identify the H2O-retained token set for the QCF simulation: protected prefix + top-`hh_size` heavy
-/// hitters (by importance) + the `recent_size` recency window. Absolute budgets, faithful to the
-/// actuator's [`H2o::keep_spec`].
+/// The H2O-retained token set: protected prefix + top-`hh_size` heavy hitters (by importance) +
+/// the `recent_size` recency window. Absolute budgets, faithful to the actuator's
+/// [`H2o::keep_spec`]. Test-only since the QCF simulation it also fed was removed — it is the
+/// independent oracle the `keep_spec` tests compare against.
+#[cfg(test)]
 fn identify_retained_h2o(
     importance: &[f32],
     current_pos: usize,
@@ -219,58 +220,6 @@ fn identify_retained_h2o(
     retained.dedup();
     retained
 }
-
-/// H2O QCF estimator: prefix + heavy-hitter + recent retained set, then O_after redistribution over
-/// it. Kept in lockstep with the faithful actuator (absolute `hh_size`/`recent_size` + prefix).
-struct H2oEstimator {
-    hh_size: usize,
-    recent_size: usize,
-    protected_prefix: usize,
-}
-
-impl QcfEstimator for H2oEstimator {
-    fn name(&self) -> &str {
-        "h2o"
-    }
-    fn curve_key(&self) -> &'static str {
-        "kv.evict_h2o"
-    }
-    fn o_after(&self, ctx: &dyn EstimatorCtx, kv_head: usize, out: &mut [f32]) -> bool {
-        let current = ctx.current_pos();
-        if current <= self.protected_prefix + self.hh_size + self.recent_size {
-            return false;
-        }
-        let mut alpha = vec![0.0f32; current];
-        ctx.alpha_h(kv_head, &mut alpha);
-        let retained = identify_retained_h2o(
-            &alpha,
-            current,
-            self.hh_size,
-            self.recent_size,
-            self.protected_prefix,
-        );
-        redistribute_value(ctx, kv_head, &alpha, &retained, ctx.beta(), out);
-        true
-    }
-}
-
-/// Registration — found via `find_qcf_estimator("h2o")`. Parses the same absolute budgets as the
-/// actuator so the estimate ranks on the identical retained set. Score-based.
-#[distributed_slice(QCF_ESTIMATORS)]
-static H2O_QCF: QcfEstimatorReg = QcfEstimatorReg {
-    name: "h2o",
-    curve_key: "kv.evict_h2o",
-    make: |p: StageParams, args: StageArgs<'_>| {
-        let (hh_size, recent_size) = parse_h2o_budgets(args);
-        Box::new(H2oEstimator {
-            hh_size,
-            recent_size,
-            protected_prefix: p.protected_prefix,
-        })
-    },
-    requires_scores: true,
-    requires_streaming_config: false,
-};
 
 #[cfg(test)]
 mod tests {

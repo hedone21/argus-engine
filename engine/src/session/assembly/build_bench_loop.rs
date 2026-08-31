@@ -34,20 +34,6 @@ use crate::session::pipeline_registry::PipelineRegistry;
 use crate::session::resilience_adapter::ResilienceAdapter;
 use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPenaltySampler};
 
-/// AB-6 §5.6.7: `WeightSwapStage` 의 `EngineSwapRuntime` 구성에 필요한 CLI 설정 묶음.
-///
-/// `build_bench_loop` 가 mf.model() 의 secondary_mmap 보유 여부를 보고, 보유 시에만
-/// `EngineSwapRuntime` 을 greenfield 구성한다(현 swap 미배선 = NoOpSwapStage). secondary
-/// 부재(happy/chat)면 swap directive 무시(dispatcher 에 `None` 전달).
-pub struct SwapWiringConfig {
-    /// CLI `--swap` normalize 결과(default = Incremental, LISWAP-6 production winner).
-    pub default_mode: crate::session::cli::SwapMode,
-    /// PhaseAware 전용 chunk 크기(bytes) = `--swap-phase-aware-chunk-mb` * 1 MB.
-    pub phase_chunk_size_bytes: usize,
-    /// PhaseAware 전용 token 당 최대 chunk 수 = `--swap-phase-aware-max-chunks-per-token`.
-    pub phase_max_chunks_per_token: usize,
-}
-
 /// The `(name, StageParams, owned extra-args)` for the configured `eviction <policy>` — shared by the
 /// v2 [`build_resilience_cache_manager`] (which builds the v2 `KVMutationStage`) and the v3
 /// [`resolve_mutation_driver`] (which builds the v3 `KVMutationStage`) so a migrated technique's v3
@@ -238,7 +224,6 @@ pub fn build_bench_loop(
     schedule_source: Option<ScheduleCommandSource>,
     // AB-6 §5.6.7: WeightSwapStage 의 swap dispatch 설정 (CLI `--swap`/`--swap-phase-aware-*`
     // normalize 결과). secondary 보유 모델일 때만 `EngineSwapRuntime` 을 구성한다.
-    swap_config: SwapWiringConfig,
     // §5.9.1 Track A: score-based policy(h2o/h2o_plus/d2o) 시 호출자가 생성한 accumulator cell.
     // 비-score 조립처는 `Arc::new(Mutex::new(None))` 더미를 넘긴다.
     score_cell: Arc<Mutex<Option<crate::inference::signal_runtime::SignalRuntime>>>,
@@ -328,7 +313,7 @@ pub fn build_bench_loop(
     // model 측 접근 seam — secondary_mmap/quant_noise/current_dtype). swap_runtime 은 아래에서
     // secondary 보유 시에만 greenfield 구성한다.
     let swap_model: Arc<TransformerModel> = Arc::clone(mf.model());
-    let has_secondary = swap_model.secondary_mmap.is_some();
+    let _has_secondary = swap_model.secondary_mmap.is_some();
 
     // β-4 (매핑 문서 4부): resilience adapter 에 held-handle 주입 → heartbeat snapshot 의
     // kv_cache_tokens/capacity 를 layer-0 handle 에서 query (poll 인자 제거 대체).
@@ -372,43 +357,6 @@ pub fn build_bench_loop(
     // β-5: CM 을 Arc<Mutex> 로 한 번 들어 dispatcher(OneShot 구성)와 Persistent stage 가 공유.
     let shared_cm = cache_manager.map(|cm| Arc::new(Mutex::new(cm)));
 
-    // AB-6 §5.6.7: secondary 보유 모델일 때만 EngineSwapRuntime 을 greenfield 구성한다.
-    // swap_backend = build_bench_loop 의 `backend`(mf 로 move 됐으나 Arc clone 보유 — backend_arc).
-    // config/release_worker 는 mf.model() 에서 query. report_tx 는 resilience adapter 의 resp_tx
-    // clone(§5.6.6 — Stage 가 &self 로 commit 시점 송신). secondary 부재(happy/chat)면 None →
-    // dispatcher 가 swap directive 무시.
-    let swap_runtime: Option<Arc<crate::session::swap_runtime::EngineSwapRuntime>> =
-        if has_secondary {
-            // EPIC 3 B3-0: WeightSwapStage::commit 이 레이어 선택을 find_weight_stage("swap")
-            // seam 으로 라우팅한다. fat-LTO --gc-sections 가 빌트인 "swap" 등록을 silent drop 하면
-            // 그 .expect() 가 decode-time 패닉이 되므로, seam 이 실제 소비되는 has_secondary 경로
-            // 에서만 construction-time 으로 fail-fast 한다(happy/chat 경로엔 미배선 = 무영향).
-            crate::weight::stage_registry::ensure_builtin_weight_stages_registered()?;
-            let report_tx = resilience.as_ref().map(|a| a.report_sender());
-            let async_dispatcher =
-                Arc::new(crate::weight::AsyncSwapDispatcher::new(backend_arc.clone()));
-            Some(Arc::new(
-                crate::session::swap_runtime::EngineSwapRuntime::new(
-                    backend_arc.clone(),
-                    async_dispatcher,
-                    Arc::new(swap_model.config.clone()),
-                    Arc::clone(&swap_model.release_worker),
-                    swap_config.default_mode,
-                    swap_config.phase_chunk_size_bytes,
-                    swap_config.phase_max_chunks_per_token,
-                    report_tx,
-                ),
-            ))
-        } else {
-            None
-        };
-    let swap_model_handle = swap_runtime.as_ref().map(|_| Arc::clone(&swap_model));
-
-    // AB-5 §5.8.4: report_tx = resilience.as_ref().map(|a| a.report_sender()) — swap_runtime
-    // 의 report_tx(build_bench_loop.rs:289)와 동일 source(같은 report_sender() clone).
-    // resilience-off 면 None → dispatcher 가 RequestQcf 무송출(inert).
-    let report_tx_for_dispatcher = resilience.as_ref().map(|a| a.report_sender());
-
     // γ-3b: schedule_source 가 있어도 dispatcher 를 구성해야 evict directive 가 OneShot
     // EvictionStage 로 submit 된다 (설계 §13.4 "schedule.is_some() OR 추가").
     let dispatcher = if resilience.is_some() || shared_cm.is_some() || schedule_source.is_some() {
@@ -420,17 +368,8 @@ pub fn build_bench_loop(
             // (이론상 무) submit 안 됨 — dispatcher 내부 inert (evict CM=None 과 등가).
             layer_slots,
             Some(Arc::clone(&hardware)),
-            // AB-6: swap directive 가 OneShot WeightSwapStage 로 submit. swap_model/swap_runtime 이
-            // None(secondary 부재)이면 dispatcher 내부 inert (happy/chat).
-            swap_model_handle,
-            swap_runtime,
-            None, // importance: argus-bench 는 score accumulator 미장착 → uniform fallback.
             // AB-2: Standard 경로는 quant-window handle 부재 → 빈 Vec (KvQuantDynamic directive inert).
             Vec::new(),
-            // AB-5: QcfEstimate 송출 채널. resilience-on 이면 Some, off 이면 None(inert).
-            report_tx_for_dispatcher,
-            // §5.9.2 Track B: ModelForward 와 공유하는 hook cell (위에서 생성).
-            Arc::clone(&hook_cell),
             // §5.9.1 Track A: ModelForward + EvictionStage 와 공유하는 score cell.
             Arc::clone(&score_cell),
         );

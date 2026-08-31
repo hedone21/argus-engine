@@ -17,8 +17,6 @@ use crate::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use crate::memory::Memory;
 use crate::memory::galloc::Galloc;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
-use crate::qcf::ImportanceCollector;
-use crate::qcf_types::SubLayer;
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -125,27 +123,9 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
         backend.clone() as Arc<dyn Backend>,
     );
 
-    // ── Importance 2-pass (only when skip_config is active) ──
-    let (importance_table, layer_skip_qcf, layer_skip_opr, layer_skip_set_len) =
-        run_importance_pass(
-            model,
-            tokenizer,
-            backend,
-            memory,
-            kv_caches,
-            hook,
-            questions,
-            vocab_size,
-            eval_config,
-            skip_config,
-        )?;
-
     // ── Per-question evaluation loop ──
     let mut results: Vec<serde_json::Value> = Vec::new();
     let overall_start = std::time::Instant::now();
-
-    let qcf_layer_skip = layer_skip_opr.map(|v| v as f64);
-    let qcf_layer_skip_layers = layer_skip_opr.map(|_| layer_skip_set_len);
 
     let trace_alloc = std::env::var("LLM_OCL_ALLOC_TRACE").is_ok();
     if trace_alloc {
@@ -291,7 +271,6 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
                     score_accumulator: hook.score_accumulator(),
                     query_stats_accumulator: None,
                     skip_config,
-                    importance_collector: None,
                     cache_self_need_scores: probe_need,
                     layer_boundary_hook: None,
                     read_stage: None,
@@ -417,7 +396,6 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
                             score_accumulator: hook.score_accumulator(),
                             query_stats_accumulator: None,
                             skip_config,
-                            importance_collector: None,
                             cache_self_need_scores: dec_need,
                             layer_boundary_hook: None,
                             read_stage: None,
@@ -510,11 +488,9 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
             "n_choices": question.choices.len(),
             "n_prompt_tokens": prompt_len,
             "final_cache_pos": final_cache_pos,
-            "qcf_layer_skip": qcf_layer_skip,
-            "qcf_layer_skip_layers": qcf_layer_skip_layers,
         });
 
-        // Merge hook-specific fields (qcf, qcf_quant_legacy, qcf_value_aware, effective_budget, etc.)
+        // Merge hook-specific fields (effective_budget, eviction counters, etc.)
         if let Some(obj) = extra.as_object() {
             for (k, v) in obj {
                 result_obj[k] = v.clone();
@@ -526,154 +502,11 @@ pub fn run_eval_ll_generic<C: EvalCacheKind>(
 
     let wall_time_s = overall_start.elapsed().as_secs_f64();
 
-    // ── Build layer_importance JSON ──
-    let layer_importance_json = importance_table.map(|table| {
-        serde_json::json!(
-            table
-                .entries()
-                .iter()
-                .map(|e| serde_json::json!({
-                    "layer": e.layer_id,
-                    "sublayer": format!("{:?}", e.sublayer),
-                    "importance": e.importance,
-                    "opr": e.opr,
-                }))
-                .collect::<Vec<serde_json::Value>>()
-        )
-    });
-
-    // Normalize layer_skip_qcf: skipped / remaining = raw / (1 - raw)
-    let layer_skip_qcf_normalized = layer_skip_qcf.map(|qcf| {
-        const NORMALIZED_CAP: f32 = 100.0;
-        if qcf >= 1.0 - 1e-7 {
-            NORMALIZED_CAP
-        } else {
-            qcf / (1.0 - qcf)
-        }
-    });
-
     Ok(EvalOutput {
         results,
         config: serde_json::json!(hook.extra_config_fields()),
         wall_time_s,
-        layer_importance: layer_importance_json,
-        layer_skip_qcf,
-        layer_skip_qcf_normalized,
-        qcf_layer_skip,
-        qcf_layer_skip_layers,
     })
-}
-
-/// Importance 2-pass: runs a forward pass on the first question's prompt to
-/// measure per-layer importance when a `SkipConfig` is active.
-///
-/// Returns `(importance_table, layer_skip_qcf, layer_skip_opr, skip_set_len)`.
-/// All fields are `None` / `0` when `skip_config` is `None` or questions is empty.
-type ImportancePassResult = (
-    Option<crate::qcf::ImportanceTable>,
-    Option<f32>,
-    Option<f32>,
-    usize,
-);
-
-#[allow(clippy::too_many_arguments)]
-fn run_importance_pass<C: EvalCacheKind>(
-    model: &TransformerModel,
-    tokenizer: &tokenizers::Tokenizer,
-    backend: &Arc<dyn Backend>,
-    memory: &dyn Memory,
-    kv_caches: &mut Vec<C>,
-    hook: &mut dyn StepHook<C>,
-    questions: &[EvalQuestion],
-    vocab_size: usize,
-    _eval_config: &EvalConfig,
-    skip_config: Option<&SkipConfig>,
-) -> Result<ImportancePassResult> {
-    let sc = match skip_config {
-        None => return Ok((None, None, None, 0)),
-        Some(sc) => sc,
-    };
-    if questions.is_empty() {
-        return Ok((None, None, None, 0));
-    }
-
-    let first_q = &questions[0];
-    let prompt_enc = tokenizer
-        .encode(first_q.prompt.as_str(), true)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let prompt_ids_imp: Vec<u32> = prompt_enc.get_ids().to_vec();
-    let imp_len = prompt_ids_imp.len();
-
-    // Reset caches before importance measurement
-    hook.reset_caches(kv_caches);
-
-    let cpu_buf = Galloc::new().alloc(imp_len * 4, DType::U8)?;
-    // SAFETY: allocated exactly imp_len u32 words above.
-    unsafe {
-        let ptr = cpu_buf.as_mut_ptr() as *mut u32;
-        std::ptr::copy_nonoverlapping(prompt_ids_imp.as_ptr(), ptr, imp_len);
-    }
-    let cpu_input = Tensor::new(
-        Shape::new(vec![1, imp_len]),
-        cpu_buf,
-        Arc::new(CpuBackend::new()),
-    );
-    let input_tensor = backend.copy_from(&cpu_input)?;
-
-    let imp_logits_buf = memory.alloc(imp_len * vocab_size * 4, DType::F32)?;
-    let mut imp_logits = Tensor::new(
-        Shape::new(vec![1, imp_len, vocab_size]),
-        imp_logits_buf,
-        backend.clone(),
-    );
-
-    let mut collector = ImportanceCollector::new();
-    C::forward_fmt_roundtrip(kv_caches, |fmts| {
-        model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &input_tensor,
-            start_pos: 0,
-            fmts,
-            backend,
-            memory,
-            logits_out: &mut imp_logits,
-            x_gen: None,
-            workspace: None,
-            logits_last_only: false,
-            score_accumulator: None,
-            query_stats_accumulator: None,
-            skip_config: None, // intentionally None for importance measurement
-            importance_collector: Some(&mut collector),
-            cache_self_need_scores: false,
-            layer_boundary_hook: None,
-            read_stage: None,
-            prefill_attn: None,
-            prefill_attn_per_row: None,
-            head_mask: None,
-            duo_heads: None,
-            q_rows: None,
-        })
-    })?;
-
-    let table = collector.build();
-
-    let skip_set: Vec<(usize, SubLayer)> = sc
-        .attn_skip
-        .union(&sc.mlp_skip)
-        .map(|&l| (l, SubLayer::Full))
-        .collect();
-    let qcf = table.compute_qcf_weight(&skip_set);
-    let opr_skip = table.compute_opr_skip(&skip_set);
-    let skip_set_len = skip_set.len();
-
-    eprintln!(
-        "[Skip] Importance measured on {} tokens, layer_skip_qcf={:.4}",
-        imp_len, qcf
-    );
-
-    // Reset caches again before actual evaluation
-    hook.reset_caches(kv_caches);
-
-    Ok((Some(table), Some(qcf), Some(opr_skip), skip_set_len))
 }
 
 /// Decide whether prefill runs token-by-token (per-step score accumulation / per-step
@@ -878,7 +711,6 @@ fn run_token_by_token_prefill<C: EvalCacheKind>(
                 score_accumulator: hook.score_accumulator(),
                 query_stats_accumulator: None,
                 skip_config,
-                importance_collector: None,
                 cache_self_need_scores: tbt_need,
                 layer_boundary_hook: None,
                 read_stage: None,
@@ -981,7 +813,6 @@ fn run_full_prefill<C: EvalCacheKind>(
             score_accumulator: hook.score_accumulator(),
             query_stats_accumulator: None,
             skip_config,
-            importance_collector: None,
             cache_self_need_scores: fp_need,
             layer_boundary_hook: None,
             read_stage: None,
@@ -1096,7 +927,6 @@ fn run_chunked_prefill<C: EvalCacheKind>(
             score_accumulator: hook.score_accumulator(),
             query_stats_accumulator: None,
             skip_config,
-            importance_collector: None,
             cache_self_need_scores: fp_need,
             layer_boundary_hook: None,
             read_stage: None,
@@ -1159,7 +989,6 @@ fn run_chunked_prefill<C: EvalCacheKind>(
                 score_accumulator: hook.score_accumulator(),
                 query_stats_accumulator: None,
                 skip_config,
-                importance_collector: None,
                 cache_self_need_scores: cp_need,
                 layer_boundary_hook: None,
                 read_stage: None,
@@ -1282,7 +1111,6 @@ mod tests {
             kv_budget_ratio: 0.0,
             greedy: true,
             kv_type: "f32".to_string(),
-            qcf_mode: "attn".to_string(),
             vocab_size: 32000,
             hidden_size: 2048,
             evict_timing: crate::session::eval::EvictTiming::default(),
@@ -1382,31 +1210,5 @@ mod tests {
             .map(|(i, _)| i)
             .unwrap_or(0);
         assert_eq!(predicted_raw, 1);
-    }
-
-    #[test]
-    fn test_layer_skip_qcf_normalized_cap() {
-        // qcf = 1.0 should cap at 100.0
-        let qcf: f32 = 1.0;
-        const NORMALIZED_CAP: f32 = 100.0;
-        let normalized = if qcf >= 1.0 - 1e-7 {
-            NORMALIZED_CAP
-        } else {
-            qcf / (1.0 - qcf)
-        };
-        assert!((normalized - 100.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_layer_skip_qcf_normalized_midrange() {
-        // qcf = 0.5 → normalized = 0.5 / 0.5 = 1.0
-        let qcf: f32 = 0.5;
-        const NORMALIZED_CAP: f32 = 100.0;
-        let normalized = if qcf >= 1.0 - 1e-7 {
-            NORMALIZED_CAP
-        } else {
-            qcf / (1.0 - qcf)
-        };
-        assert!((normalized - 1.0).abs() < 1e-5);
     }
 }

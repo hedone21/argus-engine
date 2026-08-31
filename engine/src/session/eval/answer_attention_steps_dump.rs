@@ -481,7 +481,6 @@ pub fn run_answer_attention_steps_dump(
                 score_accumulator: None,
                 query_stats_accumulator: None,
                 skip_config: None,
-                importance_collector: None,
                 cache_self_need_scores: false,
                 layer_boundary_hook: None,
                 read_stage: None,

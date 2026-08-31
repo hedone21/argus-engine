@@ -9,7 +9,7 @@
 /// cfg=off이면 unit `()` (no-op).
 ///
 /// `$counter`는 `observability::profile::quality_metrics` 모듈 내 static 식별자
-/// (NLL, QCF_KV_UNIFIED, QCF_KV_DRYRUN, QCF_WEIGHT_SWAP, QCF_LAYER_SKIP, DECODE_TOTAL).
+/// (NLL, DECODE_TOTAL).
 #[macro_export]
 macro_rules! qcf_timer {
     ($counter:ident) => {{

@@ -19,7 +19,7 @@ use crate::models::weights::LayerWeights;
 ///
 /// Inference owner (`TransformerModel`) holds an `Arc<dyn QuantNoiseAccess>`
 /// installed via `weight::setup_runtime_resources`. Consumers
-/// (`WeightSwapDecider`, `compute_qcf_weight_swap`, `QcfHelpers`) accept
+/// accept
 /// `&dyn QuantNoiseAccess` to avoid coupling to the concrete
 /// `QuantNoiseTable` type.
 pub trait QuantNoiseAccess: Send + Sync {

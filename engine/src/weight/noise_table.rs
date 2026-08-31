@@ -837,7 +837,7 @@ fn primary_tensor_to_f32(tensor: &crate::tensor::Tensor) -> Option<Vec<f32>> {
 /// with missing secondary weights, shape mismatch, or zero-magnitude denominator.
 ///
 /// `raws[i] = (X_row_major, T, d)` is the per-layer hidden state cached by
-/// `ImportanceCollector::raws_per_layer()`. `(n_heads, n_kv_heads, d_head)`
+/// per-layer activation means. `(n_heads, n_kv_heads, d_head)`
 /// describes the GQA layout. Causal masking is applied; RoPE is *not* applied
 /// (sec4 ablation — relative perturbation is invariant to RoPE under both
 /// precisions in expectation).

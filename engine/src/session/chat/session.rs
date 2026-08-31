@@ -232,12 +232,7 @@ pub(crate) fn finish_chat_loop(
                 None, // cache_manager: chat evicts out-of-loop (ensure_capacity/on_turn_end)
                 Vec::new(), // layer_slots (no partition)
                 None, // hardware
-                None, // model (no weight swap)
-                None, // swap_runtime
-                None, // importance
                 Vec::new(), // quant_window_handles (manager quant inert — chat-managed)
-                None, // report_tx
-                Arc::new(Mutex::new(None)), // hook_cell dummy
                 Arc::new(Mutex::new(None)), // score_cell dummy
             );
             builder

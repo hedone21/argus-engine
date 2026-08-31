@@ -19,7 +19,7 @@ Adreno-OpenCL·CUDA GPU 백엔드, zero-copy UMA 메모리 경로, KV-cache·pre
 > 프롬프트 생성을 하고(프롬프트를 넣으면 이어지는 텍스트와 `Decode: X ms/tok` 라인을 출력),
 > KV-cache 정밀도 포맷 플러그인(`--kv-format`)을 로드하며, score-free KV-cache eviction
 > (Sliding·StreamingLLM + `--load-plugin` stage, KV-fill 트리거)을 돌립니다. score-based
-> eviction(H2O·D2O), **KIVI** KV 양자화, tensor partition, 런타임 weight swap은 이미 구현·검증했지만
+> eviction(H2O·D2O), **KIVI** KV 양자화, tensor partition은 이미 구현·검증했지만
 > `argus-cli`가 아니라 `argus-bench`·`argus-eval`로 돌립니다. 멀티턴 chat 서버(`argus-chat`,
 > OpenAI 호환 HTTP API)도 CLI와 함께 출하됩니다. 세 가지 KV 모드(Standard·KIVI·Offload)와 manager
 > 연동 resilience를 지원하고, `--interactive` REPL은 토큰을 생성되는 대로 스트리밍합니다. `argus-cli`는

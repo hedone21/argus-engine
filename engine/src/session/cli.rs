@@ -39,36 +39,6 @@ impl From<SecondaryDtypeArg> for crate::models::weights::SecondaryDtypeChoice {
     }
 }
 
-/// `--swap` CLI 인수 — 4 swap 모드 선택용 통합 shorthand (backlog P3, 2026-05-25).
-///
-/// `--swap` (단독): default = IntraForward 활성 (LISWAP-4, production winner).
-/// `--swap <MODE>`: 명시 모드 선택. `intra-forward` / `incremental` /
-/// `phase-aware` / `layer-immediate`.
-///
-/// 기존 4 flag (`--swap-incremental-per-tick`, `--swap-intra-forward`,
-/// `--swap-phase-aware`, `--swap-layer-immediate`)는 deprecated. 직접 사용
-/// 시 stderr 1회 경고 후 그대로 동작. `--swap` 사용 시 기존 flag보다 우선.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SwapMode {
-    IntraForward,
-    Incremental,
-    PhaseAware,
-    LayerImmediate,
-}
-
-/// `--swap` value_parser.
-pub fn parse_swap_mode(s: &str) -> Result<SwapMode, String> {
-    match s.to_lowercase().as_str() {
-        "intra-forward" | "intra_forward" | "intraforward" => Ok(SwapMode::IntraForward),
-        "incremental" => Ok(SwapMode::Incremental),
-        "phase-aware" | "phase_aware" | "phaseaware" => Ok(SwapMode::PhaseAware),
-        "layer-immediate" | "layer_immediate" | "layerimmediate" => Ok(SwapMode::LayerImmediate),
-        other => Err(format!(
-            "unknown swap mode '{other}'. Valid: intra-forward, incremental, phase-aware, layer-immediate"
-        )),
-    }
-}
-
 /// `--secondary-layout` CLI 인수 값.
 ///
 /// AUF의 어떤 weights variant로 swap 후 텐서를 만들지 결정한다. 기본은
@@ -175,40 +145,6 @@ impl From<PrimaryDtypeArg> for crate::models::loader::AufDtypeChoice {
             PrimaryDtypeArg::Q4_1 => Self::Q4_1,
         }
     }
-}
-
-/// Parse `--qcf-sample-layers` argument into a list of layer indices.
-///
-/// Accepts:
-/// - `"auto"` (default): `[0, n/4, n/2, 3n/4, n-1]` via `compute_auto_sample_layers`.
-/// - `"all"`: every layer `[0..n_layers)`.
-/// - `"0,8,16,24,31"`: explicit comma-separated indices (sorted + deduped).
-pub fn parse_qcf_sample_layers(spec: &str, n_layers: usize) -> Result<Vec<usize>, String> {
-    let s = spec.trim();
-    if s.is_empty() || s.eq_ignore_ascii_case("auto") {
-        return Ok(crate::qcf::compute_auto_sample_layers(n_layers));
-    }
-    if s.eq_ignore_ascii_case("all") {
-        return Ok((0..n_layers).collect());
-    }
-    let mut out = Vec::new();
-    for part in s.split(',') {
-        let p = part.trim();
-        if p.is_empty() {
-            continue;
-        }
-        match p.parse::<usize>() {
-            Ok(v) if v < n_layers => out.push(v),
-            Ok(v) => return Err(format!("layer index {v} >= n_layers={n_layers}")),
-            Err(e) => return Err(format!("failed to parse layer index '{p}': {e}")),
-        }
-    }
-    out.sort();
-    out.dedup();
-    if out.is_empty() {
-        return Err(format!("no valid layer indices in '{s}'"));
-    }
-    Ok(out)
 }
 
 /// REQ-3: surface a one-time setup warning when an engine-level KV budget disagrees with faithful
@@ -366,45 +302,6 @@ mod tests {
         assert!(w.contains("100"));
         // No engine budget at all → nothing to reconcile.
         assert!(h2o_budget_mismatch_warning("h2o", Some(50), Some(50), 0, 0, 0.0).is_none());
-    }
-
-    #[test]
-    fn auto_llama3_8b() {
-        assert_eq!(
-            parse_qcf_sample_layers("auto", 32).unwrap(),
-            vec![0, 8, 16, 24, 31]
-        );
-    }
-
-    #[test]
-    fn all_small() {
-        assert_eq!(parse_qcf_sample_layers("all", 4).unwrap(), vec![0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn explicit() {
-        assert_eq!(
-            parse_qcf_sample_layers("0,8,16,24,31", 32).unwrap(),
-            vec![0, 8, 16, 24, 31]
-        );
-    }
-
-    #[test]
-    fn explicit_unsorted_dedup() {
-        assert_eq!(
-            parse_qcf_sample_layers("16,0,16,8", 32).unwrap(),
-            vec![0, 8, 16]
-        );
-    }
-
-    #[test]
-    fn out_of_range() {
-        assert!(parse_qcf_sample_layers("0,32", 32).is_err());
-    }
-
-    #[test]
-    fn empty_after_trim() {
-        assert!(parse_qcf_sample_layers(",", 4).is_err());
     }
 
     // ── offload storage backend CLI 검증 (B5-2a: mmap-default 버그 수정) ──
@@ -1064,10 +961,6 @@ pub struct Args {
     #[arg(long)]
     pub experiment_eviction_ratio: Option<f32>,
 
-    /// QCF variant to compute: "attn" (default), "caote", or "both".
-    #[arg(long, default_value = "attn")]
-    pub qcf_mode: String,
-
     // ── Eval-LL mode (log-likelihood evaluation) ──
     /// Enable log-likelihood evaluation mode (downstream task accuracy)
     #[arg(long, default_value_t = false)]
@@ -1097,24 +990,6 @@ pub struct Args {
     #[arg(long)]
     pub ppl: Option<String>,
 
-    /// PPL mode 에서 weight swap 을 trigger 할 decode token index (0-based).
-    /// 미지정 시 PPL decode loop 은 swap 없음 (baseline).
-    /// Requires `--secondary-gguf` to load secondary weights.
-    /// 사용 예 (LISWAP-PPL): `--ppl ref.txt --secondary-gguf ... --ppl-swap-at-token 0
-    /// --ppl-swap-ratio 0.9 --ppl-swap-per-tick 1`.
-    #[arg(long)]
-    pub ppl_swap_at_token: Option<usize>,
-
-    /// PPL swap ratio (0.0~1.0). engine `WeightSwapDecider` 가 [0.0, 1.0] 으로 clamp.
-    /// 1.0 + `LLMRS_SWAP_ALLOW_BOUNDARY_LAYERS=1` 조합 시 전 layer swap.
-    #[arg(long, default_value_t = 0.9)]
-    pub ppl_swap_ratio: f32,
-
-    /// PPL incremental swap K (layer/tick). 측정용으로 dynamic-K 비활성화, fixed K.
-    /// 기본 1 (한 step 에 1 layer 씩).
-    #[arg(long, default_value_t = 1)]
-    pub ppl_swap_per_tick: usize,
-
     /// PPL per-token NLL CSV 출력 경로. 미지정 시 dump 안 함.
     /// CSV columns: phase, token_idx, token_id, nll, swap_state, layers_swapped.
     #[arg(long)]
@@ -1128,34 +1003,6 @@ pub struct Args {
     #[arg(long)]
     pub ppl_prefill_tokens: Option<usize>,
 
-    /// LISWAP-PPL Scenario E: swap 완료 후 KV cache reset + prefill 다시 시작.
-    /// `--ppl-swap-at-token` + `--secondary-gguf` 필요. 워크플로:
-    ///   pass 1 (warmup): prefill + swap-driving decode → plan_done 시 종료
-    ///   pass 2 (measure): KV cache 0 으로 reset → prefill 다시 → decode (no swap)
-    /// pass 2 의 NLL/PPL/CSV 만 기록. 가설: cache mismatch 가 C−D artifact 원인이면
-    /// pass 2 결과가 D (Q4 native) 에 수렴해야 함.
-    #[arg(long, default_value_t = false)]
-    pub ppl_warmup_swap: bool,
-
-    /// LISWAP-PPL Scenario F: `--ppl-warmup-swap` 의 pass 2 prefill 길이를 별도로
-    /// 지정. 미지정 시 `--ppl-prefill-tokens` 값을 그대로 사용 (= 시나리오 E).
-    /// 예: pass 1 prefill=32 (swap-driving decode 28 step) + pass 2 prefill=1072
-    /// (decode loop 없음, batch path 전체) → batch path 만으로 weight 정합 검증.
-    #[arg(long)]
-    pub ppl_measure_prefill_tokens: Option<usize>,
-
-    /// LISWAP-PPL diagnostic: 모델 로드 직후 모든 layer 의 weight tensor (wq/wk/wv/
-    /// wo/w_gate/w_up/w_down) 를 readback 해서 `<dir>/layer{NN}_{name}_{dtype}.bin`
-    /// 으로 dump. swap 없는 baseline 측정용 (e.g. Q4_0 native 모델 비교 기준).
-    #[arg(long)]
-    pub dump_q4_after_load: Option<std::path::PathBuf>,
-
-    /// LISWAP-PPL diagnostic: `--ppl-warmup-swap` Pass 1 의 swap 완료 직후 (cache
-    /// reset 직전) 모든 layer 의 weight tensor 를 readback 해서 dump. swap 경로의
-    /// Q4 weight 가 standalone Q4 와 비트 단위로 일치하는지 검증용.
-    #[arg(long)]
-    pub dump_q4_after_swap: Option<std::path::PathBuf>,
-
     /// Comma-separated layer indices to skip (both attn+mlp).
     /// Example: --skip-layers 1,3,5,7
     #[arg(long, value_delimiter = ',')]
@@ -1164,11 +1011,6 @@ pub struct Args {
     /// Skip ratio (0.0-1.0). Uses SkipConfig::uniform_init() to select layers.
     #[arg(long)]
     pub skip_ratio: Option<f32>,
-
-    /// Dump per-layer importance table and exit (no inference).
-    /// Runs prefill with ImportanceCollector on the given prompt.
-    #[arg(long, default_value_t = false)]
-    pub dump_importance: bool,
 
     /// forgetting-factor 게이트 지표 덤프 경로(측정 전용, KV roadmap 항목 0 §4.2).
     /// 지정 시 PPL run 의 eviction 직전 스냅샷 + run 종료 시점에 score accumulator importance 에서
@@ -1332,15 +1174,6 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub no_self_secondary: bool,
 
-    /// Manually trigger a weight swap before generation starts.
-    /// Value: fraction of decoder layers to swap (0.0–1.0).
-    /// Example: `--force-swap-ratio 0.5` swaps 50% of layers.
-    /// Requires `--secondary-gguf` to be set; exits early with an error
-    /// if the secondary path is absent.
-    /// Intended for offline testing and debug; not for production use.
-    #[arg(long)]
-    pub force_swap_ratio: Option<f32>,
-
     /// Secondary dtype selection for AUF-backed weight swap (ENG-ALG-225, Sprint D).
     ///
     /// Controls which dtype entry is selected from a multi-dtype AUF file:
@@ -1382,23 +1215,6 @@ pub struct Args {
     #[arg(long)]
     pub tokenizer_path: Option<std::path::PathBuf>,
 
-    /// Dump per-run QCF/NLL/swap_set as a single JSON file (schema_version 1).
-    ///
-    /// Activates the warmup-prefill workflow: before the main measurement
-    /// (--ppl or generation), a short prefill with N tokens collects the
-    /// per-layer ImportanceTable used by WeightSwapDecider for accurate
-    /// importance × ε bottom-k layer selection.
-    ///
-    /// When absent, all existing behavior is unchanged (--force-swap-ratio
-    /// still uses the uniform fallback path as before).
-    #[arg(long)]
-    pub qcf_dump: Option<std::path::PathBuf>,
-
-    /// Number of tokens for the warmup prefill that builds ImportanceTable.
-    /// Only used when `--qcf-dump` is set. Default: 256.
-    #[arg(long, default_value_t = 256)]
-    pub qcf_warmup_tokens: usize,
-
     /// §4.2 decode-X experiment (EuroSys'27). When > 0, the QCF-dump warmup
     /// workflow runs `N` greedy-generation decode steps after the regular
     /// prefill and caches the per-layer hidden state at each decode step in
@@ -1412,70 +1228,6 @@ pub struct Args {
     /// Only meaningful when a secondary GGUF (Q4) is loaded.
     #[arg(long, default_value_t = 0)]
     pub decode_x_steps: usize,
-
-    /// Layer-selection algorithm for `--qcf-dump` swap path (U5 ablation, EuroSys'27).
-    /// Values: `imp` (importance-aware, default — production behavior),
-    /// `seq` (sequential 0→N-1), `rev` (reverse N-1→0),
-    /// `uni` (evenly spaced), `anti` (importance × ε descending top-k — worst-case).
-    /// Only affects the `--qcf-dump` warmup-prefill swap; the manager / live
-    /// directive paths always use `imp`.
-    #[arg(long, default_value = "imp")]
-    pub swap_algorithm: String,
-
-    /// Layer importance formula for the §4 comparison study (EuroSys'27).
-    ///
-    /// - `mean_pool` (default): `1 − cos(mean_pool(h_in), mean_pool(h_out))`,
-    ///   current ARGUS baseline (token-wise mean-pool then cosine).
-    /// - `shortgpt_bi`: `1 − (1/T) Σ_t cos(h_in,t, h_out,t)` — per-token-cosine
-    ///   block influence (BI), token-wise cosine then mean.
-    /// - `dpllm_proxy`: input-aware perturbation via
-    ///   `‖(W_F16 − W_Q4) · x_mean‖ / ‖W_F16 · x_mean‖` on attn_output.weight.
-    /// - `compare`: collect all three side-by-side. ImportanceTable still
-    ///   uses `mean_pool` for swap decisions; the other two are recorded
-    ///   only in the dump JSON's `per_layer_3way` field.
-    #[arg(long, default_value = "mean_pool")]
-    pub importance_formula: String,
-
-    /// Explicit per-layer swap list (CSV of layer indices) for §4 ground-truth
-    /// study. Bypasses `WeightSwapDecider`: when set, the listed layers are
-    /// swapped regardless of `--force-swap-ratio` or `--swap-algorithm`.
-    /// `--force-swap-ratio` must still be provided (any non-zero value) so
-    /// the warmup workflow runs; the ratio itself is ignored. Example:
-    /// `--swap-only-layers 5` swaps only layer 5.
-    #[arg(long)]
-    pub swap_only_layers: Option<String>,
-
-    /// Per-step NLL trajectory mode (U5 mid-swap quality study, EuroSys'27).
-    ///
-    /// Requires `--qcf-dump`, `--force-swap-ratio`, `--eval-ll`, `--eval-batch`.
-    /// Workflow:
-    ///   1. warmup prefill → ImportanceTable
-    ///   2. WeightSwapDecider.decide(ratio, algorithm) → ordered layer list
-    ///      of length K = floor(ratio × num_layers).
-    ///   3. for t = 0..=K:
-    ///      a. run eval-ll on the eval batch → record EvalOutput_t.
-    ///      b. if t < K: SwapExecutor.execute_on_slots(&[selected_layers[t]]).
-    ///   4. dump JSON with trajectory: array of K+1 (step, swapped_layers,
-    ///      layer_added, eval_ll_output).
-    ///
-    /// The cumulative swap state at step t mirrors ARGUS's production
-    /// incremental swap (one layer per token), letting external analysis
-    /// observe the mid-swap NLL trajectory rather than only the final state.
-    #[arg(long, default_value_t = false)]
-    pub qcf_trajectory: bool,
-
-    /// Enable QCF v3 schema metric dump for EuroSys'27 §3.
-    /// Adds qcf_layer_worst_head/qcf_layer_mean_head/qcf_record_*/qcf_d7_*/
-    /// qcf_c1_* (schema_version=3) to eval-ll output for both Eviction and quant-window.
-    #[arg(long, default_value_t = false)]
-    pub enable_qcf_experimental: bool,
-
-    /// Sample layer indices for multi-layer QCF.
-    /// Default is "all" (schema v3: every decoder layer) — required for D7/C1.
-    /// Other values: "auto" (legacy 5-tuple [0, n/4, n/2, 3n/4, n-1]),
-    /// "0,8,16,24,31" (explicit indices).
-    #[arg(long, default_value = "all")]
-    pub qcf_sample_layers: String,
 
     /// Eagerly prefault the secondary weight file at model load to remove
     /// per-swap prefault stage cost. Memory commit ≈ AUF size (e.g. 1.2 GB
@@ -1491,222 +1243,6 @@ pub struct Args {
     /// When `--secondary-gguf` is absent this flag is silently ignored.
     #[arg(long, default_value_t = false)]
     pub eager_prefault_secondary: bool,
-
-    /// Layer-Incremental Swap Stage 1 MVP (LISWAP-1, ENG-ALG-232~234, INV-144~146).
-    ///
-    /// Number of decoder layers to swap per decode token tick.
-    ///
-    /// `0` (default): single-shot path — all target layers are swapped at once
-    /// before generation, exactly as before. No behavior change.
-    ///
-    /// `>= 1`: incremental path — when `--force-swap-ratio` is set, instead of
-    /// swapping all target layers immediately, an `IncrementalSwapPlan` is
-    /// committed and the swap is distributed across decode tokens (N layers/tick).
-    ///
-    /// **Trade-off**: total swap latency increases by stage gate overhead
-    /// (~7.4 ms × N ticks on Galaxy S25), but user-perceived per-token stall
-    /// is bounded to `total_swap_latency / ceil(n_layers / per_tick)`.
-    ///
-    /// Example: 25 layers, per_tick=2 → 13 ticks × ~23 ms stall vs 290 ms
-    /// single-shot stall (9 frames vs 0 frames skipped at 30 fps).
-    ///
-    /// Requires `--force-swap-ratio` to be set. When absent, has no effect.
-    /// Per-tick > 0 with no `--force-swap-ratio`: silently ignored (no trigger).
-    #[arg(long, default_value_t = 0)]
-    pub swap_incremental_per_tick: usize,
-
-    /// LISWAP-2 prototype: Submit incremental swap chunks to a separate
-    /// transfer queue/stream so weight H2D writes overlap with the next
-    /// token's forward compute.
-    ///
-    /// Requires `--swap-incremental-per-tick > 0`. When `=0` or absent,
-    /// has no effect (silently ignored).
-    ///
-    /// **Default OFF (2026-05-13)** — async path는 `SwapExecutor`의
-    /// sub-batch reactive pause(release_pending > 0 → break)를 우회한다.
-    /// dispatcher worker로 release를 위임하기 때문에 main thread는
-    /// pending=0인 채 batch 전체를 enqueue → release_worker queue burst →
-    /// 메모리 스파이크. production swap default = sync. async는 측정용
-    /// (ablation) 시에만 명시적으로 enable.
-    #[arg(long, default_value_t = false)]
-    pub swap_async_dispatch: bool,
-
-    /// LISWAP-3 prototype (Direction A): use a `CL_MEM_ALLOC_HOST_PTR` slot
-    /// pool for swap weight upload. Bypasses the driver staging copy by
-    /// running `clEnqueueMapBuffer(MAP_WRITE) → memcpy → Unmap` on a
-    /// pre-allocated zero-copy slot.
-    ///
-    /// **Default OFF**. Requires `LLMRS_OPENCL_HOST_PTR_POOL=1` env-gate
-    /// in addition to this flag — the env hard-disables the pool path
-    /// independently so the flag alone is insufficient (Stage 4
-    /// measurement-driven decision pending).
-    ///
-    /// Compatible with `--swap-incremental-per-tick > 0` and standalone
-    /// (single-shot `--force-swap-ratio`). Falls back to the staging path
-    /// when slots are exhausted, the env-gate is unset, the backend is
-    /// not OpenCL, or pool init fails. Plan: `compiled-chasing-hopper.md`
-    /// Direction A track, Stage 3.
-    #[arg(long, default_value_t = false)]
-    pub swap_zero_copy: bool,
-
-    /// LISWAP-3 prototype: number of slots in the `CL_MEM_ALLOC_HOST_PTR`
-    /// swap pool. Stage 2 measurement on Galaxy S25 (Qwen2.5-1.5B, 28
-    /// layers, 7 Q4_0 tensors per layer) reported a sweet spot at 14
-    /// slots (= 2 layers worth of in-flight work). Effective only with
-    /// `--swap-zero-copy` + `LLMRS_OPENCL_HOST_PTR_POOL=1`.
-    #[arg(long, default_value_t = 14)]
-    pub swap_pool_slots: usize,
-
-    /// Intra-forward Layer-aligned Swap (LISWAP-4, ENG-ALG-235~238,
-    /// INV-147~150).
-    ///
-    /// `false` (default): no-op — `forward_into` carries
-    /// `layer_boundary_hook = None` and the layer loop pays only one
-    /// `Option::is_some` branch per layer (INV-147 zero overhead).
-    ///
-    /// `true`: when `--force-swap-ratio` is set, an `IntraForwardSwapHook`
-    /// is committed and dispatches per-layer swap on the layer boundary.
-    /// Plan runs to completion across decode tokens; dispatcher drain +
-    /// `ratio_generation` bump occurs once on plan retire (INV-150).
-    ///
-    /// Mutually exclusive with `--swap-incremental-per-tick > 0`
-    /// (ENG-DAT-C18). CLI parser rejects the combination.
-    #[arg(long, default_value_t = false)]
-    pub swap_intra_forward: bool,
-
-    /// Phase-aware Async Weight Swap (LISWAP-5).
-    ///
-    /// `false` (default): no-op. PHASE_HOOK 미등록 → forward path는
-    /// `op_trace::start_op` / `record`에서 atomic load 1회 + 분기로 끝남
-    /// (zero overhead).
-    ///
-    /// `true`: `--force-swap-ratio`가 설정되면 `PhaseAwareSwapDispatcher`가
-    /// commit되고, `op_trace` boundary에서 phase를 검사하여:
-    /// - `DdrPhase::CacheFit` 끝 → 다음 chunk async H2D enqueue
-    /// - `DdrPhase::Heavy` 시작 직전 → in-flight chunk 완료 대기
-    ///
-    /// `OpKind::ddr_phase()` 분류 + Phase R Scenario B (1.04× of max GREEN) +
-    /// production op CV 1.2% 측정 결과를 활용하여 swap H2D를 forward GPU
-    /// compute와 overlap.
-    ///
-    /// `--swap-incremental-per-tick > 0` / `--swap-intra-forward`와 mutually
-    /// exclusive.
-    #[arg(long, default_value_t = false)]
-    pub swap_phase_aware: bool,
-
-    /// LISWAP-6 Phase 6 — Per-layer immediate swap (LISWAP-4 alias-skip variant).
-    ///
-    /// `false` (default): no-op.
-    ///
-    /// `true`: when `--force-swap-ratio` is set, an `IntraForwardSwapHook` is
-    /// committed (identical infrastructure to `--swap-intra-forward`) but the
-    /// log line is tagged `layer-immediate` to make the measurement matrix
-    /// distinguishable. With LISWAP-6 Phase 5b alias H2D-skip applied to the
-    /// `build_layer_from_mmap_async` weight closure (swap_executor.rs:961~),
-    /// every per-layer dispatch returns dummy events and `process_commit`
-    /// short-circuits the `wait_event_blocking` fall-through. Result: 28 layer
-    /// dispatches with zero `synchronize()` accumulation when the secondary is
-    /// rpcmem DMA-BUF aliased.
-    ///
-    /// Mutually exclusive with `--swap-incremental-per-tick > 0` /
-    /// `--swap-intra-forward` / `--swap-phase-aware`.
-    #[arg(long, default_value_t = false)]
-    pub swap_layer_immediate: bool,
-
-    /// 4 swap 모드 통합 shorthand (backlog P3, 2026-05-25).
-    ///
-    /// `--swap` (단독): default = IntraForward (LISWAP-4 production winner).
-    /// `--swap <MODE>`: 명시 모드 선택. `intra-forward` / `incremental` /
-    /// `phase-aware` / `layer-immediate`.
-    ///
-    /// `--swap` 사용 시 init 단계에서 legacy 4 flag (`--swap-intra-forward`
-    /// 등)로 변환되어 기존 dispatch path가 그대로 동작한다. `Incremental` 모드
-    /// 선택 시 `--swap-incremental-per-tick K`가 0이면 K=2 default 적용.
-    ///
-    /// 기존 4 flag 직접 사용은 deprecated — init.rs에서 stderr 1회 경고
-    /// (`--swap`으로 마이그레이션 권장). 동작은 그대로 보존.
-    #[arg(long, value_parser = parse_swap_mode, num_args = 0..=1, default_missing_value = "intra-forward")]
-    pub swap: Option<SwapMode>,
-
-    /// LISWAP-6 Dynamic-K controller — auto-tune `--swap-incremental-per-tick`
-    /// based on measured per-layer release cost vs forward wall.
-    ///
-    /// Requires `--swap-incremental-per-tick > 0`. The explicit value is the
-    /// *starting* per_tick; the controller recomputes K from Phase 0 calibration
-    /// timing (no static upper cap as of 2026-05-13 — `dynamic_k.rs` hard_upper
-    /// removed). Effective only together with `--swap-async-dispatch`.
-    ///
-    /// Memory-spike avoidance is the hard constraint: K is monotone
-    /// non-increasing after calibration and a reactive pause skips swap when
-    /// the release queue is non-empty. See `dynamic_k.rs` for the algorithm.
-    ///
-    /// **Default OFF (2026-05-13)** — async path 동반 flag. async가 default
-    /// off로 바뀌면서 dynamic-K도 동반 default off (단독 의미 없음). ARGUS
-    /// 측정 시 명시적으로 enable.
-    #[arg(long, default_value_t = false)]
-    pub swap_dynamic_k: bool,
-
-    /// Probing-K adaptive controller — bottom-up alternative to `--swap-dynamic-k`
-    /// (ARGUS). Starts at `K = 1` and probes upward whenever `release_pending`
-    /// stays at 0 for a stability window. On any spike the controller drops
-    /// `K -= 1` symmetrically. Mutually exclusive with `--swap-dynamic-k`.
-    ///
-    /// Requires `--swap-incremental-per-tick > 0` (initial value ignored — the
-    /// controller starts from 1) and `--swap-async-dispatch`.
-    #[arg(long, default_value_t = false)]
-    pub swap_probing_k: bool,
-
-    /// Probing-K growth schedule when probing up. `linear` adds 1; `binary`
-    /// doubles. Only effective with `--swap-probing-k`.
-    #[arg(long, default_value = "linear")]
-    pub swap_probing_growth: String,
-
-    /// Probing-K stability window (clean tokens before probing up). Only with
-    /// `--swap-probing-k`.
-    #[arg(long, default_value_t = 5)]
-    pub swap_probing_window: usize,
-
-    /// Phase-aware swap chunk 진단 size (MB). v1 per-tensor chunking에서는
-    /// 실제 분할에 사용되지 않고 진단/보고 용도. 측정에 따라 v2에서 sub-tensor
-    /// chunking 도입 시 활용 (4 MB sweet spot 기본).
-    #[arg(long, default_value_t = 4)]
-    pub swap_phase_aware_chunk_mb: usize,
-
-    /// Phase-aware swap throttle — token당 dispatch chunk 수 상한.
-    /// 0 = 무제한 (현재 동작 유지, 252 chunks가 첫 3 token에 누적).
-    /// N>0 = 매 token N chunks까지만 → 분산을 더 길게 펼쳐 max-stall 단축.
-    /// Sweep 측정용 (Phase 2): K = {1,2,4,8,16}.
-    #[arg(long, default_value_t = 0)]
-    pub swap_phase_aware_max_chunks_per_token: usize,
-
-    /// LISWAP Phase 3 — defer force-swap trigger to decode token N (mid-decode).
-    ///
-    /// 0 (default) = no delay (swap fires right after prefill, current behavior).
-    /// N > 0       = first N decode tokens run on the primary weight, then the
-    ///               force-swap trigger (single-shot `run_layer_swap`,
-    ///               incremental plan commit, intra-forward hook commit, or
-    ///               phase-aware dispatcher arm) fires at the start of token N.
-    ///
-    /// `prefault_layers` (eager pre-warm) is always executed at prefill end
-    /// regardless of this flag — only the actual swap dispatch is deferred.
-    ///
-    /// Requires `--force-swap-ratio` to be set; otherwise ignored.
-    #[arg(long, default_value_t = 0)]
-    pub swap_delay_tokens: usize,
-
-    /// Measurement-only (EuroSys 2027 §4.2): bypass the INV-141 release_worker
-    /// drain at `SwapExecutor::execute_on_slots` entry so
-    /// `--swap-incremental-per-tick K` fires every decode token at the
-    /// user-requested K rate instead of being throttled by the previous
-    /// batch's release backlog. Equivalent to setting
-    /// `LLMRS_SWAP_FORCE_EVERY_TICK=1` (the flag sets the env if unset).
-    ///
-    /// **Memory-spike risk** — production code path keeps INV-141 to prevent
-    /// displaced primary cl_mem from accumulating on a slow release path.
-    /// Use only for layer-count predictor accuracy measurement and similar
-    /// experiments where chunk-completion-induced throttle distorts the rate.
-    #[arg(long, default_value_t = false)]
-    pub swap_no_throttle: bool,
 
     /// Top-level subcommand wrapper.
     ///
@@ -1754,43 +1290,6 @@ pub struct Args {
 /// `args.kv_budget`, ...) read through these methods so the C2 commit
 /// changes only `cli/mod.rs`. Call sites migrate to direct enum match in C3.
 impl Args {
-    /// Normalize `--swap` shorthand to legacy 4 flags (backlog P3, 2026-05-25).
-    ///
-    /// `Args::parse()` 직후 1회 호출. `--swap` set 시 해당 legacy field 활성화
-    /// (Incremental은 `--swap-incremental-per-tick`가 0이면 K=2 default).
-    /// `--swap` unset + legacy 4 flag 직접 사용 시 stderr 1회 deprecation 경고.
-    /// 이후 dispatch path는 기존 4 field만 읽으면 됨.
-    pub fn normalize_swap_shorthand(&mut self) {
-        if let Some(mode) = self.swap {
-            match mode {
-                SwapMode::IntraForward => self.swap_intra_forward = true,
-                SwapMode::Incremental => {
-                    if self.swap_incremental_per_tick == 0 {
-                        self.swap_incremental_per_tick = 2;
-                    }
-                }
-                SwapMode::PhaseAware => self.swap_phase_aware = true,
-                SwapMode::LayerImmediate => self.swap_layer_immediate = true,
-            }
-        } else {
-            let used_legacy = self.swap_incremental_per_tick > 0
-                || self.swap_intra_forward
-                || self.swap_phase_aware
-                || self.swap_layer_immediate;
-            if used_legacy {
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    eprintln!(
-                        "[deprecation] --swap-incremental-per-tick / --swap-intra-forward / \
-                         --swap-phase-aware / --swap-layer-immediate 직접 사용은 향후 제거 예정. \
-                         `--swap [intra-forward|incremental|phase-aware|layer-immediate]` 통합 \
-                         flag로 마이그레이션 권장 (backlog P3, 2026-05-25)."
-                    );
-                });
-            }
-        }
-    }
-
     /// Diagnostic dump kinds requested via `--dump <kind>[,<kind>...]` (in CLI
     /// order). Empty when no dump is selected. Validated against the known kinds
     /// at startup; see [`crate::session::eval::dump`].
@@ -1823,31 +1322,6 @@ impl Args {
     /// the `"full"` scope string (clap validates the value set).
     pub fn answer_attention_steps_full(&self) -> bool {
         self.answer_attention_steps_scope == "full"
-    }
-
-    /// Engine 내부 dispatch default mode 결정.
-    ///
-    /// Manager `SwapWeights` 수신 시 어느 mode (Incremental / IntraForward /
-    /// PhaseAware / LayerImmediate) 로 dispatch 할지의 default. `--swap` enum
-    /// 우선, 미지정 시 legacy 4 flag로부터 추론, 모두 미지정이면 LISWAP-4
-    /// production winner (IntraForward) 기본.
-    ///
-    /// `normalize_swap_shorthand()` 후 호출 권장 (legacy field 일치 보장).
-    /// 상세 mental model: arch/weight_swap.md §2.8.1.
-    pub fn resolved_swap_mode(&self) -> SwapMode {
-        if let Some(mode) = self.swap {
-            mode
-        } else if self.swap_phase_aware {
-            SwapMode::PhaseAware
-        } else if self.swap_layer_immediate {
-            SwapMode::LayerImmediate
-        } else if self.swap_intra_forward {
-            SwapMode::IntraForward
-        } else if self.swap_incremental_per_tick > 0 {
-            SwapMode::Incremental
-        } else {
-            SwapMode::IntraForward
-        }
     }
 
     /// KV mode name (runtime string — resolved against the engine KV-mode registry
