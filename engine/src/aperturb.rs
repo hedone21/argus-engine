@@ -54,6 +54,7 @@
 //! *absolute* on one that does not — where its relative accuracy is meaningless on both sides
 //! because `1 − cos` cancels. That is a property of the quantity, and it is why `l2` is the default.
 
+pub mod basis_file;
 pub mod keep;
 pub mod kernel;
 pub mod readout;
@@ -241,6 +242,12 @@ impl OutputBasis {
     #[inline]
     pub fn d(&self) -> usize {
         self.d
+    }
+
+    /// How many layers the table covers.
+    #[inline]
+    pub fn n_layers(&self) -> usize {
+        self.layers.len()
     }
 
     /// The rank fraction, or `None` on the untruncated arm.

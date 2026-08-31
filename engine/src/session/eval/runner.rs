@@ -124,6 +124,8 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
             vocab_size,
             &out_path,
             args.aperturb_tensor_dir.as_deref(),
+            args.aperturb_basis.as_deref(),
+            args.aperturb_basis_out.as_deref(),
         )?;
     }
 
