@@ -1,14 +1,14 @@
 //! The paper's Quality Cost Function — ranking KV-cache compression candidates by how far each one
 //! moves the model's own attention output, without running a forward pass.
 //!
-//! ## Not [`crate::qcf`]
+//! ## Why the module is called `aperturb` and not `qcf`
 //!
-//! That module is an older metric with the same name: a per-KV-head relative L2 on `Σ α V`, with no
-//! keys, no output projection, and no re-softmax. This one recomputes attention against the cache a
-//! candidate *would* leave behind. The two answer different questions and neither replaces the
-//! other, so they live apart. The name here is `aperturb` — the reference harness's own identifier
-//! for these columns (`aperturb_prev16_wo0p78125_l2_rms`), which keeps engine module, metric key and
-//! paper-side join key spelled the same way.
+//! The engine used to carry an unrelated metric under the name `qcf`: a per-KV-head relative L2 on
+//! `Σ α V`, with no keys, no output projection, and no re-softmax. It answered a different question
+//! and has since been removed, but the name is deliberately not reclaimed. `aperturb` is the
+//! reference harness's own identifier for these columns
+//! (`aperturb_prev16_wo0p390625_l2_rms` at the canonical `r = d/256`), which keeps engine module,
+//! metric key and paper-side join key spelled the same way.
 //!
 //! ## The measurement
 //!

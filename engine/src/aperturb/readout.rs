@@ -268,7 +268,7 @@ impl std::error::Error for ReadoutError {}
 
 /// The reference's rank-fraction token: the fraction as a percentage, with `.` written `p`.
 ///
-/// `1/128` → `0.78125%` → `"0p78125"`, which is how the metric key spells the canonical rank.
+/// `1/128` → `0.78125%` → `"0p78125"`; the canonical `1/256` spells `"0p390625"`.
 pub fn frac_token(frac: f64) -> String {
     let pct = frac * 100.0;
     let s = format!("{pct}");
