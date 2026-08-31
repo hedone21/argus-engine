@@ -1230,6 +1230,23 @@ pub struct Args {
     #[arg(long)]
     pub aperturb_tensor_dir: Option<std::path::PathBuf>,
 
+    /// `--dump aperturb`: load the output-projection basis from this file instead of factoring the
+    /// weights, and fail if the file does not belong to this model. Written by
+    /// `--aperturb-basis-out`. The decomposition is a model constant that costs 28 s at 1B and 12
+    /// min at 8B, and nothing stored it, so every run paid it again; on a phone, where factoring is
+    /// not practical at all, this is the only way the metric runs. Load-only by design: a missing
+    /// file or a header that disagrees is an error, never a quiet fall back to computing it. No
+    /// effect unless `aperturb` is requested, and not combinable with `--aperturb-basis-out`.
+    #[arg(long)]
+    pub aperturb_basis: Option<std::path::PathBuf>,
+
+    /// `--dump aperturb`: factor the output projection as usual, then write the basis to this file
+    /// for `--aperturb-basis` to load. Little-endian, 1 MB for a 1B model and 8 MB for an 8B one at
+    /// the default rank, and portable — produce it on a host and ship it with the application. No
+    /// effect unless `aperturb` is requested.
+    #[arg(long)]
+    pub aperturb_basis_out: Option<std::path::PathBuf>,
+
     /// eval-LL KV eviction timing (when eviction fires and which importance drives
     /// it). `post_prefill_probe` (default) = today's behavior: full prefill, a
     /// post-question probe, one eviction — the importance is query-informed.
