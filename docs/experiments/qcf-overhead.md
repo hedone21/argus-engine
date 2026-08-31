@@ -356,6 +356,10 @@ assumed.
 
 `llama3.2-1b`. `decide` is the algorithm; `read` is getting K and V to where it can be run.
 
+**Read the `read` columns with their allocation.** Every run in this table used
+`--max-seq-len 16384` (§5), and `read` turns out to be proportional to the *allocated* cache, not to
+`S` — see the correction below the table.
+
 | `S` | decide CPU | decide OpenCL | decide CUDA | read CPU | read OpenCL | read CUDA | read ÷ decide (CUDA) |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 493 | 0.026 | 0.037 | 0.040 | 0.010 | 0.167 | 0.347 | **8.67×** |
@@ -372,14 +376,37 @@ assumed.
 differ by at most 7.4%.
 
 **The cost of reaching the cache is not.** On CPU `read` is a dequantize; on a device cache it is a
-per-layer synchronize plus a host copy, and at short context that fixed cost dominates — 0.347 s
-against a 0.040 s decision. Only past roughly 10,000 tokens does the decision overtake the transfer.
-On `llama3.1-8b` the same term is 0.57–1.08 s per decision.
+per-layer synchronize plus a host copy. On `llama3.1-8b` the same term is 0.57–1.08 s per decision.
 
-This term does not appear in the cost model. The model is about arithmetic, and the arithmetic
-checks out; but on a GPU backend the real per-decision cost below ~10k tokens is dominated by moving
-K and V to the host, not by computing on them. Either the model needs a data-movement term, or the
-decision needs to run where the cache already lives.
+### 8.1 Correction — `read` scales with the allocation, not with `S`
+
+The paragraph that used to stand here concluded that the transfer dominates below ~10,000 tokens and
+that the cost model therefore needs a data-movement term. **That conclusion was wrong**, and the
+`read` columns above are confounded: this whole sweep ran at `--max-seq-len 16384` while `S` varied
+over a 30× range, so what looks like a weak dependence on `S` is mostly a constant charged by the
+allocation.
+
+`read` is `KVCache::host_snapshot` (`engine/src/kv/kv_cache.rs:102`), which mirrors `k_buffer` and
+`v_buffer` *whole* via `read_device_tensor_to_host` (`:73`) — and those buffers are pre-allocated at
+`capacity = max_seq_len`, not at `current_pos`. Holding `S` fixed and varying only the allocation,
+on this desktop's OpenCL backend at `S = 493`:
+
+| `--max-seq-len` | decide | read |
+|---:|---:|---:|
+| 2 560 | 0.029 | **0.028** |
+| 16 384 | 0.030 | **0.240** |
+
+`decide` does not move; `read` moves 8.6×. The CPU backend, which never enters that branch, is flat
+in the allocation — which places the whole term in the mirror and nowhere else.
+
+With the cache sized to the workload the decision overtakes the transfer at roughly **500 tokens**
+here, not 10,000. So the cost model does not need a data-movement term: the quantity such a term
+would describe is dominated by a deployment knob. What is true, and belongs in the paper, is the
+narrower statement — on a GPU backend the decision needs K and V on the host, and at a proportionate
+allocation that cost is comparable to the decision and overtaken by it within a few hundred tokens.
+
+`docs/experiments/qcf-android-longcontext.md` has the full controls, the same effect measured on
+Adreno, and the one engine change that would remove the term outright.
 
 ---
 
@@ -432,8 +459,10 @@ over. That is the whole of what remains: 0.2 s here against the 10.6 s it remove
   specified — worth one sentence, since it is what licenses the hoist.
 - The `R`-linearity claim is right in the slope and has a cache-streaming floor. At small `R` the
   decision is memory-bound.
-- Either add a data-movement term or scope the model to a host-resident cache; on GPU it is the
-  larger cost below ~10k tokens.
+- No data-movement term is needed. On a GPU backend the decision does need K and V on the host, but
+  the measured cost of that is dominated by the *allocated* cache rather than the retained one
+  (§8.1); sized to the workload it is comparable to the decision and overtaken by it within a few
+  hundred tokens. One sentence scoping the claim is enough.
 - The "no overhead after the first run" claim now holds for this code, but only because the
   factors are stored on disk and reloaded (§9.1); it did not hold for an in-memory-only
   implementation, and the paper is worth one sentence on which of the two it means.
