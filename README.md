@@ -19,9 +19,9 @@ to configure, and simple to add new techniques to without touching the engine co
 > does single-prompt text generation (prompt in, continuation + a `Decode: X ms/tok`
 > line out), can load a KV-cache precision-format plugin (`--kv-format`), and runs
 > score-free KV-cache eviction (Sliding / StreamingLLM + `--load-plugin` stages,
-> KV-fill-triggered). Score-based eviction (H2O / D2O), KIVI KV quantization, tensor
-> partition, and runtime weight swap are implemented and tested, but run through the
-> `argus-bench` / `argus-eval` binaries rather than `argus-cli`. A multi-turn chat server
+> KV-fill-triggered). Score-based eviction (H2O / D2O), KIVI KV quantization, and tensor
+> partition are implemented and tested, but run through the `argus-bench` / `argus-eval`
+> binaries rather than `argus-cli`. A multi-turn chat server
 > (`argus-chat`, OpenAI-compatible HTTP API) ships alongside the CLI: it serves all three
 > KV modes (Standard / KIVI / Offload) with manager-integrated resilience, and its
 > `--interactive` REPL streams tokens as they generate. `argus-cli` does not accept

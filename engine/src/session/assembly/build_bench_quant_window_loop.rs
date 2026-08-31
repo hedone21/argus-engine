@@ -102,10 +102,10 @@ pub fn build_bench_quant_window_loop(
 
     // AB-5 §5.8.4: report_tx = resilience.as_ref().map(|a| a.report_sender()) — Standard 경로
     // build_bench_loop 와 동일 source(같은 report_sender() clone). resilience-off 면 None → inert.
-    let report_tx_for_dispatcher = resilience.as_ref().map(|a| a.report_sender());
+    let _report_tx_for_dispatcher = resilience.as_ref().map(|a| a.report_sender());
 
     // §5.7.7: dispatcher — control + KvQuantDynamic 만 활성. eviction(kv_handles 빈 + CM=None)·
-    // partition(layer_slots 빈 + hardware None)·swap(model/swap_runtime None) 전부 inert.
+    // partition(layer_slots 빈 + hardware None) 전부 inert.
     // resilience-on 일 때만 구성(control 디렉티브 소비 + KvQuantDynamic).
     let dispatcher = resilience.is_some().then(|| {
         CommandDispatcher::new(
@@ -114,15 +114,7 @@ pub fn build_bench_quant_window_loop(
             None,       // cache_manager: eviction inert.
             Vec::new(), // layer_slots: partition 미배선.
             None,       // hardware: partition inert.
-            None,       // model: swap 미배선.
-            None,       // swap_runtime: swap inert.
-            None,       // importance.
             quant_window_handles,
-            // AB-5: QcfEstimate 송출 채널. resilience-on 이면 Some, off 이면 None(inert).
-            report_tx_for_dispatcher,
-            // §5.9.2 Track B: quant-window 경로는 swap 미배선(model None) → swap directive inert.
-            // 더미 cell (QuantWindowForward 는 ModelForward 와 무관 — hook 미소비).
-            Arc::new(std::sync::Mutex::new(None)),
             // §5.9.1 Track A: quant-window 경로는 score-based eviction 미지원 → 더미 None cell.
             Arc::new(std::sync::Mutex::new(None)),
         )

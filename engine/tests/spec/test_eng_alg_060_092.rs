@@ -1,6 +1,5 @@
-//! ENG-ALG-060 ~ ENG-ALG-092: DegradationEstimator + CachePressurePipeline
+//! ENG-ALG-060 ~ ENG-ALG-092: CachePressurePipeline
 //!
-//! PiecewiseLinear 함수, DegradationEstimator d_max clamp / EMA correction,
 //! CachePressurePipeline 실행 로직, target_bits_for_pressure / SwapHandler / EvictionHandler.
 
 // `max_seq * 1 * 4 * 4` / `100 * 1 * 4 * 4` 계산식은 코드 가독성을 위해
@@ -8,122 +7,8 @@
 #![allow(clippy::identity_op)]
 
 use argus_engine::kv::quantize_handler::target_bits_for_pressure;
-use argus_engine::qcf::QcfMetric;
-use argus_engine::qcf::estimator::{DegradationEstimator, PiecewiseLinear};
 use argus_shared::Level as PressureLevel;
 use std::collections::HashMap;
-
-// ══════════════════════════════════════════════════════════════
-// ENG-ALG-060: PiecewiseLinear 함수 평가
-// ══════════════════════════════════════════════════════════════
-
-#[test]
-fn test_eng_alg_060_piecewise_linear_below_breakpoint() {
-    let pw = PiecewiseLinear::new(0.3, 2.0, 8.0);
-    assert!((pw.evaluate(0.1) - 0.2).abs() < 1e-6);
-    assert!((pw.evaluate(0.0) - 0.0).abs() < 1e-6);
-}
-
-#[test]
-fn test_eng_alg_060_piecewise_linear_above_breakpoint() {
-    let pw = PiecewiseLinear::new(0.3, 2.0, 8.0);
-    // f(0.5) = 2.0*0.3 + 8.0*(0.5-0.3) = 0.6 + 1.6 = 2.2
-    assert!((pw.evaluate(0.5) - 2.2).abs() < 1e-5);
-}
-
-#[test]
-fn test_eng_alg_060_piecewise_linear_at_breakpoint() {
-    let pw = PiecewiseLinear::new(0.3, 2.0, 8.0);
-    assert!((pw.evaluate(0.3) - 0.6).abs() < 1e-6);
-}
-
-// ══════════════════════════════════════════════════════════════
-// ENG-ALG-060: DegradationEstimator — d_max clamp
-// ══════════════════════════════════════════════════════════════
-
-#[test]
-fn test_eng_alg_060_estimator_d_max_clamp() {
-    let est = DegradationEstimator::with_defaults(2.0);
-    let metric = QcfMetric {
-        action: "kv.evict_h2o".to_string(),
-        raw_value: 5.0,
-        normalized_value: 5.0,
-        per_head: None,
-        tokens_affected: 10,
-    };
-    let d = est.estimate(&metric);
-    assert!((d - 2.0).abs() < 1e-6, "d_max=2.0으로 클램프되어야 함");
-}
-
-// ══════════════════════════════════════════════════════════════
-// ENG-ALG-060: DegradationEstimator — unknown action fallback
-// ══════════════════════════════════════════════════════════════
-
-#[test]
-fn test_eng_alg_060_estimator_unknown_action() {
-    let est = DegradationEstimator::with_defaults(5.0);
-    let metric = QcfMetric {
-        action: "unknown_action".to_string(),
-        raw_value: 0.5,
-        normalized_value: 0.5,
-        per_head: None,
-        tokens_affected: 1,
-    };
-    let d = est.estimate(&metric);
-    // fallback → linear slope=1.0
-    assert!((d - 0.5).abs() < 1e-6);
-}
-
-// ══════════════════════════════════════════════════════════════
-// ENG-ALG-060: EMA correction
-// ══════════════════════════════════════════════════════════════
-
-#[test]
-fn test_eng_alg_060_ema_correction() {
-    let mut est = DegradationEstimator::new(
-        {
-            let mut m = HashMap::new();
-            m.insert("kv.evict_h2o".to_string(), PiecewiseLinear::linear(2.0));
-            m
-        },
-        10.0,
-        0.5, // 공격적 EMA
-    );
-
-    // Predicted: 2.0 * 0.3 = 0.6, Actual: 1.2 → ratio = 2.0
-    est.update_ema("kv.evict_h2o", 0.3, 1.2);
-    let correction = est.ema_correction("kv.evict_h2o");
-    // EMA: 0.5 * 1.0 + 0.5 * 2.0 = 1.5
-    assert!((correction - 1.5).abs() < 1e-5);
-
-    // correction 적용 후 estimate
-    let metric = QcfMetric {
-        action: "kv.evict_h2o".to_string(),
-        raw_value: 0.3,
-        normalized_value: 0.3,
-        per_head: None,
-        tokens_affected: 5,
-    };
-    let d = est.estimate(&metric);
-    // 2.0 * 0.3 * 1.5 = 0.9
-    assert!((d - 0.9).abs() < 1e-5);
-}
-
-#[test]
-fn test_eng_alg_060_ema_no_update_when_alpha_zero() {
-    let mut est = DegradationEstimator::new(
-        {
-            let mut m = HashMap::new();
-            m.insert("kv.evict_h2o".to_string(), PiecewiseLinear::linear(1.0));
-            m
-        },
-        5.0,
-        0.0, // no EMA
-    );
-
-    est.update_ema("kv.evict_h2o", 0.3, 1.2);
-    assert_eq!(est.ema_correction("kv.evict_h2o"), 1.0);
-}
 
 // ══════════════════════════════════════════════════════════════
 // ENG-ALG-091: CachePressurePipeline — 매칭 스테이지 실행
@@ -213,7 +98,6 @@ fn test_eng_alg_091_pipeline_executes_matching_stages() {
         pressure_level: PressureLevel::Critical,
         mem_available: 0,
         target_ratio: None,
-        qcf_sink: None,
     };
 
     let results = pipeline.execute(&mut ctx).unwrap();
@@ -283,7 +167,6 @@ fn test_eng_alg_091_pipeline_skips_all_at_normal() {
         pressure_level: PressureLevel::Normal,
         mem_available: 1024 * 1024 * 1024,
         target_ratio: None,
-        qcf_sink: None,
     };
 
     let results = pipeline.execute(&mut ctx).unwrap();
@@ -393,7 +276,6 @@ fn test_eng_alg_092_swap_warning_offloads() {
         pressure_level: PressureLevel::Warning,
         mem_available: 0,
         target_ratio: None,
-        qcf_sink: None,
     };
 
     let result = handler.handle(&mut ctx).unwrap();
@@ -439,7 +321,6 @@ fn test_eng_alg_092_swap_emergency_offloads() {
         pressure_level: PressureLevel::Emergency,
         mem_available: 0,
         target_ratio: None,
-        qcf_sink: None,
     };
 
     let result = handler.handle(&mut ctx).unwrap();
@@ -496,7 +377,6 @@ fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
         pressure_level: PressureLevel::Critical,
         mem_available: 0,
         target_ratio: None,
-        qcf_sink: None,
     };
 
     let result = handler.handle(&mut ctx).unwrap();
@@ -585,7 +465,6 @@ fn test_eng_alg_092_eviction_handler_wraps_h2o() {
         pressure_level: PressureLevel::Critical,
         mem_available: 0,
         target_ratio: None,
-        qcf_sink: None,
     };
 
     let result = handler.handle(&mut ctx).unwrap();
@@ -682,7 +561,6 @@ fn test_eng_alg_091_c08_context_updated_after_eviction() {
         pressure_level: PressureLevel::Critical,
         mem_available: 0,
         target_ratio: None,
-        qcf_sink: None,
     };
 
     let results = pipeline.execute(&mut ctx).unwrap();

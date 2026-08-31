@@ -10,45 +10,12 @@ use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::{KVCache, max_cache_pos};
-use crate::qcf::{QcfKvParams, VDataSource, compute_c1, compute_d7, compute_qcf_kv};
-use crate::qcf_types::{AggregationMode, QcfConfig, aggregate_heads};
-use argus_extension_api::{StageParams, find_qcf_estimator};
 
-/// QCF result from the single post-prefill eviction event (eval-ll mode).
+/// What the single post-prefill eviction event did (eval-ll mode).
 #[derive(Debug, Clone)]
-pub struct EvictionQcfResult {
+pub struct EvictionSummary {
     pub tokens_evicted: usize,
     pub eviction_ratio: f32,
-    pub qcf_value_aware: f32,
-}
-
-/// QCF record schema v3 payload — cross-family unified (Eviction + quant-window).
-///
-/// Per-layer worst-head and mean-head series of `‖ΔO_h‖₂ / ‖O_h‖₂`, plus
-/// binary pre-computed record-level scalars and D7 / C1 dispersion metrics
-/// used by EuroSys'27 §3.
-#[derive(Debug, Clone, Default)]
-pub struct ExpQcfV3 {
-    /// Per-layer worst-head value: `max_h (qcf^h_l)`.
-    pub layer_worst_head: Vec<f32>,
-    /// Per-layer mean-head value: `mean_h (qcf^h_l)`.
-    pub layer_mean_head: Vec<f32>,
-    /// `max_l layer_worst_head`.
-    pub record_worst_head_max: f32,
-    /// `mean_l layer_worst_head`.
-    pub record_worst_head_mean: f32,
-    /// `max_l layer_mean_head`.
-    pub record_mean_head_max: f32,
-    /// `mean_l layer_mean_head`.
-    pub record_mean_head_mean: f32,
-    /// D7 dispersion ratio computed on `layer_worst_head`.
-    pub d7_worst_head: f32,
-    /// D7 dispersion ratio computed on `layer_mean_head`.
-    pub d7_mean_head: f32,
-    /// C1 = D7 + population std, computed on `layer_worst_head`.
-    pub c1_worst_head: f32,
-    /// C1 = D7 + population std, computed on `layer_mean_head`.
-    pub c1_mean_head: f32,
 }
 
 /// KV cache snapshot for save/restore between multi-token choice scoring.
@@ -142,7 +109,6 @@ pub struct EvictionHook {
     /// Attention score accumulator for heavy-hitter scoring (Some iff score-based).
     pub score_accumulator: Option<SignalRuntime>,
     /// QCF metric collection config.
-    pub qcf_config: QcfConfig,
     /// Maximum KV cache tokens before eviction triggers.
     pub effective_budget: usize,
     /// Number of prefix tokens protected from eviction.
@@ -158,10 +124,8 @@ pub struct EvictionHook {
     /// Backend reference for GPU buffer read/write in snapshot/restore.
     pub backend: std::sync::Arc<dyn crate::backend::Backend>,
     /// Whether to compute and dump experimental QCF metrics (ARGUS).
-    pub experimental_enabled: bool,
     /// Sample layer indices for multi-layer QCF (ARGUS #1).
     /// Empty → use [0] for backward compat.
-    pub qcf_sample_layers: Vec<usize>,
 
     /// Whether to capture the IMP-1 `evict_importance` dump snapshot at eviction.
     /// Off by default → no capture, eviction path byte-identical (`INV-147`).
@@ -180,9 +144,7 @@ pub struct EvictionHook {
     /// Total tokens evicted this question.
     evicted_total: usize,
     /// QCF result from the single post-prefill eviction event (eval-ll mode).
-    eviction_qcf: Option<EvictionQcfResult>,
-    /// Experimental QCF payload (Some when experimental_enabled and prefill happened).
-    experimental_qcf: Option<ExpQcfV3>,
+    eviction_summary: Option<EvictionSummary>,
     /// IMP-1 dump snapshot captured at the most recent eviction (drained by the loop).
     last_evict_dump: Option<crate::session::eval::dump::EvictImportanceSnapshot>,
 
@@ -271,7 +233,6 @@ impl EvictionHook {
     pub fn new(
         cache_manager: CacheManager,
         score_accumulator: Option<SignalRuntime>,
-        qcf_config: QcfConfig,
         effective_budget: usize,
         protected_prefix: usize,
         score_based_eviction: bool,
@@ -279,15 +240,12 @@ impl EvictionHook {
         produces_merge_plan: bool,
         kv_type: String,
         backend: std::sync::Arc<dyn crate::backend::Backend>,
-        experimental_enabled: bool,
-        qcf_sample_layers: Vec<usize>,
         dump_evict_importance: bool,
         streaming_overflow: bool,
     ) -> Self {
         Self {
             cache_manager,
             score_accumulator,
-            qcf_config,
             effective_budget,
             protected_prefix,
             score_based_eviction,
@@ -295,14 +253,11 @@ impl EvictionHook {
             produces_merge_plan,
             kv_type,
             backend,
-            experimental_enabled,
-            qcf_sample_layers,
             dump_evict_importance,
             streaming_overflow,
             eviction_count: 0,
             evicted_total: 0,
-            eviction_qcf: None,
-            experimental_qcf: None,
+            eviction_summary: None,
             last_evict_dump: None,
             resident_orig: Vec::new(),
             streaming_dumps: Vec::new(),
@@ -594,229 +549,16 @@ impl StepHook<KVCache> for EvictionHook {
         let ratio = self.effective_budget as f32 / before_len as f32;
         let eviction_ratio = 1.0 - ratio;
 
-        // V buffer readback for QCF computation (GPU backends only — CPU buffers are
-        // always accessible via as_ptr() and do not need a readback).
-        let v_cpu_bytes: Option<Vec<u8>> =
-            if !caches.is_empty() && caches[0].v_buffer.buffer().as_ptr().is_null() {
-                let size = caches[0].v_buffer.buffer().size();
-                let mut buf = vec![0u8; size];
-                match self.backend.read_buffer(&caches[0].v_buffer, &mut buf) {
-                    Ok(()) => Some(buf),
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
-        // GPU score sync before QCF computation (eval-ll path).
-        // On GPU backends, forward_into() accumulates scores entirely on the device.
-        // The CPU accumulator's importance and last_layer_head_attn are empty.
-        // We sync both: (1) cumulative importance via import_gpu_scores, and
-        // (2) head importance as proxy for last_layer_head_attn (the GPU path
-        // doesn't have raw per-step attention weights, but cumulative head
-        // importance is proportional and sufficient for QCF computation).
-        self.ensure_scores_coherent();
-
-        // can_compute_qcf: true when V data is CPU-accessible (CPU backend) or
-        // successfully read back (GPU backend). Supports F32, F16, and Q4_0 dtypes.
-        let can_compute_qcf =
-            v_cpu_bytes.is_some() || !caches[0].v_buffer.buffer().as_ptr().is_null();
-
-        // QCF (unified output-error formula). Action picks the simulated retention.
-        let qcf_value_aware = if can_compute_qcf {
-            let cache = &caches[0];
-            let v_source = VDataSource::from_buffer(&cache.v_buffer, v_cpu_bytes.as_deref())
-                .unwrap_or_else(|| {
-                    // fallback: treat as F32 (may be incorrect for unknown dtypes)
-                    VDataSource::F32(cache.v_buffer.as_slice::<f32>())
-                });
-            let target_len = ((before_len as f32) * ratio) as usize;
-            // Resolve the estimator by name (d2o/h2o when score-based, else sliding); the engine no
-            // longer enumerates techniques here.
-            let (est_name, est_params) = if self.score_based_eviction {
-                let sp = StageParams {
-                    keep_ratio: self.h2o_keep_ratio,
-                    protected_prefix: self.protected_prefix,
-                    ..Default::default()
-                };
-                if self.produces_merge_plan {
-                    ("d2o", sp)
-                } else {
-                    ("h2o", sp)
-                }
-            } else {
-                ("sliding", StageParams::default())
-            };
-            let estimator = (find_qcf_estimator(est_name)
-                .expect("eviction QCF estimator registered")
-                .make)(est_params, &[]);
-            let attention_scores: Vec<f32> = self
-                .score_accumulator
-                .as_ref()
-                .and_then(|rt| rt.view())
-                .filter(|acc| acc.is_active())
-                .map(|acc| acc.importance_scores().to_vec())
-                .unwrap_or_default();
-            let head_attn_opt = self
-                .score_accumulator
-                .as_ref()
-                .and_then(|rt| rt.view())
-                .and_then(|acc| acc.last_step_head_attn());
-            // The merge simulator (cosine-nearest matching) needs K for nearest-neighbour matching; other techniques
-            // ignore `k_source` (their estimators never call read_k).
-            let k_source = if self.produces_merge_plan {
-                VDataSource::from_buffer(&cache.k_buffer, None)
-            } else {
-                None
-            };
-            let params = QcfKvParams {
-                estimator: &*estimator,
-                target_len,
-                v_source,
-                k_source,
-                attention_scores: &attention_scores,
-                head_attn: head_attn_opt,
-                n_kv_heads: cache.kv_heads(),
-                head_dim: cache.head_dim(),
-                current_pos: before_len,
-                capacity: cache.capacity(),
-                layout: cache.layout(),
-                aggregation: AggregationMode::Mean,
-                beta: 1.0,
-            };
-            let (qcf, per_head) = compute_qcf_kv(&params);
-
-            if self.experimental_enabled {
-                // Schema v3: per-layer worst-head + mean-head over the sample layers.
-                // Layer 0 reuses the `per_head` already computed above.
-                let sample_layers: Vec<usize> = if self.qcf_sample_layers.is_empty() {
-                    vec![0]
-                } else {
-                    self.qcf_sample_layers.clone()
-                };
-
-                let mut layer_worst_head: Vec<f32> = Vec::with_capacity(sample_layers.len());
-                let mut layer_mean_head: Vec<f32> = Vec::with_capacity(sample_layers.len());
-
-                for &layer_idx in &sample_layers {
-                    if layer_idx >= caches.len() {
-                        continue;
-                    }
-                    // Layer 0: reuse `per_head` from the scalar call above (no extra readback).
-                    let per_head_l: Vec<f32> = if layer_idx == 0 {
-                        per_head.clone()
-                    } else {
-                        // Per-layer V readback (GPU only — CPU buffers accessible via as_ptr).
-                        let cache_l = &caches[layer_idx];
-                        let v_cpu_bytes_l: Option<Vec<u8>> =
-                            if cache_l.v_buffer.buffer().as_ptr().is_null() {
-                                let size = cache_l.v_buffer.buffer().size();
-                                let mut buf = vec![0u8; size];
-                                match self.backend.read_buffer(&cache_l.v_buffer, &mut buf) {
-                                    Ok(()) => Some(buf),
-                                    Err(_) => None,
-                                }
-                            } else {
-                                None
-                            };
-
-                        let can_compute_l = v_cpu_bytes_l.is_some()
-                            || !cache_l.v_buffer.buffer().as_ptr().is_null();
-                        if !can_compute_l {
-                            continue;
-                        }
-
-                        let v_source_l = match VDataSource::from_buffer(
-                            &cache_l.v_buffer,
-                            v_cpu_bytes_l.as_deref(),
-                        ) {
-                            Some(vs) => vs,
-                            None => VDataSource::F32(cache_l.v_buffer.as_slice::<f32>()),
-                        };
-                        let k_source_l = if self.produces_merge_plan {
-                            VDataSource::from_buffer(&cache_l.k_buffer, None)
-                        } else {
-                            None
-                        };
-                        let target_len_l = ((cache_l.current_pos as f32) * ratio) as usize;
-                        // Same technique as the scalar call above; only target_len differs per layer.
-                        let estimator_l = (find_qcf_estimator(est_name)
-                            .expect("eviction QCF estimator registered")
-                            .make)(est_params, &[]);
-                        let params_l = QcfKvParams {
-                            estimator: &*estimator_l,
-                            target_len: target_len_l,
-                            v_source: v_source_l,
-                            k_source: k_source_l,
-                            attention_scores: &attention_scores,
-                            head_attn: head_attn_opt,
-                            n_kv_heads: cache_l.kv_heads(),
-                            head_dim: cache_l.head_dim(),
-                            current_pos: before_len,
-                            capacity: cache_l.capacity(),
-                            layout: cache_l.layout(),
-                            aggregation: AggregationMode::Mean,
-                            beta: 1.0,
-                        };
-                        let (_qcf_l, ph_l) = compute_qcf_kv(&params_l);
-                        ph_l
-                    };
-
-                    let worst = aggregate_heads(&per_head_l, &AggregationMode::Max);
-                    let mean = aggregate_heads(&per_head_l, &AggregationMode::Mean);
-                    layer_worst_head.push(worst);
-                    layer_mean_head.push(mean);
-                }
-
-                // Record-level scalars.
-                let max_or_zero = |s: &[f32]| -> f32 {
-                    s.iter().copied().fold(f32::NEG_INFINITY, f32::max).max(0.0)
-                };
-                let mean_or_zero = |s: &[f32]| -> f32 {
-                    if s.is_empty() {
-                        0.0
-                    } else {
-                        s.iter().sum::<f32>() / s.len() as f32
-                    }
-                };
-                let record_worst_head_max = if layer_worst_head.is_empty() {
-                    0.0
-                } else {
-                    max_or_zero(&layer_worst_head)
-                };
-                let record_worst_head_mean = mean_or_zero(&layer_worst_head);
-                let record_mean_head_max = if layer_mean_head.is_empty() {
-                    0.0
-                } else {
-                    max_or_zero(&layer_mean_head)
-                };
-                let record_mean_head_mean = mean_or_zero(&layer_mean_head);
-
-                let payload = ExpQcfV3 {
-                    d7_worst_head: compute_d7(&layer_worst_head),
-                    d7_mean_head: compute_d7(&layer_mean_head),
-                    c1_worst_head: compute_c1(&layer_worst_head),
-                    c1_mean_head: compute_c1(&layer_mean_head),
-                    layer_worst_head,
-                    layer_mean_head,
-                    record_worst_head_max,
-                    record_worst_head_mean,
-                    record_mean_head_max,
-                    record_mean_head_mean,
-                };
-                self.experimental_qcf = Some(payload);
-            }
-
-            qcf
-        } else {
-            0.0
-        };
-
         // IMP-1 evict_importance dump: arm the technique-agnostic keep-set capture
         // around this eviction (drained in `assemble_evict_importance` below).
         let n_layers = caches.len();
         if self.dump_evict_importance {
             crate::kv::eviction::keepset_dump::arm_capture();
         }
+        // GPU score sync before a score-based eviction reads importance (no-op on CPU). On a GPU
+        // backend the forward accumulates entirely on the device and leaves the CPU accumulator
+        // empty, so `extract` below would rank on all zeros without this. Mirrors `streaming_evict`.
+        self.ensure_scores_coherent();
 
         // Perform eviction — shared score-fed body: extract (score-based + active) → route.
         use crate::kv::eviction::score_fed;
@@ -858,11 +600,9 @@ impl StepHook<KVCache> for EvictionHook {
                 rt.reset(self.backend.as_ref());
             }
 
-            // Store QCF result for extra_question_fields
-            self.eviction_qcf = Some(EvictionQcfResult {
+            self.eviction_summary = Some(EvictionSummary {
                 tokens_evicted: evict_result.tokens_removed,
                 eviction_ratio,
-                qcf_value_aware,
             });
         } else if self.dump_evict_importance {
             // No eviction fired — drop the armed capture so it can't leak into a
@@ -882,8 +622,7 @@ impl StepHook<KVCache> for EvictionHook {
         }
         self.eviction_count = 0;
         self.evicted_total = 0;
-        self.eviction_qcf = None;
-        self.experimental_qcf = None;
+        self.eviction_summary = None;
         self.last_evict_dump = None;
         self.resident_orig.clear();
         self.streaming_dumps.clear();
@@ -996,25 +735,9 @@ impl StepHook<KVCache> for EvictionHook {
             "eviction_count": self.eviction_count,
             "evicted_tokens": self.evicted_total,
         });
-        if let Some(ref qcf) = self.eviction_qcf {
-            obj["qcf"] = serde_json::json!(qcf.qcf_value_aware);
-            obj["tokens_evicted"] = serde_json::json!(qcf.tokens_evicted);
-            obj["eviction_ratio"] = serde_json::json!(qcf.eviction_ratio);
-        }
-        if let Some(ref exp) = self.experimental_qcf {
-            obj["schema_version"] = serde_json::json!(3);
-            obj["action_family"] = serde_json::json!("eviction");
-            obj["n_layers"] = serde_json::json!(exp.layer_worst_head.len());
-            obj["qcf_layer_worst_head"] = serde_json::json!(exp.layer_worst_head);
-            obj["qcf_layer_mean_head"] = serde_json::json!(exp.layer_mean_head);
-            obj["qcf_record_worst_head_max"] = serde_json::json!(exp.record_worst_head_max);
-            obj["qcf_record_worst_head_mean"] = serde_json::json!(exp.record_worst_head_mean);
-            obj["qcf_record_mean_head_max"] = serde_json::json!(exp.record_mean_head_max);
-            obj["qcf_record_mean_head_mean"] = serde_json::json!(exp.record_mean_head_mean);
-            obj["qcf_d7_worst_head"] = serde_json::json!(exp.d7_worst_head);
-            obj["qcf_d7_mean_head"] = serde_json::json!(exp.d7_mean_head);
-            obj["qcf_c1_worst_head"] = serde_json::json!(exp.c1_worst_head);
-            obj["qcf_c1_mean_head"] = serde_json::json!(exp.c1_mean_head);
+        if let Some(ref ev) = self.eviction_summary {
+            obj["tokens_evicted"] = serde_json::json!(ev.tokens_evicted);
+            obj["eviction_ratio"] = serde_json::json!(ev.eviction_ratio);
         }
         obj
     }
@@ -1027,7 +750,6 @@ impl StepHook<KVCache> for EvictionHook {
             "h2o_keep_ratio": self.h2o_keep_ratio,
             "is_d2o": self.produces_merge_plan,
             "kv_type": self.kv_type,
-            "experimental_enabled": self.experimental_enabled,
         })
     }
 
@@ -1049,7 +771,6 @@ mod tests {
     use super::*;
     use crate::kv::cache_manager::CacheManager;
     use crate::kv::eviction::stage_registry::none_backed_policy;
-    use crate::qcf_types::{QcfConfig, QcfMode};
     use crate::resilience::sys_monitor::{MemoryStats, SystemMonitor};
     use anyhow::Result as AResult;
 
@@ -1076,14 +797,9 @@ mod tests {
         let policy = none_backed_policy();
         let monitor = Box::new(AlwaysOkMonitor);
         let manager = CacheManager::new(policy, monitor, 0, 1.0);
-        let config = QcfConfig {
-            mode: QcfMode::Attn,
-            ..Default::default()
-        };
         EvictionHook::new(
             manager,
             None,
-            config,
             budget,
             0,
             score_based,
@@ -1091,10 +807,8 @@ mod tests {
             produces_merge_plan,
             "f32".to_string(),
             crate::backend::cpu::cpu_singleton(),
-            false,
-            vec![], // qcf_sample_layers: empty → internal fallback to [0]
-            false,  // dump_evict_importance
-            false,  // streaming_overflow
+            false, // dump_evict_importance
+            false, // streaming_overflow
         )
     }
 
@@ -1214,78 +928,15 @@ mod tests {
     }
 
     #[test]
-    fn test_make_hook_with_experimental_off() {
-        // Verifies that experimental_enabled=false is accepted and stored correctly.
-        let hook = make_hook_with_d2o(512, false, false);
-        assert!(!hook.experimental_enabled);
-    }
-
-    #[test]
-    fn test_extra_question_fields_no_experimental() {
-        // When experimental_qcf is None, extra_question_fields must not contain
-        // new experimental keys.
+    fn the_record_carries_no_qcf_columns() {
         let hook = make_hook(512, false);
         let fields = hook.extra_question_fields(&[]);
+        let obj = fields.as_object().expect("object");
         assert!(
-            fields.get("qcf_value_aware_max").is_none(),
-            "qcf_value_aware_max should be absent when experimental_qcf is None"
+            obj.keys().all(|k| !k.contains("qcf")),
+            "a QCF column survived the removal: {:?}",
+            obj.keys().collect::<Vec<_>>()
         );
-        assert!(
-            fields.get("qcf_per_head").is_none(),
-            "qcf_per_head should be absent when experimental_qcf is None"
-        );
-    }
-
-    #[test]
-    fn test_extra_config_fields_experimental_enabled() {
-        // experimental_enabled field should appear in extra_config_fields.
-        let hook = make_hook(256, false);
-        let fields = hook.extra_config_fields();
-        assert_eq!(
-            fields["experimental_enabled"], false,
-            "experimental_enabled should be false for default hook"
-        );
-    }
-
-    #[test]
-    fn test_qcf_sample_layers_default_fallback() {
-        // Empty qcf_sample_layers → stored as empty vec.
-        // Internal fallback to [0] occurs at runtime in post_prefill.
-        // Here we verify the field is stored as-is and the hook is created successfully.
-        let hook = make_hook_with_d2o(512, false, false);
-        assert!(
-            hook.qcf_sample_layers.is_empty(),
-            "make_hook_with_d2o passes vec![] → qcf_sample_layers should be empty"
-        );
-    }
-
-    #[test]
-    fn test_qcf_sample_layers_explicit() {
-        // When explicit layers are provided, they should be stored unchanged.
-        let policy = none_backed_policy();
-        let monitor = Box::new(AlwaysOkMonitor);
-        let manager = CacheManager::new(policy, monitor, 0, 1.0);
-        let config = QcfConfig {
-            mode: QcfMode::Attn,
-            ..Default::default()
-        };
-        let hook = EvictionHook::new(
-            manager,
-            None,
-            config,
-            512,
-            0,
-            false,
-            0.5,
-            false,
-            "f32".to_string(),
-            crate::backend::cpu::cpu_singleton(),
-            false,
-            vec![0, 4, 8, 12, 15],
-            false, // dump_evict_importance
-            false, // streaming_overflow
-        );
-        assert_eq!(hook.qcf_sample_layers, vec![0, 4, 8, 12, 15]);
     }
 
     // ── variant b: streaming overflow eviction (mechanism, model-free) ──

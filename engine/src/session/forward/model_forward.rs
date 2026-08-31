@@ -5,7 +5,6 @@
 //! prefill workspace, and two reusable logits tensors.
 //!
 //! Out of scope for 4-3 (kept as `None` in the forward args):
-//! `skip_config`, `profiler`, `importance_collector`.
 //! These are absorbed by the `PipelineStage` registry (eviction/observe stages)
 //! — Phase β decode-loop rewrite (the v1 `EvictionStage`/`SwapStage`/
 //! `DecodeObserver` traits were deleted in β-7).
@@ -622,7 +621,6 @@ impl Forward for ModelForward {
                 score_accumulator: None,
                 query_stats_accumulator: None,
                 skip_config: None,
-                importance_collector: None,
                 cache_self_need_scores: false,
                 // §5.9.2 Track B: prefill 은 swap 금지(intra_forward_swap.rs:383 seq_len>1 가드)라
                 // hook 주입 안 함 — 항상 None.
@@ -828,7 +826,6 @@ impl Forward for ModelForward {
             // 게이트가 비용 0 보장(INV-147 byte-identical).
             query_stats_accumulator: query_stats_slot,
             skip_config: None,
-            importance_collector: None,
             cache_self_need_scores: false,
             // §5.9.2 Track B: hook 설치 시 layer loop 에 주입(wait-gate + on_layer_boundary).
             // `hook` Arc clone 이 본 forward_into 호출 동안 hook 을 살아 있게 유지한다.

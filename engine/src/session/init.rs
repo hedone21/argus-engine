@@ -48,60 +48,12 @@ pub struct SessionInitCtx {
     /// `caps.get::<dyn QuantAttnBackend>()` pull 한다.
     pub caps: Arc<CapabilityRegistry>,
 
-    /// swap layer 선택 알고리즘 (--swap-algorithm).
-    pub swap_algorithm: crate::weight::SwapAlgorithm,
-    /// layer 중요도 계산 공식 (--importance-formula).
-    pub importance_formula: crate::qcf_types::ImportanceFormula,
-    /// `compare` 모드 활성 여부 (importance_formula = MeanPool이지만 3-way 수집).
-    pub importance_compare: bool,
-    /// 명시적 swap 대상 layer 목록 (--swap-only-layers, § 4 ground-truth study).
-    pub swap_only_layers: Option<Vec<usize>>,
-
     /// 로드된 모델 (quant-window/SwitchHw가 model.layers를 swap하므로 owned).
     pub model: TransformerModel,
 }
 
 impl SessionInitCtx {
     pub fn build(args: &Args) -> anyhow::Result<Self> {
-        // ENG-DAT-C18: --swap-incremental-per-tick > 0 / --swap-intra-forward /
-        // --swap-phase-aware are mutually exclusive (LISWAP-1 vs LISWAP-4 vs
-        // LISWAP-5 — ratio_generation bump + dispatcher ownership conflict).
-        // Reject combinations explicitly so engine never starts in an ambiguous
-        // swap-policy state.
-        let swap_modes_active = (args.swap_incremental_per_tick > 0) as usize
-            + args.swap_intra_forward as usize
-            + args.swap_phase_aware as usize
-            + args.swap_layer_immediate as usize;
-        if swap_modes_active > 1 {
-            anyhow::bail!(
-                "--swap-incremental-per-tick (= {}) / --swap-intra-forward (= {}) / \
-                 --swap-phase-aware (= {}) / --swap-layer-immediate (= {}) are mutually \
-                 exclusive (ENG-DAT-C18). Pick one:\n\
-                 (a) --swap-incremental-per-tick=N                                 (LISWAP-1)\n\
-                 (b) --swap-intra-forward=true                                     (LISWAP-4)\n\
-                 (c) --swap-phase-aware=true                                       (LISWAP-5)\n\
-                 (d) --swap-layer-immediate=true                                   (LISWAP-6 P6)\n\
-                 (e) (none)                                                        (single-shot)",
-                args.swap_incremental_per_tick,
-                args.swap_intra_forward,
-                args.swap_phase_aware,
-                args.swap_layer_immediate
-            );
-        }
-
-        // --swap-no-throttle: forwards to env so SwapExecutor::execute_on_slots
-        // skips the INV-141 release_worker drain. Measurement-only (EuroSys 2027
-        // §4.2 layer-count predictor accuracy). Sets the env only if unset so the
-        // env-based invocation path (LLMRS_SWAP_FORCE_EVERY_TICK=1) keeps working
-        // independently. The executor logs a stderr warning on first read.
-        if args.swap_no_throttle && std::env::var_os("LLMRS_SWAP_FORCE_EVERY_TICK").is_none() {
-            // SAFETY: set before any worker thread that might read the variable.
-            // generate.rs::main runs single-threaded up to this point (CLI parse +
-            // Rayon pool init below). Writes after thread spawn would be UB on
-            // some platforms; this write precedes the pool builder on line 1247.
-            unsafe { std::env::set_var("LLMRS_SWAP_FORCE_EVERY_TICK", "1") };
-        }
-
         // Configure Rayon thread pool: 0 = auto-detect CPU cores
         let num_threads = if args.threads > 0 {
             args.threads
@@ -142,7 +94,6 @@ impl SessionInitCtx {
                 ("--eval-batch", args.eval_batch.is_some()),
                 ("--tensor-partition", args.tensor_partition > 0.0),
                 ("--cuda-graph", args.cuda_graph),
-                ("--dump-importance", args.dump_importance),
                 ("--experiment-schedule", args.experiment_schedule.is_some()),
             ];
             if let Some((flag, _)) = conflicts.iter().find(|(_, enabled)| *enabled) {
@@ -499,69 +450,6 @@ impl SessionInitCtx {
             ),
         };
         eprintln!("[Config] Weight dtype: {:?}", w_dtype);
-        // Validate --force-swap-ratio requires --secondary-gguf.
-        if args.force_swap_ratio.is_some() && args.secondary_gguf.is_none() {
-            anyhow::bail!(
-                "--force-swap-ratio requires --secondary-gguf to be set (no secondary weight file)"
-            );
-        }
-
-        // Parse --swap-algorithm (used by --qcf-dump warmup-swap path; U5 ablation).
-        let swap_algorithm = crate::weight::SwapAlgorithm::from_cli(&args.swap_algorithm)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--swap-algorithm: unknown value '{}'. Valid: imp, seq, rev, uni, anti",
-                    args.swap_algorithm
-                )
-            })?;
-
-        // Parse --importance-formula (§4 EuroSys'27 study). `compare` enables
-        // three_way collector + post-warmup weight-perturbation proxy ε computation.
-        let (importance_formula, importance_compare) = match args.importance_formula.as_str() {
-            "mean_pool" => (crate::qcf_types::ImportanceFormula::MeanPool, false),
-            "shortgpt_bi" => (crate::qcf_types::ImportanceFormula::PerTokenCosineBi, false),
-            "dpllm_proxy" => (
-                crate::qcf_types::ImportanceFormula::WeightPerturbProxy,
-                false,
-            ),
-            "dpllm_multi" => (
-                crate::qcf_types::ImportanceFormula::WeightPerturbMulti,
-                false,
-            ),
-            "dpllm_abs" => (crate::qcf_types::ImportanceFormula::WeightPerturbAbs, false),
-            "dpllm_qcf" => (crate::qcf_types::ImportanceFormula::WeightPerturbQcf, false),
-            "direct_attn" => (crate::qcf_types::ImportanceFormula::DirectAttn, false),
-            "compare" => (crate::qcf_types::ImportanceFormula::MeanPool, true),
-            other => anyhow::bail!(
-                "--importance-formula: unknown value '{}'. Valid: mean_pool, shortgpt_bi, dpllm_proxy, dpllm_multi, dpllm_abs, dpllm_qcf, direct_attn, compare",
-                other
-            ),
-        };
-
-        // Parse --swap-only-layers (§4 ground-truth study). CSV of layer indices.
-        // Order is preserved (trajectory mode swaps in the listed order); duplicates
-        // are dropped while keeping the first occurrence.
-        let swap_only_layers: Option<Vec<usize>> = match args.swap_only_layers.as_deref() {
-            None | Some("") => None,
-            Some(csv) => {
-                let mut v = Vec::new();
-                let mut seen = std::collections::HashSet::new();
-                for tok in csv.split(',') {
-                    let t = tok.trim();
-                    if t.is_empty() {
-                        continue;
-                    }
-                    let idx: usize = t.parse().map_err(|_| {
-                        anyhow::anyhow!("--swap-only-layers: '{}' is not a non-negative integer", t)
-                    })?;
-                    if seen.insert(idx) {
-                        v.push(idx);
-                    }
-                }
-                Some(v)
-            }
-        };
-
         let primary_path_buf = std::path::PathBuf::from(model_path);
         let primary_format = crate::models::loader::detect_primary_format(&primary_path_buf)?;
         let is_gguf = matches!(primary_format, crate::models::loader::PrimaryFormat::Gguf);
@@ -1014,10 +902,6 @@ impl SessionInitCtx {
             weights_on_gpu,
             hardware,
             caps,
-            swap_algorithm,
-            importance_formula,
-            importance_compare,
-            swap_only_layers,
             model,
         })
     }

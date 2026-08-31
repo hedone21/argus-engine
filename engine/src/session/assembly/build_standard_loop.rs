@@ -57,7 +57,6 @@ const KV_FILL_HIGH_WATER_PCT: u32 = 85;
 ///
 /// 다음을 모두 만족할 때만 `true`. 미통과 args는 generate.rs 기존 path 사용.
 ///
-/// - `args.qcf_dump.is_none()`               — `--qcf-dump` 비활성 (importance_collector 미장착)
 /// - `args.skip_ratio.unwrap_or(0.0) == 0.0` — `--skip-ratio=0` (skip_config 미장착)
 /// - `!args.profile && !args.profile_events` — profile 비활성 (profiler 미장착)
 /// - `args.eviction_policy() == "none"`        — eviction 비활성 (score_accumulator 미장착)
@@ -77,17 +76,13 @@ const KV_FILL_HIGH_WATER_PCT: u32 = 85;
 /// 호출자는 추가로 `prompt_len <= MAX_NON_CHUNKED_PREFILL_LEN`도 검증해야 한다
 /// (chunked prefill 미지원). 그 가드는 generate.rs 호출 site에서 처리.
 pub fn is_standard_happy_path(args: &Args) -> bool {
-    args.qcf_dump.is_none()
-        && args.skip_ratio.unwrap_or(0.0) == 0.0
+    args.skip_ratio.unwrap_or(0.0) == 0.0
         && !args.profile
         && !args.profile_events
         // `--d2o-layer-alloc` no longer needs its own clause: it only ever applies to `eviction d2o`,
         // and the `eviction_policy() == "none"` guard below already excludes every eviction policy.
         && args.eviction_policy() == "none"
         && args.tensor_partition == 0.0
-        && !args.swap_intra_forward
-        && !args.swap_layer_immediate
-        && !args.swap_phase_aware
 }
 
 /// Phase 4-4-a: unpack-args 형태로 standard `DecodeLoop` 조립.
@@ -358,21 +353,15 @@ pub fn build_standard_loop(
                 adapter.set_kv_handle(h);
             }
             let registry = registry.as_ref().expect("registry: resilience.is_some()");
-            // happy/chat 경로는 partition/swap/quant 미구성 (빈 slots + None hardware/model/
-            // swap_runtime + 빈 quant_window_handles). report_tx=None (AB-5: happy-path resilience 미배선).
+            // happy/chat 경로는 partition/quant 미구성 (빈 slots + None hardware + 빈
+            // quant_window_handles).
             let dispatcher = CommandDispatcher::new(
                 Arc::clone(registry),
                 kv_handles.clone(),
                 None,
                 Vec::new(),
                 None,
-                None,
-                None,
-                None,
                 Vec::new(),
-                None, // report_tx: AB-5
-                // §5.9.2 Track B: happy 경로는 swap 미구성 → 더미 cell (항상 None).
-                Arc::clone(&hook_cell),
                 // §5.9.1 Track A: happy 경로는 score-based eviction 미구성 → 더미 None cell.
                 Arc::new(Mutex::new(None)),
             );
@@ -575,13 +564,6 @@ mod tests {
     fn rejects_profile() {
         let mut args = default_args();
         args.profile = true;
-        assert!(!is_standard_happy_path(&args));
-    }
-
-    #[test]
-    fn rejects_qcf_dump() {
-        let mut args = default_args();
-        args.qcf_dump = Some(std::path::PathBuf::from("/tmp/qcf.json"));
         assert!(!is_standard_happy_path(&args));
     }
 

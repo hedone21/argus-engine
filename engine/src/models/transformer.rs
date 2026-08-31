@@ -267,10 +267,6 @@ pub struct OffloadForwardArgs<'a> {
     pub profiler: Option<&'a mut dyn crate::instrument::OpInstrument>,
     /// Optional skip configuration for layer skipping.
     pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
-    /// Optional importance collector for Layer Skip QCF.
-    /// When provided during prefill, captures per-layer cosine similarity.
-    /// Uses L2 `ImportanceCollect` trait (§13.8-G + INV-LAYER-003 trait inversion).
-    pub importance_collector: Option<&'a mut dyn crate::qcf_collector::ImportanceCollect>,
     /// When true, only compute logits for the last sequence position.
     /// Saves ~3GB GPU memory for long-context prefill (e.g., eval-ll with 5K+ tokens).
     /// logits_out shape should be [1, 1, vocab_size] instead of [1, seq_len, vocab_size].
@@ -322,7 +318,6 @@ pub struct TransformerModelForwardArgs<'a> {
     /// layer-skip 설정 (Phase α-K ①-c). production 은 항상 `None`.
     pub skip_config: Option<&'a crate::inference::skip_config::SkipConfig>,
     /// Layer Skip QCF importance collector — prefill 2-pass 전용 (Phase α-K ①-c). production 은 `None`.
-    pub importance_collector: Option<&'a mut dyn crate::qcf_collector::ImportanceCollect>,
     /// cache 자가-need(quant-window AWQE) 힌트 (Phase α-K ①-c). base trait 에 `needs_attn_scores` 가 없으므로
     /// (§4.1 R4 ③) caller 가 `caches[0].needs_attn_scores()` 를 산출해 주입한다 — `need_scores` 의 OR
     /// 항(`forward_gen.rs:409` 미러). production 은 `false`.
@@ -1491,7 +1486,6 @@ impl TransformerModel {
         // Q running mean/var 누적기 (QueryStats, future-attention 추정용; production 은 None).
         let mut query_stats_accumulator = args.query_stats_accumulator;
         let skip_config = args.skip_config;
-        let mut importance_collector = args.importance_collector;
         let cache_self_need_scores = args.cache_self_need_scores;
         // §5.9.2 Track B: IntraForward/LayerImmediate swap 의 layer-boundary hook.
         // production/eval 경로는 None → 아래 분기들이 layer 당 `is_some` branch 1회만(INV-147).
@@ -1545,15 +1539,6 @@ impl TransformerModel {
 
         // dump-importance L0 fix: the importance collector reads `x` on the host via
         // `x.as_slice::<f32>()` in `snapshot_before` below. On a GPU backend the embedding
-        // gather above is an on-device ("zero-sync") write, so layer-0's snapshot would read
-        // stale/zero managed memory before that write lands → `opr=0` at L0 only. One sync
-        // makes the gather's write host-visible. L1+ are already coherent via each layer's
-        // compute. Gated on the collector (production forward: collector=None → skipped →
-        // INV-147 byte-identical) and GPU (no-op path on CPU).
-        if importance_collector.is_some() && backend.is_gpu() {
-            backend.synchronize()?;
-        }
-
         let is_gemma3 = self.config.arch == ModelArch::Gemma3;
 
         // prefill owned PrefillWorkspace (forward_into:1583-1607 미러, CPU/GPU 모두 할당 — fmt 경로는
@@ -1627,12 +1612,6 @@ impl TransformerModel {
             } else {
                 None
             };
-
-            // importance snapshot before layer (forward_into:1733 미러) — prefill 2-pass 전용.
-            if let Some(ref mut coll) = importance_collector {
-                let x_data = x.as_slice::<f32>();
-                coll.snapshot_before(x_data, seq_len, hidden_size);
-            }
 
             if is_decode && workspace.is_none() {
                 // 발산 A (Phase α-K ①-d): 구 forward_into 의 decode(seq_len==1, workspace=None)는
@@ -1778,18 +1757,6 @@ impl TransformerModel {
             // hook=None 이면 `is_some` branch 1회(INV-147).
             if let Some(hook) = layer_boundary_hook {
                 hook.on_layer_boundary(i, seq_len);
-            }
-
-            // importance record after layer (forward_into:1882-1891 미러) — prefill 2-pass 전용.
-            if let Some(ref mut coll) = importance_collector {
-                let x_data = x.as_slice::<f32>();
-                coll.record_after(
-                    x_data,
-                    seq_len,
-                    hidden_size,
-                    i,
-                    crate::qcf_types::SubLayer::Full,
-                );
             }
 
             // CPU attention-score DecodeAttn tap — the sole production decode-score driver. workspace
@@ -3461,7 +3428,6 @@ mod tests {
             score_accumulator: None,
             profiler: None,
             skip_config: None,
-            importance_collector: None,
             logits_last_only: false,
             layer_boundary_hook: None,
             read_stage: None, // S6: 이 필드가 컴파일 통과 = 배선 연결 확인

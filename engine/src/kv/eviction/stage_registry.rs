@@ -15,8 +15,7 @@
 
 use anyhow::Result;
 use argus_extension_api::{
-    KVMutationStage, StageCaps, StageParams, TensorKind, find_mutation_stage, find_qcf_estimator,
-    mutation_stage_caps,
+    KVMutationStage, StageCaps, StageParams, TensorKind, find_mutation_stage, mutation_stage_caps,
 };
 
 use super::EvictionPolicy;
@@ -52,13 +51,6 @@ use d2o as _;
 // `find_mutation_stage("sliding")` / `find_mutation_stage("none")` visible (same rationale as streaming/h2o above).
 use no_eviction as _;
 use sliding_window as _;
-
-// Layer-importance scorers force-link (observer/score axis, EPIC 2 Stage B). The per-layer
-// importance formulas (mean_pool / shortgpt_bi) were extracted into the `layer-importance` crate;
-// this one line makes their `#[distributed_slice(LAYER_SCORERS)]` registration visible to
-// `find_layer_scorer` (same fat-LTO --gc-sections rationale as the stages above). `mean_pool` is the
-// default `--importance-formula`, so the crate is non-optional.
-use layer_importance as _;
 
 // Attention-score producer force-link (observer/score axis, EPIC 2 Stage C). The forward-time
 // score-accumulation policy (per-layer MAX / GQA averaging / value-aware overwrite / forgetting-factor decay / SUM /
@@ -400,39 +392,14 @@ pub fn ensure_builtin_stages_registered() -> Result<()> {
     // what we verify — if fat-LTO `--gc-sections` drops a crate, `mutation_stage_caps` stops resolving
     // its name and we bail. It does NOT re-declare any plugin's caps (those are read from the registry
     // by `stage_is_score_based` / `stage_default_protected_prefix` / `stage_produces_merge_plan` and
-    // owned solely by the plugin). Mirrors `ensure_score_producers_registered` /
-    // `ensure_layer_scorers_registered`, which likewise keep a hardcoded name list + assert only
-    // resolution.
+    // owned solely by the plugin). Mirrors `ensure_score_producers_registered`,
+    // which likewise keeps a hardcoded name list + asserts only resolution.
     for name in ["sliding", "streaming", "h2o", "d2o"] {
         if mutation_stage_caps(name).is_none() {
             anyhow::bail!(
                 "built-in KV mutation stage '{name}' not registered — suspect linkme fat-LTO \
                  --gc-sections silent drop of its force-linked crate (the #[distributed_slice] \
                  registration in the stage crate was not linked; see the `use X as _;` force-links)."
-            );
-        }
-    }
-
-    // QCF estimators (observer/score axis, EPIC 2): each eviction technique crate also registers a
-    // QcfEstimator into QCF_ESTIMATORS via the same force-link as the stages above. A missing entry
-    // is the same fat-LTO --gc-sections silent-drop risk — fail fast, checking the declared curve key.
-    for (name, want_curve_key) in [
-        ("sliding", "kv.evict_sliding"),
-        ("streaming", "kv.evict_streaming"),
-        ("h2o", "kv.evict_h2o"),
-        ("d2o", "kv.merge_d2o"),
-    ] {
-        let Some(reg) = find_qcf_estimator(name) else {
-            anyhow::bail!(
-                "QCF estimator '{name}' not registered — suspect linkme fat-LTO --gc-sections \
-                 silent drop of its QCF_ESTIMATORS registration."
-            );
-        };
-        if reg.curve_key != want_curve_key {
-            anyhow::bail!(
-                "QCF estimator '{name}' declares curve_key='{}' but the engine expects \
-                 '{want_curve_key}'.",
-                reg.curve_key
             );
         }
     }

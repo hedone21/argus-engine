@@ -12,7 +12,6 @@ pub struct EvalConfig {
     pub kv_budget_ratio: f32,
     pub greedy: bool,
     pub kv_type: String,
-    pub qcf_mode: String,
     /// Model vocabulary size (used for logits buffer allocation).
     pub vocab_size: usize,
     /// Model hidden dimension (used for x_gen buffer allocation).
@@ -65,42 +64,16 @@ pub struct EvalOutput {
     pub config: serde_json::Value,
     /// Wall-clock time in seconds.
     pub wall_time_s: f64,
-    /// Layer importance table (if skip_config active).
-    pub layer_importance: Option<serde_json::Value>,
-    /// Layer skip QCF (cos_sim based).
-    pub layer_skip_qcf: Option<f32>,
-    /// Layer skip QCF normalized.
-    pub layer_skip_qcf_normalized: Option<f32>,
-    /// Layer skip QCF (residual norm ratio).
-    pub qcf_layer_skip: Option<f64>,
-    /// Number of skipped layers.
-    pub qcf_layer_skip_layers: Option<usize>,
 }
 
 impl EvalOutput {
     /// Serialize to JSON matching the existing output format.
     pub fn to_json(&self) -> anyhow::Result<String> {
-        let mut output = serde_json::json!({
+        let output = serde_json::json!({
             "results": self.results,
             "config": self.config,
             "wall_time_s": self.wall_time_s,
         });
-
-        if let Some(ref li) = self.layer_importance {
-            output["layer_importance"] = li.clone();
-        }
-        if let Some(qcf) = self.layer_skip_qcf {
-            output["layer_skip_qcf"] = serde_json::json!(qcf);
-        }
-        if let Some(n) = self.layer_skip_qcf_normalized {
-            output["layer_skip_qcf_normalized"] = serde_json::json!(n);
-        }
-        if let Some(opr) = self.qcf_layer_skip {
-            output["qcf_layer_skip"] = serde_json::json!(opr);
-        }
-        if let Some(n) = self.qcf_layer_skip_layers {
-            output["qcf_layer_skip_layers"] = serde_json::json!(n);
-        }
 
         serde_json::to_string_pretty(&output).map_err(Into::into)
     }
@@ -117,11 +90,6 @@ mod tests {
             results: vec![],
             config: serde_json::json!({}),
             wall_time_s: 0.0,
-            layer_importance: None,
-            layer_skip_qcf: None,
-            layer_skip_qcf_normalized: None,
-            qcf_layer_skip: None,
-            qcf_layer_skip_layers: None,
         }
     }
 
@@ -165,105 +133,6 @@ mod tests {
         assert_eq!(v["results"].as_array().unwrap().len(), 3);
     }
 
-    // ── 2. layer_skip 필드 조건부 포함 검증 ──────────────────────────────────
-
-    /// layer_skip 관련 필드가 모두 Some일 때 JSON에 포함되는지 확인한다.
-    #[test]
-    fn test_eval_output_with_layer_skip_fields_present() {
-        let output = EvalOutput {
-            layer_skip_qcf: Some(0.15),
-            layer_skip_qcf_normalized: Some(0.176),
-            qcf_layer_skip: Some(0.384),
-            qcf_layer_skip_layers: Some(3),
-            ..minimal_output()
-        };
-        let v = parse(&output);
-
-        // 값 존재 확인
-        assert!(
-            !v["layer_skip_qcf"].is_null(),
-            "layer_skip_qcf should be present"
-        );
-        assert!(
-            !v["layer_skip_qcf_normalized"].is_null(),
-            "layer_skip_qcf_normalized should be present"
-        );
-        assert!(
-            !v["qcf_layer_skip"].is_null(),
-            "qcf_layer_skip should be present"
-        );
-        assert!(
-            !v["qcf_layer_skip_layers"].is_null(),
-            "qcf_layer_skip_layers should be present"
-        );
-
-        // 값 정확도 확인 (f32 → JSON → f64 변환 허용 오차)
-        let qcf = v["layer_skip_qcf"].as_f64().unwrap();
-        assert!(
-            (qcf - 0.15).abs() < 1e-5,
-            "layer_skip_qcf value mismatch: {}",
-            qcf
-        );
-        let norm = v["layer_skip_qcf_normalized"].as_f64().unwrap();
-        assert!(
-            (norm - 0.176).abs() < 1e-5,
-            "layer_skip_qcf_normalized value mismatch: {}",
-            norm
-        );
-        assert!((v["qcf_layer_skip"].as_f64().unwrap() - 0.384).abs() < 1e-9);
-        assert_eq!(v["qcf_layer_skip_layers"].as_u64().unwrap(), 3);
-    }
-
-    // ── 3. layer_skip 없을 때 필드 부재 확인 ─────────────────────────────────
-
-    /// layer_skip 관련 필드가 모두 None일 때 JSON 키 자체가 없어야 한다.
-    #[test]
-    fn test_eval_output_without_layer_skip_fields_absent() {
-        let output = minimal_output(); // 모든 layer_skip 필드가 None
-        let v = parse(&output);
-
-        // serde_json::Value::get() 은 키가 없으면 None을 반환한다.
-        assert!(
-            v.get("layer_skip_qcf").is_none(),
-            "layer_skip_qcf should be absent when None"
-        );
-        assert!(
-            v.get("layer_skip_qcf_normalized").is_none(),
-            "layer_skip_qcf_normalized should be absent when None"
-        );
-        assert!(
-            v.get("qcf_layer_skip").is_none(),
-            "qcf_layer_skip should be absent when None"
-        );
-        assert!(
-            v.get("qcf_layer_skip_layers").is_none(),
-            "qcf_layer_skip_layers should be absent when None"
-        );
-    }
-
-    /// layer_importance도 None일 때 키가 없어야 한다.
-    #[test]
-    fn test_eval_output_layer_importance_absent_when_none() {
-        let output = minimal_output();
-        let v = parse(&output);
-        assert!(v.get("layer_importance").is_none());
-    }
-
-    /// layer_importance가 Some일 때 JSON 배열로 포함되어야 한다.
-    #[test]
-    fn test_eval_output_layer_importance_present_when_some() {
-        let output = EvalOutput {
-            layer_importance: Some(serde_json::json!([
-                {"layer": 0, "sublayer": "Attn", "importance": 0.9, "opr": 0.1}
-            ])),
-            ..minimal_output()
-        };
-        let v = parse(&output);
-        let li = &v["layer_importance"];
-        assert!(li.is_array(), "layer_importance should be an array");
-        assert_eq!(li.as_array().unwrap().len(), 1);
-    }
-
     // ── 4. to_json() 결정론적 직렬화 검증 ────────────────────────────────────
 
     /// 동일한 EvalOutput을 두 번 직렬화하면 동일한 문자열이 나와야 한다.
@@ -273,10 +142,6 @@ mod tests {
             results: vec![serde_json::json!({"id": "q1", "predicted": 0})],
             config: serde_json::json!({"kv_type": "f32"}),
             wall_time_s: 3.15,
-            layer_skip_qcf: Some(0.25),
-            layer_skip_qcf_normalized: Some(0.333),
-            qcf_layer_skip: Some(0.5),
-            qcf_layer_skip_layers: Some(2),
             ..minimal_output()
         };
         let json1 = output.to_json().unwrap();

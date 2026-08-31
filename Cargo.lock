@@ -115,7 +115,6 @@ dependencies = [
  "h2o",
  "half",
  "kivi",
- "layer-importance",
  "libc",
  "libloading 0.8.9",
  "linkme",
@@ -142,7 +141,6 @@ dependencies = [
  "tova",
  "triattention",
  "trybuild",
- "weight-swap",
  "zbus",
 ]
 
@@ -1105,14 +1103,6 @@ dependencies = [
  "cudarc",
  "linkme",
  "ocl",
-]
-
-[[package]]
-name = "layer-importance"
-version = "0.1.0"
-dependencies = [
- "argus-extension-api",
- "linkme",
 ]
 
 [[package]]
@@ -2271,14 +2261,6 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "weight-swap"
-version = "0.1.0"
-dependencies = [
- "argus-extension-api",
- "linkme",
 ]
 
 [[package]]

@@ -17,7 +17,6 @@
 //! CPU-only mode is fully preserved for backward compatibility.
 
 use crate::backend::Backend;
-// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::{Buffer, DType};
 use crate::capability::quant_attn::QuantAttnBackend;
@@ -155,8 +154,6 @@ impl QuantizedBlocks {
 /// residual and attention F32 data. CPU residual vectors are still allocated for
 /// the quantize step (cold path). All hot-path operations dispatch GPU kernels.
 ///
-/// S-3b-4: `qcf_computer: Box<dyn QcfComputer>` 는 trait method
-/// `clone_box()` 기반 `impl Clone for Box<dyn QcfComputer>` 으로 Clone 지원.
 #[derive(Clone)]
 pub struct QuantizedRecentWindowCache {
     /// Current quantization bit-width (2, 4, or 8).
@@ -196,9 +193,6 @@ pub struct QuantizedRecentWindowCache {
     // Group size for quantization (= QKKV = 32)
     group_size: usize,
 
-    /// Accumulated flush proxy metrics (NMSE). Pushed during `flush_residual()`.
-    flush_proxies: Vec<crate::qcf_types::QcfMetric>,
-
     /// Whether AWQE computation is enabled (set via set_awqe_enabled()).
     awqe_enabled: bool,
     /// Attention scores from the previous decode step (for AWQE).
@@ -230,11 +224,6 @@ pub struct QuantizedRecentWindowCache {
     gpu_q2k_blocks: usize,
     /// Number of Q2 value blocks written to `slab.q2v`. Logic state (see above).
     gpu_q2v_blocks: usize,
-
-    /// QCF flush proxy 계산기 (L2 trait dispatch, S-3b-4 γ-2).
-    /// 기본값이자 현재 유일 구현체 = `QuantFlushQcfComputer` (stateless);
-    /// 생성자에서 기본값으로 1회 구성되며 런타임 주입 setter 는 없다.
-    qcf_computer: Box<dyn crate::qcf_computer::QcfComputer>,
 }
 
 impl QuantizedRecentWindowCache {
@@ -326,7 +315,6 @@ impl QuantizedRecentWindowCache {
             head_dim,
             max_seq_len,
             group_size: QKKV,
-            flush_proxies: Vec::new(),
             awqe_enabled: false,
             last_attn_scores: None,
             // GPU fields — None in CPU-only mode
@@ -335,8 +323,6 @@ impl QuantizedRecentWindowCache {
             slab: None,
             gpu_q2k_blocks: 0,
             gpu_q2v_blocks: 0,
-            // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cross-L3 default qcf computer (cold-path one-time init, S-3b-4 trail)
-            qcf_computer: Box::<crate::qcf::QuantFlushQcfComputer>::default(),
         }
     }
 
@@ -348,11 +334,6 @@ impl QuantizedRecentWindowCache {
     /// Current quantization bit-width.
     pub fn bits(&self) -> u8 {
         self.bits
-    }
-
-    /// Take all accumulated flush proxy metrics (NMSE), draining the internal buffer.
-    pub fn take_flush_proxies(&mut self) -> Vec<crate::qcf_types::QcfMetric> {
-        std::mem::take(&mut self.flush_proxies)
     }
 
     /// Enable/disable AWQE computation during flush.
@@ -764,48 +745,6 @@ impl QuantizedRecentWindowCache {
         Some((s.attn_k.as_ref()?, s.attn_v.as_ref()?))
     }
 
-    /// Dry-run QCF estimate for quant-window quantization (read-only, no state mutation).
-    ///
-    /// - **CPU mode** with residual data: computes actual NMSE via `compute_flush_nmse`.
-    /// - **GPU mode** or empty residual: returns a bits-based proxy
-    ///   (Q2=0.30, Q4=0.10, Q8=0.03, F16=0.0).
-    pub fn estimate_dryrun_qcf(&self) -> f32 {
-        let _t = crate::qcf_timer!(QCF_KV_DRYRUN);
-        // bits=16 means unquantized, no degradation
-        if self.bits == 16 {
-            return 0.0;
-        }
-
-        // CPU mode with data in residual: compute actual NMSE
-        if !self.is_gpu() && self.res_pos > 0 {
-            let gs = self.group_size; // QKKV
-            let n_groups = self.res_pos / gs;
-            let flush_tokens = n_groups * gs;
-            if flush_tokens > 0 {
-                let config = crate::qcf_types::QcfConfig::default();
-                let params = crate::qcf_types::QuantFlushParams {
-                    res_k: &self.res_k,
-                    res_v: &self.res_v,
-                    kv_heads: self.kv_heads,
-                    head_dim: self.head_dim,
-                    flush_tokens,
-                    res_cap: self.res_cap,
-                    bits: self.bits,
-                };
-                let metric = self.qcf_computer.flush_nmse(&params, &config);
-                return metric.normalized_value.clamp(0.0, 1.0);
-            }
-        }
-
-        // Fallback: bits-based proxy
-        match self.bits {
-            2 => 0.30,
-            4 => 0.10,
-            8 => 0.03,
-            _ => 0.0,
-        }
-    }
-
     /// Reset cache to empty state (reuse allocations).
     pub fn reset(&mut self) {
         if self.is_gpu() {
@@ -828,7 +767,6 @@ impl QuantizedRecentWindowCache {
         self.res_v.fill(0.0);
         self.res_pos = 0;
         self.q2_deq_tokens = 0;
-        self.flush_proxies.clear();
         // GPU position counters reset; buffers are reused (valid data region tracked by positions)
         self.gpu_q2k_blocks = 0;
         self.gpu_q2v_blocks = 0;
@@ -858,63 +796,6 @@ impl QuantizedRecentWindowCache {
         // How many full groups to flush
         let n_groups = self.res_pos / gs;
         let flush_tokens = n_groups * gs;
-
-        // Compute NMSE proxy before quantization (FP32 originals still available)
-        let qcf_config = crate::qcf_types::QcfConfig::default();
-        let proxy_params = crate::qcf_types::QuantFlushParams {
-            res_k: &self.res_k,
-            res_v: &self.res_v,
-            kv_heads: self.kv_heads,
-            head_dim: self.head_dim,
-            flush_tokens,
-            res_cap: self.res_cap,
-            bits: self.bits,
-        };
-        self.flush_proxies
-            .push(self.qcf_computer.flush_nmse(&proxy_params, &qcf_config));
-        self.flush_proxies
-            .push(self.qcf_computer.flush_opr(&proxy_params, &qcf_config));
-
-        // AWQE: attention-weighted quantization error (V-only)
-        if let Some(ref attn) = self.last_attn_scores {
-            let gqa_group_size = attn.n_heads_q.checked_div(self.kv_heads).unwrap_or(0);
-            if gqa_group_size > 0 && self.q2_tokens < attn.valid_len {
-                let awqe_params = crate::qcf_types::FlushAttentionParams {
-                    res_v: &self.res_v,
-                    kv_heads: self.kv_heads,
-                    head_dim: self.head_dim,
-                    flush_tokens,
-                    res_cap: self.res_cap,
-                    bits: self.bits,
-                    attn_scores: &attn.scores,
-                    n_heads_q: attn.n_heads_q,
-                    scores_stride: attn.stride,
-                    gqa_group_size,
-                    flush_cache_start: self.q2_tokens,
-                    scores_valid_len: attn.valid_len,
-                };
-                self.flush_proxies
-                    .push(self.qcf_computer.flush_awqe(&awqe_params, &qcf_config));
-
-                // AW-VOPR: attention-weighted vector output perturbation ratio
-                let vopr_params = crate::qcf_types::FlushAttentionParams {
-                    res_v: &self.res_v,
-                    kv_heads: self.kv_heads,
-                    head_dim: self.head_dim,
-                    flush_tokens,
-                    res_cap: self.res_cap,
-                    bits: self.bits,
-                    attn_scores: &attn.scores,
-                    n_heads_q: attn.n_heads_q,
-                    scores_stride: attn.stride,
-                    gqa_group_size,
-                    flush_cache_start: self.q2_tokens,
-                    scores_valid_len: attn.valid_len,
-                };
-                self.flush_proxies
-                    .push(self.qcf_computer.flush_aw_vopr(&vopr_params, &qcf_config));
-            }
-        }
 
         // === Key: per-channel quantization ===
         for h in 0..self.kv_heads {
@@ -1721,63 +1602,6 @@ impl QuantizedRecentWindowCache {
             backend.read_buffer(gpu_res_v, v_dst)?;
         }
 
-        // 2. Compute QCF proxy metrics (same as CPU path)
-        let qcf_config = crate::qcf_types::QcfConfig::default();
-        let proxy_params = crate::qcf_types::QuantFlushParams {
-            res_k: &self.res_k,
-            res_v: &self.res_v,
-            kv_heads: self.kv_heads,
-            head_dim: self.head_dim,
-            flush_tokens,
-            res_cap: self.res_cap,
-            bits: self.bits,
-        };
-        self.flush_proxies
-            .push(self.qcf_computer.flush_nmse(&proxy_params, &qcf_config));
-        self.flush_proxies
-            .push(self.qcf_computer.flush_opr(&proxy_params, &qcf_config));
-
-        // AWQE (same logic as CPU flush_residual)
-        if let Some(ref attn) = self.last_attn_scores {
-            let gqa_group_size = attn.n_heads_q.checked_div(self.kv_heads).unwrap_or(0);
-            if gqa_group_size > 0 && self.q2_tokens < attn.valid_len {
-                let awqe_params = crate::qcf_types::FlushAttentionParams {
-                    res_v: &self.res_v,
-                    kv_heads: self.kv_heads,
-                    head_dim: self.head_dim,
-                    flush_tokens,
-                    res_cap: self.res_cap,
-                    bits: self.bits,
-                    attn_scores: &attn.scores,
-                    n_heads_q: attn.n_heads_q,
-                    scores_stride: attn.stride,
-                    gqa_group_size,
-                    flush_cache_start: self.q2_tokens,
-                    scores_valid_len: attn.valid_len,
-                };
-                self.flush_proxies
-                    .push(self.qcf_computer.flush_awqe(&awqe_params, &qcf_config));
-
-                // AW-VOPR: attention-weighted vector output perturbation ratio
-                let vopr_params = crate::qcf_types::FlushAttentionParams {
-                    res_v: &self.res_v,
-                    kv_heads: self.kv_heads,
-                    head_dim: self.head_dim,
-                    flush_tokens,
-                    res_cap: self.res_cap,
-                    bits: self.bits,
-                    attn_scores: &attn.scores,
-                    n_heads_q: attn.n_heads_q,
-                    scores_stride: attn.stride,
-                    gqa_group_size,
-                    flush_cache_start: self.q2_tokens,
-                    scores_valid_len: attn.valid_len,
-                };
-                self.flush_proxies
-                    .push(self.qcf_computer.flush_aw_vopr(&vopr_params, &qcf_config));
-            }
-        }
-
         // 3. CPU quantize → temporary QuantizedBlocks (not stored in self.qk/qv)
         let new_k_blocks = n_groups * self.kv_heads * self.head_dim;
         let blocks_per_token = self.head_dim / QKKV;
@@ -1862,7 +1686,6 @@ impl QuantizedRecentWindowCache {
     /// `n_groups`: number of key groups (= flush_tokens / group_size)
     /// `tok_base`: token offset in the attention buffer for this flush
     /// `tmp_qk`/`tmp_qv`: temporary quantized blocks (not stored in self.qk/qv in GPU mode)
-    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path quant-window flush upload
     fn upload_and_dequant_flush_with(
         &mut self,
         flush_tokens: usize,
@@ -2244,7 +2067,6 @@ impl QuantizedRecentWindowCache {
     /// - `q2_deq_tokens` is kept in sync with `q2_tokens` during `flush_residual_gpu`,
     ///   so no incremental dequant is needed here.
     /// - Residual scatter: uses `kivi_scatter_residual` kernel (always re-done each call).
-    // LAYER-EXEMPT: backend_concrete_downcast — §13.8-L hot-path quant-window view assemble
     fn assemble_view_gpu(&mut self) -> Result<()> {
         // Defensive: ensure attn buffers can hold q2_tokens + res_pos
         let needed = self.q2_tokens + self.res_pos;
@@ -3412,86 +3234,6 @@ mod tests {
         assert_eq!(cache.q2_tokens, 0);
     }
 
-    #[test]
-    fn test_take_flush_proxies_accumulates_multiple_flushes() {
-        // residual_size=32 → flush triggers when res_pos reaches res_cap (32).
-        // Flush #1 fires on token index 32 (before inserting it, res_pos==32).
-        // Flush #2 fires on token index 65 (before inserting it, res_pos==32 again).
-        // So we need 65+1=66 tokens to observe 2 flushes.
-        let mut cache = QuantizedRecentWindowCache::new(1, 32, 256, 32);
-
-        // Insert 66 tokens → 2 flushes should have occurred
-        for i in 0..66 {
-            let k = make_input_tensor(1, 1, 32, i as f32 * 0.1);
-            let v = make_input_tensor(1, 1, 32, i as f32 * 0.1 + 5.0);
-            cache.update(&k, &v).unwrap();
-        }
-
-        let proxies = cache.take_flush_proxies();
-        // Each flush pushes 2 QCF metrics (compute_flush_nmse → "kv.quant_flush_nmse",
-        // compute_flush_opr → "kv.quant_flush_opr"). 2 flushes × 2 metrics = 4 total.
-        assert_eq!(
-            proxies.len(),
-            4,
-            "expected 4 flush proxies after 66 tokens with residual_size=32 (2 flushes × 2 metrics), got {}",
-            proxies.len()
-        );
-        for p in &proxies {
-            assert!(
-                p.action == "kv.quant_flush_nmse" || p.action == "kv.quant_flush_opr",
-                "unexpected action: {}",
-                p.action
-            );
-            assert!(p.raw_value >= 0.0, "NMSE should be non-negative");
-            assert_eq!(p.tokens_affected, 32);
-        }
-
-        // After take, buffer should be drained
-        let proxies2 = cache.take_flush_proxies();
-        assert!(proxies2.is_empty(), "buffer should be empty after take");
-    }
-
-    #[test]
-    fn test_take_flush_proxies_empty_when_no_flush() {
-        // residual_size=32 → no flush until 32 tokens are inserted
-        let mut cache = QuantizedRecentWindowCache::new(1, 32, 256, 32);
-
-        // Insert only 16 tokens (< residual_size) → no flush
-        for i in 0..16 {
-            let k = make_input_tensor(1, 1, 32, i as f32 * 0.1);
-            let v = make_input_tensor(1, 1, 32, i as f32 * 0.1 + 5.0);
-            cache.update(&k, &v).unwrap();
-        }
-
-        let proxies = cache.take_flush_proxies();
-        assert!(
-            proxies.is_empty(),
-            "no flush should occur below residual_size"
-        );
-    }
-
-    #[test]
-    fn test_reset_clears_flush_proxies() {
-        let mut cache = QuantizedRecentWindowCache::new(1, 32, 256, 32);
-
-        // Flush fires when res_pos reaches res_cap before inserting the 33rd token.
-        for i in 0..33 {
-            let k = make_input_tensor(1, 1, 32, i as f32 * 0.1);
-            let v = make_input_tensor(1, 1, 32, i as f32 * 0.1 + 5.0);
-            cache.update(&k, &v).unwrap();
-        }
-        assert!(
-            !cache.flush_proxies.is_empty(),
-            "flush_proxies should have entries after flush"
-        );
-
-        cache.reset();
-        assert!(
-            cache.flush_proxies.is_empty(),
-            "reset() must clear flush_proxies"
-        );
-    }
-
     // ── GPU-mode tests ────────────────────────────────────────────────────────
 
     /// `new()` / `new_with_bits()` must always create CPU-mode caches.
@@ -3571,94 +3313,6 @@ mod tests {
         assert!(
             cache.last_attn_scores.is_none(),
             "set_attn_scores must be no-op when awqe_enabled=false"
-        );
-    }
-
-    /// Test 11: awqe_enabled=true → set_attn_scores stores scores, flush produces kivi_awqe metric.
-    #[test]
-    fn test_kivi_awqe_enabled_scores_stored() {
-        let kv_heads = 1;
-        let head_dim = 32;
-        let res_cap = 32;
-        let n_heads_q = 1;
-        let max_seq = 256;
-
-        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
-        cache.set_awqe_enabled(true);
-
-        // valid_len must cover flush tokens (q2_tokens=0 .. flush_tokens=32)
-        // So valid_len >= 32
-        let valid_len = 64usize;
-        let stride = valid_len;
-        let scores: Vec<f32> = (0..n_heads_q * stride)
-            .map(|i| {
-                if i < valid_len {
-                    1.0 / valid_len as f32
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-
-        // Store scores (simulating previous decode step)
-        cache.set_attn_scores(&scores, n_heads_q, stride, valid_len);
-        assert!(cache.last_attn_scores.is_some(), "scores must be stored");
-
-        // Insert 33 tokens to trigger one flush at the 33rd token
-        for i in 0..33 {
-            let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1);
-            let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.05 + 1.0);
-            cache.update(&k, &v).unwrap();
-        }
-
-        let proxies = cache.take_flush_proxies();
-        // Must have NMSE, OPR, and AWQE
-        let awqe_metric = proxies.iter().find(|m| m.action == "kv.quant_flush_awqe");
-        assert!(
-            awqe_metric.is_some(),
-            "flush_proxies must contain 'kivi_awqe' when awqe_enabled=true and scores present; got: {:?}",
-            proxies.iter().map(|m| &m.action).collect::<Vec<_>>()
-        );
-        assert!(
-            awqe_metric.unwrap().raw_value >= 0.0,
-            "AWQE raw_value must be non-negative"
-        );
-    }
-
-    /// Test 12: awqe_enabled=true but set_attn_scores never called → no AWQE in flush_proxies.
-    #[test]
-    fn test_kivi_awqe_no_scores_no_awqe() {
-        let kv_heads = 1;
-        let head_dim = 32;
-        let res_cap = 32;
-        let max_seq = 256;
-
-        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, max_seq, res_cap);
-        cache.set_awqe_enabled(true);
-
-        // Do NOT call set_attn_scores
-        // Insert tokens to trigger a flush
-        for i in 0..33 {
-            let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1);
-            let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.05 + 1.0);
-            cache.update(&k, &v).unwrap();
-        }
-
-        let proxies = cache.take_flush_proxies();
-        let awqe_metric = proxies.iter().find(|m| m.action == "kv.quant_flush_awqe");
-        assert!(
-            awqe_metric.is_none(),
-            "flush_proxies must NOT contain 'kivi_awqe' when no scores were provided; got: {:?}",
-            proxies.iter().map(|m| &m.action).collect::<Vec<_>>()
-        );
-        // But NMSE and OPR should still be present
-        assert!(
-            proxies.iter().any(|m| m.action == "kv.quant_flush_nmse"),
-            "NMSE proxy must still be present"
-        );
-        assert!(
-            proxies.iter().any(|m| m.action == "kv.quant_flush_opr"),
-            "OPR proxy must still be present"
         );
     }
 
@@ -3899,81 +3553,6 @@ mod tests {
         assert_eq!(cache.bits(), 16);
         assert_eq!(cache.res_pos, 10);
         assert_eq!(cache.q2_tokens, 0);
-    }
-
-    // ── estimate_dryrun_qcf tests ──
-
-    #[test]
-    fn test_dryrun_qcf_bits16_returns_zero() {
-        let cache = QuantizedRecentWindowCache::new_with_bits(2, 64, 256, 32, 16);
-        assert_eq!(cache.estimate_dryrun_qcf(), 0.0);
-    }
-
-    #[test]
-    fn test_dryrun_qcf_empty_cache_returns_bits_proxy() {
-        // Empty Q2 cache (no residual data) returns bits-based proxy
-        let cache = QuantizedRecentWindowCache::new(2, 64, 256, 32);
-        assert!((cache.estimate_dryrun_qcf() - 0.30).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_dryrun_qcf_q4_empty_returns_proxy() {
-        let cache = QuantizedRecentWindowCache::new_with_bits(2, 64, 256, 32, 4);
-        assert!((cache.estimate_dryrun_qcf() - 0.10).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_dryrun_qcf_q8_empty_returns_proxy() {
-        let cache = QuantizedRecentWindowCache::new_with_bits(2, 64, 256, 32, 8);
-        assert!((cache.estimate_dryrun_qcf() - 0.03).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_dryrun_qcf_with_residual_data_computes_nmse() {
-        let kv_heads = 2;
-        let head_dim = 64;
-        let mut cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, 256, 32);
-        // Fill 32 tokens (full residual buffer, triggering NMSE path)
-        for i in 0..32 {
-            let k = make_input_tensor(1, kv_heads, head_dim, (i + 1) as f32 * 0.5);
-            let v = make_input_tensor(1, kv_heads, head_dim, (i + 1) as f32 * 0.3);
-            cache.update(&k, &v).unwrap();
-        }
-        // After 32 inserts, residual was flushed (res_pos back to 0).
-        // Insert a few more to have non-zero residual for dry-run.
-        for i in 0..5 {
-            let k = make_input_tensor(1, kv_heads, head_dim, (i + 33) as f32 * 0.5);
-            let v = make_input_tensor(1, kv_heads, head_dim, (i + 33) as f32 * 0.3);
-            cache.update(&k, &v).unwrap();
-        }
-        // res_pos should be 5 (< group_size=32), so falls back to proxy
-        assert_eq!(cache.res_pos, 5);
-        let qcf = cache.estimate_dryrun_qcf();
-        // 5 tokens < QKKV(32), so n_groups=0, flush_tokens=0 → bits proxy 0.30
-        assert!((qcf - 0.30).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_dryrun_qcf_full_residual_computes_actual_nmse() {
-        let kv_heads = 1;
-        let head_dim = 32;
-        let _cache = QuantizedRecentWindowCache::new(kv_heads, head_dim, 128, 32);
-        // Fill exactly 32 tokens without flushing (the 32nd token triggers flush
-        // during update, but estimate_dryrun_qcf is read-only and uses current res data).
-        // We need to have 32 tokens in residual for NMSE. Use bits=4 and 64-token residual.
-        let mut cache4 = QuantizedRecentWindowCache::new_with_bits(kv_heads, head_dim, 128, 64, 4);
-        for i in 0..32 {
-            let k = make_input_tensor(1, kv_heads, head_dim, (i + 1) as f32 * 0.7);
-            let v = make_input_tensor(1, kv_heads, head_dim, (i + 1) as f32 * 0.4);
-            cache4.update(&k, &v).unwrap();
-        }
-        // res_pos = 32, res_cap = 64, no flush happened yet
-        assert_eq!(cache4.res_pos, 32);
-        let qcf = cache4.estimate_dryrun_qcf();
-        // Should compute actual NMSE (between 0.0 and 1.0, not a proxy)
-        assert!((0.0..=1.0).contains(&qcf), "qcf={qcf} out of range");
-        // Q4 NMSE should be < Q2 proxy (0.30) for typical data
-        assert!(qcf < 0.30, "Q4 NMSE {qcf} should be < Q2 proxy 0.30");
     }
 
     #[test]

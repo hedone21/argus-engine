@@ -41,7 +41,6 @@ fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
 
     // `--swap` shorthand → legacy 4 flag normalize (argus_cli 와 동일).
-    args.normalize_swap_shorthand();
 
     // resilience default-on. `--no-resilience` 명시 시 effective=false.
     args.enable_resilience = !args.no_resilience;
@@ -85,13 +84,9 @@ fn main() -> anyhow::Result<()> {
 /// AB-1 bench 지원 args 가드. [`is_standard_happy_path`](argus_engine::session::is_standard_happy_path)
 /// 와 동일하되 **eviction_policy != "none" 을 허용**한다 (resilience eviction은
 /// `build_bench_loop` 가 처리). AB-4: `tensor_partition > 0` 허용(PartitionStage).
-/// AB-6: `--secondary-gguf` 허용(SwapWeights directive → WeightSwapStage). 아직
-/// 미지원인 skip / d2o-layer-alloc / qcf / profile / swap mode flag 는 그대로 차단.
+/// 아직 미지원인 skip / d2o-layer-alloc / profile flag 는 그대로 차단.
 fn bench_supported(args: &Args) -> bool {
-    args.qcf_dump.is_none()
-        && args.skip_ratio.unwrap_or(0.0) == 0.0
-        && !args.profile
-        && !args.profile_events
+    args.skip_ratio.unwrap_or(0.0) == 0.0 && !args.profile && !args.profile_events
     // `--d2o-layer-alloc` is no longer gated here: it is a d2o-private knob that rides the StageArgs
     // blob, the per-layer variance machinery is runtime-dead, and the d2o plugin ignores it — so
     // accepting it is a no-op. swap mode 3종(intra_forward/phase_aware/layer_immediate)은 §5.9.2 허용.
@@ -120,35 +115,15 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
             "argus-bench AB-0: --eval-ll / --eval-batch / --eval-continuation moved to argus-eval --eval-ll"
         );
     }
-    if args.dump_importance {
-        bail!("argus-bench AB-0: --dump-importance moved to argus-eval --dump-importance");
-    }
     if !args.dump_kinds().is_empty() || args.dump_dir.is_some() {
         bail!(
             "argus-bench AB-0: --dump <kinds> / --dump-dir is an argus-eval diagnostic; \
              use argus-eval --eval-ll --dump <kind> --dump-dir <dir>"
         );
     }
-    if args.qcf_dump.is_some() {
-        bail!(
-            "argus-bench AB-0: --qcf-dump moved to argus-eval (--qcf-dump with --eval-ll or --ppl)"
-        );
-    }
     // AB-2: quantized-KV mode 해제 (QuantWindowForward + QuantWindowBitTransitionStage 배선 완료). Offload(AB-3)는 bail 유지.
     if is_offload_mode(args) {
         bail!("argus-bench AB-3: --kv-mode Offload lands in AB-3");
-    }
-    // AB-6: `--secondary-gguf` 해제 — SwapWeights runtime directive 경로의 secondary 공급원
-    // (WeightSwapStage + build_bench_loop SwapWiringConfig 배선 완료). CLI 정적 swap
-    // (force_swap_ratio/incremental_per_tick)은 차단 유지. swap mode 3종
-    // (intra-forward/phase-aware/layer-immediate)은 §5.9.2 IntraForward hook 실배선
-    // 완료(5862325c)로 차단 해제 — SwapWiringConfig.default_mode 로 흘러 SwapWeights
-    // directive 도착 시 해당 mode로 commit된다.
-    if args.force_swap_ratio.is_some() || args.swap_incremental_per_tick > 0 {
-        bail!(
-            "argus-bench AB-6: CLI-static weight swap not supported; \
-             use SwapWeights runtime directive (mock_manager/manager IPC) with --secondary-gguf"
-        );
     }
     if args.profile || args.profile_events {
         bail!("argus-bench AB-0: --profile / --profile-events not yet supported");

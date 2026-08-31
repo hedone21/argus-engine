@@ -17,11 +17,9 @@
 //! never references engine types (`KVCache`/`Backend`).
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, EstimatorCtx, KVMutationStage, KeepTopK, MutationPhase,
-    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCtx, StageParams,
-    redistribute_value, register_kv_mutation_stage,
+    CacheHandle, CacheOpError, KVMutationStage, KeepTopK, MutationPhase, StageCtx,
+    register_kv_mutation_stage,
 };
-use linkme::distributed_slice;
 
 /// StreamingLLM eviction stage. `sink_size`/`window_size` are clamped to ≥1, matching the
 /// original engine policy constructor.
@@ -89,59 +87,10 @@ register_kv_mutation_stage!(
 
 // ── QCF estimator (observer/score axis) ──────────────────────────
 
-/// StreamingLLM QCF estimator: retains sink + recent window, evicts the middle, then rebuilds O_after
-/// over the retained set. Ported verbatim from the engine's former `compute_qcf_kv` `EvictStreaming`
-/// arm (bit-identical). `sink_size`/`window_size` come from the engine-supplied estimate config.
-struct StreamingEstimator {
-    sink_size: usize,
-    window_size: usize,
-}
-
-impl QcfEstimator for StreamingEstimator {
-    fn name(&self) -> &str {
-        "streaming"
-    }
-    fn curve_key(&self) -> &'static str {
-        "kv.evict_streaming"
-    }
-    fn o_after(&self, ctx: &dyn EstimatorCtx, kv_head: usize, out: &mut [f32]) -> bool {
-        let current = ctx.current_pos();
-        let keep_size = self.sink_size + self.window_size;
-        if current <= keep_size {
-            return false;
-        }
-        // Guard (current > sink+window) keeps the two ranges disjoint — no double-counting.
-        let retained: Vec<usize> = (0..self.sink_size)
-            .chain((current - self.window_size)..current)
-            .collect();
-        let mut alpha = vec![0.0f32; current];
-        ctx.alpha_h(kv_head, &mut alpha);
-        redistribute_value(ctx, kv_head, &alpha, &retained, ctx.beta(), out);
-        true
-    }
-}
-
-/// Registration — found via `find_qcf_estimator("streaming")`. `sink_size`/`streaming_window` flow
-/// from the engine-supplied estimate `StageParams`. Score-free, but needs an engine-supplied
-/// `(sink, window)` config, so the QCF driver skips it when none is present
-/// (`requires_streaming_config`) — matching the engine's former `streaming_config.is_some()` gate.
-#[distributed_slice(QCF_ESTIMATORS)]
-static STREAMING_QCF: QcfEstimatorReg = QcfEstimatorReg {
-    name: "streaming",
-    curve_key: "kv.evict_streaming",
-    make: |p: StageParams, _args: StageArgs<'_>| {
-        Box::new(StreamingEstimator {
-            sink_size: p.sink_size,
-            window_size: p.streaming_window,
-        })
-    },
-    requires_scores: false,
-    requires_streaming_config: true,
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argus_extension_api::StageParams;
     use argus_extension_api::{TensorHandle, TensorKind, compile_keep_top_k};
 
     /// Minimal StageCtx — StreamingLLM only reads `current_pos`/`target_len`.

@@ -33,7 +33,32 @@ use crate::backend::Backend;
 // LAYER-EXEMPT: cross_l3_vocabulary — §13.8-O pressure worker → inference weight resource (LayerWeights)
 use crate::models::weights::LayerWeights;
 use crate::runtime_resources_access::{DrainError, ReleaseWorkerAccess};
-use crate::weight::swap_executor::record_swap_release_pub;
+
+/// Charge the OpenCL diagnostic bucket for weights this worker just dropped.
+///
+/// Rehomed from the precision-swap executor when that was removed; the worker is the only caller
+/// left. `record_cl_mem_release` is a no-op unless the diag env var is set, so production runs do
+/// not pay a map update per release.
+// LAYER-EXEMPT: backend_concrete_downcast — §13.8-L cold-path release counter
+fn record_release(backend: &Arc<dyn Backend>, count: usize, bytes: usize) {
+    if count == 0 {
+        return;
+    }
+    #[cfg(feature = "opencl")]
+    {
+        if let Some(ocl_be) = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+        {
+            for _ in 0..count {
+                ocl_be.record_cl_mem_release("weight_released", bytes / count);
+            }
+            return;
+        }
+    }
+    // CPU / CUDA / non-opencl builds: nothing to record.
+    let _ = (backend, bytes);
+}
 
 /// Message sent to the release worker.
 pub enum ReleaseJob {
@@ -67,8 +92,8 @@ impl PrimaryReleaseWorker {
     /// Spawn the background worker thread.
     ///
     /// The worker retains a clone of `backend` for diagnostic calls inside
-    /// [`record_swap_release_pub`] so the caller does not need to keep the
-    /// backend alive separately.
+    /// [`record_release`] so the caller does not need to keep the backend
+    /// alive separately.
     pub fn spawn(backend: Arc<dyn Backend>) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel::<ReleaseJob>();
         let pending = Arc::new(AtomicUsize::new(0));
@@ -85,7 +110,7 @@ impl PrimaryReleaseWorker {
                             // Drop fires clReleaseMemObject destructors.
                             drop(*layer);
                             // Diagnostic hook (no-op on CPU/CUDA/non-diag builds).
-                            record_swap_release_pub(&backend, count, bytes);
+                            record_release(&backend, count, bytes);
                             pending_worker.fetch_sub(1, Ordering::Release);
                         }
                         ReleaseJob::Shutdown => break,

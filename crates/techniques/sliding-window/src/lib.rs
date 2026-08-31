@@ -20,11 +20,9 @@
 //! unchanged.
 
 use argus_extension_api::{
-    CacheHandle, CacheOpError, EstimatorCtx, KVMutationStage, KeepTopK, MutationPhase,
-    QCF_ESTIMATORS, QcfEstimator, QcfEstimatorReg, StageArgs, StageCtx, StageParams,
-    compile_keep_top_k, redistribute_value, register_kv_mutation_stage,
+    CacheHandle, CacheOpError, KVMutationStage, KeepTopK, MutationPhase, StageCtx,
+    compile_keep_top_k, register_kv_mutation_stage,
 };
-use linkme::distributed_slice;
 
 /// Sliding-window eviction stage. `protected_prefix` is clamped to a 4-token minimum (attention
 /// sink), matching the original engine policy constructor.
@@ -99,48 +97,10 @@ register_kv_mutation_stage!(
 
 // ── QCF estimator (observer/score axis) ──────────────────────────
 
-/// Sliding-window QCF estimator: simulates dropping all but the most-recent `target_len` tokens and
-/// rebuilds the per-head attention output O_after over that retained window. Ported verbatim from the
-/// engine's former `compute_qcf_kv` `EvictSliding` arm (bit-identical), now owned by this crate.
-struct SlidingEstimator;
-
-impl QcfEstimator for SlidingEstimator {
-    fn name(&self) -> &str {
-        "sliding"
-    }
-    fn curve_key(&self) -> &'static str {
-        "kv.evict_sliding"
-    }
-    fn o_after(&self, ctx: &dyn EstimatorCtx, kv_head: usize, out: &mut [f32]) -> bool {
-        let current = ctx.current_pos();
-        let target = ctx.target_len();
-        if current <= target {
-            return false; // within budget — no eviction
-        }
-        let retained_start = current - target;
-        let retained: Vec<usize> = (retained_start..current).collect();
-        let mut alpha = vec![0.0f32; current];
-        ctx.alpha_h(kv_head, &mut alpha);
-        redistribute_value(ctx, kv_head, &alpha, &retained, ctx.beta(), out);
-        true
-    }
-}
-
-/// Registration — the engine's QCF runtime finds this via `find_qcf_estimator("sliding")`. The
-/// estimate uses the engine-derived `target_len` (current_pos based), not the actuator's
-/// `eviction_window`, so the estimator carries no config. Score-free; needs no streaming config.
-#[distributed_slice(QCF_ESTIMATORS)]
-static SLIDING_QCF: QcfEstimatorReg = QcfEstimatorReg {
-    name: "sliding",
-    curve_key: "kv.evict_sliding",
-    make: |_p: StageParams, _args: StageArgs<'_>| Box::new(SlidingEstimator),
-    requires_scores: false,
-    requires_streaming_config: false,
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argus_extension_api::StageParams;
     use argus_extension_api::{TensorHandle, TensorKind};
 
     /// Minimal StageCtx — SlidingWindow only reads `current_pos`/`target_len`.

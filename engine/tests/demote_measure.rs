@@ -33,7 +33,6 @@ use argus_engine::memory::Memory;
 use argus_engine::memory::galloc::Galloc;
 use argus_engine::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use argus_engine::observability::eval::EvalCacheKind;
-use argus_engine::qcf::quant_qcf::compute_nmse_block;
 use argus_engine::quant::{BlockKVQ4, BlockQ2_0, QKKV};
 use argus_engine::shape::Shape;
 use argus_engine::tensor::Tensor;
@@ -393,27 +392,6 @@ fn test_q4_vs_q2_nmse_gap() {
     );
 }
 
-/// compute_nmse_block 재사용 정합: demote 모사의 단일 블록 NMSE가
-/// quant_qcf.rs::compute_nmse_block과 일치한다.
-#[test]
-fn test_nmse_consistency_with_quant_qcf() {
-    let src: [f32; QKKV] = std::array::from_fn(|i| (i as f32) * 0.1);
-
-    // compute_nmse_block (quant_qcf.rs 정의)
-    let nmse_from_lib = compute_nmse_block(&src, 4, 1e-8);
-
-    // 직접 계산 (demote_measure 내부 compute_nmse_block_pair 이용)
-    let roundtrip = demote_q4_block(&src);
-    let nmse_direct = compute_nmse_block_pair(&src, &roundtrip);
-
-    assert!(
-        (nmse_from_lib - nmse_direct).abs() < 1e-5,
-        "NMSE consistency: lib={:.6} direct={:.6}",
-        nmse_from_lib,
-        nmse_direct
-    );
-}
-
 // ── 게이트 ⑤: 실모델 PPL 비교 (설계서 §4.4-E) ────────────────────────────────
 //
 // 환경변수:
@@ -694,7 +672,6 @@ fn test_demote_vs_sliding_real_model_ppl() {
                     score_accumulator: None,
                     query_stats_accumulator: None,
                     skip_config: None,
-                    importance_collector: None,
                     cache_self_need_scores: false,
                     layer_boundary_hook: None,
                     read_stage: None,
@@ -745,7 +722,6 @@ fn test_demote_vs_sliding_real_model_ppl() {
                     score_accumulator: None,
                     query_stats_accumulator: None,
                     skip_config: None,
-                    importance_collector: None,
                     cache_self_need_scores: false,
                     layer_boundary_hook: None,
                     read_stage: None,
@@ -845,7 +821,6 @@ fn test_demote_vs_sliding_real_model_ppl() {
                     score_accumulator: None,
                     query_stats_accumulator: None,
                     skip_config: None,
-                    importance_collector: None,
                     cache_self_need_scores: false,
                     layer_boundary_hook: None,
                     read_stage: None,
@@ -906,7 +881,6 @@ fn test_demote_vs_sliding_real_model_ppl() {
                     score_accumulator: None,
                     query_stats_accumulator: None,
                     skip_config: None,
-                    importance_collector: None,
                     cache_self_need_scores: false,
                     layer_boundary_hook: None,
                     read_stage: None,

@@ -5,8 +5,6 @@
 //! 2. Drain timeout simulation — artificial pending bump, drain fails.
 //! 3. Worker thread join on drop (no hang).
 //! 4. Multiple enqueues all drained within deadline.
-//! 5. `SwapExecutor` rejects batch when INV-141 would be violated
-//!    (`SwapError::ReleaseDrainTimeout`).
 //!
 //! Spec: ENG-ALG-228, ENG-DAT-100, INV-141.
 
@@ -193,85 +191,4 @@ fn inv_141_concurrent_reader_simulation() {
         .expect("drain should succeed even with concurrent reader simulation");
 
     assert_eq!(worker.pending_count(), 0);
-}
-
-/// INV-141 `SwapExecutor` enforcement: when pending > 0 at batch start,
-/// `execute_on_slots` must return `SwapError::ReleaseDrainTimeout` after the
-/// internal drain deadline expires.
-///
-/// This test injects an artificial pending count by bypassing `enqueue_release`
-/// (so no real job is sent to the worker), verifying that the executor rejects
-/// the batch rather than proceeding with leaking memory.
-#[test]
-fn inv_141_swap_executor_rejects_on_drain_timeout() {
-    use std::sync::atomic::AtomicU64;
-
-    use argus_engine::memory::galloc::Galloc;
-    use argus_engine::model_config::{ModelArch, ModelConfig};
-    use argus_engine::models::weights::LayerSlot;
-    use argus_engine::weight::{SwapError, SwapExecutor};
-
-    fn minimal_config() -> ModelConfig {
-        ModelConfig {
-            arch: ModelArch::Llama,
-            hidden_size: 64,
-            num_hidden_layers: 2,
-            num_attention_heads: 4,
-            num_key_value_heads: 4,
-            head_dim: 16,
-            intermediate_size: 128,
-            vocab_size: 256,
-            rms_norm_eps: 1e-5,
-            rope_theta: 10000.0,
-            rope_freq_scaling: argus_engine::rope::RopeFreqScaling::NONE,
-            has_qkv_bias: false,
-            tie_word_embeddings: false,
-            eos_token_ids: vec![1],
-            rope_local_theta: None,
-            sliding_window: None,
-            sliding_window_pattern: None,
-            query_pre_attn_scalar: None,
-            embed_scale: None,
-            weight_prefix: String::new(),
-        }
-    }
-
-    let be = cpu_be();
-    let worker_concrete = Arc::new(PrimaryReleaseWorker::spawn(be.clone()));
-    // Keep a concrete handle for the `pending` field injection below, and
-    // hand a trait-object clone to the executor (which expects the cross-cutting
-    // `ReleaseWorkerAccess` trait, §13.8-O 본질 해소 sprint).
-    let worker: Arc<dyn argus_engine::runtime_resources_access::ReleaseWorkerAccess> =
-        worker_concrete.clone();
-
-    // Inject an artificial pending to force drain timeout.
-    worker_concrete.pending.fetch_add(1, Ordering::Release);
-
-    let layers: Vec<Arc<LayerSlot>> = (0..2)
-        .map(|_| Arc::new(LayerSlot::new(make_layer(&be), DType::F16, None, 0)))
-        .collect();
-    let ratio_gen = Arc::new(AtomicU64::new(0));
-    let config = minimal_config();
-    let memory = Galloc::new();
-
-    let executor = SwapExecutor::new_with_worker(
-        DType::Q4_0,
-        &config,
-        be.clone(),
-        &memory,
-        Arc::clone(&worker),
-    );
-
-    // Execute with no secondary mmap — normally would be a no-op, but
-    // INV-141 check happens before the secondary-absent guard.
-    let result = executor.execute_on_slots(&layers, None, &ratio_gen, &[0, 1], None);
-
-    assert!(
-        matches!(result, Err(SwapError::ReleaseDrainTimeout { .. })),
-        "executor must return ReleaseDrainTimeout when INV-141 is violated, got: {:?}",
-        result.map(|_| ())
-    );
-
-    // Restore balance so drop/join does not block.
-    worker_concrete.pending.fetch_sub(1, Ordering::Release);
 }

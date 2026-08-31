@@ -15,9 +15,7 @@ use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::KVCache;
 use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
-use crate::qcf_types::ImportanceFormula;
 use crate::session::cli::Args;
-use crate::weight::SwapAlgorithm;
 
 pub struct EvalLlRunCtx {
     pub args: Args,
@@ -25,8 +23,6 @@ pub struct EvalLlRunCtx {
     // 백엔드 / 메모리 / 모델
     pub backend: Arc<dyn Backend>,
     pub memory: Arc<dyn Memory>,
-    pub cpu_backend_arc: Arc<dyn Backend>,
-    pub gpu_backend_arc: Option<Arc<dyn Backend>>,
     pub model: TransformerModel,
     pub tokenizer: Tokenizer,
 
@@ -45,10 +41,5 @@ pub struct EvalLlRunCtx {
     pub kv_type: crate::buffer::DType,
     pub actual_protected_prefix: usize,
     pub score_based_eviction: bool,
-
     // QCF / swap 관련 (qcf_runtime 호출 시 필요)
-    pub swap_algorithm: SwapAlgorithm,
-    pub importance_formula: ImportanceFormula,
-    pub importance_compare: bool,
-    pub swap_only_layers: Option<Vec<usize>>,
 }

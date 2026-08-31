@@ -39,10 +39,9 @@ use clap::Parser;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let mut args = Args::parse();
+    let args = Args::parse();
 
     // `--swap` shorthand → legacy 4 flag normalize (argus_cli/bench 와 동일).
-    args.normalize_swap_shorthand();
 
     // ★ argus_cli/bench 와 달리 인버전 라인 생략 → enable_resilience 기본 false
     //   (handoff default-off — `--enable-resilience` opt-in 자연 동작).
@@ -72,7 +71,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// argus-eval 의 dispatch 모드. mode 우선순위는 legacy main 분기 순서를 보존:
-/// quant-window-eval → quant-window-ppl → dump_importance → eval_ll → ppl → experiment.
+/// quant-window-eval → quant-window-ppl → eval_ll → ppl → experiment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvalMode {
     /// `--eval-ll` (Standard KV).
@@ -83,8 +82,6 @@ enum EvalMode {
     Ppl,
     /// `--ppl --kv-mode kivi`.
     PplQuantWindow,
-    /// `--dump-importance`.
-    DumpImportance,
     /// `--experiment-schedule` — 정적 schedule 을 `ScheduleCommandSource` 로 실행.
     Experiment,
 }
@@ -99,18 +96,14 @@ fn classify_eval_mode(args: &Args) -> anyhow::Result<EvalMode> {
     let eval_ll_active =
         args.eval_ll || args.eval_batch.is_some() || args.eval_continuation.is_some();
     let ppl_active = args.ppl.is_some();
-    let dump_active = args.dump_importance;
     let experiment_active = args.experiment_schedule.is_some();
 
-    let n_modes = eval_ll_active as usize
-        + ppl_active as usize
-        + dump_active as usize
-        + experiment_active as usize;
+    let n_modes = eval_ll_active as usize + ppl_active as usize + experiment_active as usize;
     if n_modes == 0 {
         bail!(
             "argus-eval: no eval mode selected. Pass exactly one of: \
              --eval-ll (with --eval-batch or --eval-continuation), --ppl <text>, \
-             --dump-importance, --experiment-schedule."
+             --experiment-schedule."
         );
     }
     if n_modes > 1 {
@@ -143,8 +136,7 @@ fn classify_eval_mode(args: &Args) -> anyhow::Result<EvalMode> {
             EvalMode::Ppl
         });
     }
-    debug_assert!(dump_active);
-    Ok(EvalMode::DumpImportance)
+    unreachable!("n_modes == 1 and every other mode was handled above")
 }
 
 /// 결정된 모드를 해당 runner 로 dispatch 한다.
@@ -165,10 +157,6 @@ fn dispatch_eval(mode: EvalMode, args: Args) -> anyhow::Result<()> {
                 .clone()
                 .expect("PplKivi mode implies args.ppl.is_some()");
             eval_setup::run_ppl_quant_window(args, &ppl_path)
-        }
-        EvalMode::DumpImportance => {
-            let ctx = eval_setup::build_dump_importance_ctx(args)?;
-            argus_engine::session::dump_importance::run_dump_importance(ctx)
         }
         EvalMode::Experiment => {
             let schedule_path = args
@@ -342,14 +330,12 @@ mod tests {
 
     // ── eval_supported: 허용 케이스 ──────────────────────────────────
     #[test]
-    fn eval_supported_allows_eviction_qcf_skip() {
+    fn eval_supported_allows_eviction_and_skip() {
         // eviction 은 `eviction <policy>` nested subcommand — flag 뒤(끝)에 둔다.
         let args = make_args(&[
             "--eval-ll",
             "--skip-ratio",
             "0.2",
-            "--qcf-dump",
-            "/tmp/q.json",
             "eviction",
             "plugin",
             "--name",
@@ -431,16 +417,8 @@ mod tests {
     }
 
     #[test]
-    fn reject_allows_eviction_and_qcf() {
-        let args = make_args(&[
-            "--eval-ll",
-            "--qcf-dump",
-            "/tmp/q.json",
-            "eviction",
-            "plugin",
-            "--name",
-            "sliding",
-        ]);
+    fn reject_allows_eviction() {
+        let args = make_args(&["--eval-ll", "eviction", "plugin", "--name", "sliding"]);
         assert!(reject_unsupported_modes_eval(&args).is_ok());
         assert_eq!(args.eviction_policy(), "sliding");
     }
@@ -474,12 +452,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_dump_importance() {
-        let args = make_args(&["--dump-importance"]);
-        assert_eq!(classify_eval_mode(&args).unwrap(), EvalMode::DumpImportance);
-    }
-
-    #[test]
     fn classify_experiment() {
         let args = make_args(&["--experiment-schedule", "/tmp/s.json"]);
         assert_eq!(classify_eval_mode(&args).unwrap(), EvalMode::Experiment);
@@ -493,7 +465,7 @@ mod tests {
 
     #[test]
     fn classify_multiple_modes_bails() {
-        let args = make_args(&["--eval-ll", "--dump-importance"]);
+        let args = make_args(&["--eval-ll", "--experiment-schedule", "/tmp/s.json"]);
         let err = classify_eval_mode(&args).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"));
     }
@@ -502,19 +474,6 @@ mod tests {
     fn classify_ppl_and_eval_ll_bails() {
         let args = make_args(&["--eval-ll", "--ppl", "/tmp/ref.txt"]);
         assert!(classify_eval_mode(&args).is_err());
-    }
-
-    /// qcf-dump 는 modifier — mode 카운트에 포함하지 않으므로 ll 단독은 EvalLl.
-    #[test]
-    fn classify_qcf_dump_is_modifier_not_mode() {
-        let args = make_args(&[
-            "--eval-ll",
-            "--eval-continuation",
-            "x",
-            "--qcf-dump",
-            "/tmp/q.json",
-        ]);
-        assert_eq!(classify_eval_mode(&args).unwrap(), EvalMode::EvalLl);
     }
 
     // ── generic --dump diagnostic guard ──────────────────────────────────
