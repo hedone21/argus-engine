@@ -118,6 +118,35 @@ pub struct CommandDispatcher {
     /// actually protects) while letting a DIFFERENT budget through. Same shape as
     /// `last_partition_ratio` / `last_quant_bits` / `last_reencode_format`.
     last_evict_ratio: Option<f32>,
+    /// Tokens this context would hold if nothing had been compressed — the denominator a
+    /// `KvCompress` budget is a fraction of. The contract names it: "the fraction of the
+    /// **uncompressed KV byte** footprint to retain … not a token count and not a token
+    /// ratio" (`argus-shared::EngineCommand::KvCompress`).
+    ///
+    /// It cannot be read off the cache. Compaction renumbers `current_pos`, so a cache that
+    /// has already been compressed reports fewer positions than the conversation produced,
+    /// and taking the budget against *that* makes the command **compound instead of
+    /// restate**: a Manager walking 0.5, 0.25, 0.9, 0.85 … multiplies those together and
+    /// ratchets the cache toward nothing, because every value that differs from the last one
+    /// clears `last_evict_ratio` and applies afresh. Measured on the archived S25 runs, a
+    /// dithering thermal ramp produced 111 such directives in one cell.
+    ///
+    /// Accumulating the **positive** deltas of `current_pos` separates the two motions that
+    /// share that field: growth is appended tokens, a drop is a compaction and contributes
+    /// nothing.
+    ///
+    /// Sampled twice a step — in `dispatch` (before `KvMutate`) and in `finalize_results`
+    /// (after it), both of which the decode loop runs every step whether or not a command
+    /// arrived. The second one is what keeps the token the forward appends in the same step
+    /// as a compaction from being swallowed by the drop.
+    ///
+    /// ⚠ A compaction that lands **before the first sample** — a `PrefillEnd` prune — is
+    /// invisible, so the anchor is then the post-prefill length rather than the prompt's.
+    /// The two are mutually exclusive on the contract path: a configured candidate pool
+    /// stands the standing `PrefillEnd` consumer down.
+    logical_len: usize,
+    /// `current_pos` at the last sample, to difference against. See [`Self::logical_len`].
+    last_seen_pos: usize,
     /// bench GPU-score 경로용 backend. `submit_evict` 가 `EvictionStage::one_shot_scored` 에 넘겨,
     /// score-fed eviction 이 score 를 읽기 직전 GPU 누적 score 를 CPU accumulator 로 sync 하게 한다
     /// (`init_gpu_score_acc` 로 `gpu_score_active=true` 일 때 decode 가 CPU accumulate 를 건너뛰므로).
@@ -160,9 +189,14 @@ type AperturbSelection = (
 struct PendingCompress {
     /// Index into `CommandDispatcher::last_results`.
     result_idx: usize,
-    /// Retained fraction the directive asked for.
-    target_ratio: f32,
-    /// Resident tokens at submit time — the denominator of what was achieved.
+    /// Retained fraction the directive asked for, in the contract's units — a fraction of
+    /// [`CommandDispatcher::logical_len`], not of what was resident.
+    budget: f32,
+    /// The budget's denominator at submit time. Reported achievement uses it too, so the
+    /// Manager reads an answer in the units it asked in.
+    logical_len: usize,
+    /// Resident tokens at submit time. Only for telling "the stage removed nothing" apart
+    /// from "the stage stopped short".
     tokens_before: usize,
 }
 
@@ -185,6 +219,8 @@ impl CommandDispatcher {
             score_cell,
             control: LoopControl::default(),
             last_evict_ratio: None,
+            logical_len: 0,
+            last_seen_pos: 0,
             backend: None,
             aperturb: None,
             last_results: Vec::new(),
@@ -237,6 +273,11 @@ impl CommandDispatcher {
         {
             self.last_results[p.result_idx] = r;
         }
+        // 두 번째 표집 — 이 호출은 `KvMutate` **직후**이고 명령이 0건이어도 매 step 온다
+        // (decode_loop:362). 압축이 방금 재번호했으니 여기서 기준점을 새로 잡아 둬야, 같은
+        // step 의 forward 가 붙일 토큰이 다음 표집에서 **증가로** 보인다. 이게 없으면 압축이
+        // 일어난 step 의 토큰 하나가 매번 사라진다.
+        self.observe_context();
         std::mem::take(&mut self.last_results)
     }
 
@@ -245,14 +286,17 @@ impl CommandDispatcher {
     fn compress_outcome(&self, p: &PendingCompress) -> Option<CommandResult> {
         use crate::format::KVCacheFormat;
         let after = self.kv_handles.first()?.current_pos();
-        if p.tokens_before == 0 {
+        if p.logical_len == 0 {
             return None;
         }
-        let achieved = after as f32 / p.tokens_before as f32;
+        // Answered in the contract's units — a fraction of the uncompressed footprint — so
+        // the Manager can compare it against the budget it sent without knowing what was
+        // resident when the directive landed.
+        let achieved = after as f32 / p.logical_len as f32;
         // One token of slack: a target that lands on a fraction cannot be hit exactly, and
-        // `target_len` is `(pos * ratio) as usize` floored then `.max(1)`.
-        let slack = 1.0 / p.tokens_before as f32;
-        if achieved <= p.target_ratio + slack {
+        // `target_len` is `(logical_len * budget) as usize` floored then `.max(1)`.
+        let slack = 1.0 / p.logical_len as f32;
+        if achieved <= p.budget + slack {
             return Some(CommandResult::Ok);
         }
         Some(CommandResult::Partial {
@@ -276,6 +320,10 @@ impl CommandDispatcher {
     ///   에서 시작 후 sticky carry 하던 것과 등가.
     /// - **suspend override**: suspended 면 evict 미submit + device seam clear (v1 :344-352 등가).
     pub fn dispatch(&mut self, cmds: Vec<EngineCommand>) -> &LoopControl {
+        // 이 호출이 곧 「디코드 한 스텝」이다 (decode_loop 가 명령 유무와 무관하게 매 step
+        // 부른다) — 문맥 길이를 여기서 표집한다. 이번 step 이 제출할 압축보다 **먼저** 봐야
+        // 그 압축의 분모가 압축 전 길이가 된다.
+        self.observe_context();
         // transient(매 step 새로 결정되는) 필드만 초기화 — sticky(last_evict_ratio)는 carry.
         self.control.suspended = false;
         self.control.resumed = false;
@@ -323,24 +371,68 @@ impl CommandDispatcher {
         }
     }
 
+    /// Fold this step's cache growth into [`Self::logical_len`].
+    ///
+    /// `current_pos` moves for two unrelated reasons and only the sign tells them apart: it
+    /// rises when the forward appends a token and falls when a compaction renumbers what is
+    /// left. Taking the positive part keeps the first and discards the second, which is what
+    /// makes the budget's denominator survive compression.
+    ///
+    /// A `current_pos` of **0** is a new sequence, not a compaction — a compaction floors its
+    /// target at one token (`target_len … .max(1)`), so it can never land there.
+    fn observe_context(&mut self) {
+        use crate::format::KVCacheFormat;
+        let Some(pos) = self.kv_handles.first().map(|h| h.current_pos()) else {
+            return;
+        };
+        if pos == 0 {
+            self.logical_len = 0;
+        } else {
+            self.logical_len += pos.saturating_sub(self.last_seen_pos);
+        }
+        self.last_seen_pos = pos;
+    }
+
     /// ① evict directive 1건을 OneShot `EvictionStage` 로 submit (method-drop).
     ///
     /// 상태 A/B 등가(2부): 같은 budget 은 active 구간당 1회만 submit. CacheManager 미구성
     /// (`None`)이거나 handle 이 없으면 no-op(happy/chat 동등 — v1 `cache_manager=None` 분기).
     /// §5.9.1 Track A: score_cell 이 구성된 경우 `EvictionStage::one_shot_scored` 경로 사용 —
     /// run_eviction 이 acc.importance_scores() 를 추출해 force_evict_with_scores 호출, 직후 acc.reset().
-    fn submit_compress(&mut self, target_ratio: f32) -> CommandResult {
-        if self.last_evict_ratio == Some(target_ratio) {
+    fn submit_compress(&mut self, budget: f32) -> CommandResult {
+        use crate::format::KVCacheFormat;
+        if self.last_evict_ratio == Some(budget) {
             // 같은 budget 재요청 — 이미 이 active 구간에서 submit 됐다 (v1 evict_applied 등가).
             // 요청한 상태가 이미 성립하므로 실패가 아니다. 값이 **다르면** 아래로 내려가
             // 새 OneShot 을 submit 한다 — 그것이 bool 게이트와의 차이다.
             return CommandResult::Ok;
         }
-        if self.kv_handles.is_empty() {
+        let Some(h0) = self.kv_handles.first() else {
             return CommandResult::Rejected {
                 reason: "no kv cache handles are registered".to_string(),
             };
+        };
+        // The budget is a fraction of what this context would occupy **uncompressed**, not of
+        // what is resident now. Against the resident length a repeated budget would compound;
+        // against this one it restates, which is what makes the command idempotent.
+        let resident = h0.current_pos();
+        let target_len = ((self.logical_len as f32 * budget) as usize).max(1);
+        if target_len >= resident {
+            // The cache already fits. Nothing to remove, so nothing to score — and scoring is
+            // the expensive half: it recomputes the trailing query rows against every
+            // candidate. This is the guard that makes a Manager which re-sends a **loosened**
+            // budget every tick cost nothing.
+            //
+            // Answering `Ok` is not a silent drop: the state the directive names holds. The
+            // value is recorded so an unchanged repeat short-circuits above, while any
+            // tightening still falls through — the property the bool gate got wrong.
+            self.last_evict_ratio = Some(budget);
+            return CommandResult::Ok;
         }
+        // The stages take a fraction of the resident length, which is what they can act on.
+        // Converting here keeps the contract's denominator at the boundary and leaves
+        // `force_evict` / `--eviction-target-ratio` meaning exactly what they meant before.
+        let target_ratio = target_len as f32 / resident as f32;
         // The contract names a budget, not a technique. When a candidate pool is configured the
         // engine picks the technique itself; otherwise it applies the one the CLI configured.
         let stage: Arc<dyn crate::pipeline::PipelineStage> = match self.aperturb.as_ref() {
@@ -368,15 +460,13 @@ impl CommandDispatcher {
                 ))
             }
         };
-        self.last_evict_ratio = Some(target_ratio);
-        {
-            use crate::format::KVCacheFormat;
-            self.pending_compress = Some(PendingCompress {
-                result_idx: self.result_idx,
-                target_ratio,
-                tokens_before: self.kv_handles.first().map_or(0, |h| h.current_pos()),
-            });
-        }
+        self.last_evict_ratio = Some(budget);
+        self.pending_compress = Some(PendingCompress {
+            result_idx: self.result_idx,
+            budget,
+            logical_len: self.logical_len,
+            tokens_before: resident,
+        });
         self.registry.submit(stage);
         CommandResult::Ok
     }
@@ -547,6 +637,109 @@ mod tests {
                 "budget {budget} 는 새 OneShot 을 submit"
             );
         }
+    }
+
+    /// 호환성 보장: **첫 압축까지는 새 분모가 옛 분모와 정확히 같다.**
+    ///
+    /// `logical_len` 은 첫 표집을 기준선으로 잡고 그 뒤의 증가만 더하므로, dispatcher 가
+    /// 아직 아무것도 압축하지 않았다면 언제나 `current_pos` 와 같다 — 프리필 끝에서 prune 이
+    /// 돌았더라도(기준선이 prune 된 값이 될 뿐) 마찬가지다. 그래서 지시 1건짜리 실행
+    /// (`--aperturb-select` 실측 스케줄이 그렇다)은 이 변경 **전후로 바이트 동일**하다.
+    ///
+    /// mutation-proof: `observe_context` 를 `dispatch` 에서 빼면 `logical_len` 이 0 에 머물러
+    /// 목표가 1 토큰이 되고, 아래 achieved 단정이 깨진다.
+    #[test]
+    fn the_first_budget_targets_exactly_what_the_old_denominator_did() {
+        let (mut d, registry, h) = make_dispatcher();
+        let resident = h.current_pos();
+        assert!(is_accepted(&results_of(&mut d, vec![compress(0.5)])[0]));
+        assert_eq!(registry.len(), 1);
+        // 이것이 보장의 전부다: 첫 압축을 제출하는 순간 분모가 남은 길이와 **같다**.
+        // 그러니 `target_len` 이 옛 규칙 `(resident * budget)` 과 글자 그대로 같은 값이다.
+        assert_eq!(
+            d.logical_len, resident,
+            "첫 압축까지 문맥 길이는 남은 길이와 같아야 한다 (기존 측정 불변의 근거)"
+        );
+        // 디코드가 더 붙어도 압축 전이면 계속 같다.
+        h.with_cache_mut(|c| c.advance_pos(5));
+        d.dispatch(vec![]);
+        assert_eq!(d.logical_len, h.current_pos(), "압축 전에는 계속 일치한다");
+    }
+
+    /// 예산의 분모는 **압축 전 문맥 길이**이지 남아 있는 길이가 아니다.
+    ///
+    /// 남은 길이로 재면 명령이 **누적**된다 — 0.5 뒤의 0.6 이 「원래의 60%」가 아니라
+    /// 「남은 것의 60%」가 되어 캐시가 계단식으로 접힌다. 아카이브 S25 런에서 thermal 떨림이
+    /// 한 셀에 그런 지시를 111건 냈다.
+    ///
+    /// mutation-proof: `submit_compress` 의 분모를 `logical_len` → `resident` 로 되돌리면
+    /// 0.6 이 `0.6*60 = 36 < 60` 이라 새 stage 를 submit 해 아래 단정이 깨진다.
+    #[test]
+    fn the_budget_is_a_fraction_of_the_uncompressed_context() {
+        let (mut d, registry, h) = make_dispatcher();
+        assert!(is_accepted(&results_of(&mut d, vec![compress(0.5)])[0]));
+        assert_eq!(registry.len(), 1, "0.5 → 60 토큰 목표, submit 된다");
+        // 이 유닛 테스트는 KvMutate 를 안 돌리므로 stage 가 했을 압축을 손으로 반영한다.
+        h.with_cache_mut(|c| c.set_current_pos(60));
+
+        // 0.6 은 **느슨해진** 예산이다. 압축 전 120 기준이면 목표 72 ≥ 남은 60 이라
+        // 지울 것이 없다 — 채점도 하지 않는다.
+        let r = results_of(&mut d, vec![compress(0.6)]);
+        assert!(matches!(r[..], [CommandResult::Ok]), "{r:?}");
+        assert_eq!(
+            registry.len(),
+            1,
+            "이미 예산 안이면 stage 를 안 만든다 (채점이 비싼 쪽이다)"
+        );
+
+        // 반면 진짜로 조이는 예산은 그대로 통과한다 — 0.25*120 = 30 < 60.
+        assert!(is_accepted(&results_of(&mut d, vec![compress(0.25)])[0]));
+        assert_eq!(registry.len(), 2, "조이는 예산은 여전히 submit 된다");
+    }
+
+    /// 분모는 디코드가 붙인 만큼 **자라고**, 압축이 재번호해도 **줄지 않는다**.
+    ///
+    /// mutation-proof: `observe_context` 에서 `saturating_sub` 대신 `pos` 를 그대로 대입하면
+    /// 압축 뒤 분모가 30 으로 떨어져, 아래 0.55 가 목표 66 → 120 미만이라 submit 돼 버린다.
+    #[test]
+    fn the_denominator_grows_with_decode_and_survives_compaction() {
+        let (mut d, registry, h) = make_dispatcher();
+        results_of(&mut d, vec![compress(0.25)]); // 0.25*120 = 30
+        assert_eq!(registry.len(), 1);
+        h.with_cache_mut(|c| c.set_current_pos(30)); // stage 가 압축했다
+        d.finalize_results(); // 실제 루프처럼 압축 직후 표집한다 (decode_loop:362)
+        h.with_cache_mut(|c| c.advance_pos(90)); // 디코드가 90 토큰 더 붙였다 → 남은 120
+
+        // 문맥은 120 + 90 = 210 토큰을 만들었다. 압축이 그 사실을 지우지 않는다.
+        let r = results_of(&mut d, vec![compress(0.6)]);
+        assert!(matches!(r[..], [CommandResult::Ok]), "{r:?}");
+        assert_eq!(
+            registry.len(),
+            1,
+            "0.6*210 = 126 ≥ 남은 120 — 지울 것이 없다"
+        );
+
+        assert!(is_accepted(&results_of(&mut d, vec![compress(0.5)])[0]));
+        assert_eq!(registry.len(), 2, "0.5*210 = 105 < 120 — 조인다");
+    }
+
+    /// `current_pos` 가 0 이면 압축이 아니라 **새 시퀀스**다 — 압축은 목표를 1 로 바닥치므로
+    /// 0 에 닿을 수 없다. 분모를 안 비우면 다음 대화가 이전 대화 길이를 물려받는다.
+    #[test]
+    fn an_empty_cache_resets_the_denominator() {
+        let (mut d, registry, h) = make_dispatcher();
+        results_of(&mut d, vec![compress(0.5)]);
+        assert_eq!(registry.len(), 1);
+        h.with_cache_mut(|c| c.set_current_pos(0)); // 새 시퀀스
+        d.dispatch(vec![]); // 표집
+        h.with_cache_mut(|c| c.advance_pos(40)); // 새 프리필 40 토큰
+
+        assert!(is_accepted(&results_of(&mut d, vec![compress(0.25)])[0]));
+        assert_eq!(
+            registry.len(),
+            2,
+            "0.25*40 = 10 < 40 — 새 문맥 기준으로 조인다"
+        );
     }
 
     /// `RestoreDefaults` 는 재무장한다 — 그 뒤 같은 budget 도 다시 submit 된다.
