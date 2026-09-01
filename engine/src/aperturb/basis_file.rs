@@ -332,8 +332,10 @@ pub fn read(path: &Path, expect: &Expect) -> Result<(OutputBasis, f64), BasisFil
     let layers: Vec<Vec<f32>> = (0..n_layers)
         .map(|l| {
             payload[l * per * 4..(l + 1) * per * 4]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         })
         .collect();

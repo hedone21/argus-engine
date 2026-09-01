@@ -242,7 +242,7 @@ pub fn run_eval_ll(ctx: EvalLlRunCtx) -> Result<()> {
         let policy = args.eviction_policy();
         // `eviction plugin --name pyramidkv` — the explicit invocation of the registered PFA stage.
         let explicit_pfa_plugin = policy == arming.stage_name;
-        if routes_to_prefill_keepset(&policy, &arming.stage_name)
+        if routes_to_prefill_keepset(policy, &arming.stage_name)
             && let Some(stage) =
                 crate::kv::eviction::stage_registry::make_prefill_keepset_stage(&arming.stage_name)
         {
