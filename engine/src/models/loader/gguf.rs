@@ -1061,8 +1061,8 @@ impl GgufSource {
         // the mmap (GGUF aligns tensor data to 32 B by default, but we stay
         // defensive with `from_le_bytes`).
         let mut bytes = Vec::<u8>::with_capacity(num_elements * 2);
-        for chunk in data.chunks_exact(4) {
-            let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for chunk in data.as_chunks::<4>().0 {
+            let v = f32::from_le_bytes(*chunk);
             let h = f16::from_f32(v);
             bytes.extend_from_slice(&h.to_bits().to_le_bytes());
         }

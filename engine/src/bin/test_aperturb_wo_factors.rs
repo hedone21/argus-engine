@@ -64,14 +64,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let index = u32_at(take(4, &mut o));
         let _pad = take(4, &mut o);
         let w: Vec<f32> = take(d_out * d_in * 4, &mut o)
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         let v_r: Vec<f64> = take(d_in * r * 8, &mut o)
-            .chunks_exact(8)
-            .map(f64_at)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
             .collect();
-        let sigma: Vec<f64> = take(r * 8, &mut o).chunks_exact(8).map(f64_at).collect();
+        let sigma: Vec<f64> = take(r * 8, &mut o)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
+            .collect();
         let tail = f64_at(take(8, &mut o));
         layers.push(Layer {
             index,
