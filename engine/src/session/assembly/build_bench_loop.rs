@@ -514,7 +514,11 @@ pub fn build_bench_loop(
                     sel.names().join(", "),
                     crate::session::aperturb_basis::APERTURB_ROWS,
                 );
-                dispatcher.with_aperturb_selector(Arc::clone(sel), Arc::clone(&q_rows_cell))
+                dispatcher.with_aperturb_selector(
+                    Arc::clone(sel),
+                    Arc::clone(&q_rows_cell),
+                    Arc::clone(&pfa_cell),
+                )
             }
             None => dispatcher,
         })

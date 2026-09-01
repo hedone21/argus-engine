@@ -33,13 +33,15 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use argus_extension_api::{KVMutationStage, StageCaps};
+use argus_extension_api::{KVMutationStage, StageCaps, TensorKind};
 
 use crate::aperturb::{self, Config, Geom, KeepSets, LayerSource, OutputBasis, Readout};
 use crate::inference::q_rows::QRowCapture;
 use crate::kv::cache_handle::EngineCacheHandle;
 use crate::kv::kv_cache::KVCache;
-use crate::stages::kv::mutation::{PlannedKeep, dequant_snapshot, plan_mutation_layer};
+use crate::stages::kv::mutation::{
+    PlannedKeep, dequant_snapshot, plan_mutation_layer, plan_prefill_keepset_layer,
+};
 
 /// One technique the engine may choose, resolved once at assembly.
 pub struct Candidate {
@@ -47,6 +49,10 @@ pub struct Candidate {
     pub name: String,
     stage: Box<dyn KVMutationStage>,
     caps: StageCaps,
+    /// The attention-sink guard this candidate would have been configured with. Only the
+    /// prefill-attention seam surfaces it (`ctx.protected_prefix()`); the mid-decode ctx reports `0`
+    /// because the score-fed path applies it upstream.
+    protected_prefix: usize,
 }
 
 impl Candidate {
@@ -55,7 +61,19 @@ impl Candidate {
             name: name.into(),
             stage,
             caps,
+            protected_prefix: caps.default_protected_prefix,
         }
+    }
+
+    /// Override the declared default with the resolved `--protected-prefix`.
+    pub fn with_protected_prefix(mut self, n: usize) -> Self {
+        self.protected_prefix = n;
+        self
+    }
+
+    /// Whether this candidate decides off the prefill attention (SnapKV/PyramidKV).
+    fn reads_prefill_attn(&self) -> bool {
+        self.caps.reads.contains(&TensorKind::PrefillAttention)
     }
 }
 
@@ -70,6 +88,10 @@ pub struct Signals<'a> {
     pub importance: Option<&'a [f32]>,
     pub head_scores: Option<&'a [f32]>,
     pub last_attn: Option<&'a [f32]>,
+    /// Per-layer prefill attention (`[n_heads_q * prefix_len]`), when the producer was armed for a
+    /// prefill-end candidate. It is a prompt-era measurement that never grows, so mid-decode it is
+    /// narrower than the cache — see [`Selector::plan_one`] for what the engine does about that.
+    pub prefill_attn: Option<&'a [Vec<f32>]>,
 }
 
 /// What one candidate came back with.
@@ -80,6 +102,9 @@ pub struct Arm {
     pub score: f32,
     /// Positions retained over every layer and KV head.
     pub kept_total: usize,
+    /// The per-layer budget this candidate was finally asked for. Equal to the Manager's
+    /// `target_len` unless [`Selector::plan_calibrated`] had to ask for less.
+    pub asked: usize,
 }
 
 /// A decision, and what it cost.
@@ -97,6 +122,9 @@ pub struct Choice {
     pub tokens_after: usize,
     /// `[layer][kv_head]` retained positions the budget allows in total.
     pub budget_total: usize,
+    /// The per-layer budget the Manager's fraction resolved to — what every arm was asked for
+    /// first, and what an [`Arm::asked`] below it means was calibrated.
+    pub target_len: usize,
     /// Seconds inside [`aperturb::decide`].
     pub decide_s: f64,
     /// Seconds spent putting the cache where the metric can reach it (device mirror + dequantize).
@@ -111,6 +139,9 @@ pub struct Choice {
 pub enum NoChoice {
     /// The cache holds fewer tokens than the metric scores rows.
     TooShort { resident: usize, rows: usize },
+    /// The captured query rows no longer describe the resident cache — something renumbered it
+    /// after they were captured.
+    StaleRows { resident: usize },
     /// Every candidate was excluded, with the reasons in pool order.
     AllExcluded(Vec<(String, String)>),
 }
@@ -121,6 +152,12 @@ impl std::fmt::Display for NoChoice {
             Self::TooShort { resident, rows } => write!(
                 f,
                 "only {resident} token(s) resident but the metric scores {rows} query rows"
+            ),
+            Self::StaleRows { resident } => write!(
+                f,
+                "the captured query rows do not cover the {resident} resident token(s) — the cache \
+                 was renumbered after they were captured, so there is nothing to measure the \
+                 candidates on"
             ),
             Self::AllExcluded(v) => {
                 write!(f, "no candidate was comparable: ")?;
@@ -147,6 +184,10 @@ pub struct Selector {
     readout: Readout,
 }
 
+/// An accepted plan: the sets the metric scores, the per-layer plans the winner is applied from,
+/// and the per-layer budget the candidate was finally asked for.
+type CalibratedPlan = (KeepSets, Vec<PlannedKeep>, usize);
+
 impl Selector {
     /// `candidates` must be non-empty; a selector with nothing to choose between is a
     /// configuration error, not a runtime one.
@@ -166,6 +207,11 @@ impl Selector {
             readout: Readout::default(),
         })
     }
+
+    /// How many budgets one candidate may be asked for in a single decision
+    /// ([`Self::plan_calibrated`]). Small on purpose: the linear case needs two, and anything
+    /// needing more is not tracking the ask.
+    const MAX_BUDGET_PROBES: usize = 4;
 
     /// The pool, in the order ties are broken.
     pub fn names(&self) -> Vec<&str> {
@@ -208,6 +254,15 @@ impl Selector {
                 rows: q_rows.rows(),
             }));
         }
+        // The ring is indexed by absolute position, so anything that renumbered the cache since the
+        // rows were captured — another compaction at prefill end, or a compression a few steps ago —
+        // leaves it holding positions that no longer exist. Decline rather than measure against
+        // them; the forward refills the ring as decode goes on, so a later budget can be answered.
+        if !q_rows.covers(current_pos) {
+            return Ok(Err(NoChoice::StaleRows {
+                resident: current_pos,
+            }));
+        }
 
         // The budget the Manager asked for, in the engine's own per-layer terms — the same
         // `(pos * ratio).max(1)` floor every other keep-set path uses, so a candidate here is
@@ -219,27 +274,19 @@ impl Selector {
         // device round trip.
         let mut pool: Vec<(String, KeepSets)> = Vec::with_capacity(self.candidates.len());
         let mut plans: Vec<Vec<PlannedKeep>> = Vec::with_capacity(self.candidates.len());
+        let mut asked: Vec<usize> = Vec::with_capacity(self.candidates.len());
         let mut excluded: Vec<(String, String)> = Vec::new();
         for cand in &self.candidates {
-            match self.plan_one(cand, caches, target_len, n_kv_heads, signals) {
-                Ok(Ok((keep, layers))) => {
-                    if keep.total() > budget_total {
-                        excluded.push((
-                            cand.name.clone(),
-                            format!(
-                                "retains {} of {budget_total} budgeted positions — over budget, so \
-                                 its score is not comparable",
-                                keep.total()
-                            ),
-                        ));
-                        continue;
-                    }
+            match self.plan_calibrated(cand, caches, target_len, budget_total, n_kv_heads, signals)
+            {
+                Ok(Ok((keep, layers, ask))) => {
                     if let Err(e) = keep.validate(current_pos) {
                         excluded.push((cand.name.clone(), e.to_string()));
                         continue;
                     }
                     pool.push((cand.name.clone(), keep));
                     plans.push(layers);
+                    asked.push(ask);
                 }
                 Ok(Err(why)) => excluded.push((cand.name.clone(), why)),
                 // A stage that errors is excluded, not fatal: one broken plugin must not take the
@@ -275,10 +322,12 @@ impl Selector {
             .scored
             .iter()
             .zip(&pool)
-            .map(|(s, (_, keep))| Arm {
+            .zip(&asked)
+            .map(|((s, (_, keep)), ask)| Arm {
                 name: s.name.clone(),
                 score: s.scores.get(self.readout),
                 kept_total: keep.total(),
+                asked: *ask,
             })
             .collect();
 
@@ -296,9 +345,72 @@ impl Selector {
             tokens_before: current_pos,
             tokens_after: caches[0].current_pos(),
             budget_total,
+            target_len,
             decide_s: dec.times.total_s(),
             read_s,
         }))
+    }
+
+    /// Ask a candidate for the Manager's budget, and if it answers with more than that, ask again
+    /// for less — at most [`Self::MAX_BUDGET_PROBES`] times.
+    ///
+    /// The contract names a budget as a fraction of the resident cache. A technique's own budget
+    /// knob need not mean the same thing: kvpress-family arithmetic adds its observation window on
+    /// top of the ratio, so asked for `b` it retains `b + window`. Excluding such a candidate for
+    /// overshooting would exclude it every time, on a mismatch of vocabulary rather than of quality.
+    ///
+    /// So the engine calibrates, naming no technique: it subtracts the per-(layer, head) overshoot
+    /// from the ask and asks again. A candidate whose retention is a linear function of the ask —
+    /// which every budget-driven technique's is — lands inside on the second try. A candidate that
+    /// ignores the ask (an absolute-budget technique like faithful H2O) does not shrink at all and
+    /// is excluded on the spot, which is what it was before this existed.
+    ///
+    /// Every probe is a dry run, so a rejected ask costs planning time and not a single byte.
+    ///
+    /// Returns the accepted plan together with the budget it was finally asked for, so the decision
+    /// can report a calibrated arm as calibrated.
+    fn plan_calibrated(
+        &self,
+        cand: &Candidate,
+        caches: &mut [KVCache],
+        target_len: usize,
+        budget_total: usize,
+        n_kv_heads: usize,
+        signals: Signals<'_>,
+    ) -> Result<std::result::Result<CalibratedPlan, String>> {
+        let cells = caches.len().saturating_mul(n_kv_heads).max(1);
+        let mut ask = target_len;
+        let mut prev_total = usize::MAX;
+        for _ in 0..Self::MAX_BUDGET_PROBES {
+            let (keep, layers) = match self.plan_one(cand, caches, ask, n_kv_heads, signals)? {
+                Ok(v) => v,
+                Err(why) => return Ok(Err(why)),
+            };
+            let total = keep.total();
+            if total <= budget_total {
+                return Ok(Ok((keep, layers, ask)));
+            }
+            if total >= prev_total {
+                return Ok(Err(format!(
+                    "retains {total} of {budget_total} budgeted positions, and asking for less does \
+                     not shrink it — its budget is not the one the contract names"
+                )));
+            }
+            prev_total = total;
+            let step = (total - budget_total).div_ceil(cells).max(1);
+            let Some(next) = ask.checked_sub(step).filter(|b| *b > 0) else {
+                return Ok(Err(format!(
+                    "retains {total} of {budget_total} budgeted positions, and there is no smaller \
+                     budget left to ask it for"
+                )));
+            };
+            ask = next;
+        }
+        Ok(Err(format!(
+            "still over the {budget_total}-position budget after {} asks — over budget, so its \
+             score is not comparable",
+            Self::MAX_BUDGET_PROBES
+        )))
     }
 
     /// Run one candidate's callback over every layer without committing, and assemble the
@@ -316,22 +428,50 @@ impl Selector {
         signals: Signals<'_>,
     ) -> Result<std::result::Result<(KeepSets, Vec<PlannedKeep>), String>> {
         let n_layers = caches.len();
+        // A prefill-end candidate needs the prompt attention it was registered to read. It is
+        // resolved once, before any layer is planned, so a pool member that cannot be asked at all
+        // is excluded with that reason rather than reported as having staged nothing.
+        let pfa = if cand.reads_prefill_attn() {
+            match signals.prefill_attn {
+                Some(p) if p.len() >= n_layers => Some(p),
+                Some(p) => {
+                    return Ok(Err(format!(
+                        "reads prefill attention, but only {} of {n_layers} layers were captured",
+                        p.len()
+                    )));
+                }
+                None => {
+                    return Ok(Err(
+                        "reads prefill attention, which this run never captured".to_string(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let mut keep =
             KeepSets::with_capacity(n_layers, n_kv_heads, n_layers * n_kv_heads * target_len);
         let mut layers = Vec::with_capacity(n_layers);
         let mut asc: Vec<u32> = Vec::with_capacity(target_len);
         for (l, cache) in caches.iter_mut().enumerate() {
-            let planned = plan_mutation_layer(
-                cand.stage.as_ref(),
-                &cand.caps,
-                cache,
-                l,
-                n_layers,
-                target_len,
-                signals.importance,
-                signals.head_scores,
-                signals.last_attn,
-            )?;
+            let planned = match pfa {
+                None => Ok(plan_mutation_layer(
+                    cand.stage.as_ref(),
+                    &cand.caps,
+                    cache,
+                    l,
+                    n_layers,
+                    target_len,
+                    signals.importance,
+                    signals.head_scores,
+                    signals.last_attn,
+                )?),
+                Some(pfa) => self.plan_prefill_layer(cand, cache, l, n_layers, target_len, pfa)?,
+            };
+            let planned = match planned {
+                Ok(p) => p,
+                Err(why) => return Ok(Err(why)),
+            };
             let Some(p) = planned else {
                 return Ok(Err(format!("staged no keep-set for layer {l}")));
             };
@@ -348,6 +488,70 @@ impl Selector {
             layers.push(p);
         }
         Ok(Ok((keep, layers)))
+    }
+
+    /// Plan one layer for a candidate that decides off the prefill attention.
+    ///
+    /// The budget arrives mid-decode, but this technique's evidence is a prompt-era measurement:
+    /// `pfa[layer]` describes the first `prefix_len` positions and nothing after them. So the engine
+    /// splits the layer in two. The stage is shown a cache exactly `prefix_len` long and asked for
+    /// `target_len - tail` of it; the `tail` positions decode appended since are kept by the engine
+    /// and charged to the same budget ([`PlannedKeep::keep_tail`]).
+    ///
+    /// This is an engine-side adaptation and is not what the technique does in its own paper, where
+    /// it fires once at prefill end with no tail to account for. What it buys is that the technique
+    /// answers from its real ranking rather than from the score-free fallback it takes when the
+    /// prefill attention is absent, which is the thing that would not be worth ranking.
+    ///
+    /// The outer `Err(String)` is an exclusion reason, not a failure.
+    fn plan_prefill_layer(
+        &self,
+        cand: &Candidate,
+        cache: &mut KVCache,
+        layer_idx: usize,
+        n_layers: usize,
+        target_len: usize,
+        pfa: &[Vec<f32>],
+    ) -> Result<std::result::Result<Option<PlannedKeep>, String>> {
+        let current_pos = cache.current_pos();
+        if self.n_heads_q == 0 {
+            return Ok(Err("the model reports no query heads".to_string()));
+        }
+        // The PFA's own width, never the cache's: reading past the data zero-fills silently.
+        let prefix_len = pfa[layer_idx].len() / self.n_heads_q;
+        if prefix_len == 0 {
+            return Ok(Err(format!(
+                "layer {layer_idx}: the prefill attention capture is empty"
+            )));
+        }
+        if prefix_len > current_pos {
+            return Ok(Err(format!(
+                "layer {layer_idx}: the prefill attention covers {prefix_len} positions but only \
+                 {current_pos} are resident — the cache was compressed after it was captured"
+            )));
+        }
+        let tail = current_pos - prefix_len;
+        let Some(stage_budget) = target_len.checked_sub(tail).filter(|b| *b > 0) else {
+            return Ok(Err(format!(
+                "the {tail} decode positions its prefill attention never saw already fill the \
+                 {target_len}-position budget, so it has nothing left to rank"
+            )));
+        };
+        let mut planned = plan_prefill_keepset_layer(
+            cand.stage.as_ref(),
+            cache,
+            layer_idx,
+            n_layers,
+            stage_budget,
+            &pfa[layer_idx],
+            self.n_heads_q,
+            cand.protected_prefix,
+            prefix_len,
+        )?;
+        if let Some(p) = planned.as_mut() {
+            p.keep_tail(prefix_len, current_pos);
+        }
+        Ok(Ok(planned))
     }
 }
 
@@ -528,6 +732,24 @@ mod tests {
         cap
     }
 
+    /// A ring armed only over positions `[0, n)` — what is left of the capture after something
+    /// renumbered the cache under it, since the ring is indexed by absolute position.
+    fn q_rows_over(n: usize) -> QRowCapture {
+        let be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = crate::memory::galloc::Galloc::new();
+        let q_dim = HEADS * HD;
+        let mut cap =
+            QRowCapture::new(be.clone(), &mem, LAYERS, ROWS, q_dim).expect("arm the ring");
+        let buf = SharedBuffer::new(n * q_dim * 4, DType::F32);
+        let mut q = Tensor::new(Shape::new(vec![1, n, HEADS, HD]), Arc::new(buf), be.clone());
+        q.as_mut_slice::<f32>().fill(1.0);
+        for l in 0..LAYERS {
+            cap.capture(l, &q, be.as_ref(), 0, n, q_dim)
+                .expect("capture");
+        }
+        cap
+    }
+
     /// A stage that retains a fixed set of positions, whatever the budget — so the test names the
     /// retained set directly instead of inferring it from a policy.
     struct FixedKeep {
@@ -578,6 +800,83 @@ mod tests {
         ) -> Result<(), CacheOpError> {
             Err(CacheOpError::InvalidKeep)
         }
+    }
+
+    /// A stage that keeps the `target_len + OVERSHOOT` most recent positions — the shape of a
+    /// kvpress-family budget, which adds its observation window on top of the ratio it was asked
+    /// for. Retention tracks the ask linearly, so calibration lands it inside the budget.
+    struct Windowed;
+    const OVERSHOOT: usize = 2;
+
+    impl KVMutationStage for Windowed {
+        fn name(&self) -> &str {
+            "windowed"
+        }
+        fn on_phase(
+            &self,
+            ctx: &dyn StageCtx,
+            cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            let n = (ctx.target_len() + OVERSHOOT).min(ctx.current_pos());
+            cache.keep(&(ctx.current_pos() - n..ctx.current_pos()).collect::<Vec<_>>())
+        }
+    }
+
+    /// The prefill prefix the PFA covers, of the [`RESIDENT`] positions. The remaining
+    /// `RESIDENT - PREFIX` stand for tokens decode appended after the capture.
+    const PREFIX: usize = 6;
+
+    /// A stage that ranks the prefix by its prefill attention and keeps the `target_len` best — the
+    /// shape of SnapKV/PyramidKV, reduced to the part this seam is about. Records what the ctx told
+    /// it, so a test can assert the stage was shown the PFA's window and not the whole cache.
+    struct PrefixRanker {
+        seen_pos: std::sync::atomic::AtomicUsize,
+        seen_cols: std::sync::atomic::AtomicUsize,
+    }
+
+    impl KVMutationStage for PrefixRanker {
+        fn name(&self) -> &str {
+            "prefix_ranker"
+        }
+        fn on_phase(
+            &self,
+            ctx: &dyn StageCtx,
+            cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            use std::sync::atomic::Ordering;
+            self.seen_pos.store(ctx.current_pos(), Ordering::Relaxed);
+            let Some(pfa) = ctx.tensor(TensorKind::PrefillAttention) else {
+                return Ok(());
+            };
+            let cols = pfa.shape().cols;
+            self.seen_cols.store(cols, Ordering::Relaxed);
+            let mut row = vec![0.0f32; cols];
+            pfa.read_row(0, 0, &mut row);
+            let mut order: Vec<usize> = (0..cols).collect();
+            order.sort_by(|&a, &b| {
+                row[b]
+                    .partial_cmp(&row[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            order.truncate(ctx.target_len().min(cols));
+            order.sort_unstable();
+            cache.keep(&order)
+        }
+    }
+
+    fn pfa_caps() -> StageCaps {
+        StageCaps {
+            reads: &[TensorKind::PrefillAttention],
+            ..caps()
+        }
+    }
+
+    /// Prefill attention that ranks positions 3 and 4 above the rest, one row per query head.
+    fn pfa_favouring_3_and_4() -> Vec<Vec<f32>> {
+        let mut row = vec![0.1f32; PREFIX];
+        row[3] = 0.9;
+        row[4] = 0.8;
+        vec![row; LAYERS]
     }
 
     fn caps() -> StageCaps {
@@ -649,8 +948,9 @@ mod tests {
 
     /// A candidate that retains more than the budget is not a cheaper answer to the request, it is
     /// an answer to a different one — so it is excluded rather than allowed to win on score.
-    /// Mutation-proof: dropping the `keep.total() > budget_total` gate lets `keep_all` (which
-    /// perturbs nothing at all) win every compression, leaving the cache at 8 tokens.
+    /// `keep_all` ignores the ask, so calibration has no smaller budget to fall back to and stops.
+    /// Mutation-proof: dropping the budget gate lets `keep_all` (which perturbs nothing at all) win
+    /// every compression, leaving the cache at 8 tokens.
     #[test]
     fn an_over_budget_candidate_is_excluded_rather_than_winning_on_score() {
         let all: Vec<usize> = (0..RESIDENT).collect();
@@ -669,8 +969,198 @@ mod tests {
         );
         assert_eq!(choice.excluded.len(), 1);
         assert_eq!(choice.excluded[0].0, "keep_all");
-        assert!(choice.excluded[0].1.contains("over budget"));
+        assert!(
+            choice.excluded[0].1.contains("budgeted positions"),
+            "an ask-ignoring candidate is excluded on the budget: {}",
+            choice.excluded[0].1
+        );
         assert_eq!(choice.tokens_after, 2);
+    }
+
+    /// A candidate whose own budget arithmetic overshoots is re-asked for less rather than
+    /// excluded, and the arm reports the budget it was finally asked for. Mutation-proof: removing
+    /// the re-ask (returning the exclusion on the first overshoot) drops `windowed` from the pool
+    /// entirely, so `choice.arms.len()` falls to 1.
+    #[test]
+    fn a_candidate_that_overshoots_its_budget_is_re_asked_rather_than_excluded() {
+        let s = selector(vec![
+            Candidate::new("windowed", Box::new(Windowed), caps()),
+            fixed("mid_pair", &[3, 4]),
+        ]);
+        let mut cs = caches();
+        let q = armed_q_rows();
+        let choice = s
+            .choose_and_apply(&mut cs, 0.5, &q, Signals::default())
+            .expect("decide")
+            .expect("a choice");
+        assert!(
+            choice.excluded.is_empty(),
+            "nothing should be excluded: {:?}",
+            choice.excluded
+        );
+        assert_eq!(choice.arms.len(), 2);
+        let w = choice
+            .arms
+            .iter()
+            .find(|a| a.name == "windowed")
+            .expect("the calibrated arm is ranked");
+        // Asked for 4, it answers with 6 per layer; the engine subtracts the per-cell overshoot and
+        // asks for 2, which it answers with 4 — exactly the budget.
+        assert_eq!(choice.target_len, 4);
+        assert_eq!(w.asked, 4 - OVERSHOOT);
+        assert_eq!(w.kept_total, choice.budget_total);
+    }
+
+    /// A prefill-end candidate is asked about the window its prefill attention covers, and the
+    /// positions decode appended since are kept by the engine on top of its answer.
+    /// Mutation-proof: dropping the `keep_tail` call loses the two decode positions, and showing
+    /// the stage `cache.current_pos()` instead of the PFA's width makes `seen_*` report 8.
+    #[test]
+    fn a_prefill_end_candidate_ranks_its_prefix_and_the_decode_tail_is_kept() {
+        use std::sync::atomic::Ordering;
+        let ranker = Arc::new(PrefixRanker {
+            seen_pos: std::sync::atomic::AtomicUsize::new(0),
+            seen_cols: std::sync::atomic::AtomicUsize::new(0),
+        });
+        struct Shared(Arc<PrefixRanker>);
+        impl KVMutationStage for Shared {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+            fn on_phase(
+                &self,
+                ctx: &dyn StageCtx,
+                cache: &mut dyn CacheHandle,
+            ) -> Result<(), CacheOpError> {
+                self.0.on_phase(ctx, cache)
+            }
+        }
+        let s = selector(vec![Candidate::new(
+            "prefix_ranker",
+            Box::new(Shared(Arc::clone(&ranker))),
+            pfa_caps(),
+        )]);
+        let mut cs = caches();
+        let q = armed_q_rows();
+        let pfa = pfa_favouring_3_and_4();
+        let choice = s
+            .choose_and_apply(
+                &mut cs,
+                0.5,
+                &q,
+                Signals {
+                    prefill_attn: Some(&pfa),
+                    ..Signals::default()
+                },
+            )
+            .expect("decide")
+            .expect("a choice");
+        assert_eq!(choice.winner, "prefix_ranker");
+        // The stage saw the PFA's window, not the resident cache.
+        assert_eq!(ranker.seen_pos.load(Ordering::Relaxed), PREFIX);
+        assert_eq!(ranker.seen_cols.load(Ordering::Relaxed), PREFIX);
+        // Budget 4 = the two it ranked out of the prefix, plus the two decode positions it never
+        // measured, which the engine kept rather than let fall to a score that does not exist.
+        for c in &cs {
+            assert_eq!(survivors(c), vec![3.0, 4.0, 6.0, 7.0]);
+        }
+    }
+
+    /// A prefill-end candidate whose prefill attention was never captured is excluded with that
+    /// reason — it is not quietly asked anyway, which is what would send it down its score-free
+    /// fallback and rank something the technique does not do.
+    #[test]
+    fn a_prefill_end_candidate_without_its_attention_is_excluded() {
+        let s = selector(vec![
+            Candidate::new(
+                "prefix_ranker",
+                Box::new(PrefixRanker {
+                    seen_pos: std::sync::atomic::AtomicUsize::new(0),
+                    seen_cols: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                pfa_caps(),
+            ),
+            fixed("mid_pair", &[3, 4]),
+        ]);
+        let mut cs = caches();
+        let q = armed_q_rows();
+        let choice = s
+            .choose_and_apply(&mut cs, 0.5, &q, Signals::default())
+            .expect("decide")
+            .expect("a choice");
+        assert_eq!(choice.winner, "mid_pair");
+        assert_eq!(choice.excluded.len(), 1);
+        assert_eq!(choice.excluded[0].0, "prefix_ranker");
+        assert!(
+            choice.excluded[0].1.contains("never captured"),
+            "{}",
+            choice.excluded[0].1
+        );
+    }
+
+    /// When the decode positions outside the prefill attention already fill the budget, the
+    /// candidate is excluded with that reason rather than asked for a budget of nothing.
+    #[test]
+    fn a_prefill_end_candidate_is_excluded_when_the_decode_tail_fills_the_budget() {
+        let s = selector(vec![
+            Candidate::new(
+                "prefix_ranker",
+                Box::new(PrefixRanker {
+                    seen_pos: std::sync::atomic::AtomicUsize::new(0),
+                    seen_cols: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                pfa_caps(),
+            ),
+            fixed("mid_pair", &[3, 4]),
+        ]);
+        let mut cs = caches();
+        let q = armed_q_rows();
+        let pfa = pfa_favouring_3_and_4();
+        // ratio 0.25 of 8 resident = a 2-position budget, which the 2 decode positions consume.
+        let choice = s
+            .choose_and_apply(
+                &mut cs,
+                0.25,
+                &q,
+                Signals {
+                    prefill_attn: Some(&pfa),
+                    ..Signals::default()
+                },
+            )
+            .expect("decide")
+            .expect("a choice");
+        assert_eq!(choice.winner, "mid_pair");
+        assert_eq!(choice.excluded.len(), 1);
+        assert!(
+            choice.excluded[0].1.contains("already fill the"),
+            "{}",
+            choice.excluded[0].1
+        );
+    }
+
+    /// Query rows that no longer describe the resident cache are a decline, not a measurement and
+    /// not a failure. The ring is indexed by absolute position, so a compaction between the capture
+    /// and the decision leaves it holding positions that no longer exist.
+    ///
+    /// Mutation-proof: dropping the `covers` check makes the snapshot's own position assert fire,
+    /// which returns `Err` — and a stage that returns `Err` on `KvMutate` panics the pipeline
+    /// registry, which is exactly what this configuration did before the check existed.
+    #[test]
+    fn rows_that_no_longer_describe_the_cache_are_declined_not_measured() {
+        let s = selector(vec![fixed("mid_pair", &[3, 4])]);
+        let mut cs = caches();
+        // The ring holds positions 2..4; the cache is 8 long, so the window it would read is 6..8.
+        let q = q_rows_over(4);
+        let out = s
+            .choose_and_apply(&mut cs, 0.5, &q, Signals::default())
+            .expect("a stale ring is a decline, never an error");
+        assert!(
+            matches!(out, Err(NoChoice::StaleRows { resident: RESIDENT })),
+            "{out:?}"
+        );
+        for c in &cs {
+            assert_eq!(c.current_pos(), RESIDENT, "the cache is left alone");
+        }
     }
 
     /// A stage that stages nothing and one that errors are both excluded with a reason, and the

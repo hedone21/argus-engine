@@ -64,6 +64,9 @@ pub fn apply_prefill_keepset(
             &pfa[layer_idx],
             n_heads_q,
             protected_prefix,
+            // At prefill end the PFA covers exactly the resident prefix — the two are the same
+            // number here, and the argument only starts to matter mid-decode (the planning twin).
+            prefix_len,
         );
         let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
         // catch_unwind (mirror of `KVMutationDriverStage`, P0-5a): a panic in an untrusted plugin's

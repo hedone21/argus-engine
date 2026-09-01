@@ -153,6 +153,7 @@ pub struct CommandDispatcher {
 type AperturbSelection = (
     Arc<crate::kv::aperturb_select::Selector>,
     Arc<Mutex<Option<crate::inference::q_rows::QRowCapture>>>,
+    Arc<Mutex<Option<Vec<Vec<f32>>>>>,
 );
 
 /// A KV compression submitted this step, awaiting its post-apply reading.
@@ -209,8 +210,9 @@ impl CommandDispatcher {
         mut self,
         selector: Arc<crate::kv::aperturb_select::Selector>,
         q_rows: Arc<Mutex<Option<crate::inference::q_rows::QRowCapture>>>,
+        prefill_attn: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
     ) -> Self {
-        self.aperturb = Some((selector, q_rows));
+        self.aperturb = Some((selector, q_rows, prefill_attn));
         self
     }
 
@@ -342,12 +344,13 @@ impl CommandDispatcher {
         // The contract names a budget, not a technique. When a candidate pool is configured the
         // engine picks the technique itself; otherwise it applies the one the CLI configured.
         let stage: Arc<dyn crate::pipeline::PipelineStage> = match self.aperturb.as_ref() {
-            Some((selector, q_rows)) => Arc::new(AperturbSelectStage::new(
+            Some((selector, q_rows, prefill_attn)) => Arc::new(AperturbSelectStage::new(
                 self.kv_handles.clone(),
                 Arc::clone(selector),
                 Arc::clone(q_rows),
                 target_ratio,
                 Arc::clone(&self.score_cell),
+                Arc::clone(prefill_attn),
                 self.backend.clone(),
             )),
             None => {
@@ -503,7 +506,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut d = d.with_aperturb_selector(selector, Arc::new(Mutex::new(None)));
+        let mut d = d.with_aperturb_selector(
+            selector,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
         let r = results_of(&mut d, vec![compress(0.5)]);
         assert!(
             is_accepted(&r[0]),

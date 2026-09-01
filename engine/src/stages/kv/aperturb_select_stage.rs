@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::inference::q_rows::QRowCapture;
 use crate::inference::signal_runtime::SignalRuntime;
-use crate::kv::aperturb_select::{NoChoice, Selector, Signals};
+use crate::kv::aperturb_select::{Selector, Signals};
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
 use crate::pipeline::{LifecyclePhase, PipelineStage, StageContext, StageLifecycle, StageOutcome};
@@ -28,6 +28,9 @@ pub struct AperturbSelectStage {
     /// cell `EvictionStage` extracts from, so a candidate sees here what it would have seen had it
     /// been applied directly.
     score_cell: Arc<Mutex<Option<SignalRuntime>>>,
+    /// The per-layer prefill attention the forward captured, shared with `ModelForward`. Armed only
+    /// when a pooled candidate declares it reads `PrefillAttention`; `None` inside otherwise.
+    prefill_attn: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
     /// Present when scores may live on-device; the sync before the read is then live.
     backend: Option<Arc<dyn crate::backend::Backend>>,
     /// The fraction of the resident cache the Manager asked to keep.
@@ -35,12 +38,14 @@ pub struct AperturbSelectStage {
 }
 
 impl AperturbSelectStage {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         handles: Vec<Arc<StandardFormat>>,
         selector: Arc<Selector>,
         q_rows: Arc<Mutex<Option<QRowCapture>>>,
         target_ratio: f32,
         score_cell: Arc<Mutex<Option<SignalRuntime>>>,
+        prefill_attn: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
         backend: Option<Arc<dyn crate::backend::Backend>>,
     ) -> Self {
         Self {
@@ -48,6 +53,7 @@ impl AperturbSelectStage {
             selector,
             q_rows,
             score_cell,
+            prefill_attn,
             backend,
             target_ratio,
         }
@@ -99,10 +105,15 @@ impl AperturbSelectStage {
                 None => (None, None, None),
             }
         };
+        // The prefill attention is held across the decision, not copied: it is
+        // `n_layers * n_heads_q * prompt_len` floats, and the producer never writes it again after
+        // prefill (`ModelForward` publishes it once, on the final chunk).
+        let pfa_guard = self.prefill_attn.lock().unwrap_or_else(|e| e.into_inner());
         let signals = Signals {
             importance: importance.as_deref(),
             head_scores: head_scores.as_deref(),
             last_attn: last_attn.as_deref(),
+            prefill_attn: pfa_guard.as_deref(),
         };
 
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
@@ -112,13 +123,22 @@ impl AperturbSelectStage {
         for (f, c) in self.handles.iter().zip(temp) {
             f.put_inner(c);
         }
+        drop(pfa_guard);
 
         match outcome? {
             Ok(choice) => {
                 let arms = choice
                     .arms
                     .iter()
-                    .map(|a| format!("{}={:.4e}", a.name, a.score))
+                    .map(|a| {
+                        // `@n` marks an arm whose own budget arithmetic overshot, so the engine
+                        // asked it for `n` per layer to land on the budget the Manager set.
+                        if a.asked == choice.target_len {
+                            format!("{}={:.4e}", a.name, a.score)
+                        } else {
+                            format!("{}={:.4e}@{}", a.name, a.score, a.asked)
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(" ");
                 eprintln!(
@@ -149,11 +169,10 @@ impl AperturbSelectStage {
                     }
                 }
             }
-            Err(NoChoice::TooShort { .. }) => {
-                // Not worth a line per decode step on a short prompt: the Manager already learns
-                // the cache did not move, and the reason is geometry, not the pool.
-            }
-            Err(e @ NoChoice::AllExcluded(_)) => {
+            // One line per accepted directive, not per decode step: this stage is `OneShot`, so it
+            // runs once and is collected. A budget that produced no compression and no message
+            // reads exactly like one that was never delivered.
+            Err(e) => {
                 eprintln!("[aperturb-select] declined: {e}");
             }
         }

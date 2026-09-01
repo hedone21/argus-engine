@@ -374,6 +374,15 @@ impl<'a> SnapshotStageCtx<'a> {
     /// the shared producer cell) — used by [`PrefillKeepSetStage`](super::prefill_keepset). Copies the
     /// cache scalars (no `cache` borrow held) and borrows ONLY `pfa`, so the returned ctx coexists with
     /// the `&mut` [`EngineCacheHandle`] built from the same cache (`pfa` lives outside the cache).
+    ///
+    /// `prefix_len` is the number of positions the PFA actually covers, and it sets BOTH the handle's
+    /// column count and the ctx's `current_pos`. At prefill end those equal `cache.current_pos()`. They
+    /// stop being equal once decode appends tokens: the PFA is a prompt-era measurement and never grows,
+    /// so a caller asking a prefill-end technique mid-decode passes the PFA's own width here. Deriving
+    /// the width from the cache instead would run [`PfaSnapHandle::read_row`] off the end of the data,
+    /// where it zero-fills — the stage would rank real positions against attention that was never
+    /// measured, and nothing would report an error.
+    #[allow(clippy::too_many_arguments)]
     pub fn for_prefill_attn(
         cache: &KVCache,
         target_len: usize,
@@ -382,14 +391,16 @@ impl<'a> SnapshotStageCtx<'a> {
         pfa: &'a [f32],
         n_heads_q: usize,
         protected_prefix: usize,
+        prefix_len: usize,
     ) -> Self {
         Self {
             prefill_attn_handle: Some(PfaSnapHandle {
                 data: pfa,
                 rows: n_heads_q,
-                cols: cache.current_pos(),
+                cols: prefix_len,
             }),
             protected_prefix,
+            current_pos: prefix_len,
             ..Self::from_cache(cache, target_len, layer_idx, n_layers)
         }
     }
@@ -567,15 +578,77 @@ pub(crate) fn plan_mutation_layer(
         importance,
         head_scores,
         last_attn,
-        |h| {
-            Ok(match h.staged_keep() {
-                Some(StagedKeep::LayerWide(k)) => Some(PlannedKeep::LayerWide(k.to_vec())),
-                Some(StagedKeep::PerHead(h)) => Some(PlannedKeep::PerHead(h.to_vec())),
-                None => None,
-            })
-        },
+        |h| Ok(planned_keep_of(&h)),
     )?
     .flatten())
+}
+
+/// Read a handle's staged intent out as an owned plan, or `None` if it staged no keep.
+fn planned_keep_of(h: &EngineCacheHandle<'_>) -> Option<PlannedKeep> {
+    match h.staged_keep() {
+        Some(StagedKeep::LayerWide(k)) => Some(PlannedKeep::LayerWide(k.to_vec())),
+        Some(StagedKeep::PerHead(heads)) => Some(PlannedKeep::PerHead(heads.to_vec())),
+        None => None,
+    }
+}
+
+/// Ask a prefill-end keep-set stage (SnapKV/PyramidKV) what it would retain, **without applying it**
+/// — the [`plan_mutation_layer`] twin for the `PrefillAttention` seam.
+///
+/// Builds the same read ctx + transactional handle [`apply_prefill_keepset`](super::prefill_keepset::
+/// apply_prefill_keepset) drives, and then drops the handle instead of committing it (T-1), so the
+/// cache is byte-identical afterwards and the answer is the stage's real decision.
+///
+/// `prefix_len` is the width of `pfa`, which is also the `current_pos` the stage is shown. Mid-decode
+/// that is smaller than the cache: the stage is asked only about the prefix its prefill attention
+/// covers, and what to do with the positions appended since is the caller's decision, not the
+/// technique's (see [`PlannedKeep::keep_tail`]).
+///
+/// `Ok(None)` = the stage staged no keep for this layer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_prefill_keepset_layer(
+    stage: &dyn KVMutationStage,
+    cache: &mut KVCache,
+    layer_idx: usize,
+    n_layers: usize,
+    target_len: usize,
+    pfa: &[f32],
+    n_heads_q: usize,
+    protected_prefix: usize,
+    prefix_len: usize,
+) -> anyhow::Result<Option<PlannedKeep>> {
+    if prefix_len == 0 || cache.current_pos() == 0 {
+        return Ok(None);
+    }
+    let sctx = SnapshotStageCtx::for_prefill_attn(
+        cache,
+        target_len,
+        layer_idx,
+        n_layers,
+        pfa,
+        n_heads_q,
+        protected_prefix,
+        prefix_len,
+    );
+    let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
+    // catch_unwind, as everywhere an untrusted plugin's callback is driven: a panic must become an
+    // `Err` rather than unwind past the caller's cache bookkeeping.
+    let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        move || -> anyhow::Result<Option<PlannedKeep>> {
+            let mut handle = handle;
+            stage.on_phase(&sctx, &mut handle).map_err(|e| {
+                anyhow::anyhow!("prefill keep-set stage '{}' failed: {e}", stage.name())
+            })?;
+            Ok(planned_keep_of(&handle))
+        },
+    ));
+    match driven {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "prefill keep-set stage '{}' panicked during on_phase",
+            stage.name()
+        )),
+    }
 }
 
 /// An owned [`StagedKeep`], read out of a dry run that was never committed.
@@ -591,6 +664,23 @@ impl PlannedKeep {
         match self {
             Self::LayerWide(k) => Some(k),
             Self::PerHead(h) => h.get(kv_head).map(|v| v.as_slice()),
+        }
+    }
+
+    /// Force-keep `[from, to)` on top of what the stage staged.
+    ///
+    /// A prefill-end technique ranks only the positions its prefill attention covers. Asked
+    /// mid-decode, the tokens appended since sit outside that window entirely — they have no
+    /// measured attention, not a low one. Keeping them is the engine's call and it is stated as
+    /// such: the alternative is to let them fall to a score the technique never computed, which
+    /// would drop the newest tokens first and report the result as the technique's own.
+    ///
+    /// Every staged position is `< from` (the stage was shown a cache exactly `from` long), so
+    /// appending preserves the ascending order a keep-set requires.
+    pub(crate) fn keep_tail(&mut self, from: usize, to: usize) {
+        match self {
+            Self::LayerWide(k) => k.extend(from..to),
+            Self::PerHead(h) => h.iter_mut().for_each(|v| v.extend(from..to)),
         }
     }
 }
@@ -1401,6 +1491,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A prefill-attention stage read through a cache the PFA no longer spans: the planner shows it
+    /// the PFA's own window, and drops the handle instead of committing it.
+    ///
+    /// Mutation-proof: deriving the ctx's width from the cache instead of `prefix_len` shows the
+    /// stage 8 columns over a 5-column capture — [`PfaSnapHandle::read_row`] zero-fills the
+    /// difference, so the stage silently ranks three real positions against attention that was never
+    /// measured and the observed `current_pos` assert fails. Committing instead of planning fails
+    /// the byte and `current_pos` asserts.
+    #[test]
+    fn planning_a_prefill_keepset_shows_the_capture_window_and_touches_no_byte() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Keeps the `target_len` highest-attention prefix positions and records what it was shown.
+        struct PfaRanker {
+            seen_pos: AtomicUsize,
+            seen_cols: AtomicUsize,
+        }
+        impl KVMutationStage for PfaRanker {
+            fn name(&self) -> &str {
+                "test.pfa_ranker"
+            }
+            fn on_phase(
+                &self,
+                ctx: &dyn StageCtx,
+                cache: &mut dyn CacheHandle,
+            ) -> Result<(), CacheOpError> {
+                self.seen_pos.store(ctx.current_pos(), Ordering::Relaxed);
+                let pfa = ctx
+                    .tensor(TensorKind::PrefillAttention)
+                    .expect("the planner supplies the prefill attention");
+                let cols = pfa.shape().cols;
+                self.seen_cols.store(cols, Ordering::Relaxed);
+                let mut row = vec![0.0f32; cols];
+                pfa.read_row(0, 0, &mut row);
+                let mut order: Vec<usize> = (0..cols).collect();
+                order.sort_by(|&a, &b| {
+                    row[b]
+                        .partial_cmp(&row[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                order.truncate(ctx.target_len().min(cols));
+                order.sort_unstable();
+                cache.keep(&order)
+            }
+        }
+
+        // A 5-position capture over a cache that has since grown to RESIDENT.
+        const PREFIX: usize = 5;
+        let n_heads_q = 1;
+        let mut pfa = vec![0.1f32; PREFIX];
+        pfa[1] = 0.9;
+        pfa[4] = 0.8;
+
+        let mut cache = make_cache(DType::F32);
+        let before_k = cache.k_buffer.as_slice::<f32>().to_vec();
+        let before_v = cache.v_buffer.as_slice::<f32>().to_vec();
+        let stage = PfaRanker {
+            seen_pos: AtomicUsize::new(0),
+            seen_cols: AtomicUsize::new(0),
+        };
+        let plan =
+            plan_prefill_keepset_layer(&stage, &mut cache, 0, 1, 2, &pfa, n_heads_q, 0, PREFIX)
+                .expect("planning must not fail")
+                .expect("the stage stages a keep");
+
+        assert_eq!(plan, PlannedKeep::LayerWide(vec![1, 4]));
+        assert_eq!(stage.seen_pos.load(Ordering::Relaxed), PREFIX);
+        assert_eq!(stage.seen_cols.load(Ordering::Relaxed), PREFIX);
+        assert_eq!(
+            cache.current_pos(),
+            RESIDENT,
+            "a dry run must not renumber the cache"
+        );
+        assert_eq!(cache.k_buffer.as_slice::<f32>(), &before_k[..]);
+        assert_eq!(cache.v_buffer.as_slice::<f32>(), &before_v[..]);
     }
 
     /// A stage that stages nothing has no keep to report — the caller must be able to tell
