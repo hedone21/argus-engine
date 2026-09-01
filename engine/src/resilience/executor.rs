@@ -93,10 +93,10 @@ impl CommandExecutor {
 
     /// Set the inference phase and operational state the heartbeat carries.
     ///
-    /// Today the only heartbeat emitter is the decode loop's command poll, so what a
-    /// Manager observes is `(Decode, Running)` throughout. Making prefill observable
-    /// needs an emitter off the decode loop: `Forward::prefill` is one call from the
-    /// driver's point of view, so there is no per-chunk seam here to hang it on.
+    /// Stamped from two places, each of which *is* the engine being in that phase:
+    /// `PrefillPhaseStage` on the driver's prefill boundaries, and the command poll on
+    /// every decode step. Nothing schedules a phase in advance, so the value a heartbeat
+    /// carries is always one the engine has actually reached.
     pub fn set_phase(&mut self, phase: Phase, state: EngineState) {
         self.phase = phase;
         self.engine_state = state;
@@ -110,6 +110,17 @@ impl CommandExecutor {
             self.send_heartbeat(kv_snap);
             self.last_heartbeat = Instant::now();
         }
+    }
+
+    /// Emit a heartbeat now, whatever the interval says, and restart the interval.
+    ///
+    /// For a change worth reporting on its own rather than on a clock: entering prefill,
+    /// and leaving it having grown the cache by an entire prompt. Restarting the interval
+    /// is what keeps a forced heartbeat from being chased by a due one a millisecond
+    /// later — the caller gets one report per event, not two.
+    pub fn send_heartbeat_now(&mut self, kv_snap: &KVSnapshot) {
+        self.send_heartbeat(kv_snap);
+        self.last_heartbeat = Instant::now();
     }
 
     /// Drain arrived manager commands and return them flattened, in arrival order.

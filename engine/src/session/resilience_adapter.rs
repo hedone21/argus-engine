@@ -16,6 +16,7 @@ use argus_shared::{CommandResult, EngineCommand, EngineMessage, EngineState, Pha
 use crate::format::KVCacheFormat;
 use crate::resilience::{CommandExecutor, KVSnapshot};
 use crate::session::command_dispatcher::CommandSource;
+use crate::session::forward::PrefillProgress;
 
 /// Narrow neutral seam for a KV format's live resident byte count.
 ///
@@ -123,14 +124,56 @@ impl ResilienceAdapter {
             None => KVSnapshot::default(),
         }
     }
+
+    /// Prefill has begun: stamp the phase and report it immediately.
+    ///
+    /// Forced rather than interval-gated because the transition is itself the news. A
+    /// Manager that knows the engine entered prefill can read the quiet that follows as
+    /// work rather than as a stall — which is the whole reason [`Phase`] is on the wire,
+    /// and something no amount of utilization tells it.
+    pub fn enter_prefill(&mut self) {
+        self.executor
+            .set_phase(Phase::Prefill, EngineState::Running);
+        let kv_snap = self.build_kv_snapshot();
+        self.executor.send_heartbeat_now(&kv_snap);
+    }
+
+    /// One prefill chunk landed. Interval-gated: a prompt short enough to finish inside
+    /// one heartbeat period should not turn into a burst, and the boundaries around this
+    /// are reported unconditionally anyway.
+    pub fn prefill_chunk(&mut self) {
+        let kv_snap = self.build_kv_snapshot();
+        self.executor.send_heartbeat_if_due(&kv_snap);
+    }
+
+    /// Prefill finished. Forced, for the same reason as [`Self::enter_prefill`] and one
+    /// more: the cache just grew by the entire prompt, the largest single change in a
+    /// run, and the next report would otherwise wait on a decode step.
+    ///
+    /// The phase deliberately stays `Prefill` — this heartbeat describes the instant
+    /// prefill ended, and the first decode poll stamps `Decode` a moment later.
+    pub fn leave_prefill(&mut self) {
+        let kv_snap = self.build_kv_snapshot();
+        self.executor.send_heartbeat_now(&kv_snap);
+    }
+}
+
+/// Lets a chunked forward report prefill progress into the adapter it shares with the
+/// decode loop. The lock is uncontended here: the driver takes it inside a stage dispatch
+/// or a poll, never across `Forward::prefill`.
+impl PrefillProgress for Mutex<ResilienceAdapter> {
+    fn on_prefill_chunk(&self) {
+        self.lock()
+            .expect("resilience mutex poisoned")
+            .prefill_chunk();
+    }
 }
 
 impl CommandSource for ResilienceAdapter {
     fn poll(&mut self) -> Result<Vec<EngineCommand>> {
         // Reaching this IS the engine being in decode: it is called once per decode step
         // and nowhere else, which is why the phase stamp lives here rather than in a
-        // separate hook. See `CommandExecutor::set_phase` on why prefill is not
-        // observable through the heartbeat yet.
+        // separate hook. Prefill stamps itself the same way, from `PrefillPhaseStage`.
         self.executor.set_phase(Phase::Decode, EngineState::Running);
         let kv_snap = self.build_kv_snapshot();
         self.executor.send_heartbeat_if_due(&kv_snap);

@@ -21,7 +21,30 @@ pub use model_forward::{ModelForward, alloc_standard_kv_caches};
 pub use offload_forward::{OffloadForward, alloc_offload_kv_caches};
 pub use quant_window_forward::{QuantWindowForward, alloc_quant_window_kv_caches};
 
+use std::sync::Arc;
+
 use crate::inference::sampling::StepCtx;
+
+/// Narrow neutral seam for reporting prefill progress out of a chunked forward.
+///
+/// A long prompt is written to the cache in chunks, and the driver cannot see those
+/// boundaries: [`Forward::prefill`] is a single call from where it stands, and the chunk
+/// size is derived from backend allocation limits the driver has no business knowing.
+/// Without a report from inside, prefill is a silent interval — which for a multi-second
+/// prompt is exactly the window where the KV cache grows fastest and the Manager's last
+/// observation is most stale.
+///
+/// Implemented by the resilience adapter and installed by `DecodeLoopBuilder::build` when
+/// resilience is wired. A forward that prefills in one batch has no interior boundary and
+/// simply never calls it; the driver's `PrefillStart`/`PrefillEnd` phases still bracket
+/// the whole of prefill either way.
+pub trait PrefillProgress: Send + Sync {
+    /// One prefill chunk has been written to the KV cache.
+    ///
+    /// Not called for the final chunk — `LifecyclePhase::PrefillEnd` fires immediately
+    /// after and reports the same state.
+    fn on_prefill_chunk(&self);
+}
 
 /// Required forward pass. Provides KV-bearing model semantics.
 ///
@@ -45,6 +68,13 @@ pub trait Forward {
 
     /// Notified after an eviction stage pruned KV state.
     fn on_kv_prune(&mut self, _new_pos: usize) {}
+
+    /// Install a sink for per-chunk prefill progress, or clear it with `None`.
+    ///
+    /// Default no-op: a forward that runs prefill as one batch has no interior boundary
+    /// to report. [`model_forward::ModelForward`] overrides it — it chunks whenever the
+    /// backend caps a single allocation, which is the path a long prompt takes on GPU.
+    fn set_prefill_progress(&mut self, _sink: Option<Arc<dyn PrefillProgress>>) {}
 
     /// Notified after a format stage re-encoded KV state (a per-layer dtype change at unchanged
     /// capacity/occupancy). Default no-op; `ModelForward` overrides it to invalidate the fused GPU

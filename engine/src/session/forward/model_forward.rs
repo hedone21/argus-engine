@@ -48,7 +48,7 @@ use crate::memory::galloc::Galloc;
 #[cfg(feature = "opencl")]
 use crate::model_config::ModelArch;
 use crate::models::transformer::{TransformerModel, TransformerModelForwardArgs};
-use crate::session::forward::Forward;
+use crate::session::forward::{Forward, PrefillProgress};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 
@@ -125,6 +125,12 @@ pub struct ModelForward {
     // every other assembly) → forward arg `None` → per-layer `is_some` gate skips it
     // (byte-identical).
     q_rows: Arc<Mutex<Option<QRowCapture>>>,
+
+    // Prefill-chunk progress sink, installed by `DecodeLoopBuilder::build` when resilience is
+    // wired. `prefill` calls it after every chunk but the last, so a Manager keeps observing a
+    // long prompt instead of losing the link to a multi-second silence. `None` (every path
+    // without a Manager) → one `is_some` check per chunk = 거동-0.
+    prefill_progress: Option<Arc<dyn PrefillProgress>>,
 
     decode_workspace: LayerWorkspace,
     // Phase 4-4.5: paradigm equivalence requires `prefill_workspace: None`
@@ -229,6 +235,7 @@ impl ModelForward {
             head_mask: None,
             duo_heads: None,
             q_rows: Arc::new(Mutex::new(None)),
+            prefill_progress: None,
             decode_workspace,
             prefill_workspace: None,
             max_seq_len,
@@ -542,6 +549,10 @@ fn invalidate_plan_for_reencode<T>(gpu_plan: &mut Option<T>, sticky_disabled: &m
 }
 
 impl Forward for ModelForward {
+    fn set_prefill_progress(&mut self, sink: Option<Arc<dyn PrefillProgress>>) {
+        self.prefill_progress = sink;
+    }
+
     fn prefill(&mut self, tokens: &[u32], start_pos: usize) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             anyhow::bail!("ModelForward::prefill received zero tokens");
@@ -657,6 +668,14 @@ impl Forward for ModelForward {
             }
 
             chunk_start = chunk_end;
+
+            // Report the boundary once the chunk's writes have landed, so the snapshot the
+            // sink reads is the cache including this chunk. Skipped on the final chunk: the
+            // driver dispatches `PrefillEnd` immediately after this loop and reports the same
+            // state, and a duplicate pair at the same instant tells a Manager nothing.
+            if !is_final_chunk && let Some(sink) = &self.prefill_progress {
+                sink.on_prefill_chunk();
+            }
         }
 
         // Only the last chunk's last-token logits are kept; intermediate

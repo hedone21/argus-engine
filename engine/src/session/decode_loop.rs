@@ -745,7 +745,7 @@ impl<F> DecodeLoopBuilder<F> {
 impl DecodeLoopBuilder<HasForward> {
     /// Assemble the decode loop. Optional components default to no-op impls
     /// from [`super::defaults`].
-    pub fn build(self) -> DecodeLoop {
+    pub fn build(mut self) -> DecodeLoop {
         let pipeline = self
             .pipeline
             .unwrap_or_else(|| Arc::new(PipelineRegistry::new()));
@@ -753,8 +753,20 @@ impl DecodeLoopBuilder<HasForward> {
         // submit. with_pipeline 호출 순서와 무관하게 build() 시점에 확정된 registry 로 등록한다.
         if let Some(adapter) = self.resilience_tick {
             pipeline.submit(Arc::new(crate::stages::system::tick::TickStage::new(
-                adapter,
+                Arc::clone(&adapter),
             )));
+            // Prefill observability, wired here rather than at each assembly because the
+            // shared adapter only exists from `with_resilience` onward and the forward is
+            // only reachable in this typestate. Two halves: the stage stamps the phase on
+            // the boundaries the driver dispatches, and the progress sink reports the chunk
+            // boundaries only the forward can see. A forward that does not chunk ignores the
+            // second and is still bracketed by the first.
+            pipeline.submit(Arc::new(
+                crate::stages::system::prefill_phase::PrefillPhaseStage::new(Arc::clone(&adapter)),
+            ));
+            self.forward.0.set_prefill_progress(Some(
+                Arc::clone(&adapter) as Arc<dyn super::forward::PrefillProgress>
+            ));
         }
         DecodeLoop {
             forward: self.forward.0,
@@ -806,6 +818,90 @@ mod tests {
             logits[target] = 1.0;
             Ok(logits)
         }
+    }
+
+    /// P1b: a decode loop wired with resilience reports prefill.
+    ///
+    /// Before this, `ResilienceAdapter::poll` was the only heartbeat emitter and it lives
+    /// inside the decode loop, so a Manager's first observation of any run was already
+    /// `Decode` and prefill was indistinguishable from a hang. Both halves of the fix are
+    /// pinned here: the phase the driver's boundaries stamp, and the progress sink the
+    /// builder hands to the forward.
+    #[test]
+    fn resilience_makes_prefill_observable() {
+        use crate::resilience::CommandExecutor;
+        use crate::session::forward::PrefillProgress;
+        use crate::session::resilience_adapter::ResilienceAdapter;
+        use argus_shared::{EngineMessage, EngineState, Phase};
+        use std::time::Duration;
+
+        /// Records whether the builder installed a chunk-progress sink, and lets `prefill`
+        /// fire it the way a chunked forward would.
+        struct SinkRecorder {
+            vocab: usize,
+            sink: Option<Arc<dyn PrefillProgress>>,
+        }
+        impl Forward for SinkRecorder {
+            fn set_prefill_progress(&mut self, sink: Option<Arc<dyn PrefillProgress>>) {
+                self.sink = sink;
+            }
+            fn prefill(&mut self, _t: &[u32], _s: usize) -> anyhow::Result<Vec<f32>> {
+                // Stand in for a non-final chunk boundary inside a chunked prefill.
+                if let Some(sink) = &self.sink {
+                    sink.on_prefill_chunk();
+                }
+                Ok(vec![0.0_f32; self.vocab])
+            }
+            fn step(&mut self, _c: &StepCtx, _t: u32) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0_f32; self.vocab])
+            }
+        }
+
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
+        // Interval 0: every due-gated emission fires, so the chunk heartbeat shows up too.
+        let executor = CommandExecutor::new(cmd_rx, status_tx, Duration::from_millis(0));
+
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(SinkRecorder {
+                vocab: 8,
+                sink: None,
+            })
+            .with_resilience(ResilienceAdapter::new(executor))
+            .build();
+
+        loop_.prefill(&[1, 2, 3]).unwrap();
+
+        let mut phases = Vec::new();
+        while let Ok(EngineMessage::Heartbeat(st)) = status_rx.try_recv() {
+            phases.push((st.phase, st.state));
+        }
+        assert_eq!(
+            phases,
+            vec![
+                // PrefillStart (forced)
+                (Phase::Prefill, EngineState::Running),
+                // the forward's chunk boundary — proof the sink reached the forward
+                (Phase::Prefill, EngineState::Running),
+                // PrefillEnd (forced)
+                (Phase::Prefill, EngineState::Running),
+            ],
+            "prefill is reported three times and never as Decode"
+        );
+
+        // And the first decode step is what flips it — the phase is stamped where the
+        // engine actually is, never scheduled ahead.
+        loop_.run(1, 0).unwrap();
+        let after: Vec<_> = std::iter::from_fn(|| status_rx.try_recv().ok())
+            .filter_map(|m| match m {
+                EngineMessage::Heartbeat(st) => Some(st.phase),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            after.contains(&Phase::Decode),
+            "the decode poll stamps Decode: {after:?}"
+        );
     }
 
     /// commit-3 wiring: `with_kv_reencode_invalidation()` makes the driver call
