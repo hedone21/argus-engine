@@ -141,6 +141,27 @@ impl QRowCapture {
         Ok(())
     }
 
+    /// The first position in the read window the ring does not actually hold, or `None` when it
+    /// holds them all.
+    ///
+    /// The ring is indexed by absolute position (`p % rows`) and `slot_pos` records what each slot
+    /// really holds, so this catches both "the capture was not armed for that token" and "the cache
+    /// was renumbered under the ring" — a compaction between the capture and the read leaves the
+    /// slots holding positions that no longer exist.
+    fn first_uncovered(&self, n_resident: usize) -> Option<usize> {
+        let r_eff = self.rows.min(n_resident);
+        let first_pos = n_resident.checked_sub(r_eff)?;
+        (0..r_eff)
+            .map(|j| first_pos + j)
+            .find(|&p| self.slot_pos[p % self.rows] != p)
+    }
+
+    /// Whether the ring holds the whole window [`Self::snapshot`] would read — the cheap predicate
+    /// a caller checks before deciding it has something to measure.
+    pub fn covers(&self, n_resident: usize) -> bool {
+        self.rows.min(n_resident) > 0 && self.first_uncovered(n_resident).is_none()
+    }
+
     /// Read the ring back in chronological order for the `min(rows, n_resident)` positions ending
     /// at `n_resident - 1`.
     ///
@@ -151,16 +172,13 @@ impl QRowCapture {
             bail!("q-rows: nothing resident to snapshot");
         }
         let first_pos = n_resident - r_eff;
-        for j in 0..r_eff {
-            let p = first_pos + j;
-            if self.slot_pos[p % self.rows] != p {
-                bail!(
-                    "q-rows: slot {} holds position {} but position {p} was asked for — the \
-                     capture was not armed when that token went past",
-                    p % self.rows,
-                    self.slot_pos[p % self.rows] as i64
-                );
-            }
+        if let Some(p) = self.first_uncovered(n_resident) {
+            bail!(
+                "q-rows: slot {} holds position {} but position {p} was asked for — the \
+                 capture was not armed when that token went past",
+                p % self.rows,
+                self.slot_pos[p % self.rows] as i64
+            );
         }
         let backend = self.ring.backend().clone();
         backend.synchronize()?;
@@ -335,6 +353,26 @@ mod tests {
         // Claiming ten tokens are resident when only four went past must not silently return
         // whatever happens to sit in the ring.
         assert!(c.snapshot(10).is_err());
+        // The same condition, asked cheaply and without an error to unwrap — what a caller checks
+        // when it has a choice about whether to read at all.
+        assert!(!c.covers(10));
+        assert!(c.covers(4));
+    }
+
+    /// `covers` is false once the cache is renumbered under the ring, which is what a compaction
+    /// between the capture and the read does: the ring is indexed by absolute position, so slots
+    /// that held positions 8..12 do not answer for positions 2..6.
+    #[test]
+    fn a_renumbered_cache_is_no_longer_covered_by_the_ring() {
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+        let mut c = cap(1, 4, 2);
+        let buf = mem.alloc(12 * 2 * 4, DType::F32).unwrap();
+        let t = Tensor::new(Shape::new(vec![1, 12, 2]), buf, backend.clone());
+        c.capture(0, &t, backend.as_ref(), 0, 12, 2).unwrap();
+        assert!(c.covers(12), "the positions it really saw");
+        // A compaction left six tokens resident, renumbered 0..6. The ring still holds 8..12.
+        assert!(!c.covers(6));
     }
 
     #[test]
