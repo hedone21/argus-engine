@@ -253,6 +253,9 @@ pub fn build_inference_ctx(args: Args) -> anyhow::Result<StandardHappyCtx> {
             // heartbeat available_actions 가 Capability 와 동일 조건으로 산출되도록
             // 설정된 eviction policy 를 전파한다 (미전파 시 "none" → kv.evict_* 탈락).
             adapter.set_eviction_policy(args.eviction_policy());
+            adapter.set_kv_bytes_per_token(crate::session::resilience_init::kv_bytes_per_token(
+                &model.config,
+            ));
             adapter
         })
     } else {
@@ -870,6 +873,9 @@ pub fn build_quant_window_bench_ctx(args: Args) -> anyhow::Result<QuantWindowBen
             let mut adapter = ResilienceAdapter::new(exec);
             // StandardHappyCtx 경로와 동일 — heartbeat available_actions 일관성.
             adapter.set_eviction_policy(args.eviction_policy());
+            adapter.set_kv_bytes_per_token(crate::session::resilience_init::kv_bytes_per_token(
+                &model.config,
+            ));
             adapter
         })
     } else {

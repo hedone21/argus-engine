@@ -139,3 +139,18 @@ pub fn build_command_executor(
     }
     Ok(Some(executor))
 }
+
+/// Bytes one token occupies in the KV cache across **all** decoder layers.
+///
+/// Single source for two consumers that must agree: `EngineCapability`
+/// (`bytes_per_kv_token × num_layers`, which the Manager multiplies itself) and the
+/// heartbeat's `kv_cache_bytes` via
+/// [`ResilienceAdapter::set_kv_bytes_per_token`](crate::session::resilience_adapter::ResilienceAdapter::set_kv_bytes_per_token).
+/// Geometry at F16 — the same assumption the capability report has always shipped.
+pub fn kv_bytes_per_token(cfg: &crate::model_config::ModelConfig) -> usize {
+    cfg.num_key_value_heads
+        * cfg.head_dim
+        * 2  // K + V
+        * 2  // F16 = 2 bytes
+        * cfg.num_hidden_layers
+}
