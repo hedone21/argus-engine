@@ -41,10 +41,18 @@ use crate::session::{DecodeLoop, DecodeLoopBuilder, GreedySampler, RepetitionPen
 /// the Phase-1 decision-equivalence gate, making the driver a faithful replacement for `EvictionStage`.
 fn eviction_policy_params(args: &Args) -> (String, StageParams, Vec<(String, String)>) {
     let policy_name = args.eviction_policy().to_string();
+    let (params, extra) = stage_params_for(args, &policy_name);
+    (policy_name, params, extra)
+}
+
+/// The same derivation for a technique named explicitly rather than by `eviction <policy>` — what
+/// `--aperturb-select` needs, since each of its candidates declares its own protected-prefix
+/// default and must be instantiated with that one, not with the configured policy's.
+fn stage_params_for(args: &Args, policy_name: &str) -> (StageParams, Vec<(String, String)>) {
     // Score-based stages declare a protected-prefix (4 sinks); score-free ones declare 0 → protect 4
     // sinks by default. No per-name branch.
     let actual_protected_prefix = args.protected_prefix().unwrap_or_else(|| {
-        match stage_default_protected_prefix(&policy_name) {
+        match stage_default_protected_prefix(policy_name) {
             0 => 4,
             cap => cap,
         }
@@ -63,7 +71,7 @@ fn eviction_policy_params(args: &Args) -> (String, StageParams, Vec<(String, Str
         sink_size: args.sink_size(),
         streaming_window,
     };
-    (policy_name, params, args.stage_args())
+    (params, args.stage_args())
 }
 
 /// A resolved v3 mutation-stage selection for the production driver: the stage instance plus the
@@ -94,6 +102,97 @@ pub fn resolve_mutation_driver(args: &Args) -> Option<MutationDriverSelection> {
         caps: reg.caps,
         phase: reg.phase,
     })
+}
+
+/// Resolve `--aperturb-select` into the engine's own compression chooser, or `None` when the flag
+/// is absent (every existing path).
+///
+/// Each name is resolved through the same registry `eviction <policy>` uses, and instantiated with
+/// the same [`StageParams`] — a candidate must be the technique it would have been had it been
+/// configured directly, or the choice is between things that do not exist. The output-projection
+/// basis is loaded from `--aperturb-basis` when given, and factored from the weights otherwise.
+pub fn resolve_aperturb_selector(
+    args: &Args,
+    model: &TransformerModel,
+    backend: &Arc<dyn Backend>,
+) -> Result<Option<Arc<crate::kv::aperturb_select::Selector>>> {
+    use crate::kv::aperturb_select::{Candidate, Selector};
+    if args.aperturb_select.is_empty() {
+        return Ok(None);
+    }
+    crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
+    let mut candidates = Vec::with_capacity(args.aperturb_select.len());
+    for name in &args.aperturb_select {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let reg = find_mutation_stage(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--aperturb-select names '{name}', which is not a registered mutation stage. \
+                 registered: {:?}",
+                argus_extension_api::registered_mutation_names()
+            )
+        })?;
+        anyhow::ensure!(
+            !reg.caps.whole_model,
+            "--aperturb-select: '{name}' is a whole-model stage; the planner drives one layer at a \
+             time, so its cross-layer read would see nothing and its keep-set would not be the one \
+             it really produces"
+        );
+        // A compression budget arrives mid-decode, so a candidate has to be a technique that acts
+        // there. A `PrefillEnd` stage (PyramidKV/SnapKV) decides once, off the prefill attention it
+        // is registered to read; asked at `KvMutate` it takes its own degraded fallback, and ranking
+        // that would rank something the technique never does.
+        anyhow::ensure!(
+            reg.phase == MutationPhase::KvMutate,
+            "--aperturb-select: '{name}' fires at {:?}, not KvMutate; a compression budget arrives \
+             mid-decode and this technique does not act there",
+            reg.phase
+        );
+        // The planner supplies the same reads a mid-decode mutation gets — importance, per-head
+        // scores, last-step attention, and host-resident K/V. Anything else would reach the
+        // candidate as `None` and send it down a fallback path.
+        if let Some(kind) = reg.caps.reads.iter().find(|k| {
+            matches!(
+                k,
+                argus_extension_api::TensorKind::PrefillAttention
+                    | argus_extension_api::TensorKind::Query
+                    | argus_extension_api::TensorKind::QueryStats
+            )
+        }) {
+            anyhow::bail!(
+                "--aperturb-select: '{name}' reads {kind:?}, which the mid-decode planner cannot \
+                 supply; it would answer from its fallback path instead of from itself"
+            );
+        }
+        // Each candidate gets the params it would have been configured with, including its own
+        // declared protected-prefix default.
+        let (params, extra_owned) = stage_params_for(args, name);
+        let extra: Vec<argus_extension_api::PluginArg> = extra_owned
+            .iter()
+            .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
+            .collect();
+        candidates.push(Candidate::new(name, (reg.make)(params, &extra), reg.caps));
+    }
+
+    let (basis, residual_max) = crate::session::aperturb_basis::load_or_factor(
+        model,
+        backend,
+        args.aperturb_basis.as_deref(),
+        args.aperturb_basis_out.as_deref(),
+    )?;
+    eprintln!(
+        "[aperturb-select] basis rank {} over {} layers (worst residual {:.1e})",
+        basis.rank(),
+        basis.n_layers(),
+        residual_max,
+    );
+    Ok(Some(Arc::new(Selector::new(
+        candidates,
+        Arc::new(basis),
+        model.config.num_attention_heads,
+    )?)))
 }
 
 /// CLI `eviction <policy>` + `--swap-dir` 로 resilience-driven force eviction /
@@ -230,6 +329,11 @@ pub fn build_bench_loop(
     // Faithful-H2O `(c)`: when true (eviction == "h2o"), arm a full-prompt-window PFA producer + the
     // prefill seed so the score accumulator reflects prefill attention, not just decode.
     faithful_h2o: bool,
+    // The engine's own compression choice (`--aperturb-select`): a resolved candidate pool the
+    // dispatcher hands each `KvCompress` budget to. `Some` arms the trailing query-row capture the
+    // metric scores on and routes compressions through the selector instead of the CLI-configured
+    // policy; `None` leaves the forward byte-identical and the method-drop path untouched.
+    aperturb_selector: Option<Arc<crate::kv::aperturb_select::Selector>>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // Captured before `model` is moved into `mf` — the PFA handle row count for the prefill keep-set.
@@ -249,6 +353,11 @@ pub fn build_bench_loop(
     );
     // AB-6: swap_backend resolve 용 — mf 가 `backend` 를 move 하므로 그 전에 Arc clone 보유.
     let backend_arc = Arc::clone(&backend);
+    // The query-row ring is allocated from the same memory as the workspaces, so it is
+    // device-resident wherever they are; `mf` moves both, so hold them first.
+    let memory_arc = Arc::clone(&memory);
+    let head_dim = model.config.head_dim;
+    let n_layers_for_q = model.config.num_hidden_layers;
     // §5.9.2 Track B: ModelForward 와 WeightSwapStage(dispatcher 경유)가 공유할 hook cell 1개.
     // 양측에 Arc clone 으로 넘긴다. 초기값 None — IntraForward/LayerImmediate commit 이 Some 설치.
     let hook_cell: Arc<Mutex<Option<Arc<dyn crate::layer_boundary_hook::LayerBoundaryHook>>>> =
@@ -294,6 +403,24 @@ pub fn build_bench_loop(
              (SnapKV per-head keep-set staged at PrefillEnd)",
             arming.stage_name, arming.q_window
         );
+    }
+
+    // The engine's own compression choice: arm the trailing query-row capture. It is the one thing
+    // the metric cannot recompute — the rows are what the forward already produced, and reusing
+    // them is why a decision costs no forward pass. Unarmed (the default) both forks lend `None`
+    // and the forward is byte-identical.
+    let q_rows_cell: Arc<Mutex<Option<crate::inference::q_rows::QRowCapture>>> =
+        Arc::new(Mutex::new(None));
+    if aperturb_selector.is_some() {
+        let cap = crate::inference::q_rows::QRowCapture::new(
+            Arc::clone(&backend_arc),
+            memory_arc.as_ref(),
+            n_layers_for_q,
+            crate::session::aperturb_basis::APERTURB_ROWS,
+            n_heads_q * head_dim,
+        )?;
+        *q_rows_cell.lock().expect("q-rows cell poisoned") = Some(cap);
+        mf.set_q_rows(Arc::clone(&q_rows_cell));
     }
 
     // β-3: pos-환류용 layer-0 fmt handle (§5.2.1 (가)). coercion: Arc<StandardFormat> →
@@ -378,8 +505,28 @@ pub fn build_bench_loop(
         // backend Arc(= 동일 OpenCL = 동일 GPU score buffer)를 넘긴다. `gpu_score_active` 면 run_eviction
         // 이 score 읽기 직전 GPU→CPU sync. backend_arc 는 mf 가 move 한 backend 의 clone(build 진입부
         // 보유). non-opencl 이면 sync 가 no-op.
-        Some(dispatcher.with_backend(Some(Arc::clone(&backend_arc))))
+        let dispatcher = dispatcher.with_backend(Some(Arc::clone(&backend_arc)));
+        // A configured pool makes the engine choose; without one the dispatcher keeps method-drop.
+        Some(match aperturb_selector.as_ref() {
+            Some(sel) => {
+                eprintln!(
+                    "[aperturb-select] active — candidate pool [{}], {} query rows per decision",
+                    sel.names().join(", "),
+                    crate::session::aperturb_basis::APERTURB_ROWS,
+                );
+                dispatcher.with_aperturb_selector(Arc::clone(sel), Arc::clone(&q_rows_cell))
+            }
+            None => dispatcher,
+        })
     } else {
+        if aperturb_selector.is_some() {
+            // Nothing polls commands, so no `KvCompress` can arrive and the pool would never be
+            // asked. Say so: a silent selector reads exactly like one that was asked and declined.
+            eprintln!(
+                "[aperturb-select] inert — no command source is configured (resilience off and no \
+                 schedule), so no compression budget can reach the engine"
+            );
+        }
         None
     };
 

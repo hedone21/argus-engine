@@ -20,7 +20,7 @@ use crate::inference::signal_runtime::SignalRuntime;
 use crate::session::DecodeLoop;
 use crate::session::assembly::{
     build_bench_loop, build_bench_quant_window_loop, build_local_pressure_source,
-    build_resilience_cache_manager,
+    build_resilience_cache_manager, resolve_aperturb_selector,
 };
 use crate::session::bin_setup::QuantWindowBenchCtx;
 use crate::session::cli::Args;
@@ -136,11 +136,15 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
 
     // §5.9.1 Track A: score-based policy(h2o/h2o_plus/d2o)면 AttentionScoreAccumulator 생성.
     // 비-score 정책은 더미 None 셀을 넘긴다.
+    //
+    // A candidate in the `--aperturb-select` pool counts the same as the configured policy: it is
+    // asked what it would retain, and a score-based technique asked with no accumulator answers
+    // with its score-free degradation (recency) rather than with itself. Ranking that would be
+    // ranking a technique that was never a candidate.
     let score_cell = {
         use crate::inference::attention_scores::AttentionScoreAccumulator;
         use std::sync::{Arc, Mutex};
-        let policy = args.eviction_policy();
-        if crate::kv::eviction::stage_registry::stage_is_score_based(policy) {
+        if wants_scores(&args) {
             // EXPLICIT-REQUIRED: faithful h2o needs `--set hh_size/recent_size` (clean reject, no
             // default budget). No-op for any non-h2o policy.
             args.require_h2o_budgets()?;
@@ -159,7 +163,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
             acc.set_active(true);
             // Faithful-H2O (a): force time_normalize OFF for h2o so the large prefill column-sum base
             // is not divided by the decode-only step count. Non-h2o policies keep their behavior.
-            let faithful = args.eviction_policy() == "h2o";
+            let faithful = faithful_h2o(&args);
             acc.set_time_normalize(!faithful && !args.h2o_raw_scores());
             // Faithful-H2O (b): per-layer FLAT importance (no cross-layer MAX) so each layer evicts
             // on its own heavy hitters. Opt-in (h2o only) → off elsewhere = byte-identical.
@@ -210,6 +214,10 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         .map(|c| (c.k_buffer.size() + c.v_buffer.size()) as f64 / c.capacity() as f64)
         .sum();
 
+    // `--aperturb-select`: resolved before `model` is moved into the loop — the basis is factored
+    // from (or digest-checked against) this model's own output projections.
+    let aperturb_selector = resolve_aperturb_selector(&args, &model, &backend)?;
+
     // bin_setup이 dispatch한 kv_caches를 소비(과거엔 drop 후 typed 재할당).
     let decode_loop = build_bench_loop(
         backend.clone(),
@@ -228,8 +236,8 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         args.protected_prefix(),
         None, // γ-3b: argus-bench 는 schedule 없음 (IPC resilience 만)
         score_cell,
-        // Faithful-H2O (c): arm the prefill seed when eviction == "h2o".
-        args.eviction_policy() == "h2o",
+        faithful_h2o(&args),
+        aperturb_selector,
     )?;
 
     run_decode_loop_experiment(
@@ -242,6 +250,27 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         vocab_size,
         per_token_kv_bytes,
     )
+}
+
+/// Whether this run must accumulate attention scores: the configured `eviction <policy>` reads
+/// them, or a `--aperturb-select` candidate does.
+///
+/// Caps-driven, so neither half names a plugin — a technique declares its own `reads` and this asks.
+fn wants_scores(args: &Args) -> bool {
+    use crate::kv::eviction::stage_registry::stage_is_score_based;
+    stage_is_score_based(args.eviction_policy())
+        || args
+            .aperturb_select
+            .iter()
+            .any(|n| stage_is_score_based(n.trim()))
+}
+
+/// Faithful-H2O `(a)`/`(b)`/`(c)`: whether h2o is what this run will apply — as the configured
+/// policy, or as a candidate the engine may choose. The three faithfulness knobs (time-normalize
+/// off, per-layer FLAT importance, the prefill seed) are h2o's own; a candidate scored without them
+/// is not the technique the paper names.
+fn faithful_h2o(args: &Args) -> bool {
+    args.eviction_policy() == "h2o" || args.aperturb_select.iter().any(|n| n.trim() == "h2o")
 }
 
 /// AB-2 §5.7.7: prefill→sample→run→summary 공통부 (`run_experiment_path` / `run_quant_window_experiment_path`
@@ -470,12 +499,12 @@ pub fn run_experiment_schedule_path(
         .as_ref()
         .map(|_| build_local_pressure_source(&args, &backend));
 
-    // §5.9.1 Track A: schedule 모드도 score-based policy 시 accumulator 생성.
+    // §5.9.1 Track A: schedule 모드도 score-based policy 시 accumulator 생성 (+ a score-reading
+    // `--aperturb-select` candidate — the same reason as the IPC path above).
     let score_cell = {
         use crate::inference::attention_scores::AttentionScoreAccumulator;
         use std::sync::{Arc, Mutex};
-        let policy = args.eviction_policy();
-        if crate::kv::eviction::stage_registry::stage_is_score_based(policy) {
+        if wants_scores(&args) {
             // EXPLICIT-REQUIRED: faithful h2o needs `--set hh_size/recent_size` (clean reject, no
             // default budget). No-op for any non-h2o policy.
             args.require_h2o_budgets()?;
@@ -494,7 +523,7 @@ pub fn run_experiment_schedule_path(
             acc.set_active(true);
             // Faithful-H2O (a): force time_normalize OFF for h2o so the large prefill column-sum base
             // is not divided by the decode-only step count. Non-h2o policies keep their behavior.
-            let faithful = args.eviction_policy() == "h2o";
+            let faithful = faithful_h2o(&args);
             acc.set_time_normalize(!faithful && !args.h2o_raw_scores());
             // Faithful-H2O (b): per-layer FLAT importance (no cross-layer MAX) so each layer evicts
             // on its own heavy hitters. Opt-in (h2o only) → off elsewhere = byte-identical.
@@ -534,6 +563,8 @@ pub fn run_experiment_schedule_path(
         }
     };
 
+    let aperturb_selector = resolve_aperturb_selector(&args, &model, &backend)?;
+
     let mut decode_loop = build_bench_loop(
         backend.clone(),
         memory.clone(),
@@ -551,8 +582,8 @@ pub fn run_experiment_schedule_path(
         args.protected_prefix(),
         Some(schedule_source),
         score_cell,
-        // Faithful-H2O (c): arm the prefill seed when eviction == "h2o".
-        args.eviction_policy() == "h2o",
+        faithful_h2o(&args),
+        aperturb_selector,
     )?;
 
     let t_prefill = std::time::Instant::now();
