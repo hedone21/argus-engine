@@ -27,3 +27,19 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 opt-level = 3
+
+# TEMPORARY — must be removed before this branch merges.
+#
+# The `argus-shared` dependency is pinned to that repo's `main`, which still carries the
+# v1 contract; this branch speaks v2. Until argus-shared#2 lands on its main there is no
+# published revision to build against, so development resolves the dependency through a
+# sibling checkout instead.
+#
+# The path is relative and CI checks out this repo alone, so every job fails at manifest
+# resolution while this stanza is present. That is expected: the branch is a draft and is
+# blocked on argus-shared#2 regardless.
+#
+# To land: merge argus-shared#2, delete this stanza, `cargo update -p argus-shared` to
+# repin the lock at the merged revision, and take the PR out of draft.
+[patch."https://github.com/hedone21/argus-shared.git"]
+argus-shared = { path = "../argus-shared" }
