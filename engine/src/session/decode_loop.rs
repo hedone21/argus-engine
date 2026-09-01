@@ -209,6 +209,24 @@ impl DecodeLoop {
         self.kv_occupancy = occupancy;
     }
 
+    /// Hand this step's per-command outcomes back to the `CommandSource` that produced
+    /// them, so it can answer the directives they came from.
+    ///
+    /// `n_cmds` is what `poll` returned: with no dispatcher there is nothing that could
+    /// have applied them, which is a `Rejected` rather than silence.
+    fn report_command_results(&mut self, n_cmds: usize) {
+        let results = match self.dispatcher.as_mut() {
+            Some(d) => d.finalize_results(),
+            None => vec![
+                argus_shared::CommandResult::Rejected {
+                    reason: "engine has no command dispatcher".to_string(),
+                };
+                n_cmds
+            ],
+        };
+        self.cmd_source.report_results(results);
+    }
+
     /// v2 StopReason(pipeline.rs 4-variant) → v1 StopReason(traits.rs) 수렴 매핑
     /// (v2 §5.2.1 (다)). StopFlag 는 v2 에 없음 — driver 루프 가드 v1 유지.
     fn map_stage_stop(r: StageStopReason) -> StopReason {
@@ -321,31 +339,21 @@ impl DecodeLoop {
             // 분배 대상 0 = 거동-0. throttle_delay/target_tbt 의 sticky 는 LoopControl 이 보존.
             let cmds = self.cmd_source.poll()?;
             let n_cmds = cmds.len();
-            let (suspended, throttle_delay_ms, target_tbt_ms, results) =
+            let (suspended, throttle_delay_ms, target_tbt_ms) =
                 if let Some(d) = self.dispatcher.as_mut() {
                     let control = d.dispatch(cmds);
-                    let (s, t, tbt) = (
+                    (
                         control.suspended,
                         control.throttle_delay_ms,
                         control.target_tbt_ms,
-                    );
-                    (s, t, tbt, d.take_results())
+                    )
                 } else {
-                    // dispatcher 미구성(happy/chat): 분배할 곳이 없다. 이 경로의 cmd_source 는 NoOp 라
-                    // n_cmds 는 0 이지만, 명령이 온다면 적용되지 않았다는 것이 사실이므로 그대로 답한다.
-                    let rejected = vec![
-                        argus_shared::CommandResult::Rejected {
-                            reason: "engine has no command dispatcher".to_string(),
-                        };
-                        n_cmds
-                    ];
-                    (false, 0, 0, rejected)
+                    (false, 0, 0)
                 };
-            // 매 step 호출한다 — 명령이 0건이어도 command 가 비어 있는 directive 한 건이
-            // 응답을 못 받고 남는 것을 막는다 (directive 1건 = Response 1건).
-            self.cmd_source.report_results(results);
             if suspended {
-                // G6: suspend = loop break 보존 (pause/park 전환 금지).
+                // G6: suspend = loop break 보존 (pause/park 전환 금지). KvMutate 까지 못 가므로
+                // 여기서 응답한다 — submit-time 판정 그대로다(제출된 압축이 있었다면 미적용).
+                self.report_command_results(n_cmds);
                 stopped_by = StopReason::CommandRequested;
                 break;
             }
@@ -361,7 +369,13 @@ impl DecodeLoop {
             // (a.6) AB-3 완료: KvOffload/recall 은 OffloadStage(OneShot, KvMutate phase) 로 이전됨.
             // forward 직전). v2 EvictionStage(command-driven OneShot) 가 여기서 발화한다 — UER 로
             // cache 를 prune 한 뒤 pos-환류로 loop pos 동기화 (§5.2.1 (가)).
-            if let Some(r) = self.dispatch_phase(LifecyclePhase::KvMutate) {
+            let kv_mutate_stop = self.dispatch_phase(LifecyclePhase::KvMutate);
+            // 응답은 KvMutate **뒤**다. dispatch 는 압축을 OneShot stage 로 submit 만 하고, 실제
+            // prune 은 방금 돈 이 phase 에서 일어난다 — 그 전에 답하면 아직 아무 일도 안 일어난
+            // 캐시에 대해 `Ok` 를 보고하게 된다. 명령이 0건이어도 호출한다(directive 1건 =
+            // Response 1건 — command 가 빈 directive 도 답을 받아야 한다).
+            self.report_command_results(n_cmds);
+            if let Some(r) = kv_mutate_stop {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }

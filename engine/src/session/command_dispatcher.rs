@@ -192,9 +192,27 @@ pub struct CommandDispatcher {
     /// `with_backend` 로 OpenCL backend 를 주입한다. `None` 이면 기존 CPU accumulate 경로 무변.
     backend: Option<Arc<dyn crate::backend::Backend>>,
     /// Per-command outcomes of the last [`Self::dispatch`], in the order the commands
-    /// arrived. Drained by [`Self::take_results`] so the driver can hand them back to
+    /// arrived. Drained by [`Self::finalize_results`] so the driver can hand them back to
     /// the `CommandSource` that produced the commands.
     last_results: Vec<CommandResult>,
+    /// Where in `last_results` a KV-compression sits, and how full the cache was when it
+    /// was submitted, so [`Self::finalize_results`] can say what the stage achieved
+    /// instead of what it was asked for. `None` when no compression was submitted this
+    /// step. See [`Self::finalize_results`] for why submit-time is too early to answer.
+    pending_compress: Option<PendingCompress>,
+    /// Index the command currently being applied will occupy in `last_results`. Scratch
+    /// for `apply`, which does not otherwise know where its answer lands.
+    result_idx: usize,
+}
+
+/// A KV compression submitted this step, awaiting its post-apply reading.
+struct PendingCompress {
+    /// Index into `CommandDispatcher::last_results`.
+    result_idx: usize,
+    /// Retained fraction the directive asked for.
+    target_ratio: f32,
+    /// Resident tokens at submit time — the denominator of what was achieved.
+    tokens_before: usize,
 }
 
 impl CommandDispatcher {
@@ -231,6 +249,8 @@ impl CommandDispatcher {
             offload_armed: false,
             backend: None,
             last_results: Vec::new(),
+            pending_compress: None,
+            result_idx: 0,
         }
     }
 
@@ -256,8 +276,49 @@ impl CommandDispatcher {
 
     /// Take the per-command outcomes of the last [`Self::dispatch`], leaving the
     /// dispatcher empty. Same length and order as that call's `cmds`.
-    pub fn take_results(&mut self) -> Vec<CommandResult> {
+    ///
+    /// Call this AFTER the `KvMutate` dispatch. `dispatch` only *submits* a compression
+    /// as a one-shot stage; the stage runs later in the same step, and it can decline —
+    /// `run_policy_eviction` no-ops below `MIN_EVICT_TOKENS` rather than shave off a
+    /// handful of tokens. Answering at submit time therefore reported `Ok` for a cache
+    /// nothing had touched. Here the resident token count is read back and compared with
+    /// what the directive asked for, so a compression that did not happen, or landed
+    /// short, answers `Partial` with the fraction it actually reached.
+    pub fn finalize_results(&mut self) -> Vec<CommandResult> {
+        if let Some(p) = self.pending_compress.take() {
+            if let Some(r) = self.compress_outcome(&p) {
+                self.last_results[p.result_idx] = r;
+            }
+        }
         std::mem::take(&mut self.last_results)
+    }
+
+    /// Read back what a submitted compression achieved, or `None` to keep the submit-time
+    /// answer (no handle to measure with, or an empty cache to begin with).
+    fn compress_outcome(&self, p: &PendingCompress) -> Option<CommandResult> {
+        use crate::format::KVCacheFormat;
+        let after = self.kv_handles.first()?.current_pos();
+        if p.tokens_before == 0 {
+            return None;
+        }
+        let achieved = after as f32 / p.tokens_before as f32;
+        // One token of slack: a target that lands on a fraction cannot be hit exactly, and
+        // `target_len` is `(pos * ratio) as usize` floored then `.max(1)`.
+        let slack = 1.0 / p.tokens_before as f32;
+        if achieved <= p.target_ratio + slack {
+            return Some(CommandResult::Ok);
+        }
+        Some(CommandResult::Partial {
+            achieved,
+            reason: if after == p.tokens_before {
+                format!(
+                    "eviction declined: fewer than {} tokens would have been removed",
+                    crate::kv::MIN_EVICT_TOKENS
+                )
+            } else {
+                "eviction stopped short of the requested budget".to_string()
+            },
+        })
     }
 
     /// 도착한 command 들을 분배하고 갱신된 [`LoopControl`] 을 반환한다.
@@ -276,7 +337,9 @@ impl CommandDispatcher {
         self.control.prepare_device = None;
 
         self.last_results = Vec::with_capacity(cmds.len());
+        self.pending_compress = None;
         for cmd in &cmds {
+            self.result_idx = self.last_results.len();
             let r = self.apply(cmd);
             self.last_results.push(r);
         }
@@ -443,6 +506,14 @@ impl CommandDispatcher {
             };
         }
         self.last_evict_ratio = Some(target_ratio);
+        {
+            use crate::format::KVCacheFormat;
+            self.pending_compress = Some(PendingCompress {
+                result_idx: self.result_idx,
+                target_ratio,
+                tokens_before: self.kv_handles.first().map_or(0, |h| h.current_pos()),
+            });
+        }
         let stage = EvictionStage::one_shot_scored(
             self.kv_handles.clone(),
             Arc::clone(cm),
@@ -1175,11 +1246,19 @@ mod tests {
 
     fn results_of(d: &mut CommandDispatcher, cmds: Vec<EngineCommand>) -> Vec<CommandResult> {
         d.dispatch(cmds);
-        d.take_results()
+        d.finalize_results()
     }
 
     fn is_rejected(r: &CommandResult) -> bool {
         matches!(r, CommandResult::Rejected { .. })
+    }
+
+    /// These tests exercise the dispatcher alone — nothing runs the `KvMutate` phase, so a
+    /// submitted compression legitimately finalizes as `Partial` ("the cache did not
+    /// move"). What they assert about a compression is therefore that it was ACCEPTED,
+    /// not that it completed; `unapplied_compression_reports_partial` covers the other half.
+    fn is_accepted(r: &CommandResult) -> bool {
+        !is_rejected(r)
     }
 
     /// evict 는 CacheManager 가 구성돼 있으면 Ok, 없으면 Rejected.
@@ -1187,13 +1266,13 @@ mod tests {
     fn evict_result_tracks_cache_manager_configuration() {
         let (mut d, _r, _h) = make_dispatcher(); // CM 구성됨
         let ok = results_of(&mut d, vec![EngineCommand::KvEvictH2o { keep_ratio: 0.5 }]);
-        assert!(matches!(ok[..], [CommandResult::Ok]), "구성됨 → Ok: {ok:?}");
+        assert!(is_accepted(&ok[0]), "구성됨 → 수락: {ok:?}");
 
         // 같은 active 구간 재요청: 이미 요청 예산에 도달했으므로 실패가 아니다.
         let again = results_of(&mut d, vec![EngineCommand::KvEvictH2o { keep_ratio: 0.5 }]);
         assert!(
             matches!(again[..], [CommandResult::Ok]),
-            "재무장 게이트는 실패가 아니다: {again:?}"
+            "같은 budget 재요청은 submit 없이 Ok — 측정할 압축이 없다: {again:?}"
         );
 
         let registry = Arc::new(PipelineRegistry::new());
@@ -1281,7 +1360,7 @@ mod tests {
                 &mut d,
                 vec![EngineCommand::KvEvictH2o { keep_ratio: ratio }],
             );
-            assert!(matches!(r[..], [CommandResult::Ok]), "{ratio}: {r:?}");
+            assert!(is_accepted(&r[0]), "{ratio}: {r:?}");
             assert_eq!(
                 registry.len(),
                 i + 1,
@@ -1294,12 +1373,39 @@ mod tests {
         assert_eq!(registry.len(), 3, "같은 budget 반복 — 재submit 없음");
     }
 
-    /// `take_results` 는 비운다 — 다음 dispatch 가 이전 결과를 물려받지 않는다.
+    /// 압축을 제출했는데 stage 가 캐시를 건드리지 않았으면 `Ok` 가 아니라 `Partial` 이다.
+    /// 이 유닛 테스트는 `KvMutate` 를 돌리지 않으므로, `MIN_EVICT_TOKENS` 로 거절당한
+    /// 실전 케이스와 관측 결과가 같다 — 매니저가 「적용됐다」로 오독하면 안 되는 상황.
     #[test]
-    fn take_results_drains() {
+    fn unapplied_compression_reports_partial() {
+        use crate::format::KVCacheFormat;
+        let (mut d, registry, handle) = make_dispatcher();
+        let before = handle.current_pos();
+        let r = results_of(&mut d, vec![EngineCommand::KvEvictH2o { keep_ratio: 0.5 }]);
+        assert_eq!(registry.len(), 1, "stage 는 submit 됐다");
+        match &r[0] {
+            CommandResult::Partial { achieved, reason } => {
+                assert!(
+                    (*achieved - 1.0).abs() < 1e-6,
+                    "캐시가 안 줄었으니 achieved==1.0: {achieved}"
+                );
+                assert!(reason.contains("declined"), "이유가 실려야 한다: {reason}");
+            }
+            other => panic!("미적용 압축은 Partial 이어야 한다, got {other:?}"),
+        }
+        assert_eq!(
+            before,
+            handle.current_pos(),
+            "이 테스트는 stage 를 돌리지 않는다"
+        );
+    }
+
+    /// `finalize_results` 는 비운다 — 다음 dispatch 가 이전 결과를 물려받지 않는다.
+    #[test]
+    fn finalize_results_drains() {
         let (mut d, _r, _h) = make_dispatcher();
         d.dispatch(vec![EngineCommand::Throttle { delay_ms: 1 }]);
-        assert_eq!(d.take_results().len(), 1);
-        assert!(d.take_results().is_empty(), "두 번째 take 는 비어 있다");
+        assert_eq!(d.finalize_results().len(), 1);
+        assert!(d.finalize_results().is_empty(), "두 번째 호출은 비어 있다");
     }
 }
