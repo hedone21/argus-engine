@@ -320,17 +320,30 @@ impl DecodeLoop {
             // seam 으로 분배한다. dispatcher=None(happy/chat) 이면 cmd_source 도 NoOp → 빈 Vec →
             // 분배 대상 0 = 거동-0. throttle_delay/target_tbt 의 sticky 는 LoopControl 이 보존.
             let cmds = self.cmd_source.poll()?;
-            let (suspended, throttle_delay_ms, target_tbt_ms): (bool, u64, u64) =
+            let n_cmds = cmds.len();
+            let (suspended, throttle_delay_ms, target_tbt_ms, results) =
                 if let Some(d) = self.dispatcher.as_mut() {
                     let control = d.dispatch(cmds);
-                    (
+                    let (s, t, tbt) = (
                         control.suspended,
                         control.throttle_delay_ms,
                         control.target_tbt_ms,
-                    )
+                    );
+                    (s, t, tbt, d.take_results())
                 } else {
-                    (false, 0, 0)
+                    // dispatcher 미구성(happy/chat): 분배할 곳이 없다. 이 경로의 cmd_source 는 NoOp 라
+                    // n_cmds 는 0 이지만, 명령이 온다면 적용되지 않았다는 것이 사실이므로 그대로 답한다.
+                    let rejected = vec![
+                        argus_shared::CommandResult::Rejected {
+                            reason: "engine has no command dispatcher".to_string(),
+                        };
+                        n_cmds
+                    ];
+                    (false, 0, 0, rejected)
                 };
+            // 매 step 호출한다 — 명령이 0건이어도 command 가 비어 있는 directive 한 건이
+            // 응답을 못 받고 남는 것을 막는다 (directive 1건 = Response 1건).
+            self.cmd_source.report_results(results);
             if suspended {
                 // G6: suspend = loop break 보존 (pause/park 전환 금지).
                 stopped_by = StopReason::CommandRequested;

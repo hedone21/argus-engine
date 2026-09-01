@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -74,6 +75,13 @@ pub struct CommandExecutor {
     // secondary GGUF/AUF 파일 존재 여부. true이면 swap_weights 액션이
     // available_actions에 포함된다 (ENG-ST-032).
     has_secondary: bool,
+
+    // Directives drained but not yet answered, as `(seq_id, command_count)` in
+    // arrival order. `drain_commands` pushes; `report_results` pops and emits one
+    // `Response` per entry. The queue exists because the result of a command is
+    // only known *after* `CommandDispatcher` has applied it, which happens in the
+    // decode loop — one call site later than the drain.
+    pending_responses: VecDeque<(u64, usize)>,
 }
 
 impl CommandExecutor {
@@ -119,6 +127,7 @@ impl CommandExecutor {
             gpu_meter,
             last_heartbeat_at: now,
             has_secondary: false,
+            pending_responses: VecDeque::new(),
         }
     }
 
@@ -187,31 +196,55 @@ impl CommandExecutor {
         }
     }
 
-    /// Drain arrived manager commands and return them (pure production).
+    /// Drain arrived manager commands and return them flattened, in arrival order.
     ///
-    /// Flattens each directive's commands in order and, for every command,
-    /// immediately sends a `CommandResult::Ok` response (the executor never
-    /// rejects). Command application (eviction etc.) is the `CommandDispatcher`'s
-    /// job; heartbeat emission is separate ([`Self::send_heartbeat_if_due`]).
+    /// **The response is not sent here.** Whether a command was applied is only
+    /// known after `CommandDispatcher` has run, one call site later, so each
+    /// directive is recorded in `pending_responses` and answered by
+    /// [`Self::report_results`]. Emitting `Ok` here — as this did until the
+    /// `Rejected` semantics landed — reported success for commands the dispatcher
+    /// silently ignored (an unconfigured cache manager, a removed subsystem),
+    /// which is exactly the signal the Manager needs to learn the engine's action
+    /// set. Heartbeat emission is separate ([`Self::send_heartbeat_if_due`]).
     pub fn drain_commands(&mut self) -> Vec<EngineCommand> {
         let mut commands = Vec::new();
         while let Ok(msg) = self.cmd_rx.try_recv() {
             match msg {
                 ManagerMessage::Directive(d) => {
                     let seq_id = d.seq_id;
-                    let mut results = Vec::with_capacity(d.commands.len());
                     for cmd in &d.commands {
                         eprintln!("[Resilience] Directive seq={}: {:?}", seq_id, cmd);
-                        results.push(CommandResult::Ok);
                     }
-                    let _ = self
-                        .resp_tx
-                        .send(EngineMessage::Response(CommandResponse { seq_id, results }));
+                    self.pending_responses.push_back((seq_id, d.commands.len()));
                     commands.extend(d.commands);
                 }
             }
         }
         commands
+    }
+
+    /// Answer every directive drained since the last call, splitting `results`
+    /// back across the directives it came from.
+    ///
+    /// `results` must be the per-command outcomes of the commands the matching
+    /// [`Self::drain_commands`] returned, in the same order. The queue is always
+    /// emptied: a caller that supplies too few results has, by definition, not
+    /// applied the remainder, so those commands are answered `Rejected` rather
+    /// than left unanswered — the contract is one `Response` per `Directive`.
+    pub fn report_results(&mut self, results: Vec<CommandResult>) {
+        let mut it = results.into_iter();
+        while let Some((seq_id, n)) = self.pending_responses.pop_front() {
+            let mut batch = Vec::with_capacity(n);
+            for _ in 0..n {
+                batch.push(it.next().unwrap_or_else(|| CommandResult::Rejected {
+                    reason: "engine did not apply the directive".to_string(),
+                }));
+            }
+            let _ = self.resp_tx.send(EngineMessage::Response(CommandResponse {
+                seq_id,
+                results: batch,
+            }));
+        }
     }
 
     fn send_heartbeat(&mut self, kv_snap: &KVSnapshot) {
@@ -318,5 +351,23 @@ impl CommandExecutor {
     /// Update tensor partition ratio for heartbeat reporting.
     pub fn set_partition_ratio(&mut self, ratio: f32) {
         self.partition_ratio = ratio;
+    }
+
+    /// Set the inference phase and operational state carried by the heartbeat.
+    ///
+    /// Both fields shipped as dead placeholders (`""` / `Idle`) until this landed:
+    /// nothing wrote them, so the Manager read a constant that did not describe the
+    /// engine. Today the only heartbeat emitter is the decode loop's command poll
+    /// ([`Self::send_heartbeat_if_due`]), so what a Manager observes is
+    /// `("decode", Running)` throughout, and `("", Idle)` never reaches the wire.
+    /// Making prefill observable needs a heartbeat emitter off the decode loop —
+    /// `Forward::prefill` is one call from the driver's point of view, so there is
+    /// no per-chunk seam here to hang it on.
+    pub fn set_phase(&mut self, phase: &str, state: EngineState) {
+        if self.phase != phase {
+            self.phase.clear();
+            self.phase.push_str(phase);
+        }
+        self.engine_state = state;
     }
 }

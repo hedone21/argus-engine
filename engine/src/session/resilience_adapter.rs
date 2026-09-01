@@ -12,7 +12,10 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use argus_shared::{EngineCapability, EngineCommand, EngineMessage, QcfEstimate, WeightSwapReport};
+use argus_shared::{
+    CommandResult, EngineCapability, EngineCommand, EngineMessage, EngineState, QcfEstimate,
+    WeightSwapReport,
+};
 
 use crate::format::KVCacheFormat;
 use crate::resilience::{CommandExecutor, KVSnapshot};
@@ -54,6 +57,13 @@ pub struct ResilienceAdapter {
     /// Capability(12 액션) 를 manager merge 가 heartbeat 의 non-empty 3-액션 리스트로
     /// 덮어써 DPP 후보에서 kv eviction 이 전멸하는 결함의 원인 (2026-06-12 S25 적발).
     eviction_policy: String,
+    /// Bytes one token occupies across **all** decoder layers, at the cache's declared
+    /// dtype — the same geometry `EngineCapability.bytes_per_kv_token × num_layers`
+    /// ships. Multiplied by the live token count to fill the heartbeat's
+    /// `kv_cache_bytes`, which was a hardcoded 0 until this landed. It is a geometry
+    /// figure, not an allocator query: `KVCacheFormat` has no byte accessor, and adding
+    /// one is a plugin-facing ABI change. `0` (never set) keeps the old `0` report.
+    kv_bytes_per_token: usize,
 }
 
 impl ResilienceAdapter {
@@ -63,6 +73,7 @@ impl ResilienceAdapter {
             kv_handle: None,
             quant_handle: None,
             eviction_policy: String::new(),
+            kv_bytes_per_token: 0,
         }
     }
 
@@ -76,6 +87,13 @@ impl ResilienceAdapter {
     /// β-4: heartbeat snapshot query 용 held-handle 주입(§5.2.1 (가) — kv_pos_handle 과 동일 패턴).
     pub fn set_kv_handle(&mut self, handle: Arc<dyn KVCacheFormat>) {
         self.kv_handle = Some(handle);
+    }
+
+    /// Per-token whole-model KV footprint, for the heartbeat's `kv_cache_bytes`.
+    /// Callers use [`crate::session::resilience_init::kv_bytes_per_token`] so the figure
+    /// matches the one `EngineCapability` advertises.
+    pub fn set_kv_bytes_per_token(&mut self, bytes: usize) {
+        self.kv_bytes_per_token = bytes;
     }
 
     /// §4.5: 양자화-KV 경로에서 heartbeat kv_dtype query 용 quant handle 주입.
@@ -110,13 +128,16 @@ impl ResilienceAdapter {
 
     /// held-handle 에서 heartbeat payload 용 `KVSnapshot` 을 구성한다 (§5.2.1 (가) query).
     ///
-    /// v1 `build_kv_snapshot`(decode_loop.rs)과 동일 partial — `current_pos`/`capacity` 만 채우고
-    /// total_bytes 등은 placeholder(v1 도 0). handle 미주입 시 default(pos=0).
+    /// `current_pos`/`capacity`/`total_bytes` 를 채운다. `total_bytes` 는 live token 수 ×
+    /// [`Self::set_kv_bytes_per_token`] 기하값 — allocator 질의가 아니다(§ 필드 닥). handle
+    /// 미주입 시 default(pos=0, bytes=0).
     fn build_kv_snapshot(&self) -> KVSnapshot {
         match &self.kv_handle {
             Some(h) => KVSnapshot {
                 total_tokens: h.current_pos(),
                 capacity: h.capacity(),
+                total_bytes: (h.current_pos() as u64)
+                    .saturating_mul(self.kv_bytes_per_token as u64),
                 // §4.5: 양자화-KV 경로면 layer-0 handle 의 현재 bits 를 dtype 문자열로 매핑
                 // (v1 census `generate.rs`(d5ed71d2^) L4352 동형). 비양자화 경로(quant_handle=None)는
                 // default `""` 유지(회귀 금지).
@@ -154,9 +175,19 @@ impl CommandSource for ResilienceAdapter {
     fn poll(&mut self) -> Result<Vec<EngineCommand>> {
         // β-4: pure 화 후에도 heartbeat 송출 잔존 (매핑 문서 4부 채택안 (가)).
         // drain 직전 interval 체크 + 송출. kv_snap 은 held-handle query 로 자체 구성.
+        //
+        // This is called once per decode step and nowhere else, so reaching it *is* the
+        // engine being in decode — which is why the phase/state stamp lives here rather
+        // than in a separate hook. See `CommandExecutor::set_phase` on why prefill is not
+        // observable through the heartbeat yet.
+        self.executor.set_phase("decode", EngineState::Running);
         let kv_snap = self.build_kv_snapshot();
         self.executor.send_heartbeat_if_due(&kv_snap);
         Ok(self.executor.drain_commands())
+    }
+
+    fn report_results(&mut self, results: Vec<CommandResult>) {
+        self.executor.report_results(results);
     }
 }
 
@@ -188,5 +219,12 @@ pub(crate) struct CmdSrcWrapper(pub Arc<Mutex<ResilienceAdapter>>);
 impl CommandSource for CmdSrcWrapper {
     fn poll(&mut self) -> Result<Vec<EngineCommand>> {
         self.0.lock().expect("resilience mutex poisoned").poll()
+    }
+
+    fn report_results(&mut self, results: Vec<CommandResult>) {
+        self.0
+            .lock()
+            .expect("resilience mutex poisoned")
+            .report_results(results);
     }
 }
