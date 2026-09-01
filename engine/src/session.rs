@@ -1,3 +1,4 @@
+pub mod aperturb_basis;
 pub mod assembly;
 pub mod bin_setup;
 pub mod chat;
