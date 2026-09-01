@@ -83,7 +83,7 @@ pub fn build_bench_quant_window_loop(
 
     // §5.7.6: heartbeat kv_dtype query 용 layer-0 QuantWindowFormat concrete handle (resilience adapter
     // 에 주입 — bits query 는 base trait 표면에 없어 quant-window concrete 필요).
-    let quant_window_handle = fwd.quant_window_caches().first().cloned();
+    let quant_window_handle = quant_window_handles.first().cloned();
 
     let registry = Arc::new(PipelineRegistry::new());
 
@@ -94,6 +94,14 @@ pub fn build_bench_quant_window_loop(
             adapter.set_kv_handle(h.clone() as Arc<dyn crate::format::KVCacheFormat>);
             adapter.set_quant_handle(
                 h as Arc<dyn crate::session::resilience_adapter::QuantStageHandle>,
+            );
+            adapter.set_kv_byte_handles(
+                quant_window_handles
+                    .iter()
+                    .map(|q| {
+                        q.clone() as Arc<dyn crate::session::resilience_adapter::KvBytesHandle>
+                    })
+                    .collect(),
             );
             Some(adapter)
         }

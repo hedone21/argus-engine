@@ -36,6 +36,23 @@ pub trait QuantStageHandle: Send + Sync {
     fn current_kv_bits(&self) -> u8;
 }
 
+/// Narrow neutral seam for a KV format's live resident byte count — same idiom as
+/// [`QuantStageHandle`], for the same reason: the base [`KVCacheFormat`] surface has no
+/// byte accessor and adding one is a plugin-facing ABI change
+/// (`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`).
+///
+/// The implementations delegate to the caches' own `memory_usage_bytes()`, which is
+/// dtype-aware: it sizes Q4_0 by block, asks an opaque descriptor for
+/// `bytes_for_elems`, and otherwise multiplies by the buffer's real dtype size. That is
+/// what makes the heartbeat's `kv_cache_bytes` an actual byte count rather than a token
+/// count wearing a constant — the distinction the KV budget contract rests on, since a
+/// figure derived from fixed F16 geometry would cancel against any geometry-derived
+/// denominator and leave a byte ratio numerically identical to a token ratio.
+pub trait KvBytesHandle: Send + Sync {
+    /// Bytes this layer's K and V currently occupy for the resident tokens.
+    fn resident_bytes(&self) -> u64;
+}
+
 /// [`CommandExecutor`]를 session 3-trait으로 연결하는 어댑터 (β-4: ManagerCommandSource 역할).
 ///
 /// **β-4 (매핑 문서 4부 채택안 (가))**: `CommandSource::poll` 이 pure(`Vec<EngineCommand>` 반환)로
@@ -57,13 +74,10 @@ pub struct ResilienceAdapter {
     /// Capability(12 액션) 를 manager merge 가 heartbeat 의 non-empty 3-액션 리스트로
     /// 덮어써 DPP 후보에서 kv eviction 이 전멸하는 결함의 원인 (2026-06-12 S25 적발).
     eviction_policy: String,
-    /// Bytes one token occupies across **all** decoder layers, at the cache's declared
-    /// dtype — the same geometry `EngineCapability.bytes_per_kv_token × num_layers`
-    /// ships. Multiplied by the live token count to fill the heartbeat's
-    /// `kv_cache_bytes`, which was a hardcoded 0 until this landed. It is a geometry
-    /// figure, not an allocator query: `KVCacheFormat` has no byte accessor, and adding
-    /// one is a plugin-facing ABI change. `0` (never set) keeps the old `0` report.
-    kv_bytes_per_token: usize,
+    /// Per-layer resident-byte probes, one per decoder layer, summed for the heartbeat's
+    /// `kv_cache_bytes`. Empty (never injected) reports 0, as it did before the field
+    /// existed.
+    kv_byte_handles: Vec<Arc<dyn KvBytesHandle>>,
 }
 
 impl ResilienceAdapter {
@@ -73,7 +87,7 @@ impl ResilienceAdapter {
             kv_handle: None,
             quant_handle: None,
             eviction_policy: String::new(),
-            kv_bytes_per_token: 0,
+            kv_byte_handles: Vec::new(),
         }
     }
 
@@ -89,11 +103,18 @@ impl ResilienceAdapter {
         self.kv_handle = Some(handle);
     }
 
-    /// Per-token whole-model KV footprint, for the heartbeat's `kv_cache_bytes`.
-    /// Callers use [`crate::session::resilience_init::kv_bytes_per_token`] so the figure
-    /// matches the one `EngineCapability` advertises.
-    pub fn set_kv_bytes_per_token(&mut self, bytes: usize) {
-        self.kv_bytes_per_token = bytes;
+    /// Inject the per-layer resident-byte probes for the heartbeat's `kv_cache_bytes`.
+    /// Pass every decoder layer — the heartbeat reports the whole-model figure.
+    pub fn set_kv_byte_handles(&mut self, handles: Vec<Arc<dyn KvBytesHandle>>) {
+        self.kv_byte_handles = handles;
+    }
+
+    /// Whole-model resident KV bytes, summed over the injected per-layer probes.
+    fn resident_kv_bytes(&self) -> u64 {
+        self.kv_byte_handles
+            .iter()
+            .map(|h| h.resident_bytes())
+            .sum()
     }
 
     /// §4.5: 양자화-KV 경로에서 heartbeat kv_dtype query 용 quant handle 주입.
@@ -128,16 +149,15 @@ impl ResilienceAdapter {
 
     /// held-handle 에서 heartbeat payload 용 `KVSnapshot` 을 구성한다 (§5.2.1 (가) query).
     ///
-    /// `current_pos`/`capacity`/`total_bytes` 를 채운다. `total_bytes` 는 live token 수 ×
-    /// [`Self::set_kv_bytes_per_token`] 기하값 — allocator 질의가 아니다(§ 필드 닥). handle
-    /// 미주입 시 default(pos=0, bytes=0).
+    /// `current_pos`/`capacity`/`total_bytes` 를 채운다. `total_bytes` 는 주입된 per-layer
+    /// [`KvBytesHandle`] 합 — 캐시가 실제로 쓰는 바이트이지 토큰 수에 상수를 곱한 값이 아니다.
+    /// handle 미주입 시 default(pos=0, bytes=0).
     fn build_kv_snapshot(&self) -> KVSnapshot {
         match &self.kv_handle {
             Some(h) => KVSnapshot {
                 total_tokens: h.current_pos(),
                 capacity: h.capacity(),
-                total_bytes: (h.current_pos() as u64)
-                    .saturating_mul(self.kv_bytes_per_token as u64),
+                total_bytes: self.resident_kv_bytes(),
                 // §4.5: 양자화-KV 경로면 layer-0 handle 의 현재 bits 를 dtype 문자열로 매핑
                 // (v1 census `generate.rs`(d5ed71d2^) L4352 동형). 비양자화 경로(quant_handle=None)는
                 // default `""` 유지(회귀 금지).

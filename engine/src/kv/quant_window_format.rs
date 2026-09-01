@@ -91,6 +91,13 @@ impl crate::session::resilience_adapter::QuantStageHandle for QuantWindowFormat 
     }
 }
 
+impl crate::session::resilience_adapter::KvBytesHandle for QuantWindowFormat {
+    /// Heartbeat resident-byte probe — quantized window plus the f32 residual.
+    fn resident_bytes(&self) -> u64 {
+        self.inner.lock().unwrap().memory_usage_bytes() as u64
+    }
+}
+
 impl KVCacheFormat for QuantWindowFormat {
     fn idx(&self) -> usize {
         self.idx

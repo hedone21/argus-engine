@@ -29,7 +29,7 @@ use argus_engine::kv::standard_format::StandardFormat;
 use argus_engine::memory::host::shared::SharedBuffer;
 use argus_engine::resilience::CommandExecutor;
 use argus_engine::session::CommandSource;
-use argus_engine::session::resilience_adapter::ResilienceAdapter;
+use argus_engine::session::resilience_adapter::{KvBytesHandle, ResilienceAdapter};
 use argus_engine::shape::Shape;
 use argus_engine::tensor::Tensor;
 
@@ -74,6 +74,7 @@ fn heartbeat_continuity_via_held_handle() {
     let handle = make_handle(100);
     let h: Arc<dyn KVCacheFormat> = handle.clone();
     adapter.set_kv_handle(h);
+    adapter.set_kv_byte_handles(vec![handle.clone() as Arc<dyn KvBytesHandle>]);
 
     // interval 경과 후 pure poll → heartbeat 송출.
     std::thread::sleep(Duration::from_millis(15));
@@ -100,6 +101,14 @@ fn heartbeat_continuity_via_held_handle() {
         "heartbeat kv_cache_tokens == held-handle.current_pos()"
     );
     assert_eq!(status.kv_cache_tokens, 100);
+    // (4) kv_cache_bytes 는 캐시의 **실제 dtype** 회계다. 이 fixture 는 F32 (SharedBuffer::new(_, F32),
+    // kv_heads=1, head_dim=32, pos=100) 이므로 100*1*32*4*2 = 25600 바이트다. 같은 토큰 수를 고정
+    // F16 기하로 환산하면 12800 이 되므로, 이 단언은 "토큰 수에 상수를 곱한 값"과 진짜 바이트를
+    // 구별한다 — KV 예산이 토큰 비율이 아니라 바이트 비율이려면 반드시 성립해야 하는 성질이다.
+    assert_eq!(
+        status.kv_cache_bytes, 25_600,
+        "kv_cache_bytes 는 버퍼 dtype(F32)을 반영해야 한다 — F16 기하값 12800 이 아니다"
+    );
     // (2) actual_throughput != 0 (EMA 적재 확인).
     assert!(
         status.actual_throughput > 0.0,

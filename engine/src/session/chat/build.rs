@@ -29,12 +29,7 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
     // Resilience adapter (before the model is moved). Graceful: transport failure
     // returns None inside build_command_executor; the eviction policy is set below.
     let mut resilience: Option<ResilienceAdapter> = if args.enable_resilience {
-        let kv_bytes = crate::session::resilience_init::kv_bytes_per_token(&init.model.config);
-        build_command_executor(args, &init.model)?.map(|exec| {
-            let mut adapter = ResilienceAdapter::new(exec);
-            adapter.set_kv_bytes_per_token(kv_bytes);
-            adapter
-        })
+        build_command_executor(args, &init.model)?.map(ResilienceAdapter::new)
     } else {
         None
     };
@@ -99,6 +94,12 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
         if let Some(h) = kv_handle {
             adapter.set_kv_handle(h);
         }
+        adapter.set_kv_byte_handles(
+            kv_handles
+                .iter()
+                .map(|h| h.clone() as Arc<dyn crate::session::resilience_adapter::KvBytesHandle>)
+                .collect(),
+        );
         if let Some(q) = quant_handle {
             adapter.set_quant_handle(q);
         }

@@ -320,6 +320,14 @@ pub fn build_bench_loop(
     let resilience = match (resilience, kv_pos_handle.clone()) {
         (Some(mut adapter), Some(h)) => {
             adapter.set_kv_handle(h);
+            adapter.set_kv_byte_handles(
+                kv_handles
+                    .iter()
+                    .map(|h| {
+                        h.clone() as Arc<dyn crate::session::resilience_adapter::KvBytesHandle>
+                    })
+                    .collect(),
+            );
             Some(adapter)
         }
         (other, _) => other,

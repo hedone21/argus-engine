@@ -352,6 +352,14 @@ pub fn build_standard_loop(
             if let Some(h) = kv_pos_handle.clone() {
                 adapter.set_kv_handle(h);
             }
+            adapter.set_kv_byte_handles(
+                kv_handles
+                    .iter()
+                    .map(|h| {
+                        h.clone() as Arc<dyn crate::session::resilience_adapter::KvBytesHandle>
+                    })
+                    .collect(),
+            );
             let registry = registry.as_ref().expect("registry: resilience.is_some()");
             // happy/chat 경로는 partition/quant 미구성 (빈 slots + None hardware + 빈
             // quant_window_handles).
