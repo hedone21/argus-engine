@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn poll_same_pos_multiple_directives_order_preserved() {
         let schedule = make_schedule(vec![
-            (2, vec![EngineCommand::Throttle { delay_ms: 10 }]),
+            (2, vec![EngineCommand::KvCompress { budget: 0.9 }]),
             (2, vec![EngineCommand::Suspend]),
         ]);
         let mut src = ScheduleCommandSource::new(schedule);
@@ -136,7 +136,7 @@ mod tests {
         // pos 2: Throttle 먼저, Suspend 다음 (정의 순서 보존)
         let cmds = src.poll().unwrap();
         assert_eq!(cmds.len(), 2);
-        assert!(matches!(cmds[0], EngineCommand::Throttle { delay_ms: 10 }));
+        assert!(matches!(cmds[0], EngineCommand::KvCompress { budget: 0.9 }));
         assert!(matches!(cmds[1], EngineCommand::Suspend));
     }
 
@@ -168,7 +168,7 @@ mod tests {
                     "at_token": 10,
                     "directive": {
                         "seq_id": 1,
-                        "commands": [{"type": "throttle", "delay_ms": 100}]
+                        "commands": [{"type": "kv.compress", "budget": 0.5}]
                     }
                 },
                 {
@@ -194,7 +194,7 @@ mod tests {
         // pos 10: Throttle
         let cmds = src.poll().unwrap();
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(cmds[0], EngineCommand::Throttle { delay_ms: 100 }));
+        assert!(matches!(cmds[0], EngineCommand::KvCompress { budget: 0.5 }));
 
         // pos 11..19: empty
         for _ in 0..9 {

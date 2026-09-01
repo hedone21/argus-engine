@@ -12,9 +12,8 @@
 //!            MessageLoop::spawn()이 단일 thread + 단일 transport 소유권을 가지는지 확인.
 
 use argus_shared::{
-    CommandResponse, CommandResult, EngineCapability, EngineCommand, EngineDirective,
-    EngineMessage, EngineState, EngineStatus, Level, ManagerMessage, RecommendedBackend,
-    ResourceLevel, SystemSignal,
+    CommandResponse, CommandResult, EngineCommand, EngineDirective, EngineMessage, EngineState,
+    EngineStatus, ManagerMessage, Phase,
 };
 
 use argus_engine::resilience::{MessageLoop, MockTransport, Transport};
@@ -28,24 +27,17 @@ fn test_inv_081_engine_directive_json_roundtrip() {
     let directive = EngineDirective {
         seq_id: 42,
         commands: vec![
-            EngineCommand::Throttle { delay_ms: 50 },
-            EngineCommand::KvEvictH2o { keep_ratio: 0.48 },
-            EngineCommand::LayerSkip { skip_ratio: 0.25 },
-            EngineCommand::KvQuantDynamic { target_bits: 4 },
-            EngineCommand::SwitchHw {
-                device: "opencl".to_string(),
-            },
-            EngineCommand::PrepareComputeUnit {
-                device: "gpu".to_string(),
-            },
+            EngineCommand::Suspend,
+            EngineCommand::KvCompress { budget: 0.5 },
+            EngineCommand::KvCompress { budget: 0.5 },
+            EngineCommand::KvCompress { budget: 0.5 },
+            EngineCommand::Resume,
+            EngineCommand::Resume,
             EngineCommand::Suspend,
             EngineCommand::Resume,
             EngineCommand::RestoreDefaults,
-            EngineCommand::KvEvictSliding { keep_ratio: 0.6 },
-            EngineCommand::KvStreaming {
-                sink_size: 4,
-                window_size: 256,
-            },
+            EngineCommand::KvCompress { budget: 0.5 },
+            EngineCommand::KvCompress { budget: 0.5 },
         ],
     };
 
@@ -83,42 +75,36 @@ fn test_inv_081_manager_message_json_roundtrip() {
 #[test]
 fn test_inv_081_engine_message_all_variants_json() {
     // Capability
-    let cap = EngineMessage::Capability(EngineCapability {
-        available_devices: vec!["cpu".into(), "opencl".into()],
-        active_device: "cpu".into(),
-        max_kv_tokens: 2048,
-        bytes_per_kv_token: 256,
-        num_layers: 16,
-        ..Default::default()
+    let cap = EngineMessage::Heartbeat(EngineStatus {
+        kv_cache_bytes: 1024,
+        kv_cache_budget_bytes: 4096,
+        kv_cache_tokens: 32,
+        tbt_ms: 12.5,
+        phase: Phase::Decode,
+        state: EngineState::Running,
     });
     let json = serde_json::to_string(&cap).unwrap();
     let back: EngineMessage = serde_json::from_str(&json).unwrap();
-    assert!(matches!(back, EngineMessage::Capability(_)));
+    assert!(matches!(
+        back,
+        EngineMessage::Heartbeat(EngineStatus {
+            kv_cache_bytes: 1024,
+            kv_cache_budget_bytes: 4096,
+            kv_cache_tokens: 32,
+            tbt_ms: 12.5,
+            phase: Phase::Decode,
+            state: EngineState::Running,
+        })
+    ));
 
     // Heartbeat
     let hb = EngineMessage::Heartbeat(EngineStatus {
-        active_device: "cpu".to_string(),
-        compute_level: ResourceLevel::Normal,
-        actual_throughput: 15.0,
-        memory_level: ResourceLevel::Warning,
         kv_cache_bytes: 1024,
-        kv_cache_tokens: 100,
-        kv_cache_utilization: 0.5,
-        memory_lossless_min: 1.0,
-        memory_lossy_min: 0.01,
+        kv_cache_budget_bytes: 4096,
+        kv_cache_tokens: 32,
+        tbt_ms: 12.5,
+        phase: Phase::Decode,
         state: EngineState::Running,
-        tokens_generated: 50,
-        available_actions: vec!["throttle".into()],
-        active_actions: vec![],
-        eviction_policy: "none".into(),
-        kv_dtype: "f16".into(),
-        skip_ratio: 0.0,
-        phase: String::new(),
-        prefill_pos: 0,
-        prefill_total: 0,
-        partition_ratio: 0.0,
-        self_cpu_pct: 0.0,
-        self_gpu_pct: 0.0,
     });
     let json = serde_json::to_string(&hb).unwrap();
     let back: EngineMessage = serde_json::from_str(&json).unwrap();
@@ -150,51 +136,11 @@ fn test_inv_081_engine_message_all_variants_json() {
 }
 
 #[test]
-fn test_inv_081_system_signal_json_roundtrip() {
-    let signals = vec![
-        SystemSignal::MemoryPressure {
-            level: Level::Critical,
-            available_bytes: 1024,
-            total_bytes: 4096,
-            reclaim_target_bytes: 512,
-        },
-        SystemSignal::ComputeGuidance {
-            level: Level::Warning,
-            recommended_backend: RecommendedBackend::Gpu,
-            reason: argus_shared::ComputeReason::CpuBottleneck,
-            cpu_usage_pct: 95.0,
-            gpu_usage_pct: 20.0,
-        },
-        SystemSignal::ThermalAlert {
-            level: Level::Emergency,
-            temperature_mc: 85000,
-            throttling_active: true,
-            throttle_ratio: 0.5,
-        },
-        SystemSignal::EnergyConstraint {
-            level: Level::Normal,
-            reason: argus_shared::EnergyReason::Charging,
-            power_budget_mw: 15000,
-        },
-    ];
-
-    for sig in &signals {
-        let json = serde_json::to_string(sig).unwrap();
-        let back: SystemSignal = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            back.level(),
-            sig.level(),
-            "INV-081: SystemSignal JSON round-trip must preserve level"
-        );
-    }
-}
-
-#[test]
 fn test_inv_081_json_output_is_valid_json() {
     // Verify that wire format produces valid JSON (not binary)
     let msg = ManagerMessage::Directive(EngineDirective {
         seq_id: 99,
-        commands: vec![EngineCommand::Throttle { delay_ms: 42 }],
+        commands: vec![EngineCommand::Suspend],
     });
 
     let json_bytes = serde_json::to_vec(&msg).unwrap();
@@ -227,7 +173,7 @@ fn test_inv_082_mock_transport_bidirectional_is_1_to_1() {
     // Manager sends, Engine receives — single channel
     mgr.send(ManagerMessage::Directive(EngineDirective {
         seq_id: 1,
-        commands: vec![EngineCommand::Throttle { delay_ms: 10 }],
+        commands: vec![EngineCommand::Suspend],
     }))
     .unwrap();
 
@@ -254,7 +200,7 @@ fn test_inv_082_message_loop_single_transport_ownership() {
     // ensuring only one thread has access (1:1 constraint).
     let msgs = vec![ManagerMessage::Directive(EngineDirective {
         seq_id: 1,
-        commands: vec![EngineCommand::Throttle { delay_ms: 0 }],
+        commands: vec![EngineCommand::Suspend],
     })];
     let transport = MockTransport::from_messages(msgs);
 

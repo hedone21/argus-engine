@@ -230,9 +230,6 @@ pub(crate) fn finish_chat_loop(
                 registry,
                 kv_handles,
                 None, // cache_manager: chat evicts out-of-loop (ensure_capacity/on_turn_end)
-                Vec::new(), // layer_slots (no partition)
-                None, // hardware
-                Vec::new(), // quant_window_handles (manager quant inert — chat-managed)
                 Arc::new(Mutex::new(None)), // score_cell dummy
             );
             builder
@@ -782,7 +779,6 @@ pub(crate) fn build_chat_standard_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatM
         forward: Box::new(mf),
         kv_handles,
         kv_handle,
-        quant_handle: None,
         eviction_policy: policy_name.clone(),
         keepset: chat_keepset,
         kv_mode: ChatKvMode::Standard(Box::new(ChatKvModeStandard {
@@ -839,19 +835,15 @@ pub(crate) fn build_chat_quant_window_forward(ctx: ModeBuildCtx<'_>) -> Result<C
         max_seq_len,
     )?;
 
-    // §4.5: pos/capacity via base `kv_handle`, bit-width via the neutral `quant_handle`.
     let quant_window_handle = fwd.quant_window_caches().first().cloned();
     let kv_handle = quant_window_handle
         .clone()
         .map(|h| h as Arc<dyn KVCacheFormat>);
-    let quant_handle = quant_window_handle
-        .map(|h| h as Arc<dyn crate::session::resilience_adapter::QuantStageHandle>);
 
     Ok(ChatModeBuild {
         forward: Box::new(fwd),
         kv_handles: Vec::new(), // quant-window: no StandardFormat eviction handles.
         kv_handle,
-        quant_handle,
         eviction_policy: String::new(), // quant-window: no in-loop eviction policy.
         keepset: None,                  // quant-window has no PFA keep-set path.
         kv_mode: ChatKvMode::NonEvicting {
@@ -908,7 +900,6 @@ pub(crate) fn build_chat_offload_forward(ctx: ModeBuildCtx<'_>) -> Result<ChatMo
         kv_handles: Vec::new(),
         // Offload has no KV-format handle accessor → heartbeat KV handle is skipped.
         kv_handle: None,
-        quant_handle: None,
         eviction_policy: String::new(),
         keepset: None, // offload has no PFA keep-set path.
         kv_mode: ChatKvMode::NonEvicting {

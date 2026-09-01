@@ -88,13 +88,9 @@ pub fn build_bench_quant_window_loop(
     let registry = Arc::new(PipelineRegistry::new());
 
     // §5.7.6/§4.5: resilience adapter 에 quant-window handle 주입 → heartbeat kv_dtype 를 현재 bits 에서
-    // query. pos/capacity 는 base `set_kv_handle`, bit-width 는 중립 `set_quant_handle`.
     let resilience = match (resilience, quant_window_handle) {
         (Some(mut adapter), Some(h)) => {
             adapter.set_kv_handle(h.clone() as Arc<dyn crate::format::KVCacheFormat>);
-            adapter.set_quant_handle(
-                h as Arc<dyn crate::session::resilience_adapter::QuantStageHandle>,
-            );
             adapter.set_kv_byte_handles(
                 quant_window_handles
                     .iter()
@@ -120,9 +116,6 @@ pub fn build_bench_quant_window_loop(
             Arc::clone(&registry),
             Vec::new(), // kv_handles: quant-window 경로 eviction 미지원 (StandardFormat 부재).
             None,       // cache_manager: eviction inert.
-            Vec::new(), // layer_slots: partition 미배선.
-            None,       // hardware: partition inert.
-            quant_window_handles,
             // §5.9.1 Track A: quant-window 경로는 score-based eviction 미지원 → 더미 None cell.
             Arc::new(std::sync::Mutex::new(None)),
         )

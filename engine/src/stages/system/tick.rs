@@ -70,13 +70,8 @@ mod tests {
     fn make_adapter() -> (Arc<Mutex<ResilienceAdapter>>, mpsc::Receiver<EngineMessage>) {
         let (_cmd_tx, cmd_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::channel();
-        // heartbeat interval 0 → tick 후 poll 1회에 즉시 송출(actual_throughput 검증용).
-        let executor = CommandExecutor::new(
-            cmd_rx,
-            status_tx,
-            "cpu".to_string(),
-            Duration::from_millis(0),
-        );
+        // heartbeat interval 0 → tick 후 poll 1회에 즉시 송출(tbt_ms 검증용).
+        let executor = CommandExecutor::new(cmd_rx, status_tx, Duration::from_millis(0));
         (
             Arc::new(Mutex::new(ResilienceAdapter::new(executor))),
             status_rx,
@@ -95,7 +90,7 @@ mod tests {
         }
     }
 
-    /// PostSample 에서 tick 발화 → executor throughput EMA 적재(heartbeat actual_throughput > 0).
+    /// PostSample 에서 tick 발화 → executor throughput EMA 적재(heartbeat tbt_ms > 0).
     #[test]
     fn post_sample_fires_tick() {
         let (adapter, status_rx) = make_adapter();
@@ -118,7 +113,7 @@ mod tests {
                 .unwrap();
         }
 
-        // heartbeat 송출 → status_rx 로 actual_throughput 확인(tick 적재 증명).
+        // heartbeat 송출 → status_rx 로 tbt_ms 확인(tick 적재 증명).
         adapter
             .lock()
             .unwrap()
@@ -126,7 +121,7 @@ mod tests {
             .send_heartbeat_if_due(&KVSnapshot::default());
         let mut throughput = 0.0;
         while let Ok(EngineMessage::Heartbeat(status)) = status_rx.try_recv() {
-            throughput = status.actual_throughput;
+            throughput = status.tbt_ms;
         }
         assert!(throughput > 0.0, "tick 2회 발화로 throughput EMA 적재");
     }

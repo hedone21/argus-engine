@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use argus_shared::{
     CommandResult, EngineCommand, EngineDirective, EngineMessage, EngineState, ManagerMessage,
+    Phase,
 };
 
 use argus_engine::backend::Backend;
@@ -61,7 +62,6 @@ fn heartbeat_continuity_via_held_handle() {
     let mut exec = CommandExecutor::new(
         cmd_rx,
         resp_tx,
-        "cpu".to_string(),
         Duration::from_millis(10), // 짧은 interval 로 heartbeat 유도
     );
     // throughput EMA 적재 (actual_throughput != 0 검증용).
@@ -89,11 +89,10 @@ fn heartbeat_continuity_via_held_handle() {
         }
     }
     let status = hb.expect("interval 경과 후 heartbeat 송출되어야 함");
-    assert_eq!(status.active_device, "cpu");
     // `poll` 은 decode loop 에서만 호출되므로 heartbeat 는 언제나 decode 중 상태를 싣는다.
     // (이전에는 두 필드가 dead placeholder 라 `Idle`/`""` 로 고정 보고됐다.)
     assert_eq!(status.state, EngineState::Running);
-    assert_eq!(status.phase, "decode");
+    assert_eq!(status.phase, Phase::Decode);
     // (3) kv_cache_tokens == held-handle.current_pos() — held-handle query 전환 핵심 가드.
     assert_eq!(
         status.kv_cache_tokens,
@@ -111,8 +110,8 @@ fn heartbeat_continuity_via_held_handle() {
     );
     // (2) actual_throughput != 0 (EMA 적재 확인).
     assert!(
-        status.actual_throughput > 0.0,
-        "throughput EMA 적재 — actual_throughput != 0"
+        status.tbt_ms > 0.0,
+        "tick 2회로 time-between-tokens EMA 가 적재된다"
     );
 
     drop(cmd_tx); // 미사용 경고 억제
@@ -124,28 +123,20 @@ fn heartbeat_continuity_via_held_handle() {
 fn poll_defers_response_until_results_are_reported() {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (resp_tx, resp_rx) = mpsc::channel();
-    let exec = CommandExecutor::new(
-        cmd_rx,
-        resp_tx,
-        "cpu".to_string(),
-        Duration::from_secs(3600),
-    );
+    let exec = CommandExecutor::new(cmd_rx, resp_tx, Duration::from_secs(3600));
     let mut adapter = ResilienceAdapter::new(exec);
 
     cmd_tx
         .send(ManagerMessage::Directive(EngineDirective {
             seq_id: 7,
-            commands: vec![
-                EngineCommand::Throttle { delay_ms: 30 },
-                EngineCommand::RequestQcf,
-            ],
+            commands: vec![EngineCommand::Suspend, EngineCommand::RestoreDefaults],
         }))
         .unwrap();
 
     let cmds = adapter.poll().unwrap();
     assert_eq!(cmds.len(), 2, "drain 한 command 2건 반환");
-    assert!(matches!(cmds[0], EngineCommand::Throttle { delay_ms: 30 }));
-    assert!(matches!(cmds[1], EngineCommand::RequestQcf));
+    assert!(matches!(cmds[0], EngineCommand::Suspend));
+    assert!(matches!(cmds[1], EngineCommand::RestoreDefaults));
 
     // poll 만으로는 응답이 나가지 않는다 — 명령의 결과는 dispatcher 가 돈 뒤에야 정해진다.
     assert!(
@@ -185,19 +176,14 @@ fn poll_defers_response_until_results_are_reported() {
 fn results_are_split_back_across_directives() {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (resp_tx, resp_rx) = mpsc::channel();
-    let exec = CommandExecutor::new(
-        cmd_rx,
-        resp_tx,
-        "cpu".to_string(),
-        Duration::from_secs(3600),
-    );
+    let exec = CommandExecutor::new(cmd_rx, resp_tx, Duration::from_secs(3600));
     let mut adapter = ResilienceAdapter::new(exec);
 
     for (seq, n) in [(1u64, 2usize), (2, 1)] {
         cmd_tx
             .send(ManagerMessage::Directive(EngineDirective {
                 seq_id: seq,
-                commands: vec![EngineCommand::Throttle { delay_ms: 1 }; n],
+                commands: vec![EngineCommand::Suspend; n],
             }))
             .unwrap();
     }

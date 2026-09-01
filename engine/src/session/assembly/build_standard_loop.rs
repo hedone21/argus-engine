@@ -367,9 +367,6 @@ pub fn build_standard_loop(
                 Arc::clone(registry),
                 kv_handles.clone(),
                 None,
-                Vec::new(),
-                None,
-                Vec::new(),
                 // §5.9.1 Track A: happy 경로는 score-based eviction 미구성 → 더미 None cell.
                 Arc::new(Mutex::new(None)),
             );
@@ -454,7 +451,7 @@ pub fn build_standard_loop(
         if let Some(dispatcher) = dispatcher {
             // L1-runtime: share the dispatcher's per-step re-encode-fired signal so the loop
             // invalidates the fused GPU plan exactly on a mid-decode (command-driven) re-encode.
-            builder = builder.with_reencode_fired_cell(dispatcher.reencode_fired_cell());
+
             builder = builder.with_command_dispatcher(dispatcher);
         }
         if let Some(h) = kv_pos_handle {

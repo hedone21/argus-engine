@@ -29,7 +29,13 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
     // Resilience adapter (before the model is moved). Graceful: transport failure
     // returns None inside build_command_executor; the eviction policy is set below.
     let mut resilience: Option<ResilienceAdapter> = if args.enable_resilience {
-        build_command_executor(args, &init.model)?.map(ResilienceAdapter::new)
+        let bpt =
+            crate::session::resilience_init::uncompressed_kv_bytes_per_token(&init.model.config);
+        build_command_executor(args, &init.model)?.map(|exec| {
+            let mut a = ResilienceAdapter::new(exec);
+            a.set_uncompressed_bytes_per_token(bpt);
+            a
+        })
     } else {
         None
     };
@@ -81,16 +87,13 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
         forward,
         kv_handles,
         kv_handle,
-        quant_handle,
-        eviction_policy,
+        eviction_policy: _,
         keepset,
         kv_mode,
     } = built;
 
     // Mode-agnostic resilience handle wiring (§4.5: pos/capacity via base handle,
-    // bit-width via the neutral QuantStageHandle).
     if let Some(adapter) = resilience.as_mut() {
-        adapter.set_eviction_policy(&eviction_policy);
         if let Some(h) = kv_handle {
             adapter.set_kv_handle(h);
         }
@@ -100,9 +103,6 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
                 .map(|h| h.clone() as Arc<dyn crate::session::resilience_adapter::KvBytesHandle>)
                 .collect(),
         );
-        if let Some(q) = quant_handle {
-            adapter.set_quant_handle(q);
-        }
     }
 
     // Per-request sampling: the in-loop ChatSampler reads this shared config each

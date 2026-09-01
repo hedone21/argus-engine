@@ -1,83 +1,58 @@
-//! [`ResilienceAdapter`] — [`CommandExecutor`]를 session 인터페이스에 연결하는 어댑터.
+//! [`ResilienceAdapter`] — connects [`CommandExecutor`] to the session's command seam.
 //!
-//! `CommandExecutor`는 `poll` / `send_capability` / `on_token_generated` 메서드를 각각 갖는다.
-//! session pipeline 은 이를 [`CommandSource`](poll) / [`EngineReport`](send_*) slot 으로
-//! 받는다. **β-6 commit C**: per-token tick(`on_token_generated`)은 더 이상 `TokenTickSink`
-//! slot 이 아니라 `TickStage`(PostSample, stages/system/tick.rs)가 공유 Arc 로 호출한다
-//! ([`ResilienceAdapter::tick`]).
+//! The session pipeline takes a [`CommandSource`]; the executor offers `poll`-shaped
+//! drain plus heartbeat emission, and this adapter is the join. Per-token ticks come from
+//! `TickStage` (PostSample, `stages/system/tick.rs`) calling [`ResilienceAdapter::tick`]
+//! through a shared `Arc`.
 //!
-//! `DecodeLoopBuilder::with_resilience` 내에서 `Arc<Mutex<Self>>`로 감싸 cmd_source/report slot
-//! 에 newtype wrapper 를 주입하고, tick 은 build() 에서 TickStage 로 registry submit 한다.
+//! `DecodeLoopBuilder::with_resilience` wraps this in `Arc<Mutex<_>>` and injects the
+//! newtype wrapper into the command-source slot.
 
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use argus_shared::{
-    CommandResult, EngineCapability, EngineCommand, EngineMessage, EngineState, QcfEstimate,
-    WeightSwapReport,
-};
+use argus_shared::{CommandResult, EngineCommand, EngineMessage, EngineState, Phase};
 
 use crate::format::KVCacheFormat;
 use crate::resilience::{CommandExecutor, KVSnapshot};
-use crate::session::command_dispatcher::{CommandSource, EngineReport};
+use crate::session::command_dispatcher::CommandSource;
 
-/// Narrow neutral seam for a quantized-KV format's current bit-width (§4.5,
-/// FORMAT-axis mode/knob declaration design). The base [`KVCacheFormat`]/
-/// [`Forward`](crate::session::forward::Forward) surfaces deliberately omit a
-/// bit-width query (`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC` — no base-trait
-/// downcast). Instead, a quantized-KV technique exposes its runtime bits through
-/// this sub-trait, and the [`ResilienceAdapter`] holds it generically (no concrete
-/// `QuantWindowFormat` in its signature). The engine reads it only to fill the heartbeat
-/// `kv_dtype` field; a non-quantized (Standard/Offload) path simply never installs
-/// a handle, so `kv_dtype` stays the default `""` (behaviour unchanged).
-pub trait QuantStageHandle: Send + Sync {
-    /// Current quantization bit-width (e.g. 16/8/4/2). Mapped to a `kv_dtype`
-    /// string for the heartbeat snapshot.
-    fn current_kv_bits(&self) -> u8;
-}
-
-/// Narrow neutral seam for a KV format's live resident byte count — same idiom as
-/// [`QuantStageHandle`], for the same reason: the base [`KVCacheFormat`] surface has no
-/// byte accessor and adding one is a plugin-facing ABI change
-/// (`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC`).
+/// Narrow neutral seam for a KV format's live resident byte count.
 ///
-/// The implementations delegate to the caches' own `memory_usage_bytes()`, which is
-/// dtype-aware: it sizes Q4_0 by block, asks an opaque descriptor for
-/// `bytes_for_elems`, and otherwise multiplies by the buffer's real dtype size. That is
-/// what makes the heartbeat's `kv_cache_bytes` an actual byte count rather than a token
-/// count wearing a constant — the distinction the KV budget contract rests on, since a
-/// figure derived from fixed F16 geometry would cancel against any geometry-derived
+/// The base [`KVCacheFormat`] surface deliberately has no byte accessor
+/// (`INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC` — no base-trait downcast), so the concrete
+/// format implements this instead and the assembly injects it. Implementations delegate
+/// to the caches' own `memory_usage_bytes()`, which is dtype-aware: it sizes Q4_0 by
+/// block, asks an opaque descriptor for `bytes_for_elems`, and otherwise multiplies by
+/// the buffer's real dtype size.
+///
+/// That is what makes the heartbeat's `kv_cache_bytes` an actual byte count rather than a
+/// token count wearing a constant — the distinction the KV budget rests on, since a
+/// figure derived from fixed geometry would cancel against the geometry-derived
 /// denominator and leave a byte ratio numerically identical to a token ratio.
 pub trait KvBytesHandle: Send + Sync {
     /// Bytes this layer's K and V currently occupy for the resident tokens.
     fn resident_bytes(&self) -> u64;
 }
 
-/// [`CommandExecutor`]를 session 3-trait으로 연결하는 어댑터 (β-4: ManagerCommandSource 역할).
+/// Adapts [`CommandExecutor`] to the session's [`CommandSource`] slot.
 ///
-/// **β-4 (매핑 문서 4부 채택안 (가))**: `CommandSource::poll` 이 pure(`Vec<EngineCommand>` 반환)로
-/// retarget 되면서, heartbeat 송출은 이 source 내부에 잔존한다 — poll 직전에
-/// `send_heartbeat_if_due` 를 호출한다. heartbeat payload(`KVSnapshot`)의 `kv_snap` 운반은 poll
-/// 인자 대신 **held-handle**(register 시점 주입받은 layer-0 `Arc<dyn KVCacheFormat>`)에서
-/// `current_pos`/`capacity` 를 query 해 자체 구성한다(§5.2.1 (가) god-ctx 회피 정신).
+/// `poll` is pure — it returns the drained [`EngineCommand`]s — but heartbeat emission
+/// lives inside it, because reaching it is what tells the adapter a decode step is
+/// happening. The heartbeat payload is built from handles injected at register time
+/// rather than passed down through the step context.
 pub struct ResilienceAdapter {
     executor: CommandExecutor,
-    /// β-4: heartbeat payload 의 kv_cache_tokens/capacity 를 query 할 held-handle.
-    /// `None` 이면 partial snapshot(pos=0) — set_kv_handle 미주입 경로.
+    /// Layer-0 handle, for the resident token count and the capacity the budget
+    /// denominator is computed from. `None` leaves the snapshot empty.
     kv_handle: Option<Arc<dyn KVCacheFormat>>,
-    /// §4.5: heartbeat kv_dtype 를 query 할 quantized-KV handle (layer-0), [`QuantStageHandle`] 뒤로
-    /// 중립화 — 구체 `QuantWindowFormat` 을 adapter 시그니처에서 제거. `None` 이면 비양자화 경로
-    /// (Standard/Offload) → `kv_dtype` 는 default `""` 유지(기존 동작 불변 — 회귀 금지).
-    quant_handle: Option<Arc<dyn QuantStageHandle>>,
-    /// 설정된 eviction policy 의 canonical 이름 (예: "h2o"). 빈 문자열이면 heartbeat 가
-    /// "none" 으로 보고해 `compute_available_actions` 에서 kv.evict_* 가 빠진다 —
-    /// Capability(12 액션) 를 manager merge 가 heartbeat 의 non-empty 3-액션 리스트로
-    /// 덮어써 DPP 후보에서 kv eviction 이 전멸하는 결함의 원인 (2026-06-12 S25 적발).
-    eviction_policy: String,
-    /// Per-layer resident-byte probes, one per decoder layer, summed for the heartbeat's
-    /// `kv_cache_bytes`. Empty (never injected) reports 0, as it did before the field
-    /// existed.
+    /// Per-layer resident-byte probes, summed for `kv_cache_bytes`. Empty reports 0.
     kv_byte_handles: Vec<Arc<dyn KvBytesHandle>>,
+    /// Bytes one token occupies across all decoder layers **uncompressed**. Times the
+    /// cache capacity this is `kv_cache_budget_bytes`, the denominator a `KvCompress`
+    /// budget is a fraction of. Geometry is the right basis here and only here: the
+    /// question it answers is what the cache *would* cost without compression.
+    uncompressed_bytes_per_token: usize,
 }
 
 impl ResilienceAdapter {
@@ -85,28 +60,42 @@ impl ResilienceAdapter {
         Self {
             executor,
             kv_handle: None,
-            quant_handle: None,
-            eviction_policy: String::new(),
             kv_byte_handles: Vec::new(),
+            uncompressed_bytes_per_token: 0,
         }
     }
 
-    /// 설정된 eviction policy 이름을 heartbeat `KVSnapshot` 에 전파한다.
-    /// Capability 산출(`resilience_init.rs`)과 동일 소스(`args.eviction_policy()`)를 써야
-    /// heartbeat available_actions 가 Capability 와 일관된다.
-    pub fn set_eviction_policy(&mut self, policy: &str) {
-        self.eviction_policy = policy.to_string();
-    }
-
-    /// β-4: heartbeat snapshot query 용 held-handle 주입(§5.2.1 (가) — kv_pos_handle 과 동일 패턴).
+    /// Layer-0 handle for the heartbeat's token count and capacity.
     pub fn set_kv_handle(&mut self, handle: Arc<dyn KVCacheFormat>) {
         self.kv_handle = Some(handle);
     }
 
-    /// Inject the per-layer resident-byte probes for the heartbeat's `kv_cache_bytes`.
-    /// Pass every decoder layer — the heartbeat reports the whole-model figure.
+    /// Per-layer resident-byte probes. Pass every decoder layer — the heartbeat reports
+    /// the whole-model figure.
     pub fn set_kv_byte_handles(&mut self, handles: Vec<Arc<dyn KvBytesHandle>>) {
         self.kv_byte_handles = handles;
+    }
+
+    /// Whole-model uncompressed bytes per token, for the budget denominator. See
+    /// [`crate::session::resilience_init::uncompressed_kv_bytes_per_token`].
+    pub fn set_uncompressed_bytes_per_token(&mut self, bytes: usize) {
+        self.uncompressed_bytes_per_token = bytes;
+    }
+
+    /// Direct access for callers that configure the executor itself.
+    pub fn executor_mut(&mut self) -> &mut CommandExecutor {
+        &mut self.executor
+    }
+
+    /// Clone the engine to manager channel.
+    pub fn report_sender(&self) -> std::sync::mpsc::Sender<EngineMessage> {
+        self.executor.report_sender()
+    }
+
+    /// Per-token tick, called by `TickStage` (PostSample) for every sampled token. Feeds
+    /// the heartbeat's smoothed time-between-tokens.
+    pub fn tick(&mut self) {
+        self.executor.on_token_generated();
     }
 
     /// Whole-model resident KV bytes, summed over the injected per-layer probes.
@@ -117,90 +106,32 @@ impl ResilienceAdapter {
             .sum()
     }
 
-    /// §4.5: 양자화-KV 경로에서 heartbeat kv_dtype query 용 quant handle 주입.
+    /// Build the heartbeat's KV payload from the held handles.
     ///
-    /// base `KVCacheFormat` 표면에 bit-width query 가 없어(base trait downcast 미추가 —
-    /// INV-KVCACHELAYER-PRIMITIVE-AGNOSTIC) [`QuantStageHandle`] sub-trait 으로 중립 접근한다. 같은
-    /// layer-0 handle 의 base coerce(pos/capacity query 용 `kv_handle`)는 caller 가 별도 [`set_kv_handle`]
-    /// 로 설치한다. 비양자화 경로는 이 seam 미주입 → `kv_dtype` default `""` 유지(기존 동작 불변).
-    pub fn set_quant_handle(&mut self, handle: Arc<dyn QuantStageHandle>) {
-        self.quant_handle = Some(handle);
-    }
-
-    /// 직접 접근이 필요한 caller (capability send 전 `set_has_secondary` 등)를 위해
-    /// mutable ref를 노출한다.
-    pub fn executor_mut(&mut self) -> &mut CommandExecutor {
-        &mut self.executor
-    }
-
-    /// AB-6 §5.6.6: `EngineSwapRuntime` 구성 시 swap report 송출 채널 clone 을 노출한다
-    /// (`WeightSwapStage` 가 `&self` 로 commit 시점 송신).
-    pub fn report_sender(&self) -> std::sync::mpsc::Sender<EngineMessage> {
-        self.executor.report_sender()
-    }
-
-    /// β-6 commit C: per-token tick. [`TickStage`](crate::stages::system::tick::TickStage)(PostSample
-    /// 구독)가 매 sampled 토큰마다 호출한다. v1 `TickWrapper.on_token_generated` 와 동일 효과
-    /// (executor throughput EMA 적재 + heartbeat token count 채널). `StepCtx` 불필요(stage 는
-    /// `StepInfo` 만 본다).
-    pub fn tick(&mut self) {
-        self.executor.on_token_generated();
-    }
-
-    /// held-handle 에서 heartbeat payload 용 `KVSnapshot` 을 구성한다 (§5.2.1 (가) query).
-    ///
-    /// `current_pos`/`capacity`/`total_bytes` 를 채운다. `total_bytes` 는 주입된 per-layer
-    /// [`KvBytesHandle`] 합 — 캐시가 실제로 쓰는 바이트이지 토큰 수에 상수를 곱한 값이 아니다.
-    /// handle 미주입 시 default(pos=0, bytes=0).
+    /// `total_bytes` is what the cache actually occupies, at its real dtype;
+    /// `budget_bytes` is what it would occupy full and uncompressed. The two are
+    /// deliberately computed differently — a ratio of two geometry figures would cancel
+    /// to a token ratio and tell the Manager nothing about compression.
     fn build_kv_snapshot(&self) -> KVSnapshot {
         match &self.kv_handle {
             Some(h) => KVSnapshot {
                 total_tokens: h.current_pos(),
-                capacity: h.capacity(),
                 total_bytes: self.resident_kv_bytes(),
-                // §4.5: 양자화-KV 경로면 layer-0 handle 의 현재 bits 를 dtype 문자열로 매핑
-                // (v1 census `generate.rs`(d5ed71d2^) L4352 동형). 비양자화 경로(quant_handle=None)는
-                // default `""` 유지(회귀 금지).
-                kv_dtype: self
-                    .quant_handle
-                    .as_ref()
-                    .map(|k| bits_to_kv_dtype(k.current_kv_bits()))
-                    .unwrap_or_default(),
-                eviction_policy: self.eviction_policy.clone(),
-                ..KVSnapshot::default()
+                budget_bytes: (h.capacity() as u64)
+                    .saturating_mul(self.uncompressed_bytes_per_token as u64),
             },
-            // handle 미주입이어도 eviction policy 는 config 차원 사실 — heartbeat
-            // available_actions 가 kv.evict_* 를 잃지 않도록 항상 전파한다.
-            None => KVSnapshot {
-                eviction_policy: self.eviction_policy.clone(),
-                ..KVSnapshot::default()
-            },
+            None => KVSnapshot::default(),
         }
-    }
-}
-
-/// AB-2 §5.7.6: quant-window bit-width → heartbeat `kv_dtype` 문자열 (v1 census `generate.rs`(d5ed71d2^)
-/// L4352 동형). verify YAML(`direct_cmd_kvquant_to_q4.yaml:27-30`)이 `q4` transition 을 검사한다.
-fn bits_to_kv_dtype(bits: u8) -> String {
-    match bits {
-        16 => "f16".to_string(),
-        8 => "q8".to_string(),
-        4 => "q4".to_string(),
-        2 => "q2".to_string(),
-        other => format!("q{other}"),
     }
 }
 
 impl CommandSource for ResilienceAdapter {
     fn poll(&mut self) -> Result<Vec<EngineCommand>> {
-        // β-4: pure 화 후에도 heartbeat 송출 잔존 (매핑 문서 4부 채택안 (가)).
-        // drain 직전 interval 체크 + 송출. kv_snap 은 held-handle query 로 자체 구성.
-        //
-        // This is called once per decode step and nowhere else, so reaching it *is* the
-        // engine being in decode — which is why the phase/state stamp lives here rather
-        // than in a separate hook. See `CommandExecutor::set_phase` on why prefill is not
+        // Reaching this IS the engine being in decode: it is called once per decode step
+        // and nowhere else, which is why the phase stamp lives here rather than in a
+        // separate hook. See `CommandExecutor::set_phase` on why prefill is not
         // observable through the heartbeat yet.
-        self.executor.set_phase("decode", EngineState::Running);
+        self.executor.set_phase(Phase::Decode, EngineState::Running);
         let kv_snap = self.build_kv_snapshot();
         self.executor.send_heartbeat_if_due(&kv_snap);
         Ok(self.executor.drain_commands())
@@ -211,29 +142,10 @@ impl CommandSource for ResilienceAdapter {
     }
 }
 
-impl EngineReport for ResilienceAdapter {
-    fn send_capability(&mut self, cap: EngineCapability) {
-        self.executor.send_capability(cap);
-    }
-    fn send_qcf_estimate(&mut self, qcf: QcfEstimate) {
-        self.executor.send_qcf_estimate(qcf);
-    }
-    fn send_swap_report(&mut self, report: WeightSwapReport) {
-        self.executor.send_weight_swap_report(report);
-    }
-}
-
-// ── Arc<Mutex<ResilienceAdapter>> 기반 newtype wrapper ──
-//
-// `DecodeLoopBuilder::with_resilience`가 단일 ResilienceAdapter 인스턴스를 Arc<Mutex<…>>로
-// 감싸 cmd_source 슬롯에 wrapper 를 주입한다. per-token tick 은 `TickStage`(PostSample,
-// stages/system/tick.rs)가 공유 Arc 로 직접 호출한다 — `ResilienceAdapter::tick`.
-//
-// β-7: v1 report 슬롯 제거로 `ReportWrapper` 는 삭제됐다 — IPC 송출(capability/qcf/
-// swap_report)은 `EngineReport` trait 슬롯을 경유한 적이 없다(resilience_init 가
-// `CommandExecutor` 직접 호출). per-token 호출 빈도: poll 1회 + tick 1회 → contention 무시.
-
-/// `Arc<Mutex<ResilienceAdapter>>` 를 `CommandSource` 로 노출하는 newtype.
+/// Exposes `Arc<Mutex<ResilienceAdapter>>` as a [`CommandSource`].
+///
+/// The builder wraps a single adapter so the command-source slot and `TickStage` can
+/// share it. Per-step contention is two short locks (one poll, one tick).
 pub(crate) struct CmdSrcWrapper(pub Arc<Mutex<ResilienceAdapter>>);
 
 impl CommandSource for CmdSrcWrapper {

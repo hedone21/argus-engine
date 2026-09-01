@@ -17,25 +17,15 @@
 //! OneShot Consumed GC 1회성. directive 1회 = submit 1회 = 발화 1회 = GC. RestoreDefaults →
 //! 재제출 가능 reset. v1 `evict_applied` 는 dispatcher 내부 sticky 상태로 흡수된다.
 
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use argus_extension_api::FormatId;
-use argus_shared::{CommandResult, EngineCapability, EngineCommand, QcfEstimate, WeightSwapReport};
+use argus_shared::{CommandResult, EngineCommand};
 
-use crate::hardware::Hardware;
 use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;
-use crate::kv::quant_window_format::QuantWindowFormat;
 use crate::kv::standard_format::StandardFormat;
-use crate::models::weights::LayerSlot;
-use crate::pipeline::LifecyclePhase;
 use crate::session::pipeline_registry::PipelineRegistry;
 use crate::stages::kv::eviction::EvictionStage;
-use crate::stages::kv::format_reencode::{FixedFormatPolicy, FormatReencodeStage};
-use crate::stages::kv::offload::OffloadStage;
-use crate::stages::kv::quant_window_stage::QuantWindowBitTransitionStage;
-use crate::stages::weight::partition::PartitionStage;
 
 /// External command channel (manager IPC, schedule, stdin, ...).
 ///
@@ -64,16 +54,6 @@ pub trait CommandSource {
     fn report_results(&mut self, _results: Vec<CommandResult>) {}
 }
 
-/// Outbound reporting channel (engine → manager).
-///
-/// **Phase β-7**: moved here from the deleted `session::traits`. Implemented by
-/// `ResilienceAdapter` (the surviving `CommandExecutor` side).
-pub trait EngineReport {
-    fn send_capability(&mut self, _cap: EngineCapability) {}
-    fn send_qcf_estimate(&mut self, _qcf: QcfEstimate) {}
-    fn send_swap_report(&mut self, _report: WeightSwapReport) {}
-}
-
 /// ExecutionPlan 축소판 — driver-local 루프 제어 상태 (v2 §5.4 ② channel).
 ///
 /// `CommandDispatcher::dispatch` 가 매 step 갱신하고, `DecodeLoop::run` 이 읽어 sleep/break/pacing
@@ -87,12 +67,6 @@ pub trait EngineReport {
 #[derive(Debug, Clone, Default)]
 pub struct LoopControl {
     // ── ② control 핵심 (run() live 소비) ──
-    /// Throttle delay between tokens (ms). 0 = no throttle. (Throttle)
-    pub throttle_delay_ms: u64,
-    /// Target TBT in ms. 0 = disabled. (SetTargetTbt)
-    pub target_tbt_ms: u64,
-    /// True iff `target_tbt_ms` was explicitly set at least once. (SetTargetTbt / RestoreDefaults)
-    pub target_tbt_set: bool,
     /// Whether inference should be suspended → loop break (G6 보존). (Suspend)
     pub suspended: bool,
 
@@ -103,16 +77,9 @@ pub struct LoopControl {
     // ── ② RestoreDefaults 묶음 ──
     /// Whether to restore all action-induced state to defaults.
     pub restore_defaults: bool,
-
     // ── 과도기 (deprecated, G1) ──
-    /// Layer skip ratio. (LayerSkip — sticky, forward skip_config 측)
-    pub layer_skip: Option<f32>,
 
     // ── ③ Hardware resolve seam (run() 미소비) ──
-    /// Device to switch to. (SwitchHw)
-    pub switch_device: Option<String>,
-    /// Device to pre-warm. (PrepareComputeUnit)
-    pub prepare_device: Option<String>,
 }
 
 /// v2 §5.4 A-1 의 명령 분배자. `EngineCommand` 를 ① OneShot Stage submit / ② LoopControl /
@@ -128,21 +95,12 @@ pub struct CommandDispatcher {
     /// ① EvictionStage 들이 공유하는 단일 CacheManager (CLI 정책·sticky eviction 상태).
     /// `None` 이면 evict directive 가 와도 submit 안 함(happy/chat 동등 — eviction 미구성).
     cache_manager: Option<Arc<Mutex<CacheManager>>>,
-    /// ① PartitionStage 가 re-slice 할 전체 layer slot handle (register 시점 보유, AB-4 §5.5.1).
-    /// 비어 있으면 SetPartitionRatio directive 가 와도 submit 안 함(미구성 — happy/chat).
-    layer_slots: Vec<Arc<LayerSlot>>,
-    /// ① PartitionStage 의 companion backend resolve 용 (AB-4 §5.5.8). `None` 이면 partition
-    /// directive 무시(model/hardware 미배선 — host 단위테스트 등).
-    hardware: Option<Arc<Hardware>>,
     /// §5.9.1 Track A: score-based eviction 의 attention score accumulator 공유 cell.
     /// ModelForward(begin_step + 주입) + EvictionStage(read + reset) 와 동일 cell 을 공유한다.
     /// `compute_and_send_qcf` 에서 active acc 의 `importance_scores()` 를 QCF `token_scores` 로 전달.
     /// `submit_evict` 에서 EvictionStage 생성 시 score_cell 전달(scored 경로 선택).
     /// score-based 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미(QCF uniform fallback 유지).
     score_cell: Arc<Mutex<Option<SignalRuntime>>>,
-    /// ① QuantWindowBitTransitionStage 가 transition 할 quant-window handle (register 시점 보유, AB-2 §5.7.8). 비어 있으면
-    /// KvQuantDynamic directive 가 와도 submit 안 함(미구성 — non-quant-window: Standard/Offload).
-    quant_window_handles: Vec<Arc<QuantWindowFormat>>,
     /// ② 누적 루프 제어 상태 (sticky control — throttle/tbt 유지, evict 는 OneShot 으로 분리).
     control: LoopControl,
 
@@ -159,32 +117,6 @@ pub struct CommandDispatcher {
     /// actually protects) while letting a DIFFERENT budget through. Same shape as
     /// `last_partition_ratio` / `last_quant_bits` / `last_reencode_format`.
     last_evict_ratio: Option<f32>,
-    /// AB-4 §5.5.2: partition sticky last-applied 게이트. 같은 ratio 의 재submit 을 막고
-    /// (idempotent re-slice 비용 절감), 값 변경 시 재적용한다(evict 의 bool armed 와 다름 —
-    /// partition 은 값이 곧 상태이므로 값 비교가 정확한 게이트). RestoreDefaults 시 `None` 으로
-    /// reset(재무장) + Full 복원 submit.
-    last_partition_ratio: Option<f32>,
-    /// AB-2 §5.7.3: quant sticky last-applied 게이트. 같은 bits 의 재submit 을 막고(`transition_bits`
-    /// 자체 no-op 이기도 하나 loop 진입 자체 차단 = 비용 절감), 값 변경 시 재적용한다(partition 의
-    /// `last_partition_ratio` 와 동형 — 값이 곧 상태이므로 값 비교가 정확한 게이트, evict bool armed
-    /// 복사 금지). RestoreDefaults 시 `None` 으로 reset(재무장) — **16bit 복원 transition 없음**
-    /// (v1 등가, partition `submit_partition_full` 과 비대칭).
-    last_quant_bits: Option<u8>,
-    /// W-FORMAT-HET L1-runtime: format-reencode sticky last-applied 게이트. 같은 format 의 재submit 을
-    /// 막고(Gate-0 no-op 이기도 하나 loop 진입 차단 = 비용 절감), 값 변경 시 재적용한다(`last_quant_bits`
-    /// 와 동형 — 값이 곧 상태). RestoreDefaults 시 `None` 으로 reset(재무장) — 복원 transition 없음
-    /// (quant 와 동형: 외부가 명시적으로 다른 format 을 보내야 복원).
-    last_reencode_format: Option<String>,
-    /// W-FORMAT-HET L1-runtime: per-step "a mid-decode re-encode actually applied ≥1 layer" signal,
-    /// shared with the `FormatReencodeStage`(KvMutate) this dispatcher submits and read by the
-    /// `DecodeLoop` after the KvMutate dispatch. The stage sets it `true` on a real dtype flip; the
-    /// loop swaps it back to `false` and calls `on_kv_reencode()` (fused-plan invalidation) that step
-    /// only. Owned here (not a ctor param) so the many `CommandDispatcher::new` call sites are unchanged.
-    reencode_fired_cell: Arc<AtomicBool>,
-    /// AB-3 §5.10.3: offload 가 한 번이라도 적용됐는가 상태. KvOffload directive 도착 시 true,
-    /// RestoreDefaults recall 완료 후(submit_offload_recall) false. RestoreDefaults 시 recall
-    /// submit 여부의 게이트 — offload 미적용이면 불필요 disk 접근 0.
-    offload_armed: bool,
     /// bench GPU-score 경로용 backend. `submit_evict` 가 `EvictionStage::one_shot_scored` 에 넘겨,
     /// score-fed eviction 이 score 를 읽기 직전 GPU 누적 score 를 CPU accumulator 로 sync 하게 한다
     /// (`init_gpu_score_acc` 로 `gpu_score_active=true` 일 때 decode 가 CPU accumulate 를 건너뛰므로).
@@ -223,11 +155,6 @@ impl CommandDispatcher {
         registry: Arc<PipelineRegistry>,
         kv_handles: Vec<Arc<StandardFormat>>,
         cache_manager: Option<Arc<Mutex<CacheManager>>>,
-        layer_slots: Vec<Arc<LayerSlot>>,
-        hardware: Option<Arc<Hardware>>,
-        // AB-2 §5.7.8: QuantWindowBitTransitionStage 가 transition 할 quant-window handle. Standard/Offload 경로는 빈 Vec
-        // → KvQuantDynamic directive 무시 (inert — evict CM=None 동형).
-        quant_window_handles: Vec<Arc<QuantWindowFormat>>,
         // §5.9.1 Track A: score-based eviction 의 accumulator cell (ModelForward 공유).
         // score-based 미구성 조립처는 `Arc::new(Mutex::new(None))` 더미.
         score_cell: Arc<Mutex<Option<SignalRuntime>>>,
@@ -236,17 +163,9 @@ impl CommandDispatcher {
             registry,
             kv_handles,
             cache_manager,
-            layer_slots,
-            hardware,
-            quant_window_handles,
             score_cell,
             control: LoopControl::default(),
             last_evict_ratio: None,
-            last_partition_ratio: None,
-            last_quant_bits: None,
-            last_reencode_format: None,
-            reencode_fired_cell: Arc::new(AtomicBool::new(false)),
-            offload_armed: false,
             backend: None,
             last_results: Vec::new(),
             pending_compress: None,
@@ -260,13 +179,6 @@ impl CommandDispatcher {
     pub fn with_backend(mut self, backend: Option<Arc<dyn crate::backend::Backend>>) -> Self {
         self.backend = backend;
         self
-    }
-
-    /// W-FORMAT-HET L1-runtime: the per-step re-encode-fired signal, for the assembly to hand to the
-    /// `DecodeLoop` (`with_reencode_fired_cell`) so the loop can invalidate the fused plan exactly on
-    /// a step that re-encoded. Returns an `Arc` clone (shared with the submitted stage).
-    pub(crate) fn reencode_fired_cell(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.reencode_fired_cell)
     }
 
     /// 마지막 [`Self::dispatch`] 가 갱신한 누적 [`LoopControl`] 읽기.
@@ -285,10 +197,10 @@ impl CommandDispatcher {
     /// what the directive asked for, so a compression that did not happen, or landed
     /// short, answers `Partial` with the fraction it actually reached.
     pub fn finalize_results(&mut self) -> Vec<CommandResult> {
-        if let Some(p) = self.pending_compress.take() {
-            if let Some(r) = self.compress_outcome(&p) {
-                self.last_results[p.result_idx] = r;
-            }
+        if let Some(p) = self.pending_compress.take()
+            && let Some(r) = self.compress_outcome(&p)
+        {
+            self.last_results[p.result_idx] = r;
         }
         std::mem::take(&mut self.last_results)
     }
@@ -329,12 +241,10 @@ impl CommandDispatcher {
     ///   에서 시작 후 sticky carry 하던 것과 등가.
     /// - **suspend override**: suspended 면 evict 미submit + device seam clear (v1 :344-352 등가).
     pub fn dispatch(&mut self, cmds: Vec<EngineCommand>) -> &LoopControl {
-        // transient(매 step 새로 결정되는) 필드만 초기화 — sticky(throttle/tbt/quant/partition)는 carry.
+        // transient(매 step 새로 결정되는) 필드만 초기화 — sticky(last_evict_ratio)는 carry.
         self.control.suspended = false;
         self.control.resumed = false;
         self.control.restore_defaults = false;
-        self.control.switch_device = None;
-        self.control.prepare_device = None;
 
         self.last_results = Vec::with_capacity(cmds.len());
         self.pending_compress = None;
@@ -344,20 +254,6 @@ impl CommandDispatcher {
             self.last_results.push(r);
         }
 
-        // 상태 A/B 재무장 시맨틱 (2부 핵심 등가 명제, line 186-194): v1 의 disarm 은 **빈 batch 가
-        // 아니라 RestoreDefaults** 에서만 일어난다. v1 evict_plan 이 sticky carry 되어 빈 poll 에서도
-        // plan.evict 가 Some 유지 → evict_applied 가 reset 되지 않기 때문(decode_loop.rs:279 의
-        // plan.evict.is_none() 분기는 evict_plan=None 일 때만 = RestoreDefaults 후). 따라서 disarm 은
-        // apply 의 RestoreDefaults arm 에서만 수행한다(빈 batch 에서 disarm 금지 — active 구간 유지).
-
-        // suspend override (v1 poll :344-352): suspend 면 device seam 무효 + throttle 0.
-        if self.control.suspended {
-            self.control.switch_device = None;
-            self.control.prepare_device = None;
-            self.control.throttle_delay_ms = 0;
-            self.control.resumed = false;
-        }
-
         &self.control
     }
 
@@ -365,119 +261,29 @@ impl CommandDispatcher {
     ///
     /// The returned [`CommandResult`] is what the Manager is told. `Rejected` means the
     /// engine cannot carry the command out **in this configuration** — an unconfigured
-    /// subsystem, or a directive whose implementation was removed — and is how a Manager
-    /// discovers the engine's real action set. `Ok` means the requested state now holds,
-    /// which includes the idempotent re-arm gates (a second evict inside one active window
-    /// is not a failure; the cache is already at the requested budget).
+    /// subsystem — and is how a Manager discovers the engine's real action set, since the
+    /// contract has no capability exchange. A compression's `Ok` here is provisional:
+    /// [`Self::finalize_results`] replaces it once the stage it submitted has run.
     fn apply(&mut self, cmd: &EngineCommand) -> CommandResult {
         match cmd {
-            // ── ① evict-family 4종 → OneShot EvictionStage submit (method-drop, 3부) ──
-            EngineCommand::KvEvictH2o { keep_ratio }
-            | EngineCommand::KvEvictSliding { keep_ratio }
-            | EngineCommand::KvMergeD2o { keep_ratio } => self.submit_evict(*keep_ratio),
-            EngineCommand::KvStreaming { .. } => {
-                // StreamingLLM 은 target_len 무시 → target_ratio=0.0 (CM CLI sink/window 정책 사용).
-                self.submit_evict(0.0)
-            }
+            // ① KV 압축 → OneShot EvictionStage submit. 어떤 기법으로 줄일지는 계약이 말하지
+            // 않는다 — CM 이 보유한 CLI 구성 기법이 예산까지 prune 한다.
+            EngineCommand::KvCompress { budget } => self.submit_compress(*budget),
 
-            // ── ② control 7종 → LoopControl ──
-            EngineCommand::Throttle { delay_ms } => {
-                self.control.throttle_delay_ms = *delay_ms;
-                CommandResult::Ok
-            }
-            EngineCommand::SetTargetTbt { target_ms } => {
-                self.control.target_tbt_ms = *target_ms;
-                self.control.target_tbt_set = true;
-                CommandResult::Ok
-            }
+            // ② lifecycle → LoopControl
             EngineCommand::Suspend => {
                 self.control.suspended = true;
                 CommandResult::Ok
             }
             EngineCommand::Resume => {
                 self.control.resumed = true;
-                self.control.throttle_delay_ms = 0;
                 CommandResult::Ok
             }
             EngineCommand::RestoreDefaults => {
-                // v1 RestoreDefaults(:484-502) 등가 — reset 묶음.
                 self.control.restore_defaults = true;
-                self.control.throttle_delay_ms = 0;
-                self.control.target_tbt_ms = 0;
-                // target_tbt_set 은 false 로 (CLI fallback branch — v1 :489 주석 등가).
-                self.control.target_tbt_set = false;
-                // AB-2 §5.7.3: quant guard clear 만 (재무장 — 다음 KvQuantDynamic 이 어떤 bits 든
-                // 재적용). **16bit 복원 transition submit 없음** (v1 등가 — partition
-                // `submit_partition_full` 과 비대칭).
-                self.last_quant_bits = None;
-                // W-FORMAT-HET L1-runtime: format-reencode guard clear (재무장 — 다음
-                // KvReencodeFormat 이 어떤 format 이든 재적용). quant 와 동형으로 복원 transition 없음.
-                self.last_reencode_format = None;
-                // 상태 C 재무장: 다음 evict directive 가 새 OneShot submit 가능 (2부).
+                // 재무장: 다음 KvCompress 가 새 OneShot submit 가능.
                 self.last_evict_ratio = None;
-                // AB-4 §5.5.2: partition 을 GPU-only(Full)로 복원 + last reset(재무장). v1
-                // (`generate.rs:3132 RestoreDefaults: re-split...`)이 partition 을 GPU-only 로
-                // 되돌린 것과 등가 — Full 복원 OneShot submit 후 last=None 으로 두면 다음
-                // SetPartitionRatio 가 어떤 ratio 든 재적용된다.
-                self.submit_partition_full();
-                // AB-3 §5.10.3: offload 가 적용됐으면 recall OneShot submit.
-                self.submit_offload_recall();
                 CommandResult::Ok
-            }
-            // The estimates this answered came from the QCF metric family and went with it. The
-            // query stays in the `argus-shared` protocol, so it is answered `Rejected` — the engine
-            // will never follow it with a `QcfEstimate`, and a Manager that reads the result learns
-            // not to spend a directive on it.
-            EngineCommand::RequestQcf => CommandResult::Rejected {
-                reason: "qcf estimates are no longer produced by this engine".to_string(),
-            },
-            // SetPrefillPolicy: DecodeLoop run() 미소비 (prefill 정책은 CLI Args 경로 전용 —
-            // init.rs 가 args.prefill_* 를 직접 read). LoopControl.prefill_* 는 dead write 였어
-            // 삭제됨(2026-06-13 census) → 런타임 변경 수단이 없다.
-            EngineCommand::SetPrefillPolicy { .. } => CommandResult::Rejected {
-                reason: "prefill policy is fixed at startup".to_string(),
-            },
-
-            // ── ① offload → OneShot OffloadStage submit (AB-3 §5.10) ──
-            EngineCommand::KvOffload { ratio } => self.submit_offload(ratio.clamp(0.0, 1.0)),
-            // ── ① quant → OneShot QuantWindowBitTransitionStage submit (AB-2 §5.7.3) ──
-            EngineCommand::KvQuantDynamic { target_bits } => self.submit_kv_quant(*target_bits),
-            // ── ① reencode → OneShot KvMutate FormatReencodeStage submit (W-FORMAT-HET L1-runtime) ──
-            EngineCommand::KvReencodeFormat { format } => self.submit_format_reencode(format),
-            // ── ① partition → OneShot PartitionStage submit (AB-4 §5.5.2) ──
-            EngineCommand::SetPartitionRatio { ratio } => self.submit_partition(*ratio),
-            // `LoopControl.layer_skip` has no reader: layer skip is a startup-only CLI setting
-            // (`--skip-ratio`), so the write here changes nothing about the forward pass.
-            EngineCommand::LayerSkip { skip_ratio } => {
-                self.control.layer_skip = Some(*skip_ratio);
-                CommandResult::Rejected {
-                    reason: "layer skip is fixed at startup".to_string(),
-                }
-            }
-            // Precision swap and recall were driven by the QCF layer ranking (importance × ε) and
-            // went with it. The directives stay in the `argus-shared` protocol — it is an external
-            // crate and a manager may still send them — so they are answered `Rejected` rather than
-            // treated as a protocol error.
-            EngineCommand::SwapWeights { .. } | EngineCommand::RecallWeights { .. } => {
-                CommandResult::Rejected {
-                    reason: "weight swap is not implemented by this engine".to_string(),
-                }
-            }
-            // ── ③ Hardware resolve seam ──
-            //
-            // Both write a `LoopControl` field that `DecodeLoop::run` never reads — the seam was
-            // laid for a device switch that was never wired — so the device does not change.
-            EngineCommand::SwitchHw { device } => {
-                self.control.switch_device = Some(device.clone());
-                CommandResult::Rejected {
-                    reason: "runtime device switch is not implemented".to_string(),
-                }
-            }
-            EngineCommand::PrepareComputeUnit { device } => {
-                self.control.prepare_device = Some(device.clone());
-                CommandResult::Rejected {
-                    reason: "compute-unit pre-warm is not implemented".to_string(),
-                }
             }
         }
     }
@@ -488,7 +294,7 @@ impl CommandDispatcher {
     /// (`None`)이거나 handle 이 없으면 no-op(happy/chat 동등 — v1 `cache_manager=None` 분기).
     /// §5.9.1 Track A: score_cell 이 구성된 경우 `EvictionStage::one_shot_scored` 경로 사용 —
     /// run_eviction 이 acc.importance_scores() 를 추출해 force_evict_with_scores 호출, 직후 acc.reset().
-    fn submit_evict(&mut self, target_ratio: f32) -> CommandResult {
+    fn submit_compress(&mut self, target_ratio: f32) -> CommandResult {
         if self.last_evict_ratio == Some(target_ratio) {
             // 같은 budget 재요청 — 이미 이 active 구간에서 submit 됐다 (v1 evict_applied 등가).
             // 요청한 상태가 이미 성립하므로 실패가 아니다. 값이 **다르면** 아래로 내려가
@@ -523,143 +329,6 @@ impl CommandDispatcher {
         );
         self.registry.submit(Arc::new(stage));
         CommandResult::Ok
-    }
-
-    /// ① KvQuantDynamic directive 1건을 OneShot `QuantWindowBitTransitionStage` 로 submit (AB-2 §5.7.3).
-    ///
-    /// sticky last-applied 게이트: 같은 bits 면 재submit 0(transition_bits 자체 no-op 이기도 하나
-    /// loop 진입 차단 = 비용 절감), 값 변경 시 재적용(새 OneShot → transition). `quant_window_handles` 가
-    /// 비면 미구성(non-quant-window: Standard/Offload) — directive 무시(evict CM=None 동형). partition 의
-    /// `last_partition_ratio` 게이트와 동형(evict bool armed 복사 금지 — 값 비교 게이트).
-    fn submit_kv_quant(&mut self, target_bits: u8) -> CommandResult {
-        if self.last_quant_bits == Some(target_bits) {
-            return CommandResult::Ok; // 값 무변경 → 재submit 0 (요청 상태는 이미 성립).
-        }
-        if self.quant_window_handles.is_empty() {
-            // 미구성 (non-quant-window: Standard/Offload — quant-window handle 부재).
-            return CommandResult::Rejected {
-                reason: "kv cache is not quant-window backed".to_string(),
-            };
-        }
-        self.last_quant_bits = Some(target_bits);
-        let stage =
-            QuantWindowBitTransitionStage::one_shot(self.quant_window_handles.clone(), target_bits);
-        self.registry.submit(Arc::new(stage));
-        CommandResult::Ok
-    }
-
-    /// ① KvReencodeFormat directive 1건을 OneShot `FormatReencodeStage`(KvMutate phase)로 submit
-    /// (W-FORMAT-HET L1-runtime). `submit_kv_quant` 와 동형이나 대상이 다르다 — quant 가 quant-window
-    /// 캐시의 bit-width 를 바꾼다면, 이쪽은 `StandardFormat` per-layer 재인코딩(resident KV 의 in-place
-    /// 정밀도 다운그레이드)을 구동한다. `kv_handles`(StandardFormat) 가 비면 미구성(quant-window/offload
-    /// 경로) — directive 무시. sticky last-applied 게이트: 같은 format 이면 재submit 0(Gate-0 no-op
-    /// 진입 자체 차단), 값 변경 시 재적용. 호스트 typed-floor 레이어만 실재인코딩되고 device/opaque
-    /// 레이어는 stage 가 skip 한다(GPU 재인코딩 전까지 on-device no-op).
-    fn submit_format_reencode(&mut self, format: &str) -> CommandResult {
-        if self.last_reencode_format.as_deref() == Some(format) {
-            return CommandResult::Ok; // 값 무변경 → 재submit 0 (요청 상태는 이미 성립).
-        }
-        if self.kv_handles.is_empty() {
-            // 미구성 (StandardFormat handle 부재 — quant-window/offload 경로).
-            return CommandResult::Rejected {
-                reason: "kv cache is not standard-format backed".to_string(),
-            };
-        }
-        self.last_reencode_format = Some(format.to_string());
-        let policy = Box::new(FixedFormatPolicy::new(FormatId(format.to_string())));
-        let stage =
-            FormatReencodeStage::new_at(LifecyclePhase::KvMutate, self.kv_handles.clone(), policy)
-                .with_reencode_fired(Arc::clone(&self.reencode_fired_cell));
-        self.registry.submit(Arc::new(stage));
-        CommandResult::Ok
-    }
-
-    /// ① SetPartitionRatio directive 1건을 OneShot `PartitionStage` 로 submit (AB-4 §5.5.2).
-    ///
-    /// sticky last-applied 게이트: 같은 ratio 면 재submit 0(idempotent re-slice 비용 절감),
-    /// 값 변경 시 재적용(새 OneShot → re-slice). `layer_slots` 가 비었거나 `hardware` 가 `None`
-    /// 이면 미구성 — directive 무시(happy/chat).
-    fn submit_partition(&mut self, ratio: f32) -> CommandResult {
-        if self.last_partition_ratio == Some(ratio) {
-            return CommandResult::Ok; // 값 무변경 → 재submit 0 (요청 상태는 이미 성립).
-        }
-        if self.layer_slots.is_empty() {
-            // 미구성 (happy/chat — partition 미배선).
-            return CommandResult::Rejected {
-                reason: "tensor partition is not configured".to_string(),
-            };
-        }
-        let Some(hw) = self.hardware.as_ref() else {
-            // hardware 미배선 (host 단위테스트 등).
-            return CommandResult::Rejected {
-                reason: "no hardware is bound for tensor partition".to_string(),
-            };
-        };
-        self.last_partition_ratio = Some(ratio);
-        let stage = PartitionStage::one_shot(self.layer_slots.clone(), Arc::clone(hw), ratio);
-        self.registry.submit(Arc::new(stage));
-        CommandResult::Ok
-    }
-
-    /// RestoreDefaults 시 partition 을 GPU-only(Full)로 복원 + last reset (AB-4 §5.5.2).
-    ///
-    /// `last_partition_ratio == None` 이면 애초에 partition 이 적용된 적 없으므로 복원 불요
-    /// (no-op). 적용된 적 있으면 Full 복원 OneShot submit 후 `last=None`(재무장 — 다음
-    /// SetPartitionRatio 가 어떤 ratio 든 재적용).
-    fn submit_partition_full(&mut self) {
-        if self.last_partition_ratio.is_none() {
-            return; // partition 미적용 — 복원 불요.
-        }
-        self.last_partition_ratio = None;
-        let (false, Some(hw)) = (self.layer_slots.is_empty(), self.hardware.as_ref()) else {
-            return; // 미구성 — submit 생략 (last 는 이미 None 으로 reset 됨).
-        };
-        // ratio=1.0 → apply_partition_dispatch 가 GPU-only fast path(LayerDispatch::Full) 적용.
-        let stage = PartitionStage::one_shot(self.layer_slots.clone(), Arc::clone(hw), 1.0);
-        self.registry.submit(Arc::new(stage));
-    }
-
-    /// ① KvOffload directive 1건을 OneShot `OffloadStage` 로 submit (AB-3 §5.10).
-    ///
-    /// **transient 시맨틱** — armed 게이트 없음(매 directive = 새 submit, WeightSwapStage 동형).
-    /// `cache_manager` 미구성(`None`)이거나 handle 이 없으면 no-op(happy/chat 동등). submit 후
-    /// `offload_armed = true` — RestoreDefaults 가 recall 을 게이트할 때 사용.
-    fn submit_offload(&mut self, ratio: f32) -> CommandResult {
-        let Some(cm) = self.cache_manager.as_ref() else {
-            return CommandResult::Rejected {
-                reason: "kv cache manager is not configured".to_string(),
-            };
-        };
-        if self.kv_handles.is_empty() {
-            return CommandResult::Rejected {
-                reason: "no kv cache handles are registered".to_string(),
-            };
-        }
-        self.offload_armed = true;
-        let stage = OffloadStage::offload(self.kv_handles.clone(), Arc::clone(cm), ratio);
-        self.registry.submit(Arc::new(stage));
-        CommandResult::Ok
-    }
-
-    /// ① RestoreDefaults → offload 적용 이력 있으면 OneShot recall `OffloadStage` submit (AB-3 §5.10.3).
-    ///
-    /// `offload_armed` 이면 recall Stage submit + `offload_armed = false`. 미적용이면 no-op
-    /// (불필요 disk 접근 0). `cache_manager`/handle 미구성이어도 offload_armed 가 true 면
-    /// disarm — submit 는 생략(핸들 부재 시 이미 submit 이 안 됐으므로 armed=true 는 이론상
-    /// 없으나 방어적 처리).
-    fn submit_offload_recall(&mut self) {
-        if !self.offload_armed {
-            return; // offload 미적용 → recall 불요.
-        }
-        self.offload_armed = false;
-        let Some(cm) = self.cache_manager.as_ref() else {
-            return;
-        };
-        if self.kv_handles.is_empty() {
-            return;
-        }
-        let stage = OffloadStage::recall(self.kv_handles.clone(), Arc::clone(cm));
-        self.registry.submit(Arc::new(stage));
     }
 }
 
@@ -705,6 +374,8 @@ mod tests {
         )))
     }
 
+    /// A dispatcher with a cache manager and one layer handle — enough to submit a
+    /// compression.
     fn make_dispatcher() -> (
         CommandDispatcher,
         Arc<PipelineRegistry>,
@@ -712,541 +383,34 @@ mod tests {
     ) {
         let registry = Arc::new(PipelineRegistry::new());
         let handle = make_handle(N_TOKENS);
-        let cm = make_cm();
-        // partition/swap/quant 미구성 (빈 slots + None hardware/model/swap_runtime + 빈 quant_window_handles):
-        // evict 전용 dispatcher. report_tx=None (AB-5 단위테스트는 미배선).
         let d = CommandDispatcher::new(
             Arc::clone(&registry),
             vec![handle.clone()],
-            Some(cm),
-            Vec::new(),
-            None,
-            Vec::new(),
-            Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
+            Some(make_cm()),
+            Arc::new(Mutex::new(None)),
         );
         (d, registry, handle)
     }
 
-    // ── AB-4 (B): partition handle 을 구성한 dispatcher helper ──
-
-    fn cpu_be() -> Arc<dyn Backend> {
-        Arc::new(CpuBackend::new())
-    }
-
-    fn f32_weight(be: &Arc<dyn Backend>, out_dim: usize, in_dim: usize) -> Tensor {
-        let buf: Arc<dyn crate::buffer::Buffer> =
-            Arc::new(SharedBuffer::new(out_dim * in_dim * 4, DType::F32));
-        Tensor::new(Shape::new(vec![out_dim, in_dim]), buf, be.clone())
-    }
-
-    fn ffn_slot(be: &Arc<dyn Backend>, idx: usize) -> Arc<LayerSlot> {
-        use crate::layers::transformer_layer::TransformerLayer;
-        let small = f32_weight(be, 1, 1);
-        let layer = TransformerLayer {
-            wq: small.clone(),
-            wk: small.clone(),
-            wv: small.clone(),
-            wo: small.clone(),
-            w_gate: f32_weight(be, 512, 256),
-            w_up: f32_weight(be, 512, 256),
-            w_down: f32_weight(be, 256, 512),
-            attention_norm: small.clone(),
-            ffn_norm: small,
-            qkv_bias: None,
-            q_norm: None,
-            k_norm: None,
-            pre_ffn_norm: None,
-            post_ffn_norm: None,
-            partition_ctx: None,
-        };
-        Arc::new(LayerSlot::new(layer, DType::F32, None, idx))
-    }
-
-    fn make_partition_dispatcher() -> (CommandDispatcher, Arc<PipelineRegistry>) {
+    /// The same, with no cache manager: nothing can compress.
+    fn bare_dispatcher() -> (CommandDispatcher, Arc<PipelineRegistry>) {
         let registry = Arc::new(PipelineRegistry::new());
-        let be = cpu_be();
-        let slots: Vec<Arc<LayerSlot>> = (0..2).map(|i| ffn_slot(&be, i)).collect();
-        let host: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::galloc::Galloc::new());
-        let hw = Arc::new(Hardware::new(be.clone(), None, None, host, None));
         let d = CommandDispatcher::new(
             Arc::clone(&registry),
-            Vec::new(),
+            vec![make_handle(N_TOKENS)],
             None,
-            slots,
-            Some(hw),
-            Vec::new(),
-            Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
-        );
-        (d, registry)
-    }
-
-    // ── AB-6: swap handle(model + swap_runtime) 을 구성한 dispatcher helper ──
-
-    // ── AB-2: quant_window_handles 를 구성한 dispatcher helper (CPU QuantizedRecentWindowCache) ──
-
-    fn make_quant_dispatcher() -> (CommandDispatcher, Arc<PipelineRegistry>) {
-        use crate::kv::quant_window_cache::QuantizedRecentWindowCache;
-        use crate::kv::quant_window_format::QuantWindowFormat;
-        let registry = Arc::new(PipelineRegistry::new());
-        // CPU QuantizedRecentWindowCache(bits=16 initial — --kv-dynamic-quant 진입 동형). head_dim/residual = QKKV 배수.
-        let quant_window_handles: Vec<Arc<QuantWindowFormat>> = (0..2)
-            .map(|i| {
-                Arc::new(QuantWindowFormat::new(
-                    i,
-                    QuantizedRecentWindowCache::new_with_bits(1, 32, 128, 32, 16),
-                ))
-            })
-            .collect();
-        let d = CommandDispatcher::new(
-            Arc::clone(&registry),
-            Vec::new(),
-            None,
-            Vec::new(),
-            None,
-            quant_window_handles,       // report_tx: AB-5
-            Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
-        );
-        (d, registry)
-    }
-
-    // ── ② control: throttle/tbt/suspend ──
-
-    #[test]
-    fn throttle_sets_control() {
-        let (mut d, _r, _h) = make_dispatcher();
-        let c = d.dispatch(vec![EngineCommand::Throttle { delay_ms: 50 }]);
-        assert_eq!(c.throttle_delay_ms, 50);
-        // sticky: 다음 dispatch 에서도 유지.
-        let c2 = d.dispatch(vec![]);
-        assert_eq!(c2.throttle_delay_ms, 50);
-    }
-
-    #[test]
-    fn set_target_tbt_dirty_flag() {
-        let (mut d, _r, _h) = make_dispatcher();
-        let c0 = d.dispatch(vec![]);
-        assert!(!c0.target_tbt_set);
-        let c1 = d.dispatch(vec![EngineCommand::SetTargetTbt { target_ms: 250 }]);
-        assert!(c1.target_tbt_set);
-        assert_eq!(c1.target_tbt_ms, 250);
-        // RestoreDefaults → set=false, ms=0.
-        let c2 = d.dispatch(vec![EngineCommand::RestoreDefaults]);
-        assert!(!c2.target_tbt_set);
-        assert_eq!(c2.target_tbt_ms, 0);
-        assert!(c2.restore_defaults);
-    }
-
-    #[test]
-    fn suspend_overrides_device_seam() {
-        let (mut d, _r, _h) = make_dispatcher();
-        let c = d.dispatch(vec![
-            EngineCommand::SwitchHw {
-                device: "cpu".to_string(),
-            },
-            EngineCommand::Suspend,
-        ]);
-        assert!(c.suspended);
-        assert!(c.switch_device.is_none(), "suspend → device seam clear");
-    }
-
-    // ── ① evict OneShot submit + sticky 1회성 (상태 A) ──
-
-    #[test]
-    fn evict_submits_one_shot_once() {
-        let (mut d, registry, _h) = make_dispatcher();
-        assert_eq!(registry.len(), 0);
-        d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
-        assert_eq!(registry.len(), 1, "첫 evict directive → OneShot 1개 submit");
-        // sticky carry(빈 batch)에도 재submit 안 함 (상태 A — 같은-budget 게이트).
-        d.dispatch(vec![]);
-        assert_eq!(registry.len(), 1, "빈 batch — 재submit 없음");
-        // 같은 directive 반복도 재submit 안 함.
-        d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
-        assert_eq!(
-            registry.len(),
-            1,
-            "active 구간 내 directive 반복 — 재submit 없음"
-        );
-    }
-
-    #[test]
-    fn restore_defaults_rearms_evict() {
-        let (mut d, registry, _h) = make_dispatcher();
-        d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
-        assert_eq!(registry.len(), 1);
-        // RestoreDefaults → 재무장 (다음 KvEvict* 가 새 OneShot submit 가능).
-        d.dispatch(vec![EngineCommand::RestoreDefaults]);
-        d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
-        assert_eq!(
-            registry.len(),
-            2,
-            "RestoreDefaults 후 재무장 → 새 OneShot submit"
-        );
-    }
-
-    /// v1 sticky carry 등가: evict directive 없는 batch(빈/다른 directive)에서는 disarm 되지
-    /// 않는다 — v1 evict_plan 이 sticky carry 되어 plan.evict 가 Some 유지되므로 evict_applied 도
-    /// reset 안 됨. disarm 은 오직 RestoreDefaults 에서만 (2부 핵심 등가 명제).
-    #[test]
-    fn evict_stays_armed_without_restore_defaults() {
-        let (mut d, registry, _h) = make_dispatcher();
-        d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
-        assert_eq!(registry.len(), 1);
-        // evict directive 없는 batch (다른 directive) → 여전히 armed (sticky carry 등가, disarm 아님).
-        d.dispatch(vec![EngineCommand::Throttle { delay_ms: 10 }]);
-        d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
-        assert_eq!(
-            registry.len(),
-            1,
-            "RestoreDefaults 없이는 disarm 안 됨 — 재submit 없음"
-        );
-    }
-
-    // ── method-drop (3부): KvEvictH2o directive 라도 stage 는 method 안 받음 (target_ratio 만) ──
-
-    #[test]
-    fn method_drop_h2o_directive_submits_target_ratio_only() {
-        let (mut d, registry, handle) = make_dispatcher();
-        // CLI 정책 = sliding(make_cm). KvEvictH2o directive 가 와도 sliding 으로 prune 됨.
-        d.dispatch(vec![EngineCommand::KvEvictH2o { keep_ratio: 0.3 }]);
-        assert_eq!(registry.len(), 1);
-        // stage 발화 (KvMutate dispatch) → sliding prune.
-        let mut profiler = crate::observability::profile::OpProfiler::new();
-        let mut ctx = crate::pipeline::StageContext {
-            step: crate::pipeline::StepInfo {
-                pos: N_TOKENS,
-                decode_step: 0,
-                pressure: crate::pipeline::Pressure::new(0),
-                prev_token: 0,
-            },
-            profiler: &mut profiler,
-        };
-        use crate::pipeline::{LifecyclePhase, PipelineDispatcher};
-        registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
-        assert!(
-            handle.current_pos() < N_TOKENS,
-            "method-drop: directive method 무시, CM 정책(sliding)으로 prune"
-        );
-    }
-
-    // ── 과도기 등가 (LayerSkip) — AB-2/3/4/6 으로 이전된 quant/offload/partition/swap 제외 ──
-
-    #[test]
-    fn transitional_fields_equivalence() {
-        let (mut d, _r, _h) = make_dispatcher();
-        // AB-2: KvQuantDynamic, AB-3: KvOffload/recall, AB-4: SetPartitionRatio, AB-6: SwapWeights 는
-        // LoopControl 필드가 아니라 OneShot Stage submit 으로 이전됨. 본 테스트는 잔존 과도기
-        // 필드(layer_skip)만.
-        let c = d.dispatch(vec![EngineCommand::LayerSkip { skip_ratio: 0.25 }]);
-        assert_eq!(c.layer_skip, Some(0.25));
-        // sticky: layer_skip 는 다음 dispatch 에 carry.
-        let c2 = d.dispatch(vec![]);
-        assert_eq!(c2.layer_skip, Some(0.25), "layer_skip sticky");
-    }
-
-    // ── AB-3: offload OneShot submit + transient 시맨틱 ──
-
-    /// KvOffload directive → OneShot OffloadStage 1개 submit (transient).
-    /// 같은 directive 재도착 → 새 submit (armed 게이트 없음 — WeightSwapStage 동형).
-    #[test]
-    fn offload_submits_one_shot_each_directive() {
-        let (mut d, registry, _h) = make_dispatcher();
-        assert_eq!(registry.len(), 0);
-        d.dispatch(vec![EngineCommand::KvOffload { ratio: 0.5 }]);
-        assert_eq!(registry.len(), 1, "첫 KvOffload → OneShot 1개 submit");
-        // transient: 같은 directive 재도착 → 새 submit (armed 게이트 없음).
-        d.dispatch(vec![EngineCommand::KvOffload { ratio: 0.5 }]);
-        assert_eq!(
-            registry.len(),
-            2,
-            "transient: 같은 directive 재도착 → 새 submit"
-        );
-        // 빈 batch 는 carry 0 (offload_ratio 필드 삭제 — sticky 아님).
-        d.dispatch(vec![]);
-        assert_eq!(registry.len(), 2, "빈 batch — carry 0 (transient)");
-    }
-
-    /// offload 적용 후 RestoreDefaults → recall OneShot submit.
-    /// offload 미적용 상태 RestoreDefaults → recall submit 없음(no-op).
-    #[test]
-    fn restore_defaults_submits_recall_when_offloaded() {
-        let (mut d, registry, _h) = make_dispatcher();
-        // offload 미적용 상태 RestoreDefaults → recall submit 없음.
-        d.dispatch(vec![EngineCommand::RestoreDefaults]);
-        assert_eq!(registry.len(), 0, "offload 미적용 → recall submit 없음");
-        // offload 적용 후 RestoreDefaults → recall OneShot submit.
-        d.dispatch(vec![EngineCommand::KvOffload { ratio: 0.5 }]);
-        assert_eq!(registry.len(), 1, "KvOffload → offload OneShot submit");
-        d.dispatch(vec![EngineCommand::RestoreDefaults]);
-        assert_eq!(
-            registry.len(),
-            2,
-            "offload 적용 후 RestoreDefaults → recall OneShot submit"
-        );
-        // recall 후 armed=false → 다음 RestoreDefaults 에서 재recall 없음.
-        d.dispatch(vec![EngineCommand::RestoreDefaults]);
-        assert_eq!(
-            registry.len(),
-            2,
-            "recall 후 RestoreDefaults → recall 없음 (armed=false)"
-        );
-    }
-
-    // ── AB-2: quant OneShot submit + sticky last-applied 게이트 (§5.7.9 승계) ──
-
-    /// quant 미구성(빈 quant_window_handles) dispatcher 는 KvQuantDynamic 을 무시 (non-quant-window 경로).
-    #[test]
-    fn quant_unconfigured_ignores_directive() {
-        let (mut d, registry, _h) = make_dispatcher(); // 빈 quant_window_handles
-        d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 4 }]);
-        assert_eq!(registry.len(), 0, "quant 미구성 → directive 무시");
-    }
-
-    /// 새 bits → OneShot QuantWindowBitTransitionStage 1개 submit. 같은 bits 반복/빈 batch → 재submit 0,
-    /// 값 변경 → 재submit (partition `last_partition_ratio` 게이트 동형). RestoreDefaults 후 재무장.
-    /// **16bit 복원 submit 부재** 단언(partition `submit_partition_full` 과 비대칭).
-    #[test]
-    fn quant_sticky_resubmits_on_value_change() {
-        let (mut d, registry) = make_quant_dispatcher();
-        assert_eq!(registry.len(), 0);
-        // 첫 directive → OneShot 1 submit.
-        d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 4 }]);
-        assert_eq!(registry.len(), 1, "첫 quant directive → OneShot 1개 submit");
-        // 같은 bits 반복 → 재submit 0 (sticky last-applied).
-        d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 4 }]);
-        assert_eq!(registry.len(), 1, "같은 bits 반복 — 재submit 없음");
-        // 빈 batch 에도 재submit 0 (sticky carry 아님 — last-applied 비교).
-        d.dispatch(vec![]);
-        assert_eq!(registry.len(), 1, "빈 batch — 재submit 없음");
-        // 값 변경(4 → 8) → 새 OneShot submit.
-        d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 8 }]);
-        assert_eq!(registry.len(), 2, "bits 변경 → 새 OneShot submit");
-        // RestoreDefaults → 재무장 (16bit 복원 submit 없음 — registry 불변).
-        d.dispatch(vec![EngineCommand::RestoreDefaults]);
-        assert_eq!(
-            registry.len(),
-            2,
-            "RestoreDefaults → 16bit 복원 submit 없음 (partition 과 비대칭)"
-        );
-        // 재무장: 같은 bits(8)도 last=None reset 후라 재적용된다.
-        d.dispatch(vec![EngineCommand::KvQuantDynamic { target_bits: 8 }]);
-        assert_eq!(
-            registry.len(),
-            3,
-            "RestoreDefaults 후 재무장 → 어떤 bits 든 재적용"
-        );
-    }
-
-    // ── W-FORMAT-HET L1-runtime: format-reencode OneShot submit + sticky last-applied 게이트 ──
-
-    /// reencode 미구성(빈 kv_handles) dispatcher 는 KvReencodeFormat 을 무시 (StandardFormat handle
-    /// 부재 — quant-window/offload 경로). panic 없이 inert.
-    #[test]
-    fn reencode_unconfigured_ignores_directive() {
-        let registry = Arc::new(PipelineRegistry::new());
-        let mut d = CommandDispatcher::new(
-            Arc::clone(&registry),
-            Vec::new(), // 빈 kv_handles → StandardFormat handle 부재
-            None,
-            Vec::new(),
-            None,
-            Vec::new(),
             Arc::new(Mutex::new(None)),
         );
-        d.dispatch(vec![EngineCommand::KvReencodeFormat {
-            format: "q4_0".to_string(),
-        }]);
-        assert_eq!(
-            registry.len(),
-            0,
-            "reencode 미구성(빈 kv_handles) → directive 무시"
-        );
+        (d, registry)
     }
-
-    /// 새 format → OneShot FormatReencodeStage 1개 submit. 같은 format 반복/빈 batch → 재submit 0,
-    /// 값 변경 → 재submit (quant `last_quant_bits` 게이트 동형). RestoreDefaults 후 재무장 (복원
-    /// transition submit 없음 — quant 와 동형).
-    #[test]
-    fn reencode_sticky_resubmits_on_value_change() {
-        let (mut d, registry, _h) = make_dispatcher(); // kv_handles=[handle]
-        assert_eq!(registry.len(), 0);
-        d.dispatch(vec![EngineCommand::KvReencodeFormat {
-            format: "q4_0".to_string(),
-        }]);
-        assert_eq!(
-            registry.len(),
-            1,
-            "첫 reencode directive → OneShot 1개 submit"
-        );
-        d.dispatch(vec![EngineCommand::KvReencodeFormat {
-            format: "q4_0".to_string(),
-        }]);
-        assert_eq!(registry.len(), 1, "같은 format 반복 — 재submit 없음");
-        d.dispatch(vec![]);
-        assert_eq!(registry.len(), 1, "빈 batch — 재submit 없음");
-        d.dispatch(vec![EngineCommand::KvReencodeFormat {
-            format: "f16".to_string(),
-        }]);
-        assert_eq!(registry.len(), 2, "format 변경 → 새 OneShot submit");
-        d.dispatch(vec![EngineCommand::RestoreDefaults]);
-        assert_eq!(
-            registry.len(),
-            2,
-            "RestoreDefaults → 복원 transition submit 없음 (quant 동형)"
-        );
-        d.dispatch(vec![EngineCommand::KvReencodeFormat {
-            format: "f16".to_string(),
-        }]);
-        assert_eq!(
-            registry.len(),
-            3,
-            "RestoreDefaults 후 재무장 → 어떤 format 이든 재적용"
-        );
-    }
-
-    /// 진짜 end-to-end: KvReencodeFormat dispatch → registry 가 KvMutate 를 발화 → handle 이 실제로
-    /// 재인코딩된다. submission(`registry.len()`)만 보는 sticky 테스트와 달리 **phase 까지** 검증한다
-    /// — `submit_format_reencode` 가 잘못된 phase 를 넘기면 KvMutate 에서 발화하지 않아 FAIL 한다.
-    #[test]
-    fn reencode_command_reencodes_handle_at_kvmutate() {
-        use crate::observability::profile::OpProfiler;
-        use crate::pipeline::{PipelineDispatcher, Pressure, StageContext, StepInfo};
-
-        let (mut d, registry, handle) = make_dispatcher(); // kv_handles=[F32 handle, current_pos=120]
-        d.dispatch(vec![EngineCommand::KvReencodeFormat {
-            format: "q4_0".to_string(),
-        }]);
-        assert_eq!(registry.len(), 1, "command → OneShot submit");
-
-        // registry 를 KvMutate 로 발화 — submit 된 stage 가 이 phase 에서 재인코딩한다.
-        let mut profiler = OpProfiler::new();
-        let mut ctx = StageContext {
-            step: StepInfo {
-                pos: 0,
-                decode_step: 0,
-                pressure: Pressure::new(0),
-                prev_token: 0,
-            },
-            profiler: &mut profiler,
-        };
-        registry.dispatch(LifecyclePhase::KvMutate, &mut ctx);
-
-        assert_eq!(
-            handle.take_inner().kv_dtype(),
-            DType::Q4_0,
-            "command path: F32 handle 이 KvMutate 발화로 q4_0 재인코딩됨"
-        );
-    }
-
-    // ── exhaustive match 컴파일 강제 (게이트 2): variant 가 apply 에서 누락되면 컴파일 실패 ──
-    // (apply 의 match 가 non-exhaustive `_` 없이 전 arm 을 다루므로, variant 추가 시 컴파일 에러.)
-
-    #[test]
-    fn cache_manager_none_ignores_evict() {
-        let registry = Arc::new(PipelineRegistry::new());
-        let handle = make_handle(N_TOKENS);
-        let mut d = CommandDispatcher::new(
-            Arc::clone(&registry),
-            vec![handle],
-            None,
-            Vec::new(),
-            None,
-            Vec::new(),
-            Arc::new(Mutex::new(None)), // score_cell: §5.9.1 (테스트 더미)
-        );
-        d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
-        assert_eq!(registry.len(), 0, "CM 미구성 → evict directive 무시");
-    }
-
-    // ── AB-4 (B): partition OneShot submit + sticky last-applied 게이트 ──
-
-    /// 새 ratio → OneShot PartitionStage 1개 submit.
-    #[test]
-    fn partition_submits_one_shot_on_new_ratio() {
-        let (mut d, registry) = make_partition_dispatcher();
-        assert_eq!(registry.len(), 0);
-        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
-        assert_eq!(
-            registry.len(),
-            1,
-            "첫 partition directive → OneShot 1개 submit"
-        );
-    }
-
-    /// 같은 ratio 반복 → 재submit 0 (sticky last-applied 게이트).
-    #[test]
-    fn partition_same_ratio_no_resubmit() {
-        let (mut d, registry) = make_partition_dispatcher();
-        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
-        assert_eq!(registry.len(), 1);
-        // 같은 값 반복 → 무시 (idempotent re-slice 비용 절감).
-        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
-        assert_eq!(registry.len(), 1, "같은 ratio 반복 — 재submit 없음");
-        // 빈 batch 에도 재submit 없음 (sticky carry 아님 — last-applied 비교).
-        d.dispatch(vec![]);
-        assert_eq!(registry.len(), 1, "빈 batch — 재submit 없음");
-    }
-
-    /// 값 변경 → 재submit (partition 은 값이 곧 상태라 값 변경 시 재적용).
-    #[test]
-    fn partition_changed_ratio_resubmits() {
-        let (mut d, registry) = make_partition_dispatcher();
-        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
-        assert_eq!(registry.len(), 1);
-        // 값 변경 (0.3 → 0.5) → 새 OneShot submit (evict 의 bool armed 와 다른 시맨틱).
-        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.5 }]);
-        assert_eq!(registry.len(), 2, "ratio 변경 → 새 OneShot submit");
-    }
-
-    /// RestoreDefaults → last reset + Full 복원 OneShot submit + 재무장.
-    #[test]
-    fn restore_defaults_resets_partition() {
-        let (mut d, registry) = make_partition_dispatcher();
-        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
-        assert_eq!(registry.len(), 1);
-        // RestoreDefaults → Full 복원 OneShot submit (partition 적용된 상태였으므로).
-        d.dispatch(vec![EngineCommand::RestoreDefaults]);
-        assert_eq!(
-            registry.len(),
-            2,
-            "RestoreDefaults → Full 복원 OneShot submit"
-        );
-        // 재무장: 같은 ratio(0.3)도 last=None reset 후라 재적용된다.
-        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
-        assert_eq!(
-            registry.len(),
-            3,
-            "RestoreDefaults 후 재무장 → 어떤 ratio 든 재적용"
-        );
-    }
-
-    /// partition 미적용 상태에서 RestoreDefaults → Full 복원 submit 없음 (no-op).
-    #[test]
-    fn restore_defaults_without_partition_is_noop() {
-        let (mut d, registry) = make_partition_dispatcher();
-        d.dispatch(vec![EngineCommand::RestoreDefaults]);
-        assert_eq!(
-            registry.len(),
-            0,
-            "partition 미적용 → Full 복원 불요 (no-op)"
-        );
-    }
-
-    /// partition 미구성(빈 slots) dispatcher 는 SetPartitionRatio 를 무시.
-    #[test]
-    fn partition_unconfigured_ignores_directive() {
-        let (mut d, registry, _h) = make_dispatcher(); // 빈 slots + None hardware
-        d.dispatch(vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }]);
-        assert_eq!(registry.len(), 0, "partition 미구성 → directive 무시");
-    }
-
-    // ── AB-6: swap OneShot submit + transient 시맨틱 (§5.6.4) ──
-
-    // ── Rejected 시맨틱: 미구성/미구현 directive 는 Ok 로 답하지 않는다 ──
 
     fn results_of(d: &mut CommandDispatcher, cmds: Vec<EngineCommand>) -> Vec<CommandResult> {
         d.dispatch(cmds);
         d.finalize_results()
+    }
+
+    fn compress(budget: f32) -> EngineCommand {
+        EngineCommand::KvCompress { budget }
     }
 
     fn is_rejected(r: &CommandResult) -> bool {
@@ -1255,140 +419,65 @@ mod tests {
 
     /// These tests exercise the dispatcher alone — nothing runs the `KvMutate` phase, so a
     /// submitted compression legitimately finalizes as `Partial` ("the cache did not
-    /// move"). What they assert about a compression is therefore that it was ACCEPTED,
-    /// not that it completed; `unapplied_compression_reports_partial` covers the other half.
+    /// move"). What they assert about a compression is therefore that it was ACCEPTED;
+    /// `unapplied_compression_reports_partial` covers the other half.
     fn is_accepted(r: &CommandResult) -> bool {
         !is_rejected(r)
     }
 
-    /// evict 는 CacheManager 가 구성돼 있으면 Ok, 없으면 Rejected.
     #[test]
-    fn evict_result_tracks_cache_manager_configuration() {
-        let (mut d, _r, _h) = make_dispatcher(); // CM 구성됨
-        let ok = results_of(&mut d, vec![EngineCommand::KvEvictH2o { keep_ratio: 0.5 }]);
-        assert!(is_accepted(&ok[0]), "구성됨 → 수락: {ok:?}");
-
-        // 같은 active 구간 재요청: 이미 요청 예산에 도달했으므로 실패가 아니다.
-        let again = results_of(&mut d, vec![EngineCommand::KvEvictH2o { keep_ratio: 0.5 }]);
-        assert!(
-            matches!(again[..], [CommandResult::Ok]),
-            "같은 budget 재요청은 submit 없이 Ok — 측정할 압축이 없다: {again:?}"
-        );
-
-        let registry = Arc::new(PipelineRegistry::new());
-        let mut bare = CommandDispatcher::new(
-            Arc::clone(&registry),
-            vec![make_handle(N_TOKENS)],
-            None, // CacheManager 미구성 (happy/chat)
-            Vec::new(),
-            None,
-            Vec::new(),
-            Arc::new(Mutex::new(None)),
-        );
-        let rej = results_of(
-            &mut bare,
-            vec![EngineCommand::KvEvictH2o { keep_ratio: 0.5 }],
-        );
-        assert!(is_rejected(&rej[0]), "CM 미구성 → Rejected: {rej:?}");
-        assert_eq!(registry.len(), 0, "Rejected 는 stage 를 submit 하지 않는다");
+    fn compress_submits_one_shot_once_per_budget() {
+        let (mut d, registry, _h) = make_dispatcher();
+        assert_eq!(registry.len(), 0);
+        assert!(is_accepted(&results_of(&mut d, vec![compress(0.5)])[0]));
+        assert_eq!(registry.len(), 1, "첫 압축 → OneShot 1개 submit");
+        d.dispatch(vec![]);
+        assert_eq!(registry.len(), 1, "빈 batch — 재submit 없음");
+        let again = results_of(&mut d, vec![compress(0.5)]);
+        assert!(matches!(again[..], [CommandResult::Ok]));
+        assert_eq!(registry.len(), 1, "같은 budget 반복 — 재submit 없음");
     }
 
-    /// 구현이 제거됐거나 런타임 수단이 없는 directive 는 전부 Rejected.
-    /// 이것이 Manager 가 별도 capability 교환 없이 액션 집합을 배우는 경로다.
-    #[test]
-    fn unimplemented_directives_are_rejected() {
-        let (mut d, _r, _h) = make_dispatcher();
-        let cmds = vec![
-            EngineCommand::RequestQcf,
-            EngineCommand::SwapWeights {
-                ratio: 0.5,
-                target_dtype: argus_shared::DtypeTag::Q4_0,
-            },
-            EngineCommand::RecallWeights { ratio: 0.5 },
-            EngineCommand::LayerSkip { skip_ratio: 0.25 },
-            EngineCommand::SwitchHw {
-                device: "cpu".to_string(),
-            },
-            EngineCommand::PrepareComputeUnit {
-                device: "cpu".to_string(),
-            },
-            EngineCommand::SetPrefillPolicy {
-                chunk_size: Some(64),
-                yield_ms: None,
-                cpu_chunk_size: None,
-            },
-            // 이 dispatcher 는 partition/quant 미구성이다.
-            EngineCommand::SetPartitionRatio { ratio: 0.3 },
-            EngineCommand::KvQuantDynamic { target_bits: 4 },
-        ];
-        let n = cmds.len();
-        let results = results_of(&mut d, cmds);
-        assert_eq!(results.len(), n, "명령 1건 = 결과 1건");
-        assert!(
-            results.iter().all(is_rejected),
-            "미구현/미구성은 전부 Rejected 여야 한다: {results:?}"
-        );
-    }
-
-    /// 살아 있는 control 명령은 Ok 를 유지한다 (Rejected 로 과잉 확대 금지).
-    #[test]
-    fn live_control_directives_stay_ok() {
-        let (mut d, _r, _h) = make_dispatcher();
-        let results = results_of(
-            &mut d,
-            vec![
-                EngineCommand::Throttle { delay_ms: 5 },
-                EngineCommand::SetTargetTbt { target_ms: 100 },
-                EngineCommand::Resume,
-                EngineCommand::RestoreDefaults,
-                EngineCommand::Suspend,
-            ],
-        );
-        assert!(
-            results.iter().all(|r| matches!(r, CommandResult::Ok)),
-            "live control 은 Ok: {results:?}"
-        );
-    }
-
-    /// 예산을 조이는 연속 directive 는 매번 새 OneShot 을 submit 한다.
-    /// bool 게이트 시절에는 두 번째부터 조용히 버려지고 `Ok` 로 보고됐다.
+    /// 예산을 조이는 연속 directive 는 매번 새 OneShot 을 submit 한다. 값-무관 bool 게이트
+    /// 시절에는 두 번째부터 조용히 버려지고 `Ok` 로 보고됐다.
     #[test]
     fn tightening_budget_resubmits() {
         let (mut d, registry, _h) = make_dispatcher();
-        for (i, ratio) in [0.50f32, 0.35, 0.25].into_iter().enumerate() {
-            let r = results_of(
-                &mut d,
-                vec![EngineCommand::KvEvictH2o { keep_ratio: ratio }],
-            );
-            assert!(is_accepted(&r[0]), "{ratio}: {r:?}");
+        for (i, budget) in [0.50f32, 0.35, 0.25].into_iter().enumerate() {
+            let r = results_of(&mut d, vec![compress(budget)]);
+            assert!(is_accepted(&r[0]), "{budget}: {r:?}");
             assert_eq!(
                 registry.len(),
                 i + 1,
-                "budget {ratio} 는 새 OneShot 을 submit 해야 한다"
+                "budget {budget} 는 새 OneShot 을 submit"
             );
         }
-        // 같은 값 재요청은 여전히 재submit 하지 않는다 (once-per-window 성질 보존).
-        let r = results_of(&mut d, vec![EngineCommand::KvEvictH2o { keep_ratio: 0.25 }]);
+    }
+
+    /// `RestoreDefaults` 는 재무장한다 — 그 뒤 같은 budget 도 다시 submit 된다.
+    #[test]
+    fn restore_defaults_rearms_compression() {
+        let (mut d, registry, _h) = make_dispatcher();
+        results_of(&mut d, vec![compress(0.5)]);
+        assert_eq!(registry.len(), 1);
+        let r = results_of(&mut d, vec![EngineCommand::RestoreDefaults]);
         assert!(matches!(r[..], [CommandResult::Ok]));
-        assert_eq!(registry.len(), 3, "같은 budget 반복 — 재submit 없음");
+        results_of(&mut d, vec![compress(0.5)]);
+        assert_eq!(registry.len(), 2, "RestoreDefaults 후 재submit 가능");
     }
 
     /// 압축을 제출했는데 stage 가 캐시를 건드리지 않았으면 `Ok` 가 아니라 `Partial` 이다.
-    /// 이 유닛 테스트는 `KvMutate` 를 돌리지 않으므로, `MIN_EVICT_TOKENS` 로 거절당한
+    /// 이 유닛 테스트는 `KvMutate` 를 돌리지 않으므로 `MIN_EVICT_TOKENS` 로 거절당한
     /// 실전 케이스와 관측 결과가 같다 — 매니저가 「적용됐다」로 오독하면 안 되는 상황.
     #[test]
     fn unapplied_compression_reports_partial() {
-        use crate::format::KVCacheFormat;
         let (mut d, registry, handle) = make_dispatcher();
         let before = handle.current_pos();
-        let r = results_of(&mut d, vec![EngineCommand::KvEvictH2o { keep_ratio: 0.5 }]);
+        let r = results_of(&mut d, vec![compress(0.5)]);
         assert_eq!(registry.len(), 1, "stage 는 submit 됐다");
         match &r[0] {
             CommandResult::Partial { achieved, reason } => {
-                assert!(
-                    (*achieved - 1.0).abs() < 1e-6,
-                    "캐시가 안 줄었으니 achieved==1.0: {achieved}"
-                );
+                assert!((*achieved - 1.0).abs() < 1e-6, "achieved==1.0: {achieved}");
                 assert!(reason.contains("declined"), "이유가 실려야 한다: {reason}");
             }
             other => panic!("미적용 압축은 Partial 이어야 한다, got {other:?}"),
@@ -1396,16 +485,60 @@ mod tests {
         assert_eq!(
             before,
             handle.current_pos(),
-            "이 테스트는 stage 를 돌리지 않는다"
+            "이 테스트는 stage 를 안 돌린다"
         );
+    }
+
+    /// 압축할 수단이 없으면 `Rejected` — 계약에 capability 교환이 없으므로 이것이 매니저가
+    /// 엔진의 액션 집합을 배우는 유일한 경로다.
+    #[test]
+    fn compress_without_cache_manager_is_rejected() {
+        let (mut d, registry) = bare_dispatcher();
+        let r = results_of(&mut d, vec![compress(0.5)]);
+        assert!(is_rejected(&r[0]), "{r:?}");
+        assert_eq!(registry.len(), 0, "Rejected 는 stage 를 submit 하지 않는다");
+    }
+
+    #[test]
+    fn lifecycle_commands_are_ok_and_drive_control() {
+        let (mut d, _r, _h) = make_dispatcher();
+        let r = results_of(&mut d, vec![EngineCommand::Suspend]);
+        assert!(matches!(r[..], [CommandResult::Ok]));
+        assert!(d.control().suspended, "Suspend → LoopControl");
+
+        let r = results_of(&mut d, vec![EngineCommand::Resume]);
+        assert!(matches!(r[..], [CommandResult::Ok]));
+        assert!(
+            !d.control().suspended,
+            "다음 dispatch 가 transient 를 초기화"
+        );
+        assert!(d.control().resumed);
+
+        let r = results_of(&mut d, vec![EngineCommand::RestoreDefaults]);
+        assert!(matches!(r[..], [CommandResult::Ok]));
+        assert!(d.control().restore_defaults);
     }
 
     /// `finalize_results` 는 비운다 — 다음 dispatch 가 이전 결과를 물려받지 않는다.
     #[test]
     fn finalize_results_drains() {
         let (mut d, _r, _h) = make_dispatcher();
-        d.dispatch(vec![EngineCommand::Throttle { delay_ms: 1 }]);
+        d.dispatch(vec![EngineCommand::Suspend]);
         assert_eq!(d.finalize_results().len(), 1);
         assert!(d.finalize_results().is_empty(), "두 번째 호출은 비어 있다");
+    }
+
+    /// 명령 1건 = 결과 1건, 순서 보존.
+    #[test]
+    fn results_match_commands_one_to_one() {
+        let (mut d, _r, _h) = make_dispatcher();
+        let r = results_of(
+            &mut d,
+            vec![EngineCommand::Suspend, compress(0.5), EngineCommand::Resume],
+        );
+        assert_eq!(r.len(), 3);
+        assert!(matches!(r[0], CommandResult::Ok));
+        assert!(is_accepted(&r[1]));
+        assert!(matches!(r[2], CommandResult::Ok));
     }
 }

@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 use crate::format::KVCacheFormat;
 use crate::inference::sampling::{GreedySampler, StepCtx, TokenSampler};
@@ -322,10 +321,6 @@ impl DecodeLoop {
                 stopped_by = StopReason::StopFlag;
                 break;
             }
-            // 매 step 전체 wall-clock 시작점 (target_tbt pacing 기준 — throttle
-            // delay 도 이 측정에 포함된다).
-            let t_iter = Instant::now();
-
             // DecodeStart: t_iter 직후, (a) command poll 전.
             if let Some(r) = self.dispatch_phase(LifecyclePhase::DecodeStart) {
                 stopped_by = Self::map_stage_stop(r);
@@ -339,26 +334,16 @@ impl DecodeLoop {
             // 분배 대상 0 = 거동-0. throttle_delay/target_tbt 의 sticky 는 LoopControl 이 보존.
             let cmds = self.cmd_source.poll()?;
             let n_cmds = cmds.len();
-            let (suspended, throttle_delay_ms, target_tbt_ms) =
-                if let Some(d) = self.dispatcher.as_mut() {
-                    let control = d.dispatch(cmds);
-                    (
-                        control.suspended,
-                        control.throttle_delay_ms,
-                        control.target_tbt_ms,
-                    )
-                } else {
-                    (false, 0, 0)
-                };
+            let suspended = match self.dispatcher.as_mut() {
+                Some(d) => d.dispatch(cmds).suspended,
+                None => false,
+            };
             if suspended {
                 // G6: suspend = loop break 보존 (pause/park 전환 금지). KvMutate 까지 못 가므로
                 // 여기서 응답한다 — submit-time 판정 그대로다(제출된 압축이 있었다면 미적용).
                 self.report_command_results(n_cmds);
                 stopped_by = StopReason::CommandRequested;
                 break;
-            }
-            if throttle_delay_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
             }
 
             // (a.5) 제거: evict 는 dispatcher 가 OneShot EvictionStage 로 registry 에 submit 했고,
@@ -475,20 +460,6 @@ impl DecodeLoop {
 
             // DecodeEnd Stop 이 아니면 token push (run/run_until_stop 공통).
             generated.push(sampled);
-
-            // (h) target TBT pacing — resilience SetTargetTbt 가 설정한 목표
-            // wall-clock 에 도달하도록 step 끝에서 sleep. target_tbt_ms == 0
-            // (미설정/release) 이면 no-op이라 비-resilience 경로는 무영향.
-            // (a) 에서 LoopControl 로부터 읽은 sticky target_tbt_ms 를 사용.
-            if target_tbt_ms > 0 {
-                let elapsed_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
-                let target_ms = target_tbt_ms as f64;
-                if elapsed_ms < target_ms {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(
-                        (target_ms - elapsed_ms) / 1000.0,
-                    ));
-                }
-            }
         }
 
         // final_pos = 진짜 누적 위치(self.pos). 메모리 telemetry 용 점유는 cache 에서 직접 읽는다

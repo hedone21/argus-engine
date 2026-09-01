@@ -204,7 +204,7 @@ pub fn build_bench_loop(
     memory: Arc<dyn Memory>,
     cpu_backend: Arc<dyn Backend>,
     // AB-4: PartitionStage 의 companion resolve 용 hardware (init.rs:822 보유분 전달).
-    hardware: Arc<crate::hardware::Hardware>,
+    _hardware: Arc<crate::hardware::Hardware>,
     model: TransformerModel,
     kv_caches: Vec<KVCache>,
     max_seq_len: usize,
@@ -307,7 +307,6 @@ pub fn build_bench_loop(
     let kv_handles: Vec<Arc<crate::kv::standard_format::StandardFormat>> = mf.fmt_caches().to_vec();
 
     // AB-4: PartitionStage 가 re-slice 할 전체 layer slot handle (model.layers.clone()).
-    let layer_slots: Vec<Arc<crate::models::weights::LayerSlot>> = mf.model().layers.clone();
 
     // AB-6 §5.6.3/§5.6.7: WeightSwapStage 가 swap 할 model handle (register 시점 보유,
     // model 측 접근 seam — secondary_mmap/quant_noise/current_dtype). swap_runtime 은 아래에서
@@ -372,12 +371,6 @@ pub fn build_bench_loop(
             Arc::clone(&registry),
             kv_handles.clone(),
             shared_cm.clone(),
-            // AB-4: partition directive 가 OneShot PartitionStage 로 submit. layer_slots 비면
-            // (이론상 무) submit 안 됨 — dispatcher 내부 inert (evict CM=None 과 등가).
-            layer_slots,
-            Some(Arc::clone(&hardware)),
-            // AB-2: Standard 경로는 quant-window handle 부재 → 빈 Vec (KvQuantDynamic directive inert).
-            Vec::new(),
             // §5.9.1 Track A: ModelForward + EvictionStage 와 공유하는 score cell.
             Arc::clone(&score_cell),
         );

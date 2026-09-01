@@ -9,24 +9,24 @@
 
 use argus_engine::resilience::{MockTransport, TcpTransport, Transport, TransportError};
 use argus_shared::{
-    EngineCapability, EngineCommand, EngineDirective, EngineMessage, ManagerMessage,
+    EngineCommand, EngineDirective, EngineMessage, EngineState, EngineStatus, ManagerMessage, Phase,
 };
 
 fn sample_directive() -> ManagerMessage {
     ManagerMessage::Directive(EngineDirective {
         seq_id: 1,
-        commands: vec![EngineCommand::KvEvictH2o { keep_ratio: 0.85 }],
+        commands: vec![EngineCommand::KvCompress { budget: 0.5 }],
     })
 }
 
 fn sample_capability() -> EngineMessage {
-    EngineMessage::Capability(EngineCapability {
-        available_devices: vec!["cpu".into()],
-        active_device: "cpu".into(),
-        max_kv_tokens: 2048,
-        bytes_per_kv_token: 256,
-        num_layers: 16,
-        ..Default::default()
+    EngineMessage::Heartbeat(EngineStatus {
+        kv_cache_bytes: 1024,
+        kv_cache_budget_bytes: 4096,
+        kv_cache_tokens: 32,
+        tbt_ms: 12.5,
+        phase: Phase::Decode,
+        state: EngineState::Running,
     })
 }
 
@@ -78,7 +78,17 @@ fn test_proto_014_mock_bidirectional_round_trip() {
     // Engine → Manager
     transport.send(&sample_capability()).unwrap();
     let resp = mgr.recv().unwrap();
-    assert!(matches!(resp, EngineMessage::Capability(_)));
+    assert!(matches!(
+        resp,
+        EngineMessage::Heartbeat(EngineStatus {
+            kv_cache_bytes: 1024,
+            kv_cache_budget_bytes: 4096,
+            kv_cache_tokens: 32,
+            tbt_ms: 12.5,
+            phase: Phase::Decode,
+            state: EngineState::Running,
+        })
+    ));
 }
 
 // ══════════════════════════════════════════════════════════════

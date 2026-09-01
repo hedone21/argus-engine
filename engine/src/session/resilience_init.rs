@@ -32,19 +32,6 @@ pub fn build_command_executor(
 
     let heartbeat_interval = Duration::from_millis(1000);
 
-    // MSG-068 Phase 2: GPU self-util meter 추출.
-    // OpenCL backend + heartbeat_gpu_profile 활성 시만 Some.
-    // 그 외는 None → executor가 self_gpu_pct=0.0 송출.
-    #[allow(unused_mut)]
-    let mut gpu_meter: Option<std::sync::Arc<dyn crate::resilience::GpuSelfMeter>> = None;
-    #[cfg(feature = "opencl")]
-    if args.heartbeat_gpu_profile {
-        // argus-cli는 SessionInitCtx 해체 후 호출되므로 backend Arc를 직접 갖지 않음.
-        // gpu_meter 추출 기회가 없어 None 유지 — heartbeat self_gpu_pct=0.0.
-        // P5+에서 backend Arc를 인자로 받는 별 overload 도입 예정.
-        let _ = args.heartbeat_gpu_profile; // 컴파일러 경고 방지
-    }
-
     // transport 분기. spawn 실패 / unknown transport / feature off 모두 graceful
     // fallback (warn + Ok(None)) — default-on 정책 회귀 차단.
     let spawn_result: Result<_> = match args.resilience_transport.as_str() {
@@ -85,57 +72,27 @@ pub fn build_command_executor(
         args.resilience_transport
     );
 
-    let mut executor = CommandExecutor::with_gpu_meter(
-        cmd_rx,
-        resp_tx,
-        args.backend.clone(),
-        heartbeat_interval,
-        gpu_meter,
-    );
+    let executor = CommandExecutor::new(cmd_rx, resp_tx, heartbeat_interval);
 
-    // argus-cli v0: secondary 없음 → swap_weights 액션 미포함.
-    executor.set_has_secondary(false);
-
-    // Capability 송출 (SEQ-022).
-    // eviction policy / kv_type / secondary 여부에서 동적 산출 (compute_available_actions와
-    // 동일 조건). 정적 리스트는 signal_memory_critical 시 kv.evict_* 탈락을 유발한다.
-    let available_actions = {
-        let mut a = CommandExecutor::compute_available_actions(
-            args.eviction_policy(),
-            &args.kv_type,
-            false, // argus-cli v0: secondary 없음
-        );
-        // Capability-only 추가 액션 (Heartbeat available_actions 에는 없지만 manager 정책이
-        // 사용하는 throttle/suspend/reject_new/limit_tokens/restore_defaults/set_target_tbt).
-        for extra in &[
-            "set_target_tbt",
-            "suspend",
-            "reject_new",
-            "limit_tokens",
-            "restore_defaults",
-        ] {
-            if !a.iter().any(|x| x == extra) {
-                a.push(extra.to_string());
-            }
-        }
-        a
-    };
-    executor.send_capability(argus_shared::EngineCapability {
-        available_devices: vec!["cpu".to_string(), "opencl".to_string()],
-        active_device: args.backend.clone(),
-        max_kv_tokens: args.max_seq_len,
-        bytes_per_kv_token: model.config.num_key_value_heads
-            * model.config.head_dim
-            * 2  // K + V
-            * 2, // F16 = 2 bytes
-        num_layers: model.config.num_hidden_layers,
-        available_actions,
-    });
-    eprintln!("[Resilience] Capability sent to Manager");
-
-    // tensor_partition seed (happy path에서는 0.0 → no-op이지만 무회귀 보존)
-    if args.tensor_partition > 0.0 && args.tensor_partition < 1.0 {
-        executor.set_partition_ratio(args.tensor_partition);
-    }
+    // No capability report: the contract has none. A command the engine cannot execute is
+    // answered `Rejected`, which is both per-command and always current — a capability
+    // list could not describe an action that comes and goes with configuration, and was a
+    // second description of the engine to keep in sync by hand.
+    let _ = model;
     Ok(Some(executor))
+}
+
+/// Bytes one token occupies in the KV cache across **all** decoder layers, uncompressed.
+///
+/// Times the cache capacity this is the heartbeat's `kv_cache_budget_bytes` — the
+/// denominator a `KvCompress` budget is a fraction of. Deriving it from geometry is
+/// correct precisely because the question is hypothetical: what the cache *would* cost
+/// with no compression applied. The numerator it is compared against is measured, not
+/// derived, which is what keeps their ratio meaningful.
+pub fn uncompressed_kv_bytes_per_token(cfg: &crate::model_config::ModelConfig) -> usize {
+    cfg.num_key_value_heads
+        * cfg.head_dim
+        * 2  // K + V
+        * 2  // f16
+        * cfg.num_hidden_layers
 }
