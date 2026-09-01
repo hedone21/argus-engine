@@ -25,6 +25,7 @@ use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::standard_format::StandardFormat;
 use crate::session::pipeline_registry::PipelineRegistry;
+use crate::stages::kv::aperturb_select_stage::AperturbSelectStage;
 use crate::stages::kv::eviction::EvictionStage;
 
 /// External command channel (manager IPC, schedule, stdin, ...).
@@ -123,6 +124,14 @@ pub struct CommandDispatcher {
     /// 기본 `None`(ctor param 아님 — `reencode_fired_cell` 처럼 호출처 무변경); build_bench_loop 가
     /// `with_backend` 로 OpenCL backend 를 주입한다. `None` 이면 기존 CPU accumulate 경로 무변.
     backend: Option<Arc<dyn crate::backend::Backend>>,
+    /// The engine's own compression choice, when one is configured: a resolved candidate pool plus
+    /// the query rows the metric scores them on. `Some` makes a `KvCompress` submit an
+    /// [`AperturbSelectStage`] instead of the single CLI-configured policy — the contract says how
+    /// much KV may remain, and this is what decides by what technique.
+    ///
+    /// `None` (the default, and every path that configures no pool) keeps the method-drop
+    /// behaviour: the `CacheManager`'s one policy prunes to the budget.
+    aperturb: Option<AperturbSelection>,
     /// Per-command outcomes of the last [`Self::dispatch`], in the order the commands
     /// arrived. Drained by [`Self::finalize_results`] so the driver can hand them back to
     /// the `CommandSource` that produced the commands.
@@ -136,6 +145,15 @@ pub struct CommandDispatcher {
     /// for `apply`, which does not otherwise know where its answer lands.
     result_idx: usize,
 }
+
+/// The engine's own compression chooser, and the query rows it scores candidates on.
+///
+/// The rows come from the live forward — `ModelForward` captures into this same cell — so a
+/// decision measures what this session actually computed rather than a re-derivation of it.
+type AperturbSelection = (
+    Arc<crate::kv::aperturb_select::Selector>,
+    Arc<Mutex<Option<crate::inference::q_rows::QRowCapture>>>,
+);
 
 /// A KV compression submitted this step, awaiting its post-apply reading.
 struct PendingCompress {
@@ -167,6 +185,7 @@ impl CommandDispatcher {
             control: LoopControl::default(),
             last_evict_ratio: None,
             backend: None,
+            aperturb: None,
             last_results: Vec::new(),
             pending_compress: None,
             result_idx: 0,
@@ -178,6 +197,20 @@ impl CommandDispatcher {
     /// score buffer)를 넘긴다. 미호출(chat/standard/test)이면 `None` → 기존 CPU accumulate 경로 무변.
     pub fn with_backend(mut self, backend: Option<Arc<dyn crate::backend::Backend>>) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Let the engine choose its own compression technique: a `KvCompress` then submits an
+    /// [`AperturbSelectStage`](crate::stages::kv::aperturb_select_stage::AperturbSelectStage) over
+    /// `selector`'s candidate pool instead of applying the one configured policy. `q_rows` is the
+    /// cell `ModelForward` captures into, shared so the decision reads the rows this session's own
+    /// forward produced.
+    pub fn with_aperturb_selector(
+        mut self,
+        selector: Arc<crate::kv::aperturb_select::Selector>,
+        q_rows: Arc<Mutex<Option<crate::inference::q_rows::QRowCapture>>>,
+    ) -> Self {
+        self.aperturb = Some((selector, q_rows));
         self
     }
 
@@ -301,16 +334,37 @@ impl CommandDispatcher {
             // 새 OneShot 을 submit 한다 — 그것이 bool 게이트와의 차이다.
             return CommandResult::Ok;
         }
-        let Some(cm) = self.cache_manager.as_ref() else {
-            return CommandResult::Rejected {
-                reason: "kv cache manager is not configured".to_string(),
-            };
-        };
         if self.kv_handles.is_empty() {
             return CommandResult::Rejected {
                 reason: "no kv cache handles are registered".to_string(),
             };
         }
+        // The contract names a budget, not a technique. When a candidate pool is configured the
+        // engine picks the technique itself; otherwise it applies the one the CLI configured.
+        let stage: Arc<dyn crate::pipeline::PipelineStage> = match self.aperturb.as_ref() {
+            Some((selector, q_rows)) => Arc::new(AperturbSelectStage::new(
+                self.kv_handles.clone(),
+                Arc::clone(selector),
+                Arc::clone(q_rows),
+                target_ratio,
+                Arc::clone(&self.score_cell),
+                self.backend.clone(),
+            )),
+            None => {
+                let Some(cm) = self.cache_manager.as_ref() else {
+                    return CommandResult::Rejected {
+                        reason: "kv cache manager is not configured".to_string(),
+                    };
+                };
+                Arc::new(EvictionStage::one_shot_scored(
+                    self.kv_handles.clone(),
+                    Arc::clone(cm),
+                    target_ratio,
+                    Arc::clone(&self.score_cell),
+                    self.backend.clone(),
+                ))
+            }
+        };
         self.last_evict_ratio = Some(target_ratio);
         {
             use crate::format::KVCacheFormat;
@@ -320,14 +374,7 @@ impl CommandDispatcher {
                 tokens_before: self.kv_handles.first().map_or(0, |h| h.current_pos()),
             });
         }
-        let stage = EvictionStage::one_shot_scored(
-            self.kv_handles.clone(),
-            Arc::clone(cm),
-            target_ratio,
-            Arc::clone(&self.score_cell),
-            self.backend.clone(),
-        );
-        self.registry.submit(Arc::new(stage));
+        self.registry.submit(stage);
         CommandResult::Ok
     }
 }
@@ -423,6 +470,47 @@ mod tests {
     /// `unapplied_compression_reports_partial` covers the other half.
     fn is_accepted(r: &CommandResult) -> bool {
         !is_rejected(r)
+    }
+
+    /// A configured candidate pool is what decides, and it needs no `CacheManager` — the technique
+    /// no longer comes from one. Mutation-proof: leaving the `cache_manager` guard ahead of the
+    /// selector branch makes this `Rejected` and submits nothing.
+    #[test]
+    fn a_configured_pool_compresses_without_a_cache_manager() {
+        use crate::kv::aperturb_select::{Candidate, Selector};
+
+        let registry = Arc::new(PipelineRegistry::new());
+        let d = CommandDispatcher::new(
+            Arc::clone(&registry),
+            vec![make_handle(N_TOKENS)],
+            None, // no cache manager — the selector is the whole configuration
+            Arc::new(Mutex::new(None)),
+        );
+        let basis = Arc::new(
+            crate::aperturb::OutputBasis::from_layers(vec![vec![1.0f32]], 1, 1, None).unwrap(),
+        );
+        let selector = Arc::new(
+            Selector::new(
+                vec![Candidate::new(
+                    "none",
+                    argus_extension_api::find_mutation_stage("none")
+                        .map(|r| (r.make)(Default::default(), &[]))
+                        .expect("the built-in no-eviction stage is registered"),
+                    argus_extension_api::StageCaps::SCORE_FREE,
+                )],
+                basis,
+                1,
+            )
+            .unwrap(),
+        );
+        let mut d = d.with_aperturb_selector(selector, Arc::new(Mutex::new(None)));
+        let r = results_of(&mut d, vec![compress(0.5)]);
+        assert!(
+            is_accepted(&r[0]),
+            "a pool-configured compression must not be rejected for a missing cache manager: {:?}",
+            r[0]
+        );
+        assert_eq!(registry.len(), 1, "one selection stage submitted");
     }
 
     #[test]

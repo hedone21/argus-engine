@@ -41,6 +41,21 @@ fn current_format_name(cache: &KVCache) -> &'static str {
     }
 }
 
+/// A staged keep-set, read back before [`EngineCacheHandle::commit`] rather than applied.
+///
+/// The transaction layer already separates "what the stage decided" from "what the cache does with
+/// it" — T-1 stages the intent and only `commit` renumbers. Borrowing the intent out is what lets a
+/// caller ask a technique what it *would* retain without paying for it: score a pool of candidates
+/// against the untouched cache, then commit only the winner. Dropping the handle instead of
+/// committing leaves the cache byte-identical, by the same T-1 property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedKeep<'a> {
+    /// Every KV head of the layer retains the same ascending positions.
+    LayerWide(&'a [usize]),
+    /// One ascending list per KV head, all of equal length.
+    PerHead(&'a [Vec<usize>]),
+}
+
 /// The single staged position-mutating compaction slot (T-2: at most one per callback).
 enum Compaction {
     /// LayerWide keep — all heads keep the same ascending positions.
@@ -125,6 +140,19 @@ impl<'a> EngineCacheHandle<'a> {
             prev = Some(k);
         }
         Ok(())
+    }
+
+    /// The keep-set staged so far, or `None` if the callback staged no keep.
+    ///
+    /// A read of the staged intent, not of the cache: nothing has been applied yet. `Offload` and
+    /// `Recall` stage a residency move rather than a keep and read back as `None` — a caller that
+    /// scores retained sets has nothing to score there.
+    pub fn staged_keep(&self) -> Option<StagedKeep<'_>> {
+        match self.compaction.as_ref()? {
+            Compaction::Keep(k) => Some(StagedKeep::LayerWide(k)),
+            Compaction::KeepPerHead(h) => Some(StagedKeep::PerHead(h)),
+            Compaction::Offload(_) | Compaction::Recall => None,
+        }
     }
 
     /// Stage a compaction, rejecting a second one (T-2).

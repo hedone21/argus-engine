@@ -39,6 +39,11 @@ pub mod standard_format;
 // (single renumber), routing every op to an existing executor (the v2 plan executor / apply_weighted_merges
 // / apply_format_plan / swap_handler). The format twin of the plan executor in eviction/stage_registry.
 pub mod cache_handle;
+// The engine's own compression choice: ask every configured technique what it would retain at the
+// Manager's budget, score those retained sets with `crate::aperturb`, and apply the smallest
+// perturbation. The narrow contract's engine half — the Manager sets a budget, this picks the
+// technique.
+pub mod aperturb_select;
 // HYBRID v3 — the declarative coordinate map for KV techniques (axis cell + phase + signal edges).
 // A static, CI-validatable matrix of "what technique sits where, consuming/feeding which signals".
 pub mod descriptor;

@@ -15,6 +15,7 @@
 //! bit-width 를 `transition_bits` 로 런타임 전환하는 OneShot Stage. EvictionStage 와 형제(KV 축).
 //! 나머지 입주자(weighted-merge/Swap/TierMove)는 후속 substep 에서 채운다.
 
+pub mod aperturb_select_stage;
 pub mod eviction;
 pub mod format_reencode;
 // HYBRID v3 — driver for imperative KVMutationStage callbacks (mutation twin of format_reencode).

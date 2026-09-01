@@ -1072,22 +1072,38 @@ pub struct Args {
     #[arg(long)]
     pub aperturb_tensor_dir: Option<std::path::PathBuf>,
 
-    /// `--dump aperturb`: load the output-projection basis from this file instead of factoring the
-    /// weights, and fail if the file does not belong to this model. Written by
-    /// `--aperturb-basis-out`. The decomposition is a model constant that costs 28 s at 1B and 12
-    /// min at 8B, and nothing stored it, so every run paid it again; on a phone, where factoring is
-    /// not practical at all, this is the only way the metric runs. Load-only by design: a missing
-    /// file or a header that disagrees is an error, never a quiet fall back to computing it. No
-    /// effect unless `aperturb` is requested, and not combinable with `--aperturb-basis-out`.
+    /// Load the output-projection basis from this file instead of factoring the weights, and fail if
+    /// the file does not belong to this model. Written by `--aperturb-basis-out`. The decomposition
+    /// is a model constant that costs 28 s at 1B and 12 min at 8B, and nothing stored it, so every
+    /// run paid it again; on a phone, where factoring is not practical at all, this is the only way
+    /// the metric runs. Load-only by design: a missing file or a header that disagrees is an error,
+    /// never a quiet fall back to computing it. Read by both `--dump aperturb` and
+    /// `--aperturb-select`; not combinable with `--aperturb-basis-out`.
     #[arg(long)]
     pub aperturb_basis: Option<std::path::PathBuf>,
 
-    /// `--dump aperturb`: factor the output projection as usual, then write the basis to this file
-    /// for `--aperturb-basis` to load. Little-endian, 1 MB for a 1B model and 8 MB for an 8B one at
-    /// the default rank, and portable — produce it on a host and ship it with the application. No
-    /// effect unless `aperturb` is requested.
+    /// Factor the output projection as usual, then write the basis to this file for
+    /// `--aperturb-basis` to load. Little-endian, 1 MB for a 1B model and 8 MB for an 8B one at the
+    /// default rank, and portable — produce it on a host and ship it with the application. Honored
+    /// by both `--dump aperturb` and `--aperturb-select`.
     #[arg(long)]
     pub aperturb_basis_out: Option<std::path::PathBuf>,
+
+    /// Let the engine choose its own KV compression: a comma-separated pool of registered technique
+    /// names (e.g. `h2o,sliding,streaming`). A `KvCompress { budget }` from the Manager then asks each of
+    /// them what it would retain at that budget, scores those retained sets by how far each moves
+    /// the model's own attention output, and applies the one that moves it least — instead of
+    /// applying the single `eviction <policy>` the CLI configured.
+    ///
+    /// A candidate must be a technique that acts where the budget arrives — mid-decode, at
+    /// `KvMutate` — and must read only what the planner can supply there. A prefill-end stage
+    /// (PyramidKV/SnapKV) is refused rather than ranked on its degraded fallback.
+    ///
+    /// Needs `--aperturb-basis` unless a startup decomposition is acceptable (28 s at 1B, 12 min at
+    /// 8B). Off by default: the forward then never captures query rows and the compression path is
+    /// byte-identical to before.
+    #[arg(long, value_delimiter = ',')]
+    pub aperturb_select: Vec<String>,
 
     /// eval-LL KV eviction timing (when eviction fires and which importance drives
     /// it). `post_prefill_probe` (default) = today's behavior: full prefill, a
@@ -1469,11 +1485,14 @@ impl Args {
     /// `--set` (the budget IS the policy — there is no default). Returns a clean error instead of a
     /// deep panic at stage construction. No-op for any non-`h2o` policy. Call once at session setup.
     pub fn require_h2o_budgets(&self) -> anyhow::Result<()> {
-        if self.eviction_policy() == "h2o"
-            && (self.h2o_hh_size().is_none() || self.h2o_recent_size().is_none())
-        {
+        // A candidate in the `--aperturb-select` pool is a technique this run may apply, so it
+        // needs its budgets on the same terms as the configured policy — otherwise h2o would be
+        // ranked, and possibly chosen, on budgets nobody set.
+        let h2o_in_play = self.eviction_policy() == "h2o"
+            || self.aperturb_select.iter().any(|n| n.trim() == "h2o");
+        if h2o_in_play && (self.h2o_hh_size().is_none() || self.h2o_recent_size().is_none()) {
             anyhow::bail!(
-                "eviction policy 'h2o' requires explicit budgets: pass \
+                "'h2o' requires explicit budgets: pass \
                  `--set hh_size=<N> --set recent_size=<M>` (faithful H2O keeps hh_size heavy hitters \
                  + recent_size recent tokens; there is no default)."
             );
