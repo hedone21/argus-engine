@@ -147,9 +147,18 @@ pub struct CommandDispatcher {
     control: LoopControl,
 
     // ── sticky 상태 (2부 — v1 executor 의 sticky carry/게이트 흡수) ──
-    /// 상태 A 등가(v1 `evict_applied`): active 구간당 evict OneShot 1회만 submit.
-    /// evict directive 도착 시 true, RestoreDefaults 도착 시 false 로 재무장.
-    evict_armed: bool,
+    /// Last budget an evict OneShot was submitted for in this active window, or `None`
+    /// before the first one and after a `RestoreDefaults` re-arm.
+    ///
+    /// This was a bare `evict_armed: bool` (v1 `evict_applied` equivalence: at most one
+    /// OneShot per active window). A bool gate is value-BLIND: the second directive of a
+    /// tightening sequence — 0.50 then 0.35 then 0.25 as pressure rises — was dropped and
+    /// answered `Ok`, so the manager saw success, saw the cache unchanged, and escalated
+    /// into a budget it could never reach. Comparing the value instead keeps the
+    /// once-per-window property for a REPEATED budget (which is what the equivalence
+    /// actually protects) while letting a DIFFERENT budget through. Same shape as
+    /// `last_partition_ratio` / `last_quant_bits` / `last_reencode_format`.
+    last_evict_ratio: Option<f32>,
     /// AB-4 §5.5.2: partition sticky last-applied 게이트. 같은 ratio 의 재submit 을 막고
     /// (idempotent re-slice 비용 절감), 값 변경 시 재적용한다(evict 의 bool armed 와 다름 —
     /// partition 은 값이 곧 상태이므로 값 비교가 정확한 게이트). RestoreDefaults 시 `None` 으로
@@ -214,7 +223,7 @@ impl CommandDispatcher {
             quant_window_handles,
             score_cell,
             control: LoopControl::default(),
-            evict_armed: false,
+            last_evict_ratio: None,
             last_partition_ratio: None,
             last_quant_bits: None,
             last_reencode_format: None,
@@ -341,8 +350,8 @@ impl CommandDispatcher {
                 // W-FORMAT-HET L1-runtime: format-reencode guard clear (재무장 — 다음
                 // KvReencodeFormat 이 어떤 format 이든 재적용). quant 와 동형으로 복원 transition 없음.
                 self.last_reencode_format = None;
-                // 상태 C 재무장: 다음 KvEvict* directive 가 새 OneShot submit 가능 (2부).
-                self.evict_armed = false;
+                // 상태 C 재무장: 다음 evict directive 가 새 OneShot submit 가능 (2부).
+                self.last_evict_ratio = None;
                 // AB-4 §5.5.2: partition 을 GPU-only(Full)로 복원 + last reset(재무장). v1
                 // (`generate.rs:3132 RestoreDefaults: re-split...`)이 partition 을 GPU-only 로
                 // 되돌린 것과 등가 — Full 복원 OneShot submit 후 last=None 으로 두면 다음
@@ -412,14 +421,15 @@ impl CommandDispatcher {
 
     /// ① evict directive 1건을 OneShot `EvictionStage` 로 submit (method-drop).
     ///
-    /// 상태 A/B 등가(2부): `evict_armed` 게이트로 active 구간당 1회만 submit. CacheManager 미구성
+    /// 상태 A/B 등가(2부): 같은 budget 은 active 구간당 1회만 submit. CacheManager 미구성
     /// (`None`)이거나 handle 이 없으면 no-op(happy/chat 동등 — v1 `cache_manager=None` 분기).
     /// §5.9.1 Track A: score_cell 이 구성된 경우 `EvictionStage::one_shot_scored` 경로 사용 —
     /// run_eviction 이 acc.importance_scores() 를 추출해 force_evict_with_scores 호출, 직후 acc.reset().
     fn submit_evict(&mut self, target_ratio: f32) -> CommandResult {
-        if self.evict_armed {
-            // 이미 active 구간 내 submit 됨 (재적용 방지 — v1 evict_applied 등가). The cache is
-            // already at a requested budget, so the state the Manager asked for holds.
+        if self.last_evict_ratio == Some(target_ratio) {
+            // 같은 budget 재요청 — 이미 이 active 구간에서 submit 됐다 (v1 evict_applied 등가).
+            // 요청한 상태가 이미 성립하므로 실패가 아니다. 값이 **다르면** 아래로 내려가
+            // 새 OneShot 을 submit 한다 — 그것이 bool 게이트와의 차이다.
             return CommandResult::Ok;
         }
         let Some(cm) = self.cache_manager.as_ref() else {
@@ -432,7 +442,7 @@ impl CommandDispatcher {
                 reason: "no kv cache handles are registered".to_string(),
             };
         }
-        self.evict_armed = true;
+        self.last_evict_ratio = Some(target_ratio);
         let stage = EvictionStage::one_shot_scored(
             self.kv_handles.clone(),
             Arc::clone(cm),
@@ -776,7 +786,7 @@ mod tests {
         assert_eq!(registry.len(), 0);
         d.dispatch(vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }]);
         assert_eq!(registry.len(), 1, "첫 evict directive → OneShot 1개 submit");
-        // sticky carry(빈 batch)에도 재submit 안 함 (상태 A — evict_armed 게이트).
+        // sticky carry(빈 batch)에도 재submit 안 함 (상태 A — 같은-budget 게이트).
         d.dispatch(vec![]);
         assert_eq!(registry.len(), 1, "빈 batch — 재submit 없음");
         // 같은 directive 반복도 재submit 안 함.
@@ -1259,6 +1269,29 @@ mod tests {
             results.iter().all(|r| matches!(r, CommandResult::Ok)),
             "live control 은 Ok: {results:?}"
         );
+    }
+
+    /// 예산을 조이는 연속 directive 는 매번 새 OneShot 을 submit 한다.
+    /// bool 게이트 시절에는 두 번째부터 조용히 버려지고 `Ok` 로 보고됐다.
+    #[test]
+    fn tightening_budget_resubmits() {
+        let (mut d, registry, _h) = make_dispatcher();
+        for (i, ratio) in [0.50f32, 0.35, 0.25].into_iter().enumerate() {
+            let r = results_of(
+                &mut d,
+                vec![EngineCommand::KvEvictH2o { keep_ratio: ratio }],
+            );
+            assert!(matches!(r[..], [CommandResult::Ok]), "{ratio}: {r:?}");
+            assert_eq!(
+                registry.len(),
+                i + 1,
+                "budget {ratio} 는 새 OneShot 을 submit 해야 한다"
+            );
+        }
+        // 같은 값 재요청은 여전히 재submit 하지 않는다 (once-per-window 성질 보존).
+        let r = results_of(&mut d, vec![EngineCommand::KvEvictH2o { keep_ratio: 0.25 }]);
+        assert!(matches!(r[..], [CommandResult::Ok]));
+        assert_eq!(registry.len(), 3, "같은 budget 반복 — 재submit 없음");
     }
 
     /// `take_results` 는 비운다 — 다음 dispatch 가 이전 결과를 물려받지 않는다.
