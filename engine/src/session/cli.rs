@@ -1095,9 +1095,18 @@ pub struct Args {
     /// the model's own attention output, and applies the one that moves it least — instead of
     /// applying the single `eviction <policy>` the CLI configured.
     ///
-    /// A candidate must be a technique that acts where the budget arrives — mid-decode, at
-    /// `KvMutate` — and must read only what the planner can supply there. A prefill-end stage
-    /// (PyramidKV/SnapKV) is refused rather than ranked on its degraded fallback.
+    /// A candidate must read only what the planner can supply. That is everything a mid-decode
+    /// mutation gets — importance, per-head scores, last-step attention, host-resident K/V — plus,
+    /// for a prefill-end technique (PyramidKV/SnapKV), the prompt attention the forward captured:
+    /// such a candidate is asked about the prefix that attention covers, and the positions decode
+    /// appended since are kept on top of its answer. Pooling one arms the prefill-attention producer
+    /// and stands the standing `PrefillEnd` consumer down — the technique becomes a candidate, not a
+    /// policy. Two candidates wanting different observation windows are refused.
+    ///
+    /// A candidate whose own budget arithmetic overshoots the requested one (the kvpress family adds
+    /// its observation window on top of the ratio) is re-asked for less, up to a few times, and the
+    /// arm reports the budget it was finally asked for. One that ignores the ask entirely (an
+    /// absolute-budget technique like faithful H2O) is excluded.
     ///
     /// Needs `--aperturb-basis` unless a startup decomposition is acceptable (28 s at 1B, 12 min at
     /// 8B). Off by default: the forward then never captures query rows and the compression path is

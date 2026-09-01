@@ -111,17 +111,30 @@ pub fn resolve_mutation_driver(args: &Args) -> Option<MutationDriverSelection> {
 /// the same [`StageParams`] — a candidate must be the technique it would have been had it been
 /// configured directly, or the choice is between things that do not exist. The output-projection
 /// basis is loaded from `--aperturb-basis` when given, and factored from the weights otherwise.
+/// A resolved candidate pool plus what the forward must produce for it.
+///
+/// `pfa_window` is `Some(w)` when a pooled candidate decides off the prefill attention: the forward
+/// has to be armed to SUM over exactly `w` trailing prompt queries, and the standing `PrefillEnd`
+/// consumer for that same technique has to stand down — it would prune the cache at prefill end,
+/// before the budget the pool exists to answer has even arrived.
+pub struct AperturbPool {
+    pub selector: Arc<crate::kv::aperturb_select::Selector>,
+    pub pfa_window: Option<usize>,
+}
+
 pub fn resolve_aperturb_selector(
     args: &Args,
     model: &TransformerModel,
     backend: &Arc<dyn Backend>,
-) -> Result<Option<Arc<crate::kv::aperturb_select::Selector>>> {
+) -> Result<Option<AperturbPool>> {
     use crate::kv::aperturb_select::{Candidate, Selector};
     if args.aperturb_select.is_empty() {
         return Ok(None);
     }
     crate::kv::eviction::stage_registry::ensure_builtin_stages_registered()?;
     let mut candidates = Vec::with_capacity(args.aperturb_select.len());
+    // `Some((first_candidate_name, window))` once a prefill-end candidate is admitted.
+    let mut pfa_window: Option<(String, usize)> = None;
     for name in &args.aperturb_select {
         let name = name.trim();
         if name.is_empty() {
@@ -134,37 +147,62 @@ pub fn resolve_aperturb_selector(
                 argus_extension_api::registered_mutation_names()
             )
         })?;
+        let reads_pfa = reg
+            .caps
+            .reads
+            .contains(&argus_extension_api::TensorKind::PrefillAttention);
         anyhow::ensure!(
             !reg.caps.whole_model,
             "--aperturb-select: '{name}' is a whole-model stage; the planner drives one layer at a \
              time, so its cross-layer read would see nothing and its keep-set would not be the one \
              it really produces"
         );
-        // A compression budget arrives mid-decode, so a candidate has to be a technique that acts
-        // there. A `PrefillEnd` stage (PyramidKV/SnapKV) decides once, off the prefill attention it
-        // is registered to read; asked at `KvMutate` it takes its own degraded fallback, and ranking
-        // that would rank something the technique never does.
-        anyhow::ensure!(
-            reg.phase == MutationPhase::KvMutate,
-            "--aperturb-select: '{name}' fires at {:?}, not KvMutate; a compression budget arrives \
-             mid-decode and this technique does not act there",
-            reg.phase
-        );
         // The planner supplies the same reads a mid-decode mutation gets — importance, per-head
-        // scores, last-step attention, and host-resident K/V. Anything else would reach the
-        // candidate as `None` and send it down a fallback path.
+        // scores, last-step attention, and host-resident K/V — plus, for a prefill-end technique,
+        // the prompt attention the forward captured. Anything else would reach the candidate as
+        // `None` and send it down a fallback path, and ranking a fallback ranks something the
+        // technique never does.
         if let Some(kind) = reg.caps.reads.iter().find(|k| {
             matches!(
                 k,
-                argus_extension_api::TensorKind::PrefillAttention
-                    | argus_extension_api::TensorKind::Query
+                argus_extension_api::TensorKind::Query
                     | argus_extension_api::TensorKind::QueryStats
             )
         }) {
             anyhow::bail!(
-                "--aperturb-select: '{name}' reads {kind:?}, which the mid-decode planner cannot \
-                 supply; it would answer from its fallback path instead of from itself"
+                "--aperturb-select: '{name}' reads {kind:?}, which the planner cannot supply; it \
+                 would answer from its fallback path instead of from itself"
             );
+        }
+        // A compression budget arrives mid-decode. A `KvMutate` technique acts there by
+        // construction. A `PrefillEnd` one (PyramidKV/SnapKV) does not — it is admitted only
+        // because it reads the prefill attention, which the forward can keep alive into decode, and
+        // the planner then asks it about the prompt prefix that attention covers.
+        anyhow::ensure!(
+            reg.phase == MutationPhase::KvMutate || reads_pfa,
+            "--aperturb-select: '{name}' fires at {:?}, not KvMutate, and reads no prefill \
+             attention; a compression budget arrives mid-decode and this technique does not act \
+             there",
+            reg.phase
+        );
+        if reads_pfa {
+            let w = reg
+                .caps
+                .prefill_attn_window
+                .unwrap_or(crate::kv::eviction::stage_registry::PFA_Q_WINDOW_DEFAULT);
+            // Two candidates wanting different observation windows cannot both be measured: the
+            // forward SUMs over one window, and the loser would rank a different set of heavy
+            // hitters than it declares.
+            if let Some((prev_name, prev_w)) = &pfa_window
+                && *prev_w != w
+            {
+                anyhow::bail!(
+                    "--aperturb-select: '{name}' wants a {w}-query prefill-attention window but \
+                     '{prev_name}' wants {prev_w}; the forward produces one window, so they cannot \
+                     both be measured in the same pool"
+                );
+            }
+            pfa_window.get_or_insert((name.to_string(), w));
         }
         // Each candidate gets the params it would have been configured with, including its own
         // declared protected-prefix default.
@@ -173,7 +211,11 @@ pub fn resolve_aperturb_selector(
             .iter()
             .map(|(k, v)| argus_extension_api::PluginArg { key: k, val: v })
             .collect();
-        candidates.push(Candidate::new(name, (reg.make)(params, &extra), reg.caps));
+        let protected_prefix = params.protected_prefix;
+        candidates.push(
+            Candidate::new(name, (reg.make)(params, &extra), reg.caps)
+                .with_protected_prefix(protected_prefix),
+        );
     }
 
     let (basis, residual_max) = crate::session::aperturb_basis::load_or_factor(
@@ -188,11 +230,21 @@ pub fn resolve_aperturb_selector(
         basis.n_layers(),
         residual_max,
     );
-    Ok(Some(Arc::new(Selector::new(
-        candidates,
-        Arc::new(basis),
-        model.config.num_attention_heads,
-    )?)))
+    if let Some((name, w)) = &pfa_window {
+        eprintln!(
+            "[aperturb-select] '{name}' decides off the prefill attention; the forward will arm a \
+             {w}-query window and the decode positions appended after prefill are force-kept \
+             (see PlannedKeep::keep_tail — an engine-side adaptation, not the paper's placement)"
+        );
+    }
+    Ok(Some(AperturbPool {
+        selector: Arc::new(Selector::new(
+            candidates,
+            Arc::new(basis),
+            model.config.num_attention_heads,
+        )?),
+        pfa_window: pfa_window.map(|(_, w)| w),
+    }))
 }
 
 /// CLI `eviction <policy>` + `--swap-dir` 로 resilience-driven force eviction /
@@ -333,7 +385,7 @@ pub fn build_bench_loop(
     // dispatcher hands each `KvCompress` budget to. `Some` arms the trailing query-row capture the
     // metric scores on and routes compressions through the selector instead of the CLI-configured
     // policy; `None` leaves the forward byte-identical and the method-drop path untouched.
-    aperturb_selector: Option<Arc<crate::kv::aperturb_select::Selector>>,
+    aperturb_pool: Option<AperturbPool>,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // Captured before `model` is moved into `mf` — the PFA handle row count for the prefill keep-set.
@@ -395,14 +447,43 @@ pub fn build_bench_loop(
     let keepset_arming = (cache_manager.is_none() && !faithful_h2o)
         .then(crate::kv::eviction::stage_registry::resolve_prefill_keepset_arming)
         .flatten();
+    // A pooled prefill-end candidate takes the PFA producer over. Its window wins (it is the one the
+    // candidate declared), and the standing `PrefillEnd` consumer below stands down: leaving it in
+    // would prune the cache at prefill end, so the budget the pool exists to answer would arrive to
+    // an already-compressed cache and every candidate would be ranked on the leftovers.
+    let selector_pfa_window = aperturb_pool.as_ref().and_then(|p| p.pfa_window);
     let pfa_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>> = Arc::new(Mutex::new(None));
-    if let Some(arming) = &keepset_arming {
-        mf.set_prefill_attn(pfa_cell.clone(), arming.q_window);
-        eprintln!(
-            "[prefill-keepset] '{}' active — PFA producer arms q_window={} \
-             (SnapKV per-head keep-set staged at PrefillEnd)",
-            arming.stage_name, arming.q_window
-        );
+    match (selector_pfa_window, &keepset_arming) {
+        (Some(w), arming) => {
+            mf.set_prefill_attn(pfa_cell.clone(), w);
+            if let Some(a) = arming {
+                eprintln!(
+                    "[aperturb-select] the standing PrefillEnd consumer '{}' stands down — it is a \
+                     candidate now, not a policy",
+                    a.stage_name
+                );
+            }
+        }
+        (None, Some(arming)) if aperturb_pool.is_some() => {
+            // A pool without a prefill-end candidate: the producer is still armed (it is what makes
+            // the consumer's technique available at all), but the consumer must not fire.
+            mf.set_prefill_attn(pfa_cell.clone(), arming.q_window);
+            eprintln!(
+                "[aperturb-select] the standing PrefillEnd consumer '{}' stands down — a candidate \
+                 pool is configured, and pruning at prefill end would leave the pool nothing to \
+                 measure on",
+                arming.stage_name
+            );
+        }
+        (None, Some(arming)) => {
+            mf.set_prefill_attn(pfa_cell.clone(), arming.q_window);
+            eprintln!(
+                "[prefill-keepset] '{}' active — PFA producer arms q_window={} \
+                 (SnapKV per-head keep-set staged at PrefillEnd)",
+                arming.stage_name, arming.q_window
+            );
+        }
+        (None, None) => {}
     }
 
     // The engine's own compression choice: arm the trailing query-row capture. It is the one thing
@@ -411,7 +492,7 @@ pub fn build_bench_loop(
     // and the forward is byte-identical.
     let q_rows_cell: Arc<Mutex<Option<crate::inference::q_rows::QRowCapture>>> =
         Arc::new(Mutex::new(None));
-    if aperturb_selector.is_some() {
+    if aperturb_pool.is_some() {
         let cap = crate::inference::q_rows::QRowCapture::new(
             Arc::clone(&backend_arc),
             memory_arc.as_ref(),
@@ -467,7 +548,11 @@ pub fn build_bench_loop(
     // pressure-driven persistent EvictionStage below (phase-disjoint: PrefillEnd vs KvMutate → submit
     // order immaterial). Mirrors `build_standard_loop`. Reads the per-layer PFA the armed `mf` fills and
     // applies the SnapKV per-head keep-set via the shared `apply_prefill_keepset` executor.
-    if let Some(arming) = &keepset_arming
+    // A configured pool stands the standing consumer down, whether or not the pool contains the
+    // consumer's technique: pruning at prefill end renumbers the cache under the captured query
+    // rows, so the budget the pool exists to answer would arrive with nothing left to measure on.
+    if aperturb_pool.is_none()
+        && let Some(arming) = &keepset_arming
         && let Some(stage) =
             crate::kv::eviction::stage_registry::make_prefill_keepset_stage(&arming.stage_name)
     {
@@ -507,15 +592,15 @@ pub fn build_bench_loop(
         // 보유). non-opencl 이면 sync 가 no-op.
         let dispatcher = dispatcher.with_backend(Some(Arc::clone(&backend_arc)));
         // A configured pool makes the engine choose; without one the dispatcher keeps method-drop.
-        Some(match aperturb_selector.as_ref() {
-            Some(sel) => {
+        Some(match aperturb_pool.as_ref() {
+            Some(pool) => {
                 eprintln!(
                     "[aperturb-select] active — candidate pool [{}], {} query rows per decision",
-                    sel.names().join(", "),
+                    pool.selector.names().join(", "),
                     crate::session::aperturb_basis::APERTURB_ROWS,
                 );
                 dispatcher.with_aperturb_selector(
-                    Arc::clone(sel),
+                    Arc::clone(&pool.selector),
                     Arc::clone(&q_rows_cell),
                     Arc::clone(&pfa_cell),
                 )
@@ -523,7 +608,7 @@ pub fn build_bench_loop(
             None => dispatcher,
         })
     } else {
-        if aperturb_selector.is_some() {
+        if aperturb_pool.is_some() {
             // Nothing polls commands, so no `KvCompress` can arrive and the pool would never be
             // asked. Say so: a silent selector reads exactly like one that was asked and declined.
             eprintln!(
