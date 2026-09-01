@@ -400,7 +400,7 @@ pub fn build_bench_loop(
             kv_handles,
             Arc::clone(cm),
             pressure_evict_ratio,
-            argus_shared::Level::Warning,
+            crate::kv::PressureLevel::Warning,
         );
         registry.submit(Arc::new(persistent));
     }

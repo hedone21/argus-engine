@@ -19,7 +19,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use argus_shared::Level;
+use crate::kv::PressureLevel as Level;
 
 use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;

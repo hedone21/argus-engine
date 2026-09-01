@@ -19,7 +19,7 @@
 //! 거버넌스: §1.2 Mechanism over policy(순서·안전 = stage 작성자 책임, §5.3),
 //! `INV-DECODE-STAGE-001/004/005/006/007`, `INV-STAGE-LAYER-HANDLE`, `INV-HOTPATH-DISPATCH`.
 
-use argus_shared::Level;
+use crate::kv::PressureLevel as Level;
 
 use crate::observability::profile::OpProfiler;
 

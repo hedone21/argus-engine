@@ -21,8 +21,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::kv::PressureLevel as Level;
 use anyhow::Result;
-use argus_shared::Level;
 
 use crate::backend::Backend;
 use crate::format::KVCacheFormat;

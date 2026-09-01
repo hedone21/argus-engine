@@ -6,8 +6,8 @@
 // kv_heads=1, head_dim=4, bytes_per_elem=4 항목을 명시적으로 표기함.
 #![allow(clippy::identity_op)]
 
+use argus_engine::kv::PressureLevel;
 use argus_engine::kv::quantize_handler::target_bits_for_pressure;
-use argus_shared::Level as PressureLevel;
 use std::collections::HashMap;
 
 // ══════════════════════════════════════════════════════════════

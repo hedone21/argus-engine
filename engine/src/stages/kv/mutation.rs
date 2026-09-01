@@ -30,11 +30,11 @@ use std::cell::OnceCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::kv::PressureLevel as Level;
 use argus_extension_api::{
     CrossLayerStageCtx, KVMutationStage, MutationPhase, StageCaps, StageCtx, TensorDtype,
     TensorHandle, TensorKind, TensorShape,
 };
-use argus_shared::Level;
 
 #[cfg(test)]
 use crate::inference::attention_scores::AttentionScoreAccumulator;

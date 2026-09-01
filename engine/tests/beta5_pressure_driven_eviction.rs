@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use argus_engine::backend::Backend;
 use argus_engine::backend::cpu::CpuBackend;
 use argus_engine::buffer::{Buffer, DType};
+use argus_engine::kv::PressureLevel as Level;
 use argus_engine::kv::cache_manager::CacheManager;
 use argus_engine::kv::eviction::stage_registry::{
     ensure_builtin_stages_registered, make_stage_backed_policy,
@@ -33,7 +34,6 @@ use argus_engine::shape::Shape;
 use argus_engine::stages::kv::eviction::EvictionStage;
 use argus_engine::tensor::Tensor;
 use argus_extension_api::StageParams;
-use argus_shared::Level;
 
 const KV_HEADS: usize = 1;
 const HEAD_DIM: usize = 32;
