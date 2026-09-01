@@ -39,7 +39,7 @@ use argus_extension_api::{
 #[cfg(test)]
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::signal_runtime::SignalRuntime;
-use crate::kv::cache_handle::{EngineCacheHandle, EngineModelCacheHandle};
+use crate::kv::cache_handle::{EngineCacheHandle, EngineModelCacheHandle, StagedKeep};
 use crate::kv::dequant::{dequantize_k, dequantize_v};
 use crate::kv::eviction_handler::MIN_EVICT_TOKENS;
 use crate::kv::kv_cache::KVCache;
@@ -520,9 +520,102 @@ pub(crate) fn drive_mutation_layer(
     head_scores: Option<&[f32]>,
     last_attn: Option<&[f32]>,
 ) -> anyhow::Result<bool> {
+    Ok(run_mutation_layer(
+        stage,
+        caps,
+        cache,
+        layer_idx,
+        n_layers,
+        target_len,
+        importance,
+        head_scores,
+        last_attn,
+        |h| h.commit(),
+    )?
+    .unwrap_or(false))
+}
+
+/// Ask a [`KVMutationStage`] what it would retain at `target_len`, **without applying it**.
+///
+/// The same callback the production path drives, run against the same read ctx and the same
+/// transactional handle — and then dropped instead of committed. Nothing mutates until `commit`
+/// (T-1), so the cache is byte-identical afterwards and the answer is the stage's real decision
+/// rather than a re-derivation of it.
+///
+/// `Ok(None)` means the stage staged no keep for this layer: an empty cache, a stage that declined
+/// to act at this budget, or one that staged a residency move instead. A caller scoring retained
+/// sets has nothing to score there and should say so rather than substitute a keep of its own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_mutation_layer(
+    stage: &dyn KVMutationStage,
+    caps: &StageCaps,
+    cache: &mut KVCache,
+    layer_idx: usize,
+    n_layers: usize,
+    target_len: usize,
+    importance: Option<&[f32]>,
+    head_scores: Option<&[f32]>,
+    last_attn: Option<&[f32]>,
+) -> anyhow::Result<Option<PlannedKeep>> {
+    Ok(run_mutation_layer(
+        stage,
+        caps,
+        cache,
+        layer_idx,
+        n_layers,
+        target_len,
+        importance,
+        head_scores,
+        last_attn,
+        |h| {
+            Ok(match h.staged_keep() {
+                Some(StagedKeep::LayerWide(k)) => Some(PlannedKeep::LayerWide(k.to_vec())),
+                Some(StagedKeep::PerHead(h)) => Some(PlannedKeep::PerHead(h.to_vec())),
+                None => None,
+            })
+        },
+    )?
+    .flatten())
+}
+
+/// An owned [`StagedKeep`], read out of a dry run that was never committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PlannedKeep {
+    LayerWide(Vec<usize>),
+    PerHead(Vec<Vec<usize>>),
+}
+
+impl PlannedKeep {
+    /// This layer's keep for one KV head — the per-head list, or the shared one.
+    pub(crate) fn head(&self, kv_head: usize) -> Option<&[usize]> {
+        match self {
+            Self::LayerWide(k) => Some(k),
+            Self::PerHead(h) => h.get(kv_head).map(|v| v.as_slice()),
+        }
+    }
+}
+
+/// Build the read ctx + handle, run the stage's callback, and hand the still-uncommitted handle to
+/// `finish`. The shared core of [`drive_mutation_layer`] (which commits) and
+/// [`plan_mutation_layer`] (which reads the staged intent and drops it).
+///
+/// `Ok(None)` when the cache holds nothing — there is no frame to mutate or to plan against.
+#[allow(clippy::too_many_arguments)]
+fn run_mutation_layer<T>(
+    stage: &dyn KVMutationStage,
+    caps: &StageCaps,
+    cache: &mut KVCache,
+    layer_idx: usize,
+    n_layers: usize,
+    target_len: usize,
+    importance: Option<&[f32]>,
+    head_scores: Option<&[f32]>,
+    last_attn: Option<&[f32]>,
+    finish: impl FnOnce(EngineCacheHandle<'_>) -> anyhow::Result<T>,
+) -> anyhow::Result<Option<T>> {
     let current_pos = cache.current_pos();
     if current_pos == 0 {
-        return Ok(false);
+        return Ok(None);
     }
     let max_seq = cache.max_seq_len;
     let n_kv_heads = cache.kv_heads();
@@ -577,16 +670,16 @@ pub(crate) fn drive_mutation_layer(
     };
     let handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
     let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        move || -> anyhow::Result<bool> {
+        move || -> anyhow::Result<T> {
             let mut handle = handle;
             stage
                 .on_phase(&sctx, &mut handle)
                 .map_err(|e| anyhow::anyhow!("mutation stage '{}' failed: {e}", stage.name()))?;
-            handle.commit()
+            finish(handle)
         },
     ));
     match driven {
-        Ok(r) => r,
+        Ok(r) => r.map(Some),
         Err(_) => Err(anyhow::anyhow!(
             "mutation stage '{}' panicked during on_phase/commit",
             stage.name()
@@ -1243,6 +1336,92 @@ mod tests {
             let keep: Vec<usize> = (0..ctx.target_len().min(ctx.current_pos())).collect();
             cache.keep(&keep)
         }
+    }
+
+    /// The dry run reports the same keep-set the committed run applies, and leaves every byte of
+    /// K and V — and `current_pos` — exactly as it found them. That equality is what lets a caller
+    /// score several techniques against one cache and commit only the winner.
+    ///
+    /// Mutation-proof: making `plan_mutation_layer` commit (swapping its `finish` for `h.commit()`)
+    /// shrinks the cache and fails the `current_pos` assert; returning a re-derived keep instead of
+    /// the staged one fails the equality against the committed run.
+    #[test]
+    fn planning_reports_the_committed_keep_without_touching_a_byte() {
+        let mut planned_cache = make_cache(DType::F32);
+        let before_k = planned_cache.k_buffer.as_slice::<f32>().to_vec();
+        let before_v = planned_cache.v_buffer.as_slice::<f32>().to_vec();
+        let target_len = 7;
+        let plan = plan_mutation_layer(
+            &BudgetKeepStage,
+            &StageCaps::SCORE_FREE,
+            &mut planned_cache,
+            0,
+            1,
+            target_len,
+            None,
+            None,
+            None,
+        )
+        .expect("planning must not fail")
+        .expect("the stage stages a keep at this budget");
+        assert_eq!(plan, PlannedKeep::LayerWide((0..target_len).collect()));
+        assert_eq!(
+            planned_cache.current_pos(),
+            RESIDENT,
+            "a dry run must not renumber the cache"
+        );
+        assert_eq!(planned_cache.k_buffer.as_slice::<f32>(), &before_k[..]);
+        assert_eq!(planned_cache.v_buffer.as_slice::<f32>(), &before_v[..]);
+
+        // The committed twin, from the same starting bytes: the plan is what actually lands.
+        let mut driven_cache = make_cache(DType::F32);
+        assert!(
+            drive_mutation_layer(
+                &BudgetKeepStage,
+                &StageCaps::SCORE_FREE,
+                &mut driven_cache,
+                0,
+                1,
+                target_len,
+                None,
+                None,
+                None,
+            )
+            .expect("driving must not fail")
+        );
+        assert_eq!(driven_cache.current_pos(), target_len);
+        for slot in 0..target_len {
+            for head in 0..KV_HEADS {
+                let dst = driven_cache.offset(slot, head);
+                let src = planned_cache.offset(plan.head(head).unwrap()[slot], head);
+                assert_eq!(
+                    &driven_cache.k_buffer.as_slice::<f32>()[dst..dst + HD],
+                    &before_k[src..src + HD],
+                    "slot {slot} head {head}: the committed run kept the position the plan named"
+                );
+            }
+        }
+    }
+
+    /// A stage that stages nothing has no keep to report — the caller must be able to tell
+    /// "retain everything" from "declined to answer", and `None` is how.
+    #[test]
+    fn a_stage_that_stages_nothing_plans_no_keep() {
+        let mut cache = make_cache(DType::F32);
+        let plan = plan_mutation_layer(
+            &NoopMutStage,
+            &StageCaps::SCORE_FREE,
+            &mut cache,
+            0,
+            1,
+            4,
+            None,
+            None,
+            None,
+        )
+        .expect("planning must not fail");
+        assert!(plan.is_none());
+        assert_eq!(cache.current_pos(), RESIDENT);
     }
 
     fn drive_budget_keep(resident: usize, target_ratio: f32) -> usize {
