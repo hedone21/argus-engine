@@ -66,10 +66,23 @@ pub use swap_handler::SwapHandler;
 
 // ── Pressure level ─────────────────────────────────────────────────
 
-/// Memory pressure severity, reused from the shared signal type.
+/// Memory pressure severity.
 ///
-/// `Normal < Warning < Critical < Emergency` (derives `Ord`).
-pub type PressureLevel = argus_shared::Level;
+/// `Normal < Warning < Critical < Emergency` (derives `Ord`), which the eviction and
+/// quantization handlers rely on to compare bands.
+///
+/// This was an alias for `argus_shared::Level`, which made an engine-internal notion of
+/// pressure look like part of the Manager IPC contract. It is not: nothing puts a level
+/// on the wire, and the CLI-driven pressure pipeline (`CacheManager`, `Pressure::band`,
+/// `KvFillPressureSource`) is its only consumer. Owning the enum here lets the shared
+/// crate hold nothing but the wire types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PressureLevel {
+    Normal,
+    Warning,
+    Critical,
+    Emergency,
+}
 
 // ── Handler context ────────────────────────────────────────────────
 

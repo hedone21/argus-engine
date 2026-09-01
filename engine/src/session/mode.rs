@@ -26,7 +26,6 @@ use crate::memory::Memory;
 use crate::models::transformer::TransformerModel;
 use crate::session::cli::Args;
 use crate::session::forward::Forward;
-use crate::session::resilience_adapter::QuantStageHandle;
 
 /// Plugin/builtin-declared capabilities the engine reads **before** instantiating a
 /// mode (off the [`KvModeReg`], not via a trait method — the decision precedes
@@ -88,7 +87,6 @@ pub struct ChatModeBuild {
     pub kv_handle: Option<Arc<dyn crate::format::KVCacheFormat>>,
     /// §4.5 quant bit-width handle for the resilience heartbeat (`Some` only for a
     /// quantized-KV mode). Points at the same layer-0 handle as `kv_handle`.
-    pub quant_handle: Option<Arc<dyn QuantStageHandle>>,
     /// The eviction policy name to set on the resilience adapter (`""` for
     /// quantized/offload, which have no in-loop eviction).
     pub eviction_policy: String,

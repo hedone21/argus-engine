@@ -20,12 +20,7 @@ use argus_shared::{EngineMessage, ManagerMessage};
 fn test_seq_034_heartbeat_timing() {
     let (_cmd_tx, cmd_rx) = mpsc::channel::<ManagerMessage>();
     let (resp_tx, resp_rx) = mpsc::channel();
-    let mut executor = CommandExecutor::new(
-        cmd_rx,
-        resp_tx,
-        "cpu".to_string(),
-        Duration::from_millis(100),
-    );
+    let mut executor = CommandExecutor::new(cmd_rx, resp_tx, Duration::from_millis(100));
 
     // interval 미도달 -> heartbeat 없어야 함
     executor.send_heartbeat_if_due(&KVSnapshot::default());
@@ -52,12 +47,7 @@ fn test_seq_034_heartbeat_timing() {
 fn test_seq_013_eof_disconnect_graceful() {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ManagerMessage>();
     let (resp_tx, _resp_rx) = mpsc::channel();
-    let mut executor = CommandExecutor::new(
-        cmd_rx,
-        resp_tx,
-        "cpu".to_string(),
-        Duration::from_secs(3600),
-    );
+    let mut executor = CommandExecutor::new(cmd_rx, resp_tx, Duration::from_secs(3600));
 
     // sender drop으로 EOF 시뮬레이션
     drop(cmd_tx);

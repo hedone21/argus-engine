@@ -385,6 +385,14 @@ impl StandardFormat {
     }
 }
 
+impl crate::session::resilience_adapter::KvBytesHandle for StandardFormat {
+    /// Heartbeat resident-byte probe. Delegates to the cache's own dtype-aware
+    /// accounting; the base `KVCacheFormat` trait stays unchanged (neutral sub-trait).
+    fn resident_bytes(&self) -> u64 {
+        self.with_cache_mut(|c| c.memory_usage_bytes()) as u64
+    }
+}
+
 impl KVCacheFormat for StandardFormat {
     fn idx(&self) -> usize {
         self.idx

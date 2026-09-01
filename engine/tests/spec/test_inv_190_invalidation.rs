@@ -18,7 +18,7 @@ use argus_engine::kv::standard_format::StandardFormat;
 use argus_engine::kv_cache_ops::KVLayout;
 use argus_engine::memory::Memory;
 use argus_engine::memory::galloc::Galloc;
-use argus_engine::session::prefix_cache::{RestoredPrefix, save_prefix, try_restore_prefix};
+use argus_engine::session::prefix_cache::{save_prefix, try_restore_prefix};
 use argus_engine::shape::Shape;
 use argus_engine::tensor::Tensor;
 use std::sync::Arc;

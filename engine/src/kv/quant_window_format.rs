@@ -67,10 +67,9 @@ impl QuantWindowFormat {
         f(&mut guard)
     }
 
-    /// 현재 양자화 bit-width (AB-2 §5.7.6 — heartbeat kv_dtype query 용).
-    ///
-    /// `QuantizedRecentWindowCache::bits()`(quant_window_cache.rs:406) 위임. ResilienceAdapter 가 layer-0 QuantWindowFormat handle
-    /// 에서 현재 bits 를 query 해 `bits→dtype` 문자열로 매핑한다.
+    /// Current quantization bit-width. Only `QuantWindowBitTransitionStage`'s tests read
+    /// it now — the heartbeat carried it until `kv_dtype` left the contract.
+    #[cfg(test)]
     pub(crate) fn current_bits(&self) -> u8 {
         self.inner.lock().unwrap().bits()
     }
@@ -84,10 +83,10 @@ impl QuantWindowFormat {
     }
 }
 
-impl crate::session::resilience_adapter::QuantStageHandle for QuantWindowFormat {
-    /// §4.5: heartbeat kv_dtype query — `current_bits()` 위임. base trait 무변(중립 sub-trait).
-    fn current_kv_bits(&self) -> u8 {
-        self.current_bits()
+impl crate::session::resilience_adapter::KvBytesHandle for QuantWindowFormat {
+    /// Heartbeat resident-byte probe — quantized window plus the f32 residual.
+    fn resident_bytes(&self) -> u64 {
+        self.inner.lock().unwrap().memory_usage_bytes() as u64
     }
 }
 

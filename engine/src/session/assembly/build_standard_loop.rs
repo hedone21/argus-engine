@@ -21,8 +21,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::kv::PressureLevel as Level;
 use anyhow::Result;
-use argus_shared::Level;
 
 use crate::backend::Backend;
 use crate::format::KVCacheFormat;
@@ -352,6 +352,14 @@ pub fn build_standard_loop(
             if let Some(h) = kv_pos_handle.clone() {
                 adapter.set_kv_handle(h);
             }
+            adapter.set_kv_byte_handles(
+                kv_handles
+                    .iter()
+                    .map(|h| {
+                        h.clone() as Arc<dyn crate::session::resilience_adapter::KvBytesHandle>
+                    })
+                    .collect(),
+            );
             let registry = registry.as_ref().expect("registry: resilience.is_some()");
             // happy/chat 경로는 partition/quant 미구성 (빈 slots + None hardware + 빈
             // quant_window_handles).
@@ -359,9 +367,6 @@ pub fn build_standard_loop(
                 Arc::clone(registry),
                 kv_handles.clone(),
                 None,
-                Vec::new(),
-                None,
-                Vec::new(),
                 // §5.9.1 Track A: happy 경로는 score-based eviction 미구성 → 더미 None cell.
                 Arc::new(Mutex::new(None)),
             );
@@ -446,7 +451,7 @@ pub fn build_standard_loop(
         if let Some(dispatcher) = dispatcher {
             // L1-runtime: share the dispatcher's per-step re-encode-fired signal so the loop
             // invalidates the fused GPU plan exactly on a mid-decode (command-driven) re-encode.
-            builder = builder.with_reencode_fired_cell(dispatcher.reencode_fired_cell());
+
             builder = builder.with_command_dispatcher(dispatcher);
         }
         if let Some(h) = kv_pos_handle {

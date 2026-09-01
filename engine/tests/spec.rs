@@ -1,7 +1,3 @@
-#[path = "spec/test_fsm_operating_mode.rs"]
-mod test_fsm_operating_mode;
-#[path = "spec/test_inv_003.rs"]
-mod test_inv_003;
 #[path = "spec/test_inv_081_082.rs"]
 mod test_inv_081_082;
 
@@ -16,19 +12,13 @@ mod test_eng_alg_030_048;
 mod test_eng_alg_060_092;
 #[path = "spec/test_eng_dat_012_031.rs"]
 mod test_eng_dat_012_031;
-#[path = "spec/test_eng_st_052_060.rs"]
-mod test_eng_st_052_060;
 #[path = "spec/test_proto_010_062.rs"]
 mod test_proto_010_062;
 
 // ── Protocol / State / Cross-cutting 테스트 ──
-#[path = "spec/test_eng_st_032.rs"]
-mod test_eng_st_032;
 
 // ── MSG-060 Engine Self-Utilization (2026-04 Phase 1) ──
 // MSG-060 필드 17~18, MSG-067~069, INV-091~092
-#[path = "spec/test_msg_060_self_util.rs"]
-mod test_msg_060_self_util;
 
 // ── Tensor Partition × Plan 통합 테스트 ──
 #[path = "spec/test_eng_alg_200_plan_partition.rs"]
@@ -279,9 +269,3 @@ mod test_inv_rpcmem_008_no_raw_clientbuf;
 // INV-193: currently-Q4_0 layer 만 후보 + ratio 선택 로직.
 // INV-194: recall 후 NMSE ≤ 0.01 정확성 (device-gated, AUF 모델 필요).
 // INV-195: loud no-op 5종 + double_commit_guard (panic/Err-강하 금지).
-#[path = "spec/test_inv_192_recall_explicit_trigger.rs"]
-mod test_inv_192_recall_explicit_trigger;
-#[path = "spec/test_inv_193_recall_candidate_selection.rs"]
-mod test_inv_193_recall_candidate_selection;
-#[path = "spec/test_inv_194_recall_accuracy.rs"]
-mod test_inv_194_recall_accuracy;

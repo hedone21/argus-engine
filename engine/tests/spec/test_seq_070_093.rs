@@ -76,7 +76,7 @@ fn test_seq_080_parse_error_then_normal_recv() {
     // 정상 JSON 전송
     let msg = ManagerMessage::Directive(argus_shared::EngineDirective {
         seq_id: 1,
-        commands: vec![EngineCommand::Throttle { delay_ms: 10 }],
+        commands: vec![EngineCommand::Suspend],
     });
     let json = serde_json::to_vec(&msg).unwrap();
     let len = (json.len() as u32).to_be_bytes();
@@ -145,7 +145,7 @@ fn test_seq_081_oversized_payload_rejected_then_normal() {
     // 정상 JSON 전송
     let msg = ManagerMessage::Directive(argus_shared::EngineDirective {
         seq_id: 2,
-        commands: vec![EngineCommand::Throttle { delay_ms: 20 }],
+        commands: vec![EngineCommand::Suspend],
     });
     let json = serde_json::to_vec(&msg).unwrap();
     let len = (json.len() as u32).to_be_bytes();

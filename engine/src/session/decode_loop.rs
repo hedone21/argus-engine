@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 use crate::format::KVCacheFormat;
 use crate::inference::sampling::{GreedySampler, StepCtx, TokenSampler};
@@ -209,6 +208,24 @@ impl DecodeLoop {
         self.kv_occupancy = occupancy;
     }
 
+    /// Hand this step's per-command outcomes back to the `CommandSource` that produced
+    /// them, so it can answer the directives they came from.
+    ///
+    /// `n_cmds` is what `poll` returned: with no dispatcher there is nothing that could
+    /// have applied them, which is a `Rejected` rather than silence.
+    fn report_command_results(&mut self, n_cmds: usize) {
+        let results = match self.dispatcher.as_mut() {
+            Some(d) => d.finalize_results(),
+            None => vec![
+                argus_shared::CommandResult::Rejected {
+                    reason: "engine has no command dispatcher".to_string(),
+                };
+                n_cmds
+            ],
+        };
+        self.cmd_source.report_results(results);
+    }
+
     /// v2 StopReason(pipeline.rs 4-variant) → v1 StopReason(traits.rs) 수렴 매핑
     /// (v2 §5.2.1 (다)). StopFlag 는 v2 에 없음 — driver 루프 가드 v1 유지.
     fn map_stage_stop(r: StageStopReason) -> StopReason {
@@ -304,10 +321,6 @@ impl DecodeLoop {
                 stopped_by = StopReason::StopFlag;
                 break;
             }
-            // 매 step 전체 wall-clock 시작점 (target_tbt pacing 기준 — throttle
-            // delay 도 이 측정에 포함된다).
-            let t_iter = Instant::now();
-
             // DecodeStart: t_iter 직후, (a) command poll 전.
             if let Some(r) = self.dispatch_phase(LifecyclePhase::DecodeStart) {
                 stopped_by = Self::map_stage_stop(r);
@@ -320,24 +333,17 @@ impl DecodeLoop {
             // seam 으로 분배한다. dispatcher=None(happy/chat) 이면 cmd_source 도 NoOp → 빈 Vec →
             // 분배 대상 0 = 거동-0. throttle_delay/target_tbt 의 sticky 는 LoopControl 이 보존.
             let cmds = self.cmd_source.poll()?;
-            let (suspended, throttle_delay_ms, target_tbt_ms): (bool, u64, u64) =
-                if let Some(d) = self.dispatcher.as_mut() {
-                    let control = d.dispatch(cmds);
-                    (
-                        control.suspended,
-                        control.throttle_delay_ms,
-                        control.target_tbt_ms,
-                    )
-                } else {
-                    (false, 0, 0)
-                };
+            let n_cmds = cmds.len();
+            let suspended = match self.dispatcher.as_mut() {
+                Some(d) => d.dispatch(cmds).suspended,
+                None => false,
+            };
             if suspended {
-                // G6: suspend = loop break 보존 (pause/park 전환 금지).
+                // G6: suspend = loop break 보존 (pause/park 전환 금지). KvMutate 까지 못 가므로
+                // 여기서 응답한다 — submit-time 판정 그대로다(제출된 압축이 있었다면 미적용).
+                self.report_command_results(n_cmds);
                 stopped_by = StopReason::CommandRequested;
                 break;
-            }
-            if throttle_delay_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
             }
 
             // (a.5) 제거: evict 는 dispatcher 가 OneShot EvictionStage 로 registry 에 submit 했고,
@@ -348,7 +354,13 @@ impl DecodeLoop {
             // (a.6) AB-3 완료: KvOffload/recall 은 OffloadStage(OneShot, KvMutate phase) 로 이전됨.
             // forward 직전). v2 EvictionStage(command-driven OneShot) 가 여기서 발화한다 — UER 로
             // cache 를 prune 한 뒤 pos-환류로 loop pos 동기화 (§5.2.1 (가)).
-            if let Some(r) = self.dispatch_phase(LifecyclePhase::KvMutate) {
+            let kv_mutate_stop = self.dispatch_phase(LifecyclePhase::KvMutate);
+            // 응답은 KvMutate **뒤**다. dispatch 는 압축을 OneShot stage 로 submit 만 하고, 실제
+            // prune 은 방금 돈 이 phase 에서 일어난다 — 그 전에 답하면 아직 아무 일도 안 일어난
+            // 캐시에 대해 `Ok` 를 보고하게 된다. 명령이 0건이어도 호출한다(directive 1건 =
+            // Response 1건 — command 가 빈 directive 도 답을 받아야 한다).
+            self.report_command_results(n_cmds);
+            if let Some(r) = kv_mutate_stop {
                 stopped_by = Self::map_stage_stop(r);
                 break;
             }
@@ -448,20 +460,6 @@ impl DecodeLoop {
 
             // DecodeEnd Stop 이 아니면 token push (run/run_until_stop 공통).
             generated.push(sampled);
-
-            // (h) target TBT pacing — resilience SetTargetTbt 가 설정한 목표
-            // wall-clock 에 도달하도록 step 끝에서 sleep. target_tbt_ms == 0
-            // (미설정/release) 이면 no-op이라 비-resilience 경로는 무영향.
-            // (a) 에서 LoopControl 로부터 읽은 sticky target_tbt_ms 를 사용.
-            if target_tbt_ms > 0 {
-                let elapsed_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
-                let target_ms = target_tbt_ms as f64;
-                if elapsed_ms < target_ms {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(
-                        (target_ms - elapsed_ms) / 1000.0,
-                    ));
-                }
-            }
         }
 
         // final_pos = 진짜 누적 위치(self.pos). 메모리 telemetry 용 점유는 cache 에서 직접 읽는다
@@ -747,7 +745,7 @@ impl<F> DecodeLoopBuilder<F> {
 impl DecodeLoopBuilder<HasForward> {
     /// Assemble the decode loop. Optional components default to no-op impls
     /// from [`super::defaults`].
-    pub fn build(self) -> DecodeLoop {
+    pub fn build(mut self) -> DecodeLoop {
         let pipeline = self
             .pipeline
             .unwrap_or_else(|| Arc::new(PipelineRegistry::new()));
@@ -755,8 +753,20 @@ impl DecodeLoopBuilder<HasForward> {
         // submit. with_pipeline 호출 순서와 무관하게 build() 시점에 확정된 registry 로 등록한다.
         if let Some(adapter) = self.resilience_tick {
             pipeline.submit(Arc::new(crate::stages::system::tick::TickStage::new(
-                adapter,
+                Arc::clone(&adapter),
             )));
+            // Prefill observability, wired here rather than at each assembly because the
+            // shared adapter only exists from `with_resilience` onward and the forward is
+            // only reachable in this typestate. Two halves: the stage stamps the phase on
+            // the boundaries the driver dispatches, and the progress sink reports the chunk
+            // boundaries only the forward can see. A forward that does not chunk ignores the
+            // second and is still bracketed by the first.
+            pipeline.submit(Arc::new(
+                crate::stages::system::prefill_phase::PrefillPhaseStage::new(Arc::clone(&adapter)),
+            ));
+            self.forward.0.set_prefill_progress(Some(
+                Arc::clone(&adapter) as Arc<dyn super::forward::PrefillProgress>
+            ));
         }
         DecodeLoop {
             forward: self.forward.0,
@@ -808,6 +818,90 @@ mod tests {
             logits[target] = 1.0;
             Ok(logits)
         }
+    }
+
+    /// P1b: a decode loop wired with resilience reports prefill.
+    ///
+    /// Before this, `ResilienceAdapter::poll` was the only heartbeat emitter and it lives
+    /// inside the decode loop, so a Manager's first observation of any run was already
+    /// `Decode` and prefill was indistinguishable from a hang. Both halves of the fix are
+    /// pinned here: the phase the driver's boundaries stamp, and the progress sink the
+    /// builder hands to the forward.
+    #[test]
+    fn resilience_makes_prefill_observable() {
+        use crate::resilience::CommandExecutor;
+        use crate::session::forward::PrefillProgress;
+        use crate::session::resilience_adapter::ResilienceAdapter;
+        use argus_shared::{EngineMessage, EngineState, Phase};
+        use std::time::Duration;
+
+        /// Records whether the builder installed a chunk-progress sink, and lets `prefill`
+        /// fire it the way a chunked forward would.
+        struct SinkRecorder {
+            vocab: usize,
+            sink: Option<Arc<dyn PrefillProgress>>,
+        }
+        impl Forward for SinkRecorder {
+            fn set_prefill_progress(&mut self, sink: Option<Arc<dyn PrefillProgress>>) {
+                self.sink = sink;
+            }
+            fn prefill(&mut self, _t: &[u32], _s: usize) -> anyhow::Result<Vec<f32>> {
+                // Stand in for a non-final chunk boundary inside a chunked prefill.
+                if let Some(sink) = &self.sink {
+                    sink.on_prefill_chunk();
+                }
+                Ok(vec![0.0_f32; self.vocab])
+            }
+            fn step(&mut self, _c: &StepCtx, _t: u32) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0_f32; self.vocab])
+            }
+        }
+
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
+        // Interval 0: every due-gated emission fires, so the chunk heartbeat shows up too.
+        let executor = CommandExecutor::new(cmd_rx, status_tx, Duration::from_millis(0));
+
+        let mut loop_ = DecodeLoopBuilder::new()
+            .with_forward(SinkRecorder {
+                vocab: 8,
+                sink: None,
+            })
+            .with_resilience(ResilienceAdapter::new(executor))
+            .build();
+
+        loop_.prefill(&[1, 2, 3]).unwrap();
+
+        let mut phases = Vec::new();
+        while let Ok(EngineMessage::Heartbeat(st)) = status_rx.try_recv() {
+            phases.push((st.phase, st.state));
+        }
+        assert_eq!(
+            phases,
+            vec![
+                // PrefillStart (forced)
+                (Phase::Prefill, EngineState::Running),
+                // the forward's chunk boundary — proof the sink reached the forward
+                (Phase::Prefill, EngineState::Running),
+                // PrefillEnd (forced)
+                (Phase::Prefill, EngineState::Running),
+            ],
+            "prefill is reported three times and never as Decode"
+        );
+
+        // And the first decode step is what flips it — the phase is stamped where the
+        // engine actually is, never scheduled ahead.
+        loop_.run(1, 0).unwrap();
+        let after: Vec<_> = std::iter::from_fn(|| status_rx.try_recv().ok())
+            .filter_map(|m| match m {
+                EngineMessage::Heartbeat(st) => Some(st.phase),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            after.contains(&Phase::Decode),
+            "the decode poll stamps Decode: {after:?}"
+        );
     }
 
     /// commit-3 wiring: `with_kv_reencode_invalidation()` makes the driver call

@@ -117,8 +117,8 @@ impl PressureSource for KvFillPressureSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv::PressureLevel as Level;
     use crate::resilience::sys_monitor::MemoryStats;
-    use argus_shared::Level;
     use std::sync::Mutex;
 
     /// available 값을 주입 가능한 mock monitor.

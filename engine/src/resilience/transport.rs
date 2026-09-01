@@ -473,18 +473,18 @@ mod tests {
     fn sample_directive() -> ManagerMessage {
         ManagerMessage::Directive(EngineDirective {
             seq_id: 1,
-            commands: vec![EngineCommand::KvEvictH2o { keep_ratio: 0.85 }],
+            commands: vec![EngineCommand::KvCompress { budget: 0.85 }],
         })
     }
 
     fn sample_capability() -> EngineMessage {
-        EngineMessage::Capability(EngineCapability {
-            available_devices: vec!["cpu".into()],
-            active_device: "cpu".into(),
-            max_kv_tokens: 2048,
-            bytes_per_kv_token: 256,
-            num_layers: 16,
-            ..Default::default()
+        EngineMessage::Heartbeat(EngineStatus {
+            kv_cache_bytes: 1024,
+            kv_cache_budget_bytes: 4096,
+            kv_cache_tokens: 32,
+            tbt_ms: 12.5,
+            phase: argus_shared::Phase::Decode,
+            state: argus_shared::EngineState::Running,
         })
     }
 
@@ -562,7 +562,7 @@ mod tests {
         // Engine → Manager
         transport.send(&sample_capability()).unwrap();
         let resp = mgr.recv().unwrap();
-        assert!(matches!(resp, EngineMessage::Capability(_)));
+        assert!(matches!(resp, EngineMessage::Heartbeat(_)));
     }
 
     #[test]
@@ -573,7 +573,7 @@ mod tests {
         for i in 1..=5 {
             let directive = ManagerMessage::Directive(EngineDirective {
                 seq_id: i,
-                commands: vec![EngineCommand::Throttle { delay_ms: 30 }],
+                commands: vec![EngineCommand::Suspend],
             });
             mgr.send(directive).unwrap();
             let msg = transport.recv().unwrap();
@@ -659,7 +659,7 @@ mod tests {
 
             // Read response
             let response = read_engine_message(&mut server_stream).unwrap();
-            assert!(matches!(response, EngineMessage::Capability(_)));
+            assert!(matches!(response, EngineMessage::Heartbeat(_)));
 
             drop(server_stream);
             let received = handle.join().unwrap();
@@ -688,7 +688,7 @@ mod tests {
             for seq_id in 1..=3 {
                 let msg = ManagerMessage::Directive(EngineDirective {
                     seq_id,
-                    commands: vec![EngineCommand::Throttle { delay_ms: 0 }],
+                    commands: vec![EngineCommand::Suspend],
                 });
                 write_manager_message(&mut server_stream, &msg).unwrap();
             }
@@ -841,7 +841,7 @@ mod tests {
             let (mut server_stream, _) = listener.accept().unwrap();
             write_manager_message(&mut server_stream, &sample_directive()).unwrap();
             let response = read_engine_message(&mut server_stream).unwrap();
-            assert!(matches!(response, EngineMessage::Capability(_)));
+            assert!(matches!(response, EngineMessage::Heartbeat(_)));
 
             drop(server_stream);
             let received = handle.join().unwrap();
@@ -869,7 +869,7 @@ mod tests {
             for seq_id in 1u64..=3 {
                 let msg = ManagerMessage::Directive(EngineDirective {
                     seq_id,
-                    commands: vec![EngineCommand::Throttle { delay_ms: 0 }],
+                    commands: vec![EngineCommand::Suspend],
                 });
                 write_manager_message(&mut server_stream, &msg).unwrap();
             }

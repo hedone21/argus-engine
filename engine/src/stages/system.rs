@@ -8,5 +8,10 @@
 //! **입주자 1호(Phase β-6 commit C)**: [`tick::TickStage`] — `PostSample` phase 에서
 //! `ResilienceAdapter` 의 per-token tick(throughput EMA + heartbeat token count)을 발화한다.
 //! v1 `TokenTickSink`(`TickWrapper`) 의 stage 화. `SwitchStage` 등 나머지는 후속.
+//!
+//! **입주자 2호**: [`prefill_phase::PrefillPhaseStage`] — `PrefillStart`/`PrefillEnd` 에서
+//! heartbeat 의 `Phase` 를 stamp 하고 강제 송출한다. 그 전까지 매니저가 관측하는 phase 는
+//! decode 상수였고, 긴 prompt 의 prefill 은 hang 과 구분 불가한 무음 구간이었다.
 
+pub mod prefill_phase;
 pub mod tick;

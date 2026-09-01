@@ -29,7 +29,7 @@ pub mod standard_happy;
 pub use crate::inference::sampling::{GreedySampler, StepCtx, TokenSampler};
 pub use assembly::{build_standard_loop, is_standard_happy_path};
 pub use bin_setup::build_inference_ctx;
-pub use command_dispatcher::{CommandDispatcher, CommandSource, EngineReport, LoopControl};
+pub use command_dispatcher::{CommandDispatcher, CommandSource, LoopControl};
 pub use decode_loop::{
     DecodeLoop, DecodeLoopBuilder, DecodeResult, HasForward, NoForward, StopReason,
 };
