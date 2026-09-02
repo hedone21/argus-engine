@@ -1,0 +1,19 @@
+[package]
+name = "adakv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# AdaKV / Ada-SnapKV (Feng et al., 2024 — https://arxiv.org/abs/2407.11550) technique crate — the
+# SnapKV observation-window ranking with the layer's KV budget REDISTRIBUTED across KV heads by a
+# flattened top-k competition (FFY0/AdaKV `update_kv_gqa`, KV-head unit, floor_alpha blend), applied
+# at prefill end. Stage-axis extension depending only on `argus-extension-api` + `linkme`. Each KV head
+# keeps a DIFFERENT number of tokens, which is the ragged per-head keep the engine's container
+# right-aligns (`CacheHandle::head_start`). Force-linked via one `use adakv as _;` (the pyramidkv /
+# snapkv precedent); private knobs (compression_ratio/window_size/kernel_size/floor_alpha/pooling)
+# ride the StageArgs blob.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

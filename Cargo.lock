@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "adakv"
+version = "0.1.0"
+dependencies = [
+ "argus-extension-api",
+ "linkme",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -100,6 +108,7 @@ dependencies = [
 name = "argus-engine"
 version = "0.1.0"
 dependencies = [
+ "adakv",
  "anyhow",
  "arc-swap",
  "argus-extension-api",
