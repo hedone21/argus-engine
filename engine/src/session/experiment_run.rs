@@ -256,6 +256,44 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
 /// them, or a `--aperturb-select` candidate does.
 ///
 /// Caps-driven, so neither half names a plugin — a technique declares its own `reads` and this asks.
+/// `--tbt-log`: one JSON line per generated token, the shape the §5.2 harness and its plots read
+/// (`{"token_idx","tbt_ms","forward_ms","cache_pos","pacing_ms"}`; token 0 is the prefill token
+/// with the TTFT as its TBT and the prompt length as its occupancy, and `cache_pos` is the KV
+/// occupancy after each decode step — so a compression
+/// shows up as a drop in this column). `forward_ms` equals `tbt_ms` and `pacing_ms` is 0: this
+/// loop has no pacing and does not split the step further.
+fn write_tbt_log(
+    path: &str,
+    prefill_ms: f64,
+    prompt_len: usize,
+    result: &crate::session::decode_loop::DecodeResult,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    writeln!(
+        f,
+        "{{\"token_idx\":0,\"tbt_ms\":{:.2},\"forward_ms\":{:.2},\"cache_pos\":{},\"pacing_ms\":0.00}}",
+        prefill_ms, prefill_ms, prompt_len
+    )?;
+    for (i, (ms, pos)) in result
+        .step_ms
+        .iter()
+        .zip(result.step_cache_pos.iter())
+        .enumerate()
+    {
+        writeln!(
+            f,
+            "{{\"token_idx\":{},\"tbt_ms\":{:.2},\"forward_ms\":{:.2},\"cache_pos\":{},\"pacing_ms\":0.00}}",
+            i + 1,
+            ms,
+            ms,
+            pos
+        )?;
+    }
+    f.flush()?;
+    Ok(())
+}
+
 fn wants_scores(args: &Args) -> bool {
     use crate::kv::eviction::stage_registry::stage_is_score_based;
     stage_is_score_based(args.eviction_policy())
@@ -303,6 +341,10 @@ fn run_decode_loop_experiment(
     let t_decode = std::time::Instant::now();
     let result = decode_loop.run(args.num_tokens - 1, first_token)?;
     let decode_total_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+    if let Some(path) = args.tbt_log.as_deref() {
+        write_tbt_log(path, prefill_ms, tokens.len(), &result)
+            .map_err(|e| anyhow::anyhow!("writing --tbt-log {path}: {e}"))?;
+    }
 
     // Suspend 시 break → CommandRequested. legacy 와 동일 문자열을 emit 하여
     // verify thermal_emergency_suspend 의 stderr_pattern 을 충족한다.
@@ -601,6 +643,10 @@ pub fn run_experiment_schedule_path(
     let t_decode = std::time::Instant::now();
     let result = decode_loop.run(args.num_tokens - 1, first_token)?;
     let decode_total_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+    if let Some(path) = args.tbt_log.as_deref() {
+        write_tbt_log(path, prefill_ms, tokens.len(), &result)
+            .map_err(|e| anyhow::anyhow!("writing --tbt-log {path}: {e}"))?;
+    }
 
     if result.stopped_by == StopReason::CommandRequested {
         eprintln!("\n[Resilience] Inference suspended by system signal");
