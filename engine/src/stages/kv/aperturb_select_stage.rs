@@ -69,8 +69,8 @@ impl AperturbSelectStage {
     /// other compression: the Manager is told what the cache actually did through the dispatcher's
     /// read-back, and substituting an unscored technique here would make that answer a fiction.
     fn run_selection(&self) -> anyhow::Result<()> {
-        let guard = self.q_rows.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(q_rows) = guard.as_ref() else {
+        let mut guard = self.q_rows.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(q_rows) = guard.as_mut() else {
             eprintln!(
                 "[aperturb-select] declined: the query-row capture is not armed, so there are no \
                  rows to measure the candidates on"

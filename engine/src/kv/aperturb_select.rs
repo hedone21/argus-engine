@@ -27,14 +27,31 @@
 //! ## Cost
 //!
 //! One decision costs `|C|+1` attention passes over the resident cache at the `R` trailing query
-//! rows, plus one host mirror of K and V. It is paid when a compression is requested, not per
-//! token. `Choice` carries the split so a run can report it rather than assume it.
+//! rows, plus one host mirror of K and V, plus — with a prefill-end candidate in the pool — one
+//! window-attention pass at the ring's `W` rows (below). It is paid when a compression is
+//! requested, not per token. `Choice` carries the split so a run can report it rather than assume
+//! it.
+//!
+//! ## Prefill-end candidates
+//!
+//! SnapKV, PyramidKV and AdaKV rank keys by how much a trailing observation window of queries
+//! attended to them. In their papers that window is the prompt's last queries and the ranking
+//! happens once, at prefill end. Here a budget arrives mid-decode, so the engine recomputes the
+//! same quantity at the decision point: the query-row ring holds the trailing window (sized at
+//! assembly to the window the candidates declare), the decision mirrors every layer's K anyway,
+//! and the window's softmax over the resident positions — SUM-pooled over the rows, the prefill
+//! capture's own format — is what the candidate is shown ([`window_attention`]). It is then
+//! ranking the whole resident cache, decode positions included, so it answers any budget; nothing
+//! is force-kept, and no prompt-era capture has to be carried through a compaction for it. The
+//! ranking rule is the technique's; the placement is the engine's, and is stated as such.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use argus_extension_api::{KVMutationStage, StageCaps, TensorKind};
+use rayon::prelude::*;
 
+use crate::aperturb::kernel::logits_into;
 use crate::aperturb::{self, Config, Geom, KeepSets, LayerSource, OutputBasis, Readout};
 use crate::inference::prefill_attn::PrefillAttn;
 use crate::inference::q_rows::QRowCapture;
@@ -190,6 +207,10 @@ pub struct Selector {
     /// Query heads, which the cache does not know (it holds KV heads).
     n_heads_q: usize,
     readout: Readout,
+    /// How many of the ring's trailing rows the metric scores at. The ring may hold more — it is
+    /// sized to the observation window a prefill-end candidate declares — and the metric's cost
+    /// is linear in its rows, so the two are decoupled here.
+    metric_rows: usize,
 }
 
 /// An accepted plan: the sets the metric scores, the per-layer plans the winner is applied from,
@@ -213,7 +234,14 @@ impl Selector {
             basis,
             n_heads_q,
             readout: Readout::default(),
+            metric_rows: usize::MAX,
         })
+    }
+
+    /// Score at the ring's trailing `rows` rather than at every row it holds.
+    pub fn with_metric_rows(mut self, rows: usize) -> Self {
+        self.metric_rows = rows.max(1);
+        self
     }
 
     /// How many budgets one candidate may be asked for in a single decision
@@ -234,7 +262,7 @@ impl Selector {
         &self,
         caches: &mut [KVCache],
         target_ratio: f32,
-        q_rows: &QRowCapture,
+        q_rows: &mut QRowCapture,
         signals: Signals<'_>,
     ) -> Result<std::result::Result<Choice, NoChoice>> {
         let n_layers = caches.len();
@@ -282,15 +310,56 @@ impl Selector {
         let target_len = (((current_pos as f32) * target_ratio) as usize).max(1);
         let budget_total = target_len * n_layers * n_kv_heads;
 
-        // Plan first, while nothing has been read back: a candidate that cannot answer costs no
-        // device round trip.
+        // Read back before planning: a prefill-end candidate is shown the window attention over
+        // the cache as it stands, and that comes from this mirror. (A pool without one could plan
+        // first and save the round trip when every candidate is excluded; the paper's pool is
+        // not that pool.)
+        let t_read = std::time::Instant::now();
+        let src = HostLayers::read(
+            caches,
+            current_pos,
+            n_kv_heads,
+            head_dim,
+            q_rows,
+            self.metric_rows,
+        )?;
+        let read_s = t_read.elapsed().as_secs_f64();
+        let window_attn = if self.candidates.iter().any(Candidate::reads_prefill_attn) {
+            let gw = Geom {
+                n_layers,
+                n_heads_q: self.n_heads_q,
+                n_kv_heads,
+                head_dim,
+                current_pos,
+                rows: src.window_rows,
+            };
+            let rows = (0..n_layers)
+                .map(|l| window_attention(&src, l, gw))
+                .collect::<Result<Vec<_>>>()?;
+            Some(PrefillAttn::captured(rows))
+        } else {
+            None
+        };
+        // What the candidates plan from. The prompt capture in `signals` is not it (module
+        // header), but it is still what the compaction below carries forward for whoever else
+        // reads it.
+        let plan_signals = Signals {
+            prefill_attn: window_attn.as_ref(),
+            ..signals
+        };
         let mut pool: Vec<(String, KeepSets)> = Vec::with_capacity(self.candidates.len());
         let mut plans: Vec<Vec<PlannedKeep>> = Vec::with_capacity(self.candidates.len());
         let mut asked: Vec<usize> = Vec::with_capacity(self.candidates.len());
         let mut excluded: Vec<(String, String)> = Vec::new();
         for cand in &self.candidates {
-            match self.plan_calibrated(cand, caches, target_len, budget_total, n_kv_heads, signals)
-            {
+            match self.plan_calibrated(
+                cand,
+                caches,
+                target_len,
+                budget_total,
+                n_kv_heads,
+                plan_signals,
+            ) {
                 Ok(Ok((keep, layers, ask))) => {
                     if let Err(e) = keep.validate(current_pos) {
                         excluded.push((cand.name.clone(), e.to_string()));
@@ -309,10 +378,6 @@ impl Selector {
         if pool.is_empty() {
             return Ok(Err(NoChoice::AllExcluded(excluded)));
         }
-
-        let t_read = std::time::Instant::now();
-        let src = HostLayers::read(caches, current_pos, n_kv_heads, head_dim, q_rows)?;
-        let read_s = t_read.elapsed().as_secs_f64();
 
         let g = Geom {
             n_layers,
@@ -364,6 +429,11 @@ impl Selector {
         // Quoted as a per-head mean: a ragged winner leaves `current_pos` at the longest head.
         let tokens_after = caches[0].resident_tokens();
         let cursor_after = caches[0].current_pos();
+        // Tell the ring now, not when the decode loop next notices: the next budget may arrive
+        // before that step.
+        if cursor_after < current_pos {
+            q_rows.renumbered_to(cursor_after);
+        }
 
         // Carry the prompt attention into the numbering the compaction just imposed. It belongs to
         // the session and not to whoever won, so it is carried whenever the cache actually moved —
@@ -534,24 +604,13 @@ impl Selector {
         Ok(Ok((keep, layers)))
     }
 
-    /// Plan one layer for a candidate that decides off the prefill attention.
+    /// Plan one layer for a candidate that decides off the observation-window attention.
     ///
-    /// The budget arrives mid-decode, but this technique's evidence is a prompt-era measurement:
-    /// `pfa[layer]` describes the first `prefix_len` positions and nothing after them. So the engine
-    /// splits the layer in two. The stage is shown a cache exactly `prefix_len` long and asked for
-    /// `target_len - tail` of it; the `tail` positions decode appended since are kept by the engine
-    /// and charged to the same budget ([`PlannedKeep::keep_tail`]).
-    ///
-    /// This is an engine-side adaptation and is not what the technique does in its own paper, where
-    /// it fires once at prefill end with no tail to account for. What it buys is that the technique
-    /// answers from its real ranking rather than from the score-free fallback it takes when the
-    /// prefill attention is absent, which is the thing that would not be worth ranking.
-    ///
-    /// A capture wider than the cache is the backstop for a compaction the capture was not carried
-    /// through ([`PrefillAttn::gather`] carries it through the ones this selector applies, and the
-    /// decode loop drops it on the ones nothing carried it through). It stays because the loop
-    /// watches layer 0's occupancy alone, so a keep-set that shrinks only some layers is still
-    /// possible, and reading a capture past its width zero-fills in silence.
+    /// `pfa[layer_idx]` is [`window_attention`] over the resident cache for this decision, so its
+    /// width is the cache's own and the stage is shown every resident position — the decode tail
+    /// included, which its paper never has to rank because it fires before there is one. The
+    /// width check stays as the guard it always was: a capture narrower or wider than the cache
+    /// ranks keys by another key's score, silently.
     ///
     /// The outer `Err(String)` is an exclusion reason, not a failure.
     fn plan_prefill_layer(
@@ -567,41 +626,26 @@ impl Selector {
         if self.n_heads_q == 0 {
             return Ok(Err("the model reports no query heads".to_string()));
         }
-        // The PFA's own width, never the cache's: reading past the data zero-fills silently.
-        let prefix_len = pfa[layer_idx].len() / self.n_heads_q;
-        if prefix_len == 0 {
+        // The capture's own width, never the cache's: reading past the data zero-fills silently.
+        let width = pfa[layer_idx].len() / self.n_heads_q;
+        if width != current_pos {
             return Ok(Err(format!(
-                "layer {layer_idx}: the prefill attention capture is empty"
+                "layer {layer_idx}: the window attention covers {width} positions but \
+                 {current_pos} are resident"
             )));
         }
-        if prefix_len > current_pos {
-            return Ok(Err(format!(
-                "layer {layer_idx}: the prefill attention covers {prefix_len} positions but only \
-                 {current_pos} are resident — the cache was compressed after it was captured"
-            )));
-        }
-        let tail = current_pos - prefix_len;
-        let Some(stage_budget) = target_len.checked_sub(tail).filter(|b| *b > 0) else {
-            return Ok(Err(format!(
-                "the {tail} decode positions its prefill attention never saw already fill the \
-                 {target_len}-position budget, so it has nothing left to rank"
-            )));
-        };
-        let mut planned = plan_prefill_keepset_layer(
+        plan_prefill_keepset_layer(
             cand.stage.as_ref(),
             cache,
             layer_idx,
             n_layers,
-            stage_budget,
+            target_len,
             &pfa[layer_idx],
             self.n_heads_q,
             cand.protected_prefix,
-            prefix_len,
-        )?;
-        if let Some(p) = planned.as_mut() {
-            p.keep_tail(prefix_len, current_pos);
-        }
-        Ok(Ok(planned))
+            width,
+        )
+        .map(Ok)
     }
 }
 
@@ -636,10 +680,15 @@ fn apply_planned(
 
 /// Host-resident `(Q rows, K, V)` for one decision — the metric's [`LayerSource`].
 struct HostLayers {
+    /// The metric's rows: the trailing `rows` of the ring, `[n_heads_q][rows][head_dim]`.
     q: Vec<Vec<f32>>,
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
     rows: usize,
+    /// Every row the ring holds, `[n_heads_q][window_rows][head_dim]` — the observation window a
+    /// prefill-end candidate is shown ([`window_attention`]). The metric's rows are its tail.
+    window_q: Vec<Vec<f32>>,
+    window_rows: usize,
     /// Per-layer, per-KV-head first resident position (`KVCache::head_starts`).
     starts: Vec<Vec<usize>>,
 }
@@ -651,18 +700,24 @@ impl HostLayers {
         n_kv_heads: usize,
         head_dim: usize,
         q_rows: &QRowCapture,
+        metric_rows: usize,
     ) -> Result<Self> {
         let q_snap = q_rows.snapshot(current_pos)?;
         let n_layers = caches.len();
+        let rows = q_snap.rows.min(metric_rows).max(1);
         let mut out = Self {
             q: Vec::with_capacity(n_layers),
             k: Vec::with_capacity(n_layers),
             v: Vec::with_capacity(n_layers),
-            rows: q_snap.rows,
+            rows,
+            window_q: Vec::with_capacity(n_layers),
+            window_rows: q_snap.rows,
             starts: Vec::with_capacity(n_layers),
         };
         for (l, cache) in caches.iter().enumerate() {
-            out.q.push(q_snap.layer_head_major(l, head_dim));
+            let all = q_snap.layer_head_major(l, head_dim);
+            out.q.push(trailing_rows(&all, q_snap.rows, rows, head_dim));
+            out.window_q.push(all);
             let (k, v) = read_layer_kv(cache, current_pos, n_kv_heads, head_dim)
                 .with_context(|| format!("reading layer {l}'s K/V for the decision"))?;
             out.k.push(k);
@@ -671,6 +726,74 @@ impl HostLayers {
         }
         Ok(out)
     }
+
+    fn window_q(&self, layer: usize) -> &[f32] {
+        &self.window_q[layer]
+    }
+}
+
+/// The last `rows` of each head's `all_rows`: `[n_heads_q][all_rows][head_dim]` in,
+/// `[n_heads_q][rows][head_dim]` out.
+fn trailing_rows(all: &[f32], all_rows: usize, rows: usize, head_dim: usize) -> Vec<f32> {
+    if rows >= all_rows {
+        return all.to_vec();
+    }
+    let n_q = all.len() / (all_rows * head_dim).max(1);
+    let mut out = Vec::with_capacity(n_q * rows * head_dim);
+    for h in 0..n_q {
+        let base = (h * all_rows + (all_rows - rows)) * head_dim;
+        out.extend_from_slice(&all[base..base + rows * head_dim]);
+    }
+    out
+}
+
+/// The observation-window attention over the resident cache, in the prefill capture's format.
+///
+/// `[n_heads_q][current_pos]`, SUM-pooled over the ring's `g.rows` query rows: row `t`, at
+/// absolute position `g.row_pos(t)`, softmaxes over the keys at or before it that its KV head
+/// holds. A ragged head's holes (below its `head_start`) are absent from the softmax and read
+/// `0.0` — where a prompt capture carried through a ragged keep puts them too. The logits are the
+/// metric's own ([`logits_into`]), so a candidate ranks from the arithmetic it is scored by.
+fn window_attention(src: &HostLayers, layer: usize, g: Geom) -> Result<Vec<f32>> {
+    let (s, rows, n_rep) = (g.current_pos, g.rows, g.n_rep());
+    let mut z = vec![0.0f32; g.logit_len()];
+    logits_into(src.window_q(layer), src.keys(layer), &mut z, g)
+        .map_err(|e| anyhow::anyhow!("layer {layer}: {e}"))?;
+    let heads = (0..g.n_heads_q)
+        .into_par_iter()
+        .map(|h| -> Result<Vec<f32>> {
+            let start = src.head_start(layer, h / n_rep).min(s);
+            let zh = &z[h * rows * s..(h + 1) * rows * s];
+            let mut acc = vec![0.0f32; s];
+            let mut w = Vec::with_capacity(s);
+            for t in 0..rows {
+                // Causal: row `t` sees the keys at or before its own position.
+                let end = (g.row_pos(t) + 1).min(s);
+                if end <= start {
+                    continue;
+                }
+                let zr = &zh[t * s + start..t * s + end];
+                let m = zr.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                anyhow::ensure!(
+                    m.is_finite(),
+                    "layer {layer}, head {h}: non-finite logit in the window attention"
+                );
+                w.clear();
+                let mut sum = 0.0f32;
+                for &zp in zr {
+                    let e = (zp - m).exp();
+                    w.push(e);
+                    sum += e;
+                }
+                let inv = 1.0 / sum;
+                for (j, &e) in w.iter().enumerate() {
+                    acc[start + j] += e * inv;
+                }
+            }
+            Ok(acc)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(heads.concat())
 }
 
 impl LayerSource for HostLayers {
@@ -771,6 +894,23 @@ mod tests {
             b[i * d + i] = 1.0;
         }
         Arc::new(OutputBasis::from_layers(vec![b; LAYERS], d, d, None).expect("identity basis"))
+    }
+
+    /// [`make_cache`] with keys that make the window attend to positions 3 and 4 above the rest
+    /// (`⟨q, k⟩` of 2.0 and 1.5 against 0.5 elsewhere, for the ring's all-ones query).
+    fn make_cache_favouring_3_and_4() -> KVCache {
+        let mut c = make_cache();
+        for (pos, k) in [(3usize, 1.0f32), (4, 0.75)] {
+            let off = c.offset(pos, 0);
+            c.k_buffer.as_mut_slice::<f32>()[off..off + HD].fill(k);
+        }
+        c
+    }
+
+    fn caches_favouring_3_and_4() -> Vec<KVCache> {
+        (0..LAYERS)
+            .map(|_| make_cache_favouring_3_and_4())
+            .collect()
     }
 
     /// A ring armed over the trailing `ROWS` positions of every layer, with a constant query — with
@@ -934,12 +1074,17 @@ mod tests {
         }
     }
 
-    /// Prefill attention that ranks positions 3 and 4 above the rest, one row per query head.
-    fn pfa_favouring_3_and_4() -> PrefillAttn {
+    /// A prompt capture over the [`PREFIX`] that ranks `a` above `b` above the rest, one row per
+    /// query head.
+    fn pfa_favouring(a: usize, b: usize) -> PrefillAttn {
         let mut row = vec![0.1f32; PREFIX];
-        row[3] = 0.9;
-        row[4] = 0.8;
+        row[a] = 0.9;
+        row[b] = 0.8;
         PrefillAttn::captured(vec![row; LAYERS])
+    }
+
+    fn pfa_favouring_3_and_4() -> PrefillAttn {
+        pfa_favouring(3, 4)
     }
 
     fn caps() -> StageCaps {
@@ -986,9 +1131,9 @@ mod tests {
             fixed("mid_pair", &[3, 4]),
         ]);
         let mut cs = caches();
-        let q = armed_q_rows();
+        let mut q = armed_q_rows();
         let choice = s
-            .choose_and_apply(&mut cs, 0.25, &q, Signals::default())
+            .choose_and_apply(&mut cs, 0.25, &mut q, Signals::default())
             .expect("decide")
             .expect("a choice");
         assert_eq!(choice.winner, "mid_pair");
@@ -1019,9 +1164,9 @@ mod tests {
         let all: Vec<usize> = (0..RESIDENT).collect();
         let s = selector(vec![fixed("keep_all", &all), fixed("mid_pair", &[3, 4])]);
         let mut cs = caches();
-        let q = armed_q_rows();
+        let mut q = armed_q_rows();
         let choice = s
-            .choose_and_apply(&mut cs, 0.25, &q, Signals::default())
+            .choose_and_apply(&mut cs, 0.25, &mut q, Signals::default())
             .expect("decide")
             .expect("a choice");
         assert_eq!(choice.winner, "mid_pair");
@@ -1051,9 +1196,9 @@ mod tests {
             fixed("mid_pair", &[3, 4]),
         ]);
         let mut cs = caches();
-        let q = armed_q_rows();
+        let mut q = armed_q_rows();
         let choice = s
-            .choose_and_apply(&mut cs, 0.5, &q, Signals::default())
+            .choose_and_apply(&mut cs, 0.5, &mut q, Signals::default())
             .expect("decide")
             .expect("a choice");
         assert!(
@@ -1076,10 +1221,14 @@ mod tests {
 
     /// A prefill-end candidate is asked about the window its prefill attention covers, and the
     /// positions decode appended since are kept by the engine on top of its answer.
-    /// Mutation-proof: dropping the `keep_tail` call loses the two decode positions, and showing
-    /// the stage `cache.current_pos()` instead of the PFA's width makes `seen_*` report 8.
+    /// A prefill-end candidate is shown the window attention over the WHOLE resident cache — the
+    /// decode tail included — recomputed from the ring, and ranks all of it.
+    ///
+    /// Mutation-proof: showing the stage a prompt-width capture makes `seen_*` report `PREFIX`;
+    /// force-keeping the tail puts 6 and 7 in the survivors; a window that is not causal gives
+    /// column 7 both rows' attention and it ties the rest instead of falling below them.
     #[test]
-    fn a_prefill_end_candidate_ranks_its_prefix_and_the_decode_tail_is_kept() {
+    fn a_prefill_end_candidate_ranks_the_resident_cache_off_the_ring() {
         use std::sync::atomic::Ordering;
         let ranker = Arc::new(PrefixRanker {
             seen_pos: std::sync::atomic::AtomicUsize::new(0),
@@ -1103,14 +1252,46 @@ mod tests {
             Box::new(Shared(Arc::clone(&ranker))),
             pfa_caps(),
         )]);
-        let mut cs = caches();
-        let q = armed_q_rows();
-        let pfa = pfa_favouring_3_and_4();
+        let mut cs = caches_favouring_3_and_4();
+        let mut q = armed_q_rows();
+        // No prompt capture at all: the ring is the source.
+        let choice = s
+            .choose_and_apply(&mut cs, 0.5, &mut q, Signals::default())
+            .expect("decide")
+            .expect("a choice");
+        assert_eq!(choice.winner, "prefix_ranker");
+        assert!(choice.excluded.is_empty(), "{:?}", choice.excluded);
+        assert_eq!(ranker.seen_pos.load(Ordering::Relaxed), RESIDENT);
+        assert_eq!(ranker.seen_cols.load(Ordering::Relaxed), RESIDENT);
+        // Budget 4: the two keys the window attends to most, then the earliest of the equal rest.
+        // The decode positions 6 and 7 are ranked like any other and fall (7 lowest of all: only
+        // the last row sees it).
+        for c in &cs {
+            assert_eq!(survivors(c), vec![0.0, 1.0, 3.0, 4.0]);
+        }
+    }
+
+    /// The prompt capture in `Signals` is not what a prefill-end candidate ranks from: it is
+    /// narrower than the cache and favours other keys, and neither shows in the survivors. It IS
+    /// still carried through the compaction, for whoever else reads it.
+    #[test]
+    fn the_prompt_capture_is_carried_but_not_ranked_from() {
+        let s = selector(vec![Candidate::new(
+            "prefix_ranker",
+            Box::new(PrefixRanker {
+                seen_pos: std::sync::atomic::AtomicUsize::new(0),
+                seen_cols: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            pfa_caps(),
+        )]);
+        let mut cs = caches_favouring_3_and_4();
+        let mut q = armed_q_rows();
+        let pfa = pfa_favouring(1, 5);
         let choice = s
             .choose_and_apply(
                 &mut cs,
                 0.5,
-                &q,
+                &mut q,
                 Signals {
                     prefill_attn: Some(&pfa),
                     ..Signals::default()
@@ -1119,105 +1300,51 @@ mod tests {
             .expect("decide")
             .expect("a choice");
         assert_eq!(choice.winner, "prefix_ranker");
-        // The stage saw the PFA's window, not the resident cache.
-        assert_eq!(ranker.seen_pos.load(Ordering::Relaxed), PREFIX);
-        assert_eq!(ranker.seen_cols.load(Ordering::Relaxed), PREFIX);
-        // Budget 4 = the two it ranked out of the prefix, plus the two decode positions it never
-        // measured, which the engine kept rather than let fall to a score that does not exist.
+        assert!(choice.excluded.is_empty(), "{:?}", choice.excluded);
         for c in &cs {
-            assert_eq!(survivors(c), vec![3.0, 4.0, 6.0, 7.0]);
+            assert_eq!(survivors(c), vec![0.0, 1.0, 3.0, 4.0]);
+        }
+        let carried = choice.prefill_attn.expect("carried through the keep");
+        // Prompt positions 0, 1, 3, 4 survived: the capture is 4 wide, column 1 is still the
+        // favoured old column 1, and old column 5 is gone with its key.
+        assert_eq!(carried.rows()[0], vec![0.1, 0.9, 0.1, 0.1]);
+    }
+
+    /// A budget the decode tail alone would once have filled is answered: the tail is ranked like
+    /// any other position, so a 2-position budget keeps the two keys the window favours.
+    #[test]
+    fn the_decode_tail_is_ranked_like_any_other_position() {
+        let s = selector(vec![Candidate::new(
+            "prefix_ranker",
+            Box::new(PrefixRanker {
+                seen_pos: std::sync::atomic::AtomicUsize::new(0),
+                seen_cols: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            pfa_caps(),
+        )]);
+        let mut cs = caches_favouring_3_and_4();
+        let mut q = armed_q_rows();
+        // ratio 0.25 of 8 resident = a 2-position budget.
+        let choice = s
+            .choose_and_apply(&mut cs, 0.25, &mut q, Signals::default())
+            .expect("decide")
+            .expect("a choice");
+        assert_eq!(choice.winner, "prefix_ranker");
+        assert!(choice.excluded.is_empty(), "{:?}", choice.excluded);
+        for c in &cs {
+            assert_eq!(survivors(c), vec![3.0, 4.0]);
         }
     }
 
-    /// A prefill-end candidate whose prefill attention was never captured is excluded with that
-    /// reason — it is not quietly asked anyway, which is what would send it down its score-free
-    /// fallback and rank something the technique does not do.
-    #[test]
-    fn a_prefill_end_candidate_without_its_attention_is_excluded() {
-        let s = selector(vec![
-            Candidate::new(
-                "prefix_ranker",
-                Box::new(PrefixRanker {
-                    seen_pos: std::sync::atomic::AtomicUsize::new(0),
-                    seen_cols: std::sync::atomic::AtomicUsize::new(0),
-                }),
-                pfa_caps(),
-            ),
-            fixed("mid_pair", &[3, 4]),
-        ]);
-        let mut cs = caches();
-        let q = armed_q_rows();
-        let choice = s
-            .choose_and_apply(&mut cs, 0.5, &q, Signals::default())
-            .expect("decide")
-            .expect("a choice");
-        assert_eq!(choice.winner, "mid_pair");
-        assert_eq!(choice.excluded.len(), 1);
-        assert_eq!(choice.excluded[0].0, "prefix_ranker");
-        assert!(
-            choice.excluded[0].1.contains("never captured"),
-            "{}",
-            choice.excluded[0].1
-        );
-    }
-
-    /// When the decode positions outside the prefill attention already fill the budget, the
-    /// candidate is excluded with that reason rather than asked for a budget of nothing.
-    #[test]
-    fn a_prefill_end_candidate_is_excluded_when_the_decode_tail_fills_the_budget() {
-        let s = selector(vec![
-            Candidate::new(
-                "prefix_ranker",
-                Box::new(PrefixRanker {
-                    seen_pos: std::sync::atomic::AtomicUsize::new(0),
-                    seen_cols: std::sync::atomic::AtomicUsize::new(0),
-                }),
-                pfa_caps(),
-            ),
-            fixed("mid_pair", &[3, 4]),
-        ]);
-        let mut cs = caches();
-        let q = armed_q_rows();
-        let pfa = pfa_favouring_3_and_4();
-        // ratio 0.25 of 8 resident = a 2-position budget, which the 2 decode positions consume.
-        let choice = s
-            .choose_and_apply(
-                &mut cs,
-                0.25,
-                &q,
-                Signals {
-                    prefill_attn: Some(&pfa),
-                    ..Signals::default()
-                },
-            )
-            .expect("decide")
-            .expect("a choice");
-        assert_eq!(choice.winner, "mid_pair");
-        assert_eq!(choice.excluded.len(), 1);
-        assert!(
-            choice.excluded[0].1.contains("already fill the"),
-            "{}",
-            choice.excluded[0].1
-        );
-    }
-
-    /// A prefill-end candidate answers a SECOND budget, because the capture is carried through the
-    /// compaction the first one applied rather than left behind in the old numbering.
+    /// A prefill-end candidate answers a SECOND budget from the ring alone: after the first
+    /// compaction the window is recomputed over the renumbered cache, so the candidate is shown
+    /// the 4 survivors and ranks them by where the favoured keys now sit.
     ///
-    /// The compression keeps prompt positions 3 and 4 (the two the prompt attention favours) plus
-    /// the 2-position decode tail, so `V` becomes `[3, 4, 6, 7]` and the carried capture is 2 wide.
-    /// The second budget then finds the candidate still comparable, ranking a 2-column capture
-    /// against a 4-long cache, and keeps the column that WAS position 3 — `V[0] == 3.0` is the
-    /// prompt's own favourite surviving a renumbering.
-    ///
-    /// Mutation-proof three ways. Not carrying it at all (`prefill_attn: None` on `Choice`) makes
-    /// the second decision exclude the candidate — "covers 6 positions but only 4 are resident" —
-    /// and `mid_pair` wins with `V == [3, 6, 7]`... which is the same first element, so the
-    /// `seen_cols` and exclusion assertions are the ones that catch it. Carrying the ROWS
-    /// unchanged (skipping the gather) makes `seen_cols` 6. Gathering by `j` instead of `keep[j]`
-    /// puts position 0's 0.1 where 3's 0.9 was, so the retained survivor becomes 4.0.
+    /// Mutation-proof: recomputing over the pre-compaction width excludes the candidate ("covers
+    /// 8 positions but 4 are resident"); ranking by the old numbering keeps old columns 3 and 4,
+    /// which are now the keys that WERE 0 and 1.
     #[test]
-    fn a_carried_capture_lets_a_prefill_end_candidate_answer_the_next_budget() {
+    fn a_prefill_end_candidate_answers_the_next_budget_from_the_ring() {
         let ranker = Arc::new(PrefixRanker {
             seen_pos: std::sync::atomic::AtomicUsize::new(0),
             seen_cols: std::sync::atomic::AtomicUsize::new(0),
@@ -1240,56 +1367,50 @@ mod tests {
             Box::new(Shared(Arc::clone(&ranker))),
             pfa_caps(),
         )]);
-        let mut cs = caches();
+        let mut cs = caches_favouring_3_and_4();
         let mut q = armed_q_rows();
-        let pfa = pfa_favouring_3_and_4();
 
         let first = s
-            .choose_and_apply(
-                &mut cs,
-                0.5,
-                &q,
-                Signals {
-                    prefill_attn: Some(&pfa),
-                    ..Signals::default()
-                },
-            )
+            .choose_and_apply(&mut cs, 0.5, &mut q, Signals::default())
             .expect("decide")
             .expect("a choice");
         assert_eq!(first.tokens_after, 4);
-        assert_eq!(survivors(&cs[0]), vec![3.0, 4.0, 6.0, 7.0]);
-        let carried = first
-            .prefill_attn
-            .expect("the capture is carried, not dropped");
-        assert_eq!(carried.rows()[0], vec![0.9, 0.8], "the favoured columns");
+        assert_eq!(survivors(&cs[0]), vec![0.0, 1.0, 3.0, 4.0]);
 
-        // The ring keeps stamping RoPE positions while the cache is renumbered down; the decode
-        // loop reports the gap. Without it the second decision declines on the rows, not the PFA.
-        q.set_drift(RESIDENT - first.tokens_after);
+        // The ring keeps stamping RoPE positions while the cache was renumbered down. The chooser
+        // reported the gap itself, so the second budget is answered before any decode step has
+        // run (mutation-proof: drop `renumbered_to` and this declines on stale rows).
         let second = s
-            .choose_and_apply(
-                &mut cs,
-                0.75,
-                &q,
-                Signals {
-                    prefill_attn: Some(&carried),
-                    ..Signals::default()
-                },
-            )
+            .choose_and_apply(&mut cs, 0.75, &mut q, Signals::default())
             .expect("decide")
             .expect("a choice");
-        assert!(
-            second.excluded.is_empty(),
-            "the carried capture keeps the candidate comparable: {:?}",
-            second.excluded
-        );
+        assert!(second.excluded.is_empty(), "{:?}", second.excluded);
         assert_eq!(second.winner, "prefix_ranker");
         assert_eq!(
             ranker.seen_cols.load(std::sync::atomic::Ordering::Relaxed),
-            2,
-            "the stage is shown the carried width, not the prompt's"
+            4,
+            "the stage is shown the cache as it stands"
         );
-        assert_eq!(survivors(&cs[0]), vec![3.0, 6.0, 7.0]);
+        // Budget 3 of [0, 1, 3, 4]: the favoured keys (now at 2 and 3), then the earliest tie.
+        assert_eq!(survivors(&cs[0]), vec![0.0, 3.0, 4.0]);
+    }
+
+    /// The metric scores at the ring's TAIL while the window a candidate is shown is the whole
+    /// ring: `HostLayers::read` keeps both, and the metric's rows are the last of the window's.
+    #[test]
+    fn the_metric_rows_are_the_tail_of_the_window() {
+        let cs = caches();
+        let q = armed_q_rows();
+        let src = HostLayers::read(&cs, RESIDENT, HEADS, HD, &q, 1).expect("read");
+        assert_eq!((src.rows, src.window_rows), (1, ROWS));
+        for l in 0..LAYERS {
+            let win = src.window_q(l);
+            assert_eq!(win.len(), HEADS * ROWS * HD);
+            assert_eq!(src.query_rows(l), &win[(ROWS - 1) * HD..ROWS * HD]);
+        }
+        let all = HostLayers::read(&cs, RESIDENT, HEADS, HD, &q, usize::MAX).expect("read");
+        assert_eq!(all.rows, ROWS);
+        assert_eq!(all.query_rows(0), all.window_q(0));
     }
 
     /// A capture is carried only when the cache actually moved. A decision that retains everything
@@ -1299,13 +1420,13 @@ mod tests {
     fn nothing_is_carried_when_nothing_was_compressed() {
         let s = selector(vec![fixed("keep_all", &(0..RESIDENT).collect::<Vec<_>>())]);
         let mut cs = caches();
-        let q = armed_q_rows();
+        let mut q = armed_q_rows();
         let pfa = pfa_favouring_3_and_4();
         let choice = s
             .choose_and_apply(
                 &mut cs,
                 1.0,
-                &q,
+                &mut q,
                 Signals {
                     prefill_attn: Some(&pfa),
                     ..Signals::default()
@@ -1329,9 +1450,9 @@ mod tests {
         let s = selector(vec![fixed("mid_pair", &[3, 4])]);
         let mut cs = caches();
         // The ring holds positions 2..4; the cache is 8 long, so the window it would read is 6..8.
-        let q = q_rows_over(4);
+        let mut q = q_rows_over(4);
         let out = s
-            .choose_and_apply(&mut cs, 0.5, &q, Signals::default())
+            .choose_and_apply(&mut cs, 0.5, &mut q, Signals::default())
             .expect("a stale ring is a decline, never an error");
         assert!(
             matches!(out, Err(NoChoice::StaleRows { resident: RESIDENT })),
@@ -1353,9 +1474,9 @@ mod tests {
             fixed("mid_pair", &[3, 4]),
         ]);
         let mut cs = caches();
-        let q = armed_q_rows();
+        let mut q = armed_q_rows();
         let choice = s
-            .choose_and_apply(&mut cs, 0.25, &q, Signals::default())
+            .choose_and_apply(&mut cs, 0.25, &mut q, Signals::default())
             .expect("decide")
             .expect("a choice");
         assert_eq!(choice.winner, "mid_pair");
@@ -1371,9 +1492,9 @@ mod tests {
         let all: Vec<usize> = (0..RESIDENT).collect();
         let s = selector(vec![fixed("keep_all", &all)]);
         let mut cs = caches();
-        let q = armed_q_rows();
+        let mut q = armed_q_rows();
         let r = s
-            .choose_and_apply(&mut cs, 0.25, &q, Signals::default())
+            .choose_and_apply(&mut cs, 0.25, &mut q, Signals::default())
             .expect("decide");
         match r {
             Err(NoChoice::AllExcluded(v)) => assert_eq!(v.len(), 1),
@@ -1395,9 +1516,9 @@ mod tests {
         for c in &mut cs {
             c.set_current_pos(ROWS);
         }
-        let q = armed_q_rows();
+        let mut q = armed_q_rows();
         let r = s
-            .choose_and_apply(&mut cs, 0.25, &q, Signals::default())
+            .choose_and_apply(&mut cs, 0.25, &mut q, Signals::default())
             .expect("decide");
         assert!(matches!(r, Err(NoChoice::TooShort { resident: 2, .. })));
         assert_eq!(cs[0].current_pos(), ROWS);

@@ -610,10 +610,10 @@ fn planned_keep_of(h: &EngineCacheHandle<'_>) -> Option<PlannedKeep> {
 /// apply_prefill_keepset) drives, and then drops the handle instead of committing it (T-1), so the
 /// cache is byte-identical afterwards and the answer is the stage's real decision.
 ///
-/// `prefix_len` is the width of `pfa`, which is also the `current_pos` the stage is shown. Mid-decode
-/// that is smaller than the cache: the stage is asked only about the prefix its prefill attention
-/// covers, and what to do with the positions appended since is the caller's decision, not the
-/// technique's (see [`PlannedKeep::keep_tail`]).
+/// `prefix_len` is the width of `pfa`, which is also the `current_pos` the stage is shown. The
+/// engine's own chooser hands it the window attention over the resident cache, so the two agree
+/// and the stage ranks every resident position; a narrower capture shows the stage only the prefix
+/// it covers.
 ///
 /// `Ok(None)` = the stage staged no keep for this layer.
 #[allow(clippy::too_many_arguments)]
@@ -675,23 +675,6 @@ impl PlannedKeep {
         match self {
             Self::LayerWide(k) => Some(k),
             Self::PerHead(h) => h.get(kv_head).map(|v| v.as_slice()),
-        }
-    }
-
-    /// Force-keep `[from, to)` on top of what the stage staged.
-    ///
-    /// A prefill-end technique ranks only the positions its prefill attention covers. Asked
-    /// mid-decode, the tokens appended since sit outside that window entirely — they have no
-    /// measured attention, not a low one. Keeping them is the engine's call and it is stated as
-    /// such: the alternative is to let them fall to a score the technique never computed, which
-    /// would drop the newest tokens first and report the result as the technique's own.
-    ///
-    /// Every staged position is `< from` (the stage was shown a cache exactly `from` long), so
-    /// appending preserves the ascending order a keep-set requires.
-    pub(crate) fn keep_tail(&mut self, from: usize, to: usize) {
-        match self {
-            Self::LayerWide(k) => k.extend(from..to),
-            Self::PerHead(h) => h.iter_mut().for_each(|v| v.extend(from..to)),
         }
     }
 }
