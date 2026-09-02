@@ -422,12 +422,13 @@ impl CommandDispatcher {
     /// run_eviction 이 acc.importance_scores() 를 추출해 force_evict_with_scores 호출, 직후 acc.reset().
     fn submit_compress(&mut self, budget: f32) -> CommandResult {
         use crate::format::KVCacheFormat;
-        if self.last_evict_ratio == Some(budget) {
-            // 같은 budget 재요청 — 이미 이 active 구간에서 submit 됐다 (v1 evict_applied 등가).
-            // 요청한 상태가 이미 성립하므로 실패가 아니다. 값이 **다르면** 아래로 내려가
-            // 새 OneShot 을 submit 한다 — 그것이 bool 게이트와의 차이다.
-            return CommandResult::Ok;
-        }
+        // A repeated budget names a state, not an action: it is answered `Ok` below when the
+        // cache is still within it (the `target_len >= resident` guard), and re-applied when
+        // decode has grown the cache back past it. Short-circuiting every repeat, as this once
+        // did, made a budget hold only at the instant it was sent — a Manager parked at its
+        // floor watched the cache regrow from 1.4K to 4K tokens (idle 8K, 2026-09-02). With the
+        // denominator fixed at the uncompressed length there is nothing for a re-application to
+        // compound.
         let Some(h0) = self.kv_handles.first() else {
             return CommandResult::Rejected {
                 reason: "no kv cache handles are registered".to_string(),
@@ -635,17 +636,37 @@ mod tests {
         assert_eq!(registry.len(), 1, "one selection stage submitted");
     }
 
+    /// A repeated budget names a state. While the cache is within it — here the first
+    /// compaction is simulated by moving the cursor under the target, since nothing runs
+    /// `KvMutate` in these tests — the repeat is `Ok` and submits nothing; once decode has
+    /// grown the cache back past it, the same value submits again. Mutation-proof: restoring
+    /// the old `last_evict_ratio == budget` short-circuit keeps the registry at 1 on the last
+    /// step, which is the cache regrowing unchecked under a Manager parked at its floor.
     #[test]
-    fn compress_submits_one_shot_once_per_budget() {
-        let (mut d, registry, _h) = make_dispatcher();
+    fn a_repeated_budget_reapplies_only_when_the_cache_has_regrown_past_it() {
+        let (mut d, registry, h) = make_dispatcher();
         assert_eq!(registry.len(), 0);
         assert!(is_accepted(&results_of(&mut d, vec![compress(0.5)])[0]));
         assert_eq!(registry.len(), 1, "첫 압축 → OneShot 1개 submit");
         d.dispatch(vec![]);
         assert_eq!(registry.len(), 1, "빈 batch — 재submit 없음");
+        let full = h.current_pos();
+        h.with_cache_mut(|c| c.set_current_pos(full / 2));
         let again = results_of(&mut d, vec![compress(0.5)]);
-        assert!(matches!(again[..], [CommandResult::Ok]));
-        assert_eq!(registry.len(), 1, "같은 budget 반복 — 재submit 없음");
+        assert!(matches!(again[..], [CommandResult::Ok]), "{again:?}");
+        assert_eq!(
+            registry.len(),
+            1,
+            "예산 안 — 같은 budget 반복은 재submit 없음"
+        );
+        h.with_cache_mut(|c| c.set_current_pos(full));
+        let regrown = results_of(&mut d, vec![compress(0.5)]);
+        assert!(is_accepted(&regrown[0]), "{regrown:?}");
+        assert_eq!(
+            registry.len(),
+            2,
+            "예산 밖으로 다시 자람 — 같은 budget 이 재적용된다"
+        );
     }
 
     /// 예산을 조이는 연속 directive 는 매번 새 OneShot 을 submit 한다. 값-무관 bool 게이트
