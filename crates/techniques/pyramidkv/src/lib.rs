@@ -28,8 +28,10 @@
 //!    attention summed over the window to every prefix key): mean over the window (÷window),
 //!    `avg_pool1d(kernel, pad=kernel/2, stride=1, count_include_pad=True)`, GQA group-mean over the
 //!    q-heads of each kv-head, then keep the budget's worth of highest-scored positions **plus the
-//!    always-kept recent window** — i.e. `topk` with the window forced in. Routed through the
-//!    engine's [`compile_keep_top_k`] (prefix `0`, recent = `window`, heavy = `budget − window`).
+//!    always-kept recent window** — i.e. `topk` with the window forced in. This is the selection the
+//!    whole SnapKV family shares (kvpress `PyramidKVPress` inherits `SnapKVPress.score` unchanged),
+//!    so it lives in the extension API as [`snapkv_per_head_keep`] (prefix `0`, recent = `window`,
+//!    heavy = `budget − window`, via [`compile_keep_top_k`]); this crate contributes only the budget.
 //!    The engine must observe EXACTLY `window_size` trailing queries: that width is declared on
 //!    [`StageCaps::prefill_attn_window`] (a producer of a different width sums a different
 //!    query set and ranks different heavy hitters — the former D1 divergence).
@@ -75,8 +77,8 @@
 
 use argus_extension_api::{
     CacheHandle, CacheOpError, KVMutationStage, KeepSpec, KeepTopK, MutationPhase, SignalId,
-    StageArgs, StageCaps, StageCtx, StageParams, TensorKind, compile_keep_top_k,
-    register_kv_mutation_stage,
+    SnapKvSelect, StageArgs, StageCaps, StageCtx, StageParams, TensorKind, compile_keep_top_k,
+    register_kv_mutation_stage, snapkv_per_head_keep,
 };
 
 /// The caps for the v3 registration: PyramidKV reads the prefill attention (SnapKV score
@@ -142,90 +144,6 @@ pub fn get_layer_budget(
     (max_num - layer_idx as f64 * steps)
         .round_ties_even()
         .max(0.0) as usize
-}
-
-/// `F.avg_pool1d(input, kernel_size, padding=kernel_size/2, stride=1, count_include_pad=True)`.
-///
-/// Zero-pads `kernel/2` on each side and divides every window by `kernel_size` (padded zeros are
-/// counted in the denominator — `count_include_pad=True`, PyTorch's default). For an ODD kernel the
-/// output length equals the input length (kvpress always uses `kernel_size=5`); `out.len()` must
-/// equal `input.len()`.
-fn avg_pool1d(input: &[f32], kernel: usize, out: &mut [f32]) {
-    let n = input.len();
-    let pad = kernel / 2;
-    for (i, o) in out.iter_mut().enumerate().take(n) {
-        let mut s = 0.0f32;
-        for j in 0..kernel {
-            let idx = i as isize - pad as isize + j as isize;
-            if idx >= 0 && (idx as usize) < n {
-                s += input[idx as usize];
-            }
-        }
-        *o = s / kernel as f32;
-    }
-}
-
-/// Per-head SnapKV keep-set selection from a per-q-head attention reader.
-///
-/// `read_qhead(qh, out)` fills `out[0..cols]` with attention head `qh`'s window-summed attention to
-/// every prefix key. Produces one ascending keep-list per kv-head, each of length
-/// `heavy + window.min(current)` (= the per-layer budget), so all heads keep an equal count.
-#[allow(clippy::too_many_arguments)]
-fn per_head_keep(
-    read_qhead: impl Fn(usize, &mut [f32]),
-    n_q_heads: usize,
-    n_kv_heads: usize,
-    cols: usize,
-    current: usize,
-    window: usize,
-    kernel: usize,
-    heavy: usize,
-    protected: usize,
-) -> Vec<Vec<usize>> {
-    let groups = (n_q_heads / n_kv_heads).max(1);
-    let heavy_len = current - window; // scoring region [0, current-window); window is force-kept
-
-    // pooled[qh][pos] = avg_pool( attn[qh][0..heavy_len] / window )
-    let mut pooled = vec![vec![0.0f32; heavy_len]; n_q_heads];
-    let mut row = vec![0.0f32; cols];
-    let inv_window = 1.0f32 / window as f32;
-    for (qh, p) in pooled.iter_mut().enumerate() {
-        read_qhead(qh, &mut row);
-        // ÷window (KVPress's mean over the window queries; SUM→MEAN). Order-of-ops mirrors the
-        // reference so the f32 values — hence the topk SET — match.
-        let scaled: Vec<f32> = row[..heavy_len].iter().map(|&v| v * inv_window).collect();
-        avg_pool1d(&scaled, kernel, p);
-    }
-
-    (0..n_kv_heads)
-        .map(|kvh| {
-            let base = kvh * groups;
-            // GQA group-mean over the q-heads of this kv-head.
-            let inv_groups = 1.0f32 / groups as f32;
-            let scores: Vec<f32> = (0..heavy_len)
-                .map(|pos| {
-                    let mut s = 0.0f32;
-                    for g in 0..groups {
-                        s += pooled[base + g][pos];
-                    }
-                    s * inv_groups
-                })
-                .collect();
-            // window force-kept (recent), top `heavy` from the scored region; ascending keep-list. The
-            // protected prefix (`--protected-prefix`, default 0) is force-kept in front — `heavy` is
-            // ranked over `prefix..recent_start`, so prefix/heavy never overlap and every head keeps an
-            // equal count (the single-`current_pos` invariant holds).
-            compile_keep_top_k(
-                KeepTopK {
-                    current,
-                    prefix: protected,
-                    recent: window,
-                    heavy,
-                },
-                |pos| scores.get(pos).copied().unwrap_or(0.0),
-            )
-        })
-        .collect()
 }
 
 // ── config ───────────────────────────────────────────────────────────────────
@@ -388,16 +306,18 @@ impl PyramidKv {
             let n_kv = ctx.n_kv_heads().max(1);
             let heavy_len = current - window;
             if n_q >= n_kv && n_q % n_kv == 0 && cols >= heavy_len {
-                let heads = per_head_keep(
+                let heads = snapkv_per_head_keep(
+                    SnapKvSelect {
+                        n_q_heads: n_q,
+                        n_kv_heads: n_kv,
+                        cols,
+                        current,
+                        window,
+                        kernel: self.cfg.kernel_size,
+                        heavy,
+                        protected,
+                    },
                     |qh, out| pfa.read_row(qh, 0, out), // PFA is per_head:false → kv_head ignored
-                    n_q,
-                    n_kv,
-                    cols,
-                    current,
-                    window,
-                    self.cfg.kernel_size,
-                    heavy,
-                    protected,
                 );
                 return Some(KeepSpec::PerHead(heads));
             }

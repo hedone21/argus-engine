@@ -238,19 +238,21 @@ fn per_head_selection_matches_kvpress_fixture() {
         }
 
         let attn = synth_attn(n_q, k_len, seed);
-        let got = per_head_keep(
+        let got = snapkv_per_head_keep(
+            SnapKvSelect {
+                n_q_heads: n_q,
+                n_kv_heads: n_kv,
+                cols: k_len,
+                current: k_len,
+                window,
+                kernel,
+                heavy: n_kept - window,
+                protected: 0, // protected_prefix (sink guard) off — faithful selection
+            },
             |qh, out| {
                 let base = qh * k_len;
                 out.copy_from_slice(&attn[base..base + k_len]);
             },
-            n_q,
-            n_kv,
-            k_len,
-            k_len,
-            window,
-            kernel,
-            n_kept - window,
-            0, // protected_prefix (sink guard) off — faithful selection
         );
         assert_eq!(
             got, expected,
@@ -271,16 +273,18 @@ fn per_head_keep_hand_traced() {
     // heavy region [0,4) scores ∝ attn (÷window is monotone): attn=[10,50,30,40].
     // ranking 1(50)>3(40)>2(30)>0(10) → top-2 = {1,3}; window=[4,5]. keep={1,3,4,5}.
     let attn = [10.0f32, 50.0, 30.0, 40.0, 7.0, 9.0];
-    let got = per_head_keep(
+    let got = snapkv_per_head_keep(
+        SnapKvSelect {
+            n_q_heads: 1,
+            n_kv_heads: 1,
+            cols: 6,
+            current: 6,
+            window: 2,
+            kernel: 1,
+            heavy: 2,
+            protected: 0,
+        },
         |_qh, out| out.copy_from_slice(&attn),
-        1,
-        1,
-        6,
-        6,
-        2,
-        1,
-        2,
-        0,
     );
     assert_eq!(got, vec![vec![1usize, 3, 4, 5]]);
 }
@@ -374,19 +378,21 @@ fn v3_native_per_head_decision() {
     // Independent oracle: budget (get_layer_budget) × per-head selection (per_head_keep).
     let n_kept = get_layer_budget(current, 0.5, window, beta, n_layers, layer_idx);
     assert!(n_kept > window && n_kept < current, "n_kept={n_kept}");
-    let expected = per_head_keep(
+    let expected = snapkv_per_head_keep(
+        SnapKvSelect {
+            n_q_heads: n_q,
+            n_kv_heads: n_kv,
+            cols: current,
+            current,
+            window,
+            kernel,
+            heavy: n_kept - window,
+            protected: 0, // protected_prefix (sink guard) off — faithful selection
+        },
         |qh, out| {
             let base = qh * current;
             out.copy_from_slice(&attn[base..base + current]);
         },
-        n_q,
-        n_kv,
-        current,
-        current,
-        window,
-        kernel,
-        n_kept - window,
-        0, // protected_prefix (sink guard) off — faithful selection
     );
 
     // v3 decision via a concrete PyramidKv built from the same config.

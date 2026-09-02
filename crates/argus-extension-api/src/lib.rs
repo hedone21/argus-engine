@@ -861,6 +861,116 @@ pub fn keep_union(sets: &[&[usize]]) -> Vec<usize> {
     out
 }
 
+/// `F.avg_pool1d(input, kernel_size, padding=kernel_size/2, stride=1, count_include_pad=True)`.
+///
+/// Zero-pads `kernel/2` on each side and divides every window by `kernel` (padded zeros are counted
+/// in the denominator — `count_include_pad=True`, PyTorch's default). For an ODD kernel the output
+/// length equals the input length (kvpress always uses `kernel_size=5`); `out.len()` must equal
+/// `input.len()`. The smoothing step of the SnapKV score pipeline ([`snapkv_per_head_keep`]).
+pub fn avg_pool1d(input: &[f32], kernel: usize, out: &mut [f32]) {
+    let n = input.len();
+    let pad = kernel / 2;
+    for (i, o) in out.iter_mut().enumerate().take(n) {
+        let mut s = 0.0f32;
+        for j in 0..kernel {
+            let idx = i as isize - pad as isize + j as isize;
+            if idx >= 0 && (idx as usize) < n {
+                s += input[idx as usize];
+            }
+        }
+        *o = s / kernel as f32;
+    }
+}
+
+/// The geometry of one SnapKV per-head selection ([`snapkv_per_head_keep`]): everything the
+/// selection needs besides the attention itself. The SnapKV-family analogue of [`KeepTopK`] — a
+/// technique supplies its budget as `heavy` (= kept count − `window`), and the selection owns the
+/// score pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapKvSelect {
+    /// Attention (query) heads the prefill attention is recorded for — pre-GQA, one reader row each.
+    pub n_q_heads: usize,
+    /// KV heads: one keep-list per KV head, averaging the `n_q_heads / n_kv_heads` query heads of
+    /// its group (the heads of a group are consecutive). Must divide `n_q_heads`.
+    pub n_kv_heads: usize,
+    /// Width of a reader row (the prefix the attention covers); at least `current − window`.
+    pub cols: usize,
+    /// Resident token count the keep-lists index into.
+    pub current: usize,
+    /// The trailing observation window — the queries the attention was summed over. Always kept,
+    /// never scored (kvpress pads the window in at `max + 1`). At most `current`.
+    pub window: usize,
+    /// [`avg_pool1d`] kernel; odd (kvpress default 5).
+    pub kernel: usize,
+    /// Heavy hitters to keep by score from the scored region `[protected, current − window)`.
+    pub heavy: usize,
+    /// Protected prefix, force-kept in front of every head (ADDITIVE to the budget; `0` is
+    /// kvpress-faithful).
+    pub protected: usize,
+}
+
+/// SnapKV per-head keep-set selection (Li et al. 2024) from a per-query-head attention reader — the
+/// `SnapKVPress.score` + `topk` selection of NVIDIA kvpress, which the whole SnapKV family (SnapKV,
+/// PyramidKV, …) shares; the techniques differ only in the budget they hand in as `spec.heavy`.
+///
+/// `read_qhead(qh, out)` fills `out[..spec.cols]` with attention head `qh`'s window-summed attention
+/// to every prefix key (the engine's [`TensorKind::PrefillAttention`]). The pipeline runs in
+/// kvpress's operation order so the f32 values — hence the top-k SET — match: ÷`window` (the mean
+/// over the window queries; SUM → MEAN), [`avg_pool1d`], GQA group-mean over the query heads of each
+/// KV head, then [`compile_keep_top_k`] with the window forced in (`recent = window`, `heavy`,
+/// `prefix = protected`). Returns one ascending keep-list per KV head, all of equal length — the
+/// engine's single-`current_pos` invariant for a per-head keep.
+///
+/// Ties break lower-index-first (the STABLE top-k), which is NOT `torch.topk`'s
+/// implementation-defined order; real f32 attention ties with measure zero.
+pub fn snapkv_per_head_keep(
+    spec: SnapKvSelect,
+    read_qhead: impl Fn(usize, &mut [f32]),
+) -> Vec<Vec<usize>> {
+    let groups = (spec.n_q_heads / spec.n_kv_heads.max(1)).max(1);
+    // Scoring region [0, current − window); the window itself is force-kept.
+    let heavy_len = spec.current.saturating_sub(spec.window);
+
+    // pooled[qh][pos] = avg_pool( attn[qh][0..heavy_len] / window )
+    let mut pooled = vec![vec![0.0f32; heavy_len]; spec.n_q_heads];
+    let mut row = vec![0.0f32; spec.cols];
+    let inv_window = 1.0f32 / spec.window as f32;
+    for (qh, p) in pooled.iter_mut().enumerate() {
+        read_qhead(qh, &mut row);
+        let scaled: Vec<f32> = row[..heavy_len].iter().map(|&v| v * inv_window).collect();
+        avg_pool1d(&scaled, spec.kernel, p);
+    }
+
+    (0..spec.n_kv_heads)
+        .map(|kvh| {
+            let base = kvh * groups;
+            // GQA group-mean over the q-heads of this kv-head.
+            let inv_groups = 1.0f32 / groups as f32;
+            let scores: Vec<f32> = (0..heavy_len)
+                .map(|pos| {
+                    let mut s = 0.0f32;
+                    for g in 0..groups {
+                        s += pooled[base + g][pos];
+                    }
+                    s * inv_groups
+                })
+                .collect();
+            // Window force-kept (recent), top `heavy` from the scored region, protected prefix in
+            // front — `heavy` is ranked over `prefix..recent_start`, so prefix and heavy never
+            // overlap and every head keeps an equal count.
+            compile_keep_top_k(
+                KeepTopK {
+                    current: spec.current,
+                    prefix: spec.protected,
+                    recent: spec.window,
+                    heavy: spec.heavy,
+                },
+                |pos| scores.get(pos).copied().unwrap_or(0.0),
+            )
+        })
+        .collect()
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // v3 native registry — KV_MUTATION_STAGES (static-linkme only)
 // ════════════════════════════════════════════════════════════════════════════
@@ -3059,6 +3169,79 @@ pub fn registered_cuda_quant_attn_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `avg_pool1d` is PyTorch's `count_include_pad=True` pooling: the edge windows divide by the
+    /// full kernel, not by the number of in-range taps. kernel=3 over [3, 6, 9]: [ (0+3+6)/3,
+    /// (3+6+9)/3, (6+9+0)/3 ] = [3, 6, 5]. Dividing by the in-range count would give [4.5, 6, 7.5].
+    #[test]
+    fn avg_pool1d_counts_padding_in_the_denominator() {
+        let mut out = [0.0f32; 3];
+        avg_pool1d(&[3.0, 6.0, 9.0], 3, &mut out);
+        assert_eq!(out, [3.0, 6.0, 5.0]);
+        // kernel=1 is the identity.
+        avg_pool1d(&[3.0, 6.0, 9.0], 1, &mut out);
+        assert_eq!(out, [3.0, 6.0, 9.0]);
+    }
+
+    /// Hand-traced SnapKV selection: n_q=n_kv=1, kernel=1 (no pooling), window=2, heavy=2, current=6.
+    /// The scored region [0, 4) ranks by attention (÷window is monotone): attn=[10,50,30,40] →
+    /// 1(50) > 3(40) > 2(30) > 0(10) → top-2 = {1, 3}; window = [4, 5]. keep = {1, 3, 4, 5}.
+    #[test]
+    fn snapkv_per_head_keep_hand_traced() {
+        let attn = [10.0f32, 50.0, 30.0, 40.0, 7.0, 9.0];
+        let got = snapkv_per_head_keep(
+            SnapKvSelect {
+                n_q_heads: 1,
+                n_kv_heads: 1,
+                cols: 6,
+                current: 6,
+                window: 2,
+                kernel: 1,
+                heavy: 2,
+                protected: 0,
+            },
+            |_qh, out| out.copy_from_slice(&attn),
+        );
+        assert_eq!(got, vec![vec![1usize, 3, 4, 5]]);
+    }
+
+    /// GQA: the two query heads of a KV head are averaged BEFORE the top-k (kvpress `scores.view(bsz,
+    /// n_kv, groups, L−w).mean(2)`), so a position one head loves and the other ignores can lose to a
+    /// position both rate moderately. head0=[0, 100, 0, 0], head1=[0, 0, 60, 60] → group mean
+    /// [0, 50, 30, 30]; heavy=1 keeps position 1 (50) over 2/3 (30). Summing per head instead of
+    /// averaging would not change the ORDER here, so also pin the protected prefix: with
+    /// `protected=1` the prefix is force-kept and the heavy hitter is ranked over [1, 4) — still 1.
+    #[test]
+    fn snapkv_per_head_keep_group_means_query_heads_and_keeps_prefix() {
+        let heads = [
+            [0.0f32, 100.0, 0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 60.0, 60.0, 1.0, 1.0],
+        ];
+        let spec = SnapKvSelect {
+            n_q_heads: 2,
+            n_kv_heads: 1,
+            cols: 6,
+            current: 6,
+            window: 2,
+            kernel: 1,
+            heavy: 1,
+            protected: 0,
+        };
+        let got = snapkv_per_head_keep(spec, |qh, out| out.copy_from_slice(&heads[qh]));
+        assert_eq!(got, vec![vec![1usize, 4, 5]]);
+        let got = snapkv_per_head_keep(
+            SnapKvSelect {
+                protected: 1,
+                ..spec
+            },
+            |qh, out| out.copy_from_slice(&heads[qh]),
+        );
+        assert_eq!(
+            got,
+            vec![vec![0usize, 1, 4, 5]],
+            "prefix additive, heavy ranked past it"
+        );
+    }
 
     /// (T1) `compile_keep_top_k` produces the 3-partition keep-list the built-in eviction plugins
     /// hand-roll. Pins: prefix-inclusive, heavy hitters by STABLE desc score re-sorted ascending,
