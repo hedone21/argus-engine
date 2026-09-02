@@ -37,8 +37,14 @@ pub struct AperturbSelectStage {
     prefill_attn: Arc<Mutex<Option<PrefillAttn>>>,
     /// Present when scores may live on-device; the sync before the read is then live.
     backend: Option<Arc<dyn crate::backend::Backend>>,
-    /// The fraction of the resident cache the Manager asked to keep.
-    target_ratio: f32,
+    /// The tokens the Manager's budget comes to, against the uncompressed context. Carried as
+    /// a count, not as a fraction of the resident cache: two directives submitted in one step
+    /// (a ratchet that keeps ticking while a decision stalls the engine) would each have taken
+    /// their fraction against the length at submit time, and the second, run after the first
+    /// had already compacted, applied that stale fraction to the shrunken cache — 0.25 of
+    /// 3,390 became 396 tokens on an S25 (2026-09-02). The fraction is formed here, when the
+    /// stage runs, against what is resident then.
+    target_len: usize,
 }
 
 impl AperturbSelectStage {
@@ -47,7 +53,7 @@ impl AperturbSelectStage {
         handles: Vec<Arc<StandardFormat>>,
         selector: Arc<Selector>,
         q_rows: Arc<Mutex<Option<QRowCapture>>>,
-        target_ratio: f32,
+        target_len: usize,
         score_cell: Arc<Mutex<Option<SignalRuntime>>>,
         prefill_attn: Arc<Mutex<Option<PrefillAttn>>>,
         backend: Option<Arc<dyn crate::backend::Backend>>,
@@ -59,7 +65,7 @@ impl AperturbSelectStage {
             score_cell,
             prefill_attn,
             backend,
-            target_ratio,
+            target_len,
         }
     }
 
@@ -123,9 +129,25 @@ impl AperturbSelectStage {
         };
 
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
+        // The fraction the candidates are asked for, against the cache as it stands NOW — an
+        // earlier directive this step may already have compacted it (see `target_len`).
+        let resident = temp.first().map_or(0, |c| c.resident_tokens());
+        let cursor = temp.first().map_or(0, |c| c.current_pos());
+        if self.target_len >= resident || cursor == 0 {
+            for (f, c) in self.handles.iter().zip(temp) {
+                f.put_inner(c);
+            }
+            eprintln!(
+                "[aperturb-select] budget of {} tokens: the cache already holds {resident}, \
+                 nothing to remove",
+                self.target_len
+            );
+            return Ok(());
+        }
+        let target_ratio = self.target_len as f32 / cursor as f32;
         let outcome = self
             .selector
-            .choose_and_apply(&mut temp, self.target_ratio, q_rows, signals);
+            .choose_and_apply(&mut temp, target_ratio, q_rows, signals);
         for (f, c) in self.handles.iter().zip(temp) {
             f.put_inner(c);
         }
@@ -149,13 +171,14 @@ impl AperturbSelectStage {
                     .join(" ");
                 eprintln!(
                     "[aperturb-select] budget={:.3} {} → {} tokens, chose '{}' [{arms}] \
-                     decide={:.3}s read={:.3}s",
-                    self.target_ratio,
+                     decide={:.3}s read={:.3}s window={:.3}s",
+                    target_ratio,
                     choice.tokens_before,
                     choice.tokens_after,
                     choice.winner,
                     choice.decide_s,
                     choice.read_s,
+                    choice.window_s,
                 );
                 for (name, why) in &choice.excluded {
                     eprintln!("[aperturb-select]   excluded '{name}': {why}");

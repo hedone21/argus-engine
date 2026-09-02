@@ -145,6 +145,9 @@ pub struct Choice {
     pub target_len: usize,
     /// Seconds inside [`aperturb::decide`].
     pub decide_s: f64,
+    /// Wall time of [`window_attention`] over every layer — the prefill-end candidates' input
+    /// (`0.0` when none is in the pool).
+    pub window_s: f64,
     /// Seconds spent putting the cache where the metric can reach it (device mirror + dequantize).
     pub read_s: f64,
     /// What the prompt-attention capture must become now that the winner has been applied.
@@ -324,6 +327,7 @@ impl Selector {
             self.metric_rows,
         )?;
         let read_s = t_read.elapsed().as_secs_f64();
+        let t_window = std::time::Instant::now();
         let window_attn = if self.candidates.iter().any(Candidate::reads_prefill_attn) {
             let gw = Geom {
                 n_layers,
@@ -340,6 +344,7 @@ impl Selector {
         } else {
             None
         };
+        let window_s = t_window.elapsed().as_secs_f64();
         // What the candidates plan from. The prompt capture in `signals` is not it (module
         // header), but it is still what the compaction below carries forward for whoever else
         // reads it.
@@ -460,6 +465,7 @@ impl Selector {
             budget_total,
             target_len,
             decide_s: dec.times.total_s(),
+            window_s,
             read_s,
             prefill_attn,
         }))

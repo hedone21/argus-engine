@@ -450,9 +450,13 @@ impl CommandDispatcher {
             self.last_evict_ratio = Some(budget);
             return CommandResult::Ok;
         }
-        // The stages take a fraction of the resident length, which is what they can act on.
-        // Converting here keeps the contract's denominator at the boundary and leaves
-        // `force_evict` / `--eviction-target-ratio` meaning exactly what they meant before.
+        // The configured-technique stage takes a fraction of the resident length, which is what
+        // it can act on. Converting here keeps the contract's denominator at the boundary and
+        // leaves `force_evict` / `--eviction-target-ratio` meaning exactly what they meant
+        // before. The pool stage takes the count and forms its fraction when it runs: two
+        // directives in one step would otherwise both take theirs against the length at submit
+        // time, and the second would apply a stale fraction to a cache the first had already
+        // compacted.
         let target_ratio = target_len as f32 / resident as f32;
         // The contract names a budget, not a technique. When a candidate pool is configured the
         // engine picks the technique itself; otherwise it applies the one the CLI configured.
@@ -461,7 +465,7 @@ impl CommandDispatcher {
                 self.kv_handles.clone(),
                 Arc::clone(selector),
                 Arc::clone(q_rows),
-                target_ratio,
+                target_len,
                 Arc::clone(&self.score_cell),
                 Arc::clone(prefill_attn),
                 self.backend.clone(),
