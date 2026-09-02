@@ -34,6 +34,7 @@ use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
 use crate::inference::duo_heads::DuoHeads;
 use crate::inference::head_mask::HeadMask;
+use crate::inference::prefill_attn::PrefillAttn;
 use crate::inference::q_rows::QRowCapture;
 use crate::inference::query_stats::QueryStatsAccumulator;
 use crate::inference::sampling::StepCtx;
@@ -95,7 +96,7 @@ pub struct ModelForward {
     // `wants_prefill_attn` 이면 prefill 최종 청크가 layer 별 `[n_heads_q * prefix_len]` SUM-pooled
     // attention 확률을 채워 이 cell 에 넣고, stage 가 PrefillEnd 에서 읽는다. 미무장 시 더미 None cell +
     // false → prefill 비용 0(byte-identical). `q_window` 는 plugin policy(arming 시 주입).
-    prefill_attn_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+    prefill_attn_cell: Arc<Mutex<Option<PrefillAttn>>>,
     wants_prefill_attn: bool,
     q_window: usize,
     // Faithful-H2O `(c)`: when true, the final-prefill-chunk PFA column-sums are folded into the
@@ -310,7 +311,7 @@ impl ModelForward {
     /// R-P1-1: prefill-end PFA producer 무장(`set_read_stage` 미러). assembly 가 PrefillKeepSetStage 와
     /// 공유하는 `cell` Arc + plugin policy `q_window` 를 주입한다. 미호출(production 기본)이면 PFA 미산출
     /// → prefill byte-identical(`wants_prefill_attn=false`).
-    pub fn set_prefill_attn(&mut self, cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>, q_window: usize) {
+    pub fn set_prefill_attn(&mut self, cell: Arc<Mutex<Option<PrefillAttn>>>, q_window: usize) {
         self.prefill_attn_cell = cell;
         self.wants_prefill_attn = true;
         self.q_window = q_window;
@@ -664,7 +665,7 @@ impl Forward for ModelForward {
                         cfg.num_key_value_heads,
                     );
                 }
-                *self.prefill_attn_cell.lock().unwrap() = Some(buf);
+                *self.prefill_attn_cell.lock().unwrap() = Some(PrefillAttn::captured(buf));
             }
 
             chunk_start = chunk_end;

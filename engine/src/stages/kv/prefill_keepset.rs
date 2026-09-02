@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use argus_extension_api::KVMutationStage;
 
+use crate::inference::prefill_attn::PrefillAttn;
 use crate::kv::cache_handle::EngineCacheHandle;
 use crate::kv::kv_cache::KVCache;
 use crate::kv::standard_format::StandardFormat;
@@ -100,7 +101,7 @@ pub struct PrefillKeepSetStage {
     /// keep-set 생산 plugin (`caps.reads ∋ PrefillAttention`) — v3 imperative [`KVMutationStage`].
     stage: Box<dyn KVMutationStage>,
     /// §5.1 producer(`ModelForward`)와 공유하는 PFA cell. `PrefillEnd` 에서 read.
-    prefill_attn_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+    prefill_attn_cell: Arc<Mutex<Option<PrefillAttn>>>,
     /// attention head 수(pre-GQA) — PFA handle shape `rows`.
     n_heads_q: usize,
     /// keep budget ratio (`target_len = prefix_len * ratio`).
@@ -121,7 +122,7 @@ impl PrefillKeepSetStage {
     pub fn new(
         handles: Vec<Arc<StandardFormat>>,
         stage: Box<dyn KVMutationStage>,
-        prefill_attn_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+        prefill_attn_cell: Arc<Mutex<Option<PrefillAttn>>>,
         n_heads_q: usize,
         target_ratio: f32,
         protected_prefix: usize,
@@ -145,7 +146,7 @@ impl PrefillKeepSetStage {
     pub fn persistent(
         handles: Vec<Arc<StandardFormat>>,
         stage: Box<dyn KVMutationStage>,
-        prefill_attn_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+        prefill_attn_cell: Arc<Mutex<Option<PrefillAttn>>>,
         n_heads_q: usize,
         target_ratio: f32,
         protected_prefix: usize,
@@ -193,7 +194,7 @@ impl PipelineStage for PrefillKeepSetStage {
             .lock()
             .expect("PrefillKeepSetStage PFA cell Mutex poisoned");
         let pfa = match pfa_guard.as_ref() {
-            Some(v) => v,
+            Some(v) => v.rows(),
             None => return Ok(done),
         };
 
@@ -367,14 +368,14 @@ mod tests {
     }
 
     /// PFA cell 에 odd 위치를 선호하는 점수를 채운다(n_heads_q 행 × prefix_len 열, 1 layer).
-    fn odd_favoring_pfa(n_heads_q: usize, prefix_len: usize) -> Arc<Mutex<Option<Vec<Vec<f32>>>>> {
+    fn odd_favoring_pfa(n_heads_q: usize, prefix_len: usize) -> Arc<Mutex<Option<PrefillAttn>>> {
         let mut layer = vec![0.0f32; n_heads_q * prefix_len];
         for h in 0..n_heads_q {
             for kp in 0..prefix_len {
                 layer[h * prefix_len + kp] = if kp % 2 == 1 { 1.0 } else { 0.01 };
             }
         }
-        Arc::new(Mutex::new(Some(vec![layer])))
+        Arc::new(Mutex::new(Some(PrefillAttn::captured(vec![layer]))))
     }
 
     #[test]
@@ -515,7 +516,7 @@ mod tests {
     fn unarmed_cell_is_noop_consumed() {
         // PFA cell None(미무장/미산출) → Consumed + cache 불변.
         let handle = Arc::new(StandardFormat::new(0, make_cache(8)));
-        let cell: Arc<Mutex<Option<Vec<Vec<f32>>>>> = Arc::new(Mutex::new(None));
+        let cell: Arc<Mutex<Option<PrefillAttn>>> = Arc::new(Mutex::new(None));
         let stage = PrefillKeepSetStage::new(
             vec![handle.clone()],
             Box::new(TopKPfaStage),
@@ -647,9 +648,9 @@ mod tests {
             0,
             make_head_major_cache(n_kv_heads, prefix_len),
         ));
-        let cell = Arc::new(Mutex::new(Some(vec![divergent_pfa(
-            n_heads_q, n_kv_heads, prefix_len,
-        )])));
+        let cell = Arc::new(Mutex::new(Some(PrefillAttn::captured(vec![
+            divergent_pfa(n_heads_q, n_kv_heads, prefix_len),
+        ]))));
         let stage = PrefillKeepSetStage::new(
             vec![handle.clone()],
             Box::new(PerHeadTopKStage),
@@ -764,7 +765,7 @@ mod tests {
         let pfa: Vec<Vec<f32>> = (0..N_LAYERS)
             .map(|l| synth_attn(N_Q, K_LEN, 1000 + l as i64))
             .collect();
-        let cell = Arc::new(Mutex::new(Some(pfa)));
+        let cell = Arc::new(Mutex::new(Some(PrefillAttn::captured(pfa))));
 
         // pyramidkv with explicit knobs via the StageArgs blob (compression_ratio drives the budget,
         // so PrefillKeepSetStage's target_ratio is irrelevant here — set to 1.0).

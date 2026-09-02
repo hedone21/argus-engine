@@ -54,7 +54,7 @@ pub struct QRowCapture {
     /// degradation"). The cache's `current_pos` is renumbered DOWN by the same event. So the two
     /// clocks separate by exactly the number of evicted positions, permanently and cumulatively,
     /// and a reader that asks in `current_pos` terms is asking about positions the ring stopped
-    /// holding — from the first compaction onward, forever. [`Self::note_prune`] adds the gap back
+    /// holding — from the first compaction onward, forever. [`Self::set_drift`] carries the gap over
     /// so the window can be addressed in the ring's coordinate without losing the check that
     /// catches a capture which simply stopped.
     drift: usize,

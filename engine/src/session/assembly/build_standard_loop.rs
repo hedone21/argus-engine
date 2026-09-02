@@ -28,6 +28,7 @@ use crate::backend::Backend;
 use crate::format::KVCacheFormat;
 use crate::inference::duo_heads::DuoHeads;
 use crate::inference::head_mask::HeadMask;
+use crate::inference::prefill_attn::PrefillAttn;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::kv_cache::KVCache;
@@ -170,7 +171,7 @@ pub fn build_standard_loop(
     // PR1 은 그런 builtin 0개 → `arm_prefill_keepset=false` → set_prefill_attn/submit 미진입 = 기존과
     // byte-identical. cell 은 producer(ModelForward)와 consumer(PrefillKeepSetStage)가 공유한다.
     let n_heads_q = model.config.num_attention_heads;
-    let pfa_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>> = Arc::new(Mutex::new(None));
+    let pfa_cell: Arc<Mutex<Option<PrefillAttn>>> = Arc::new(Mutex::new(None));
     // The shared caps-driven arming decision (the SAME one bench/eval now consult — the direction-B
     // root-cause fix). `Some` iff a PFA-reading keep-set stage (pyramidkv) is registered.
     let keepset_arming = crate::kv::eviction::stage_registry::resolve_prefill_keepset_arming();

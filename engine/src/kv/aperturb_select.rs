@@ -36,6 +36,7 @@ use anyhow::{Context, Result};
 use argus_extension_api::{KVMutationStage, StageCaps, TensorKind};
 
 use crate::aperturb::{self, Config, Geom, KeepSets, LayerSource, OutputBasis, Readout};
+use crate::inference::prefill_attn::PrefillAttn;
 use crate::inference::q_rows::QRowCapture;
 use crate::kv::cache_handle::EngineCacheHandle;
 use crate::kv::kv_cache::KVCache;
@@ -88,10 +89,10 @@ pub struct Signals<'a> {
     pub importance: Option<&'a [f32]>,
     pub head_scores: Option<&'a [f32]>,
     pub last_attn: Option<&'a [f32]>,
-    /// Per-layer prefill attention (`[n_heads_q * prefix_len]`), when the producer was armed for a
-    /// prefill-end candidate. It is a prompt-era measurement that never grows, so mid-decode it is
-    /// narrower than the cache — see [`Selector::plan_one`] for what the engine does about that.
-    pub prefill_attn: Option<&'a [Vec<f32>]>,
+    /// The prompt attention the forward captured, when the producer was armed for a prefill-end
+    /// candidate. It is a prompt-era measurement that never grows, so mid-decode it is narrower
+    /// than the cache — see [`Selector::plan_one`] for what the engine does about that.
+    pub prefill_attn: Option<&'a PrefillAttn>,
 }
 
 /// What one candidate came back with.
@@ -129,6 +130,13 @@ pub struct Choice {
     pub decide_s: f64,
     /// Seconds spent putting the cache where the metric can reach it (device mirror + dequantize).
     pub read_s: f64,
+    /// What the prompt-attention capture must become now that the winner has been applied.
+    ///
+    /// The compaction renumbered the cache under it, so the capture the caller holds is about to
+    /// describe the wrong keys. `Some` is that capture carried into the new numbering
+    /// ([`PrefillAttn::gather`]); `None` means it could not be carried and the caller must drop it.
+    /// Always `None` when nothing was compressed — there is then nothing to carry it through.
+    pub(crate) prefill_attn: Option<PrefillAttn>,
 }
 
 /// Anything that stops the engine from making a choice it can stand behind.
@@ -256,7 +264,7 @@ impl Selector {
         }
         // Decline rather than measure against rows the ring does not actually hold. A compaction
         // renumbers the cache while the capture keeps stamping RoPE positions; the decode loop
-        // reports each prune (`QRowCapture::note_prune`) so the two clocks stay reconcilable and a
+        // reports each prune (`QRowCapture::set_drift`) so the two clocks stay reconcilable and a
         // later budget CAN be answered. Without that report this guard was permanent — one
         // compression per session, every later budget silently declined (measured on an S25,
         // 2026-09-02). What still lands here is a genuine gap: a capture that was not armed when
@@ -340,17 +348,35 @@ impl Selector {
             apply_planned(cache, l, n_layers, &plans[winner][l])
                 .with_context(|| format!("applying '{}' to layer {l}", pool[winner].0))?;
         }
+        let tokens_after = caches[0].current_pos();
+
+        // Carry the prompt attention into the numbering the compaction just imposed. It belongs to
+        // the session and not to whoever won, so it is carried whenever the cache actually moved —
+        // a technique that reads it can then answer the NEXT budget too, instead of being excluded
+        // until decode regrows past the prompt and then readmitted against a capture that no longer
+        // describes the cache. The plans are in the pre-compaction numbering, which is exactly what
+        // `gather` maps from.
+        let prefill_attn = signals
+            .prefill_attn
+            .filter(|_| tokens_after < current_pos)
+            .and_then(|pfa| {
+                let plan = &plans[winner];
+                pfa.gather(tokens_after, self.n_heads_q, n_kv_heads, |l, h| {
+                    plan.get(l).and_then(|p| p.head(h))
+                })
+            });
 
         Ok(Ok(Choice {
             winner: pool[winner].0.clone(),
             arms,
             excluded,
             tokens_before: current_pos,
-            tokens_after: caches[0].current_pos(),
+            tokens_after,
             budget_total,
             target_len,
             decide_s: dec.times.total_s(),
             read_s,
+            prefill_attn,
         }))
     }
 
@@ -435,7 +461,7 @@ impl Selector {
         // resolved once, before any layer is planned, so a pool member that cannot be asked at all
         // is excluded with that reason rather than reported as having staged nothing.
         let pfa = if cand.reads_prefill_attn() {
-            match signals.prefill_attn {
+            match signals.prefill_attn.map(PrefillAttn::rows) {
                 Some(p) if p.len() >= n_layers => Some(p),
                 Some(p) => {
                     return Ok(Err(format!(
@@ -505,6 +531,12 @@ impl Selector {
     /// it fires once at prefill end with no tail to account for. What it buys is that the technique
     /// answers from its real ranking rather than from the score-free fallback it takes when the
     /// prefill attention is absent, which is the thing that would not be worth ranking.
+    ///
+    /// A capture wider than the cache is the backstop for a compaction the capture was not carried
+    /// through ([`PrefillAttn::gather`] carries it through the ones this selector applies, and the
+    /// decode loop drops it on the ones nothing carried it through). It stays because the loop
+    /// watches layer 0's occupancy alone, so a keep-set that shrinks only some layers is still
+    /// possible, and reading a capture past its width zero-fills in silence.
     ///
     /// The outer `Err(String)` is an exclusion reason, not a failure.
     fn plan_prefill_layer(
@@ -875,11 +907,11 @@ mod tests {
     }
 
     /// Prefill attention that ranks positions 3 and 4 above the rest, one row per query head.
-    fn pfa_favouring_3_and_4() -> Vec<Vec<f32>> {
+    fn pfa_favouring_3_and_4() -> PrefillAttn {
         let mut row = vec![0.1f32; PREFIX];
         row[3] = 0.9;
         row[4] = 0.8;
-        vec![row; LAYERS]
+        PrefillAttn::captured(vec![row; LAYERS])
     }
 
     fn caps() -> StageCaps {
@@ -1139,6 +1171,122 @@ mod tests {
             "{}",
             choice.excluded[0].1
         );
+    }
+
+    /// A prefill-end candidate answers a SECOND budget, because the capture is carried through the
+    /// compaction the first one applied rather than left behind in the old numbering.
+    ///
+    /// The compression keeps prompt positions 3 and 4 (the two the prompt attention favours) plus
+    /// the 2-position decode tail, so `V` becomes `[3, 4, 6, 7]` and the carried capture is 2 wide.
+    /// The second budget then finds the candidate still comparable, ranking a 2-column capture
+    /// against a 4-long cache, and keeps the column that WAS position 3 — `V[0] == 3.0` is the
+    /// prompt's own favourite surviving a renumbering.
+    ///
+    /// Mutation-proof three ways. Not carrying it at all (`prefill_attn: None` on `Choice`) makes
+    /// the second decision exclude the candidate — "covers 6 positions but only 4 are resident" —
+    /// and `mid_pair` wins with `V == [3, 6, 7]`... which is the same first element, so the
+    /// `seen_cols` and exclusion assertions are the ones that catch it. Carrying the ROWS
+    /// unchanged (skipping the gather) makes `seen_cols` 6. Gathering by `j` instead of `keep[j]`
+    /// puts position 0's 0.1 where 3's 0.9 was, so the retained survivor becomes 4.0.
+    #[test]
+    fn a_carried_capture_lets_a_prefill_end_candidate_answer_the_next_budget() {
+        let ranker = Arc::new(PrefixRanker {
+            seen_pos: std::sync::atomic::AtomicUsize::new(0),
+            seen_cols: std::sync::atomic::AtomicUsize::new(0),
+        });
+        struct Shared(Arc<PrefixRanker>);
+        impl KVMutationStage for Shared {
+            fn name(&self) -> &str {
+                "prefix_ranker"
+            }
+            fn on_phase(
+                &self,
+                ctx: &dyn StageCtx,
+                cache: &mut dyn CacheHandle,
+            ) -> Result<(), CacheOpError> {
+                self.0.on_phase(ctx, cache)
+            }
+        }
+        let s = selector(vec![Candidate::new(
+            "prefix_ranker",
+            Box::new(Shared(Arc::clone(&ranker))),
+            pfa_caps(),
+        )]);
+        let mut cs = caches();
+        let mut q = armed_q_rows();
+        let pfa = pfa_favouring_3_and_4();
+
+        let first = s
+            .choose_and_apply(
+                &mut cs,
+                0.5,
+                &q,
+                Signals {
+                    prefill_attn: Some(&pfa),
+                    ..Signals::default()
+                },
+            )
+            .expect("decide")
+            .expect("a choice");
+        assert_eq!(first.tokens_after, 4);
+        assert_eq!(survivors(&cs[0]), vec![3.0, 4.0, 6.0, 7.0]);
+        let carried = first
+            .prefill_attn
+            .expect("the capture is carried, not dropped");
+        assert_eq!(carried.rows()[0], vec![0.9, 0.8], "the favoured columns");
+
+        // The ring keeps stamping RoPE positions while the cache is renumbered down; the decode
+        // loop reports the gap. Without it the second decision declines on the rows, not the PFA.
+        q.set_drift(RESIDENT - first.tokens_after);
+        let second = s
+            .choose_and_apply(
+                &mut cs,
+                0.75,
+                &q,
+                Signals {
+                    prefill_attn: Some(&carried),
+                    ..Signals::default()
+                },
+            )
+            .expect("decide")
+            .expect("a choice");
+        assert!(
+            second.excluded.is_empty(),
+            "the carried capture keeps the candidate comparable: {:?}",
+            second.excluded
+        );
+        assert_eq!(second.winner, "prefix_ranker");
+        assert_eq!(
+            ranker.seen_cols.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the stage is shown the carried width, not the prompt's"
+        );
+        assert_eq!(survivors(&cs[0]), vec![3.0, 6.0, 7.0]);
+    }
+
+    /// A capture is carried only when the cache actually moved. A decision that retains everything
+    /// leaves the numbering alone, so re-stamping the capture would hand the decode loop's shrink
+    /// detector an excuse for a compaction that never happened.
+    #[test]
+    fn nothing_is_carried_when_nothing_was_compressed() {
+        let s = selector(vec![fixed("keep_all", &(0..RESIDENT).collect::<Vec<_>>())]);
+        let mut cs = caches();
+        let q = armed_q_rows();
+        let pfa = pfa_favouring_3_and_4();
+        let choice = s
+            .choose_and_apply(
+                &mut cs,
+                1.0,
+                &q,
+                Signals {
+                    prefill_attn: Some(&pfa),
+                    ..Signals::default()
+                },
+            )
+            .expect("decide")
+            .expect("a choice");
+        assert_eq!(choice.tokens_after, choice.tokens_before);
+        assert!(choice.prefill_attn.is_none());
     }
 
     /// Query rows that no longer describe the resident cache are a decline, not a measurement and

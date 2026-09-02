@@ -20,6 +20,7 @@ use crate::buffer::DType;
 use crate::capability::quant_attn::QuantAttnBackend;
 use crate::format::KVCacheFormat;
 use crate::inference::attention_scores::AttentionScoreAccumulator;
+use crate::inference::prefill_attn::PrefillAttn;
 use crate::inference::sampling::SamplingConfig;
 use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;
@@ -45,7 +46,7 @@ use crate::session::resilience_adapter::ResilienceAdapter;
 /// drained per-turn by [`ChatSession::prefill`] — `ModelForward`'s own `score_cell` stays a dummy
 /// `None` so chat decode + the GPU plan fast path remain byte-identical.
 pub struct FaithfulPrefillSeed {
-    pub cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+    pub cell: Arc<Mutex<Option<PrefillAttn>>>,
     pub n_heads_q: usize,
     pub n_kv_heads: usize,
     /// The forward's backend handle — `ChatSession::prefill` needs it to push the prefill seed into the
@@ -61,7 +62,7 @@ pub struct FaithfulPrefillSeed {
 /// owns the cache — mirroring the `cache_manager.is_none() && !faithful_h2o` gate in `build_bench_loop`.
 pub struct ChatKeepsetArming {
     /// PFA producer cell shared with `ModelForward::set_prefill_attn`; read by the `PrefillEnd` stage.
-    pub cell: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+    pub cell: Arc<Mutex<Option<PrefillAttn>>>,
     /// Registered keep-set stage name (resolved via `resolve_prefill_keepset_arming`).
     pub stage_name: String,
     pub n_heads_q: usize,
@@ -259,11 +260,21 @@ impl ChatSession {
             if let Some((buf, n_heads_q, n_kv_heads, backend)) = seed
                 && let Some(rt) = s.score_accumulator.as_mut()
             {
-                let prompt_len = buf.first().map(|l| l.len() / n_heads_q.max(1)).unwrap_or(0);
+                let prompt_len = buf
+                    .rows()
+                    .first()
+                    .map(|l| l.len() / n_heads_q.max(1))
+                    .unwrap_or(0);
                 // CPU-only reset of the prior turn's accumulation, then dual-seed this turn's prompt
                 // (the seed OVERWRITES the GPU cumulative, so no device reset is needed here).
                 rt.reset_host_only();
-                rt.seed(backend.as_ref(), &buf, prompt_len, n_heads_q, n_kv_heads);
+                rt.seed(
+                    backend.as_ref(),
+                    buf.rows(),
+                    prompt_len,
+                    n_heads_q,
+                    n_kv_heads,
+                );
             }
         }
         self.pos = self.decode_loop.pos_snapshot();

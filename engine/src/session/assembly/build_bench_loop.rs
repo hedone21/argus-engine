@@ -18,6 +18,7 @@ use argus_extension_api::{
 };
 
 use crate::backend::Backend;
+use crate::inference::prefill_attn::PrefillAttn;
 use crate::inference::sampling::SamplingConfig;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::eviction::EvictionPolicy;
@@ -452,7 +453,7 @@ pub fn build_bench_loop(
     // would prune the cache at prefill end, so the budget the pool exists to answer would arrive to
     // an already-compressed cache and every candidate would be ranked on the leftovers.
     let selector_pfa_window = aperturb_pool.as_ref().and_then(|p| p.pfa_window);
-    let pfa_cell: Arc<Mutex<Option<Vec<Vec<f32>>>>> = Arc::new(Mutex::new(None));
+    let pfa_cell: Arc<Mutex<Option<PrefillAttn>>> = Arc::new(Mutex::new(None));
     match (selector_pfa_window, &keepset_arming) {
         (Some(w), arming) => {
             mf.set_prefill_attn(pfa_cell.clone(), w);

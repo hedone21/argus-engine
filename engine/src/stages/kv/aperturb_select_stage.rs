@@ -11,6 +11,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::inference::prefill_attn::PrefillAttn;
 use crate::inference::q_rows::QRowCapture;
 use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::aperturb_select::{Selector, Signals};
@@ -28,9 +29,12 @@ pub struct AperturbSelectStage {
     /// cell `EvictionStage` extracts from, so a candidate sees here what it would have seen had it
     /// been applied directly.
     score_cell: Arc<Mutex<Option<SignalRuntime>>>,
-    /// The per-layer prefill attention the forward captured, shared with `ModelForward`. Armed only
-    /// when a pooled candidate declares it reads `PrefillAttention`; `None` inside otherwise.
-    prefill_attn: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+    /// The prompt attention the forward captured, shared with `ModelForward`. Armed only when a
+    /// pooled candidate declares it reads `PrefillAttention`; `None` inside otherwise.
+    ///
+    /// Written as well as read: a compression renumbers the positions its columns are indexed by,
+    /// so the capture is carried into the new numbering here or it is dropped.
+    prefill_attn: Arc<Mutex<Option<PrefillAttn>>>,
     /// Present when scores may live on-device; the sync before the read is then live.
     backend: Option<Arc<dyn crate::backend::Backend>>,
     /// The fraction of the resident cache the Manager asked to keep.
@@ -45,7 +49,7 @@ impl AperturbSelectStage {
         q_rows: Arc<Mutex<Option<QRowCapture>>>,
         target_ratio: f32,
         score_cell: Arc<Mutex<Option<SignalRuntime>>>,
-        prefill_attn: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+        prefill_attn: Arc<Mutex<Option<PrefillAttn>>>,
         backend: Option<Arc<dyn crate::backend::Backend>>,
     ) -> Self {
         Self {
@@ -106,14 +110,16 @@ impl AperturbSelectStage {
             }
         };
         // The prefill attention is held across the decision, not copied: it is
-        // `n_layers * n_heads_q * prompt_len` floats, and the producer never writes it again after
-        // prefill (`ModelForward` publishes it once, on the final chunk).
+        // `n_layers * n_heads_q * prompt_len` floats, and `ModelForward` publishes it once, on the
+        // final prefill chunk. The lock is released before the write-back below, which is the only
+        // other thing that ever touches it.
         let pfa_guard = self.prefill_attn.lock().unwrap_or_else(|e| e.into_inner());
+        let had_pfa = pfa_guard.is_some();
         let signals = Signals {
             importance: importance.as_deref(),
             head_scores: head_scores.as_deref(),
             last_attn: last_attn.as_deref(),
-            prefill_attn: pfa_guard.as_deref(),
+            prefill_attn: pfa_guard.as_ref(),
         };
 
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
@@ -126,7 +132,7 @@ impl AperturbSelectStage {
         drop(pfa_guard);
 
         match outcome? {
-            Ok(choice) => {
+            Ok(mut choice) => {
                 let arms = choice
                     .arms
                     .iter()
@@ -167,6 +173,23 @@ impl AperturbSelectStage {
                             None => rt.reset_host_only(),
                         }
                     }
+                    drop(cell);
+                    // The prompt attention is indexed by those same positions, but unlike an
+                    // accumulator it can be CARRIED rather than reset: a key's pooled prompt
+                    // attention does not change because another key left. The selector gathered it
+                    // through the keep-set it applied, so a prefill-end candidate can answer the
+                    // next budget as well. `None` is a capture that could not be carried, and
+                    // storing it says so — leaving the old rows in place would hand the next
+                    // decision a ranking of keys that are no longer there.
+                    let carried = choice.prefill_attn.take();
+                    if had_pfa && carried.is_none() {
+                        eprintln!(
+                            "[aperturb-select]   the prefill-attention capture was dropped: the \
+                             applied keep-set leaves no prompt prefix a single capture width can \
+                             describe"
+                        );
+                    }
+                    *self.prefill_attn.lock().unwrap_or_else(|e| e.into_inner()) = carried;
                 }
             }
             // One line per accepted directive, not per decode step: this stage is `OneShot`, so it

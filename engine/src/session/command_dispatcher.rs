@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use argus_shared::{CommandResult, EngineCommand};
 
+use crate::inference::prefill_attn::PrefillAttn;
 use crate::inference::signal_runtime::SignalRuntime;
 use crate::kv::cache_manager::CacheManager;
 use crate::kv::standard_format::StandardFormat;
@@ -182,7 +183,7 @@ pub struct CommandDispatcher {
 type AperturbSelection = (
     Arc<crate::kv::aperturb_select::Selector>,
     Arc<Mutex<Option<crate::inference::q_rows::QRowCapture>>>,
-    Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+    Arc<Mutex<Option<PrefillAttn>>>,
 );
 
 /// A KV compression submitted this step, awaiting its post-apply reading.
@@ -246,7 +247,7 @@ impl CommandDispatcher {
         mut self,
         selector: Arc<crate::kv::aperturb_select::Selector>,
         q_rows: Arc<Mutex<Option<crate::inference::q_rows::QRowCapture>>>,
-        prefill_attn: Arc<Mutex<Option<Vec<Vec<f32>>>>>,
+        prefill_attn: Arc<Mutex<Option<PrefillAttn>>>,
     ) -> Self {
         self.aperturb = Some((selector, q_rows, prefill_attn));
         self
@@ -260,6 +261,16 @@ impl CommandDispatcher {
         &self,
     ) -> Option<&Arc<Mutex<Option<crate::inference::q_rows::QRowCapture>>>> {
         self.aperturb.as_ref().map(|(_, q, _)| q)
+    }
+
+    /// The prompt-attention capture the pool's prefill-end candidates decide off, when one is
+    /// configured.
+    ///
+    /// Handed out for the same reason as [`Self::aperturb_q_rows`]: its columns are cache
+    /// positions, a compaction renumbers them, and the decode loop is the only place that sees
+    /// every compaction — including the ones no candidate pool performed.
+    pub fn aperturb_prefill_attn(&self) -> Option<&Arc<Mutex<Option<PrefillAttn>>>> {
+        self.aperturb.as_ref().map(|(_, _, p)| p)
     }
 
     /// 마지막 [`Self::dispatch`] 가 갱신한 누적 [`LoopControl`] 읽기.

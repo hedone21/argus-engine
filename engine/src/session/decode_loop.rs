@@ -217,6 +217,20 @@ impl DecodeLoop {
             {
                 cap.set_drift(self.pos.saturating_sub(occupancy));
             }
+            // 같은 재번호가 prefill attention 도 무효로 만든다 — 그 열은 캐시 슬롯 번호라
+            // compaction 이 가리키는 키를 바꾼다. q-row 링과 달리 시계를 맞춰 줄 수가 없고
+            // (열이 옮겨 간 게 아니라 **사라진다**), 유일하게 살릴 방법은 keep-set 을 통해
+            // 다시 모으는 것뿐이다. 그 재수집을 한 압축만 자기 점유를 대며 통과하고, 나머지는
+            // 전부 여기서 버려진다. 안 버리면 디코드가 프롬프트 길이를 다시 넘는 순간
+            // `prefix_len <= current_pos` 가 되살아나 **조용히 재편입**되고, 후보는 이미 없는
+            // 키의 점수로 살아 있는 키를 랭킹한다(거절이 아니라 틀린 답).
+            if let Some(d) = self.dispatcher.as_ref()
+                && let Some(cell) = d.aperturb_prefill_attn()
+                && let Ok(mut g) = cell.lock()
+                && !g.as_mut().is_some_and(|p| p.survives_shrink_to(occupancy))
+            {
+                *g = None;
+            }
         }
         self.kv_occupancy = occupancy;
     }
@@ -810,6 +824,9 @@ impl DecodeLoopBuilder<HasForward> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::inference::prefill_attn::PrefillAttn;
+    use crate::pipeline::StageLifecycle;
 
     /// Forward stub: prefill returns logits[0]=1.0, step returns logits with
     /// the next index biased highest so GreedySampler picks `step_count + 1`.
@@ -1674,6 +1691,157 @@ mod tests {
         );
         // OneShot Consumed → registry GC.
         assert_eq!(registry.len(), 0, "OneShot Consumed 후 registry GC");
+    }
+
+    /// A compaction nobody carried the prompt attention through DROPS it.
+    ///
+    /// The capture's columns are cache slots. A compaction renumbers those slots, so the rows now
+    /// name keys that are not there — and the width guard in `plan_prefill_layer` only catches it
+    /// while `prefix_len > current_pos`. Decode regrows past the prompt length within a few dozen
+    /// tokens, and from then on the guard passes and a prefill-end candidate ranks live keys by
+    /// dead keys' scores. That is a wrong answer, not a refusal, so the capture is dropped here.
+    ///
+    /// Mutation-proof: deleting the invalidation leaves the cell `Some`.
+    #[test]
+    fn a_compaction_nobody_carried_the_prompt_attention_through_drops_it() {
+        let (cell, mut loop_) = shrinking_loop(PrefillAttn::captured(vec![vec![0.5f32; PROMPT]]));
+        loop_
+            .prefill(&(0..PROMPT as u32).collect::<Vec<_>>())
+            .unwrap();
+        loop_.run(1, 0).unwrap();
+        assert!(
+            cell.lock().unwrap().is_none(),
+            "an uncarried capture must not survive the compaction that renumbered it"
+        );
+    }
+
+    /// The one compaction the capture WAS gathered through leaves it in place — otherwise the
+    /// selector's carry would be undone one step later and a prefill-end candidate could still
+    /// only ever answer one budget.
+    ///
+    /// Mutation-proof: dropping unconditionally (ignoring `survives_shrink_to`) empties the cell.
+    #[test]
+    fn the_compaction_the_capture_was_gathered_through_leaves_it_in_place() {
+        let keep: Vec<usize> = (0..SHRUNK).collect();
+        let carried = PrefillAttn::captured(vec![vec![0.5f32; PROMPT]])
+            .gather(SHRUNK, 1, 1, |_, _| Some(&keep[..]))
+            .expect("the capture carries");
+        let (cell, mut loop_) = shrinking_loop(carried);
+        loop_
+            .prefill(&(0..PROMPT as u32).collect::<Vec<_>>())
+            .unwrap();
+        loop_.run(1, 0).unwrap();
+        let g = cell.lock().unwrap();
+        let held = g
+            .as_ref()
+            .expect("the gathered capture survives its own compaction");
+        assert_eq!(held.rows()[0].len(), SHRUNK);
+    }
+
+    const PROMPT: usize = 32;
+    const SHRUNK: usize = 20;
+
+    /// A loop whose `KvMutate` compacts the single layer from [`PROMPT`] to [`SHRUNK`] once, with
+    /// `cell` wired in as the pool's prompt-attention capture. Returns the cell so the test can
+    /// read what the shrink detector did to it.
+    #[allow(clippy::type_complexity)]
+    fn shrinking_loop(pfa: PrefillAttn) -> (Arc<Mutex<Option<PrefillAttn>>>, DecodeLoop) {
+        use crate::backend::Backend;
+        use crate::backend::cpu::CpuBackend;
+        use crate::buffer::DType;
+        use crate::format::KVCacheFormat;
+        use crate::kv::aperturb_select::{Candidate, Selector};
+        use crate::kv::kv_cache::KVCache;
+        use crate::kv::standard_format::StandardFormat;
+        use crate::memory::host::shared::SharedBuffer;
+        use crate::shape::Shape;
+        use crate::tensor::Tensor;
+
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 4;
+        const MAX_SEQ: usize = 64;
+
+        /// Compacts the layer once, at `KvMutate` — the same instant an `AperturbSelectStage`
+        /// would, so the driver's shrink detector sees exactly what it sees in production.
+        struct ShrinkOnce(Arc<StandardFormat>);
+        impl PipelineStage for ShrinkOnce {
+            fn name(&self) -> &str {
+                "test.shrink_once"
+            }
+            fn lifecycle(&self) -> StageLifecycle {
+                StageLifecycle::OneShot
+            }
+            fn on_phase(
+                &self,
+                phase: &LifecyclePhase,
+                _ctx: &mut StageContext<'_>,
+            ) -> anyhow::Result<StageOutcome> {
+                if *phase != LifecyclePhase::KvMutate {
+                    return Ok(StageOutcome::Continue);
+                }
+                self.0.with_cache_mut(|c| c.current_pos = SHRUNK);
+                Ok(StageOutcome::Consumed)
+            }
+        }
+
+        let n = MAX_SEQ * KV_HEADS * HEAD_DIM;
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let shape = Shape::new(vec![1, MAX_SEQ, KV_HEADS, HEAD_DIM]);
+        let k = Tensor::new(
+            shape.clone(),
+            Arc::new(SharedBuffer::new(n * 4, DType::F32)),
+            backend.clone(),
+        );
+        let v = Tensor::new(
+            shape,
+            Arc::new(SharedBuffer::new(n * 4, DType::F32)),
+            backend,
+        );
+        let mut cache = KVCache::new(k, v, MAX_SEQ);
+        cache.current_pos = PROMPT;
+        let handle = Arc::new(StandardFormat::new(0, cache));
+
+        let registry = Arc::new(PipelineRegistry::new());
+        registry.submit(Arc::new(ShrinkOnce(handle.clone())));
+
+        let cell = Arc::new(Mutex::new(Some(pfa)));
+        let basis = Arc::new(
+            crate::aperturb::OutputBasis::from_layers(vec![vec![1.0f32]], 1, 1, None).unwrap(),
+        );
+        let selector = Arc::new(
+            Selector::new(
+                vec![Candidate::new(
+                    "none",
+                    argus_extension_api::find_mutation_stage("none")
+                        .map(|r| (r.make)(Default::default(), &[]))
+                        .expect("the built-in no-eviction stage is registered"),
+                    argus_extension_api::StageCaps::SCORE_FREE,
+                )],
+                basis,
+                1,
+            )
+            .unwrap(),
+        );
+        let dispatcher = CommandDispatcher::new(
+            Arc::clone(&registry),
+            vec![handle.clone()],
+            None,
+            Arc::new(Mutex::new(None)),
+        )
+        .with_aperturb_selector(selector, Arc::new(Mutex::new(None)), Arc::clone(&cell));
+
+        let pos_handle: Arc<dyn KVCacheFormat> = handle.clone();
+        let loop_ = DecodeLoopBuilder::new()
+            .with_forward(MockForward {
+                vocab: 16,
+                step_count: 0,
+            })
+            .with_kv_capacity(MAX_SEQ)
+            .with_pipeline(Arc::clone(&registry))
+            .with_command_dispatcher(dispatcher)
+            .with_kv_pos_handle(pos_handle)
+            .build();
+        (cell, loop_)
     }
 
     /// 회귀(강화): eviction 1회 후 후속 step 들에서 cache 가 정상 성장(+1/step)할 때
