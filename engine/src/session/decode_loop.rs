@@ -204,6 +204,19 @@ impl DecodeLoop {
             // compaction). 보유 plan 의 geometry 가 stale → 다음 step lazy rebuild 로 강하. self.pos 는
             // 의도적으로 불변(위 닥 — 원위치 RoPE phase 보존).
             self.forward.on_kv_prune(occupancy);
+            // 같은 이유로 q-row 링의 시계도 여기서 어긋난다: 링은 RoPE 위치(`self.pos`)를 찍는데
+            // 캐시는 재번호된다. 두 시계를 **같은 순간에** 읽어 gap 을 그대로 넘긴다 — 누적하면
+            // 직전 step 의 점유(한 토큰 낡은 값)를 쓰게 되고, 링이 정확히 `rows` 칸이라 그 1칸
+            // 차이가 이미 덮어쓰인 위치를 요구해 결국 전부 거절된다(S25 실측 2026-09-02).
+            // 안 알려 주면 링은 옳은 행을 들고 있으면서 모든 요청을 거절해, 한 런에 압축 결정이
+            // **1회만** 성립하고 나머지는 조용히 declined 로 떨어진다.
+            if let Some(d) = self.dispatcher.as_ref()
+                && let Some(q) = d.aperturb_q_rows()
+                && let Ok(mut g) = q.lock()
+                && let Some(cap) = g.as_mut()
+            {
+                cap.set_drift(self.pos.saturating_sub(occupancy));
+            }
         }
         self.kv_occupancy = occupancy;
     }

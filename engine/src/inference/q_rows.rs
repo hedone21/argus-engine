@@ -47,6 +47,17 @@ pub struct QRowCapture {
     /// bookkeeping only — it is what turns "the ring was not armed at that step" from a plausible
     /// wrong answer into an error.
     slot_pos: Vec<usize>,
+    /// How far the ring's clock has run ahead of the cache's, in positions.
+    ///
+    /// The ring stamps RoPE positions, which by design keep counting across a compaction
+    /// (`decode_loop`: "Do NOT reset start_pos to current_pos after eviction ... severe NLL
+    /// degradation"). The cache's `current_pos` is renumbered DOWN by the same event. So the two
+    /// clocks separate by exactly the number of evicted positions, permanently and cumulatively,
+    /// and a reader that asks in `current_pos` terms is asking about positions the ring stopped
+    /// holding — from the first compaction onward, forever. [`Self::note_prune`] adds the gap back
+    /// so the window can be addressed in the ring's coordinate without losing the check that
+    /// catches a capture which simply stopped.
+    drift: usize,
 }
 
 impl QRowCapture {
@@ -68,6 +79,7 @@ impl QRowCapture {
             q_dim,
             ring: Tensor::new(Shape::new(vec![n_layers, rows, q_dim]), buf, backend),
             slot_pos: vec![usize::MAX; rows],
+            drift: 0,
         })
     }
 
@@ -141,25 +153,52 @@ impl QRowCapture {
         Ok(())
     }
 
-    /// The first position in the read window the ring does not actually hold, or `None` when it
-    /// holds them all.
+    /// The `min(rows, n_resident)` most recently captured positions, as `(first_pos, count)`, or
+    /// `None` when the ring cannot serve that many.
     ///
-    /// The ring is indexed by absolute position (`p % rows`) and `slot_pos` records what each slot
-    /// really holds, so this catches both "the capture was not armed for that token" and "the cache
-    /// was renumbered under the ring" — a compaction between the capture and the read leaves the
-    /// slots holding positions that no longer exist.
-    fn first_uncovered(&self, n_resident: usize) -> Option<usize> {
+    /// **The window is taken in the ring's own coordinate, ending at [`Self::last_pos`].** The
+    /// caller passes `n_resident` (the cache's `current_pos`) only to bound how many rows it is
+    /// entitled to ask for — never as a position. Addressing the window as
+    /// `[n_resident - r, n_resident)` is what used to break here: a compaction renumbers the cache
+    /// down by the number of evicted positions while the capture keeps stamping RoPE positions that
+    /// do not, so from the first compaction onward the asked-for window sat entirely below the
+    /// stamped one and every later read was refused. The rows themselves were always fine — they
+    /// are the trailing queries, which is exactly what the metric probes with; only the labels were
+    /// being compared across two different clocks.
+    ///
+    /// `slot_pos` is still checked position by position, so "the capture was not armed at that
+    /// step" remains a loud failure rather than a plausible wrong answer.
+    fn trailing_window(&self, n_resident: usize) -> Option<(usize, usize)> {
         let r_eff = self.rows.min(n_resident);
-        let first_pos = n_resident.checked_sub(r_eff)?;
-        (0..r_eff)
-            .map(|j| first_pos + j)
-            .find(|&p| self.slot_pos[p % self.rows] != p)
+        if r_eff == 0 {
+            return None;
+        }
+        // `n_resident` counts cache slots; the ring counts RoPE positions. `drift` is the gap.
+        let end = n_resident + self.drift;
+        let first = end.checked_sub(r_eff)?;
+        if (first..end).any(|p| self.slot_pos[p % self.rows] != p) {
+            return None;
+        }
+        Some((first, r_eff))
+    }
+
+    /// Set how far the ring's clock leads the cache's: `rope_pos - resident`.
+    ///
+    /// Stated absolutely, from the two clocks themselves, rather than accumulated per prune. The
+    /// accumulating form has to be handed the resident count from *immediately before* the
+    /// compaction, and the decode loop's shrink detector only holds the count from the previous
+    /// step — one token older. That one position is not a rounding error here: the ring is exactly
+    /// `rows` long, so a window shifted down by one asks for a position the newest capture has
+    /// already overwritten, and every read is refused just as if nothing had been reported
+    /// (measured on an S25, 2026-09-02). Reading both clocks at the same instant cannot drift.
+    pub fn set_drift(&mut self, gap: usize) {
+        self.drift = gap;
     }
 
     /// Whether the ring holds the whole window [`Self::snapshot`] would read — the cheap predicate
     /// a caller checks before deciding it has something to measure.
     pub fn covers(&self, n_resident: usize) -> bool {
-        self.rows.min(n_resident) > 0 && self.first_uncovered(n_resident).is_none()
+        self.trailing_window(n_resident).is_some()
     }
 
     /// Read the ring back in chronological order for the `min(rows, n_resident)` positions ending
@@ -167,19 +206,15 @@ impl QRowCapture {
     ///
     /// One device-to-host transfer for the whole ring, at the decision point — not per step.
     pub fn snapshot(&self, n_resident: usize) -> Result<QRowSnapshot> {
-        let r_eff = self.rows.min(n_resident);
-        if r_eff == 0 {
-            bail!("q-rows: nothing resident to snapshot");
-        }
-        let first_pos = n_resident - r_eff;
-        if let Some(p) = self.first_uncovered(n_resident) {
+        let Some((first_pos, r_eff)) = self.trailing_window(n_resident) else {
             bail!(
-                "q-rows: slot {} holds position {} but position {p} was asked for — the \
-                 capture was not armed when that token went past",
-                p % self.rows,
-                self.slot_pos[p % self.rows] as i64
+                "q-rows: cannot serve the {} trailing row(s) for {n_resident} resident token(s) \
+                 (ring is {} position(s) ahead of the cache) — the capture was not armed when \
+                 those tokens went past",
+                self.rows.min(n_resident),
+                self.drift
             );
-        }
+        };
         let backend = self.ring.backend().clone();
         backend.synchronize()?;
         let mut flat = vec![0.0f32; self.n_layers * self.rows * self.q_dim];
@@ -373,6 +408,90 @@ mod tests {
         assert!(c.covers(12), "the positions it really saw");
         // A compaction left six tokens resident, renumbered 0..6. The ring still holds 8..12.
         assert!(!c.covers(6));
+    }
+
+    /// The bug this ring shipped with: a compaction renumbers the cache down while the capture
+    /// keeps stamping RoPE positions, so every read after the FIRST compaction was refused for the
+    /// rest of the session. Telling the ring about the prune closes the gap.
+    #[test]
+    fn a_pruned_cache_is_covered_again_once_the_ring_is_told() {
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+        let mut c = cap(1, 4, 2);
+        let buf = mem.alloc(12 * 2 * 4, DType::F32).unwrap();
+        let t = Tensor::new(Shape::new(vec![1, 12, 2]), buf, backend.clone());
+        c.capture(0, &t, backend.as_ref(), 0, 12, 2).unwrap();
+        assert!(c.covers(12), "the positions it really saw");
+        // A compaction left six resident, renumbered 0..6. Untold, the ring refuses.
+        assert!(!c.covers(6));
+        c.set_drift(6);
+        assert!(
+            c.covers(6),
+            "after the prune is accounted for, the trailing rows are readable again"
+        );
+        assert!(c.snapshot(6).is_ok());
+    }
+
+    /// The gap grows at every compaction, and a run does many. Reporting it absolutely means the
+    /// second compaction's report already includes the first one's.
+    #[test]
+    fn drift_accumulates_across_repeated_prunes() {
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+        let mut c = cap(1, 4, 2);
+        let buf = mem.alloc(20 * 2 * 4, DType::F32).unwrap();
+        let t = Tensor::new(Shape::new(vec![1, 20, 2]), buf, backend.clone());
+        c.capture(0, &t, backend.as_ref(), 0, 20, 2).unwrap();
+        // Two compactions: 20 -> 14 (gap 6), then 14 -> 9 (cumulative gap 11).
+        c.set_drift(6);
+        c.set_drift(11);
+        assert!(
+            c.covers(9),
+            "9 resident + 11 drift = the 20 positions captured"
+        );
+        assert!(!c.covers(20), "20 + 11 = 31 was never captured");
+    }
+
+    /// The gap must be the one measured at the SAME instant on both clocks. Reporting it one
+    /// position stale — which is what accumulating from the previous step's occupancy does — shifts
+    /// the window down by one, onto a position the newest capture has already overwritten, because
+    /// the ring is exactly `rows` long. The symptom is indistinguishable from never reporting at
+    /// all: every read refused.
+    #[test]
+    fn a_gap_reported_one_position_stale_still_refuses() {
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+        let mut c = cap(1, 4, 2);
+        let buf = mem.alloc(10 * 2 * 4, DType::F32).unwrap();
+        let t = Tensor::new(Shape::new(vec![1, 10, 2]), buf, backend.clone());
+        // Positions 0..9 went past; the ring (4 slots) holds 6..9.
+        c.capture(0, &t, backend.as_ref(), 0, 10, 2).unwrap();
+        // The cache was compacted to 6 resident while the RoPE clock stayed at 10: gap 4.
+        c.set_drift(4);
+        assert!(c.covers(6), "the exact gap reads the window the ring holds");
+        // One stale: the window slides to 5..9, and slot 5 % 4 = 1 now holds 9.
+        c.set_drift(3);
+        assert!(
+            !c.covers(6),
+            "a stale gap asks for a position already overwritten"
+        );
+    }
+
+    /// The guarantee the prune accounting must NOT trade away: a capture that simply stopped still
+    /// has to be refused. Drift explains a renumbering, not a gap in the recording.
+    #[test]
+    fn a_capture_that_stopped_is_still_refused_after_a_prune() {
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+        let mut c = cap(1, 4, 2);
+        let buf = mem.alloc(12 * 2 * 4, DType::F32).unwrap();
+        let t = Tensor::new(Shape::new(vec![1, 12, 2]), buf, backend.clone());
+        c.capture(0, &t, backend.as_ref(), 0, 12, 2).unwrap();
+        c.set_drift(6);
+        // Decode went on for four more tokens with the capture disarmed: the cache says 10
+        // resident, but the ring never saw positions 12..16.
+        assert!(!c.covers(10));
+        assert!(c.snapshot(10).is_err());
     }
 
     #[test]

@@ -252,6 +252,16 @@ impl CommandDispatcher {
         self
     }
 
+    /// The query-row ring the pool measures on, when one is configured.
+    ///
+    /// Handed out so the decode loop can tell the ring about a compaction: the ring's clock and
+    /// the cache's `current_pos` separate at every prune, and nothing else sees both numbers.
+    pub fn aperturb_q_rows(
+        &self,
+    ) -> Option<&Arc<Mutex<Option<crate::inference::q_rows::QRowCapture>>>> {
+        self.aperturb.as_ref().map(|(_, q, _)| q)
+    }
+
     /// 마지막 [`Self::dispatch`] 가 갱신한 누적 [`LoopControl`] 읽기.
     pub fn control(&self) -> &LoopControl {
         &self.control

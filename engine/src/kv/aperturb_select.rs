@@ -254,10 +254,13 @@ impl Selector {
                 rows: q_rows.rows(),
             }));
         }
-        // The ring is indexed by absolute position, so anything that renumbered the cache since the
-        // rows were captured — another compaction at prefill end, or a compression a few steps ago —
-        // leaves it holding positions that no longer exist. Decline rather than measure against
-        // them; the forward refills the ring as decode goes on, so a later budget can be answered.
+        // Decline rather than measure against rows the ring does not actually hold. A compaction
+        // renumbers the cache while the capture keeps stamping RoPE positions; the decode loop
+        // reports each prune (`QRowCapture::note_prune`) so the two clocks stay reconcilable and a
+        // later budget CAN be answered. Without that report this guard was permanent — one
+        // compression per session, every later budget silently declined (measured on an S25,
+        // 2026-09-02). What still lands here is a genuine gap: a capture that was not armed when
+        // those tokens went past.
         if !q_rows.covers(current_pos) {
             return Ok(Err(NoChoice::StaleRows {
                 resident: current_pos,
