@@ -52,7 +52,7 @@ fn current_format_name(cache: &KVCache) -> &'static str {
 pub enum StagedKeep<'a> {
     /// Every KV head of the layer retains the same ascending positions.
     LayerWide(&'a [usize]),
-    /// One ascending list per KV head, all of equal length.
+    /// One ascending list per KV head. The lengths may differ (a ragged keep).
     PerHead(&'a [Vec<usize>]),
 }
 
@@ -60,7 +60,8 @@ pub enum StagedKeep<'a> {
 enum Compaction {
     /// LayerWide keep — all heads keep the same ascending positions.
     Keep(Vec<usize>),
-    /// Per-head keep — `[n_kv_heads][keep]`, each ascending, all equal length (HeadMajor only).
+    /// Per-head keep — `[n_kv_heads][keep]`, each ascending (HeadMajor only). Unequal lengths
+    /// right-align the heads at commit and leave the cache ragged (`KVCache::head_start`).
     KeepPerHead(Vec<Vec<usize>>),
     /// Offload the LRU prefix of `n` tokens through the swap handler (residency axis).
     Offload(usize),
@@ -220,6 +221,8 @@ impl<'a> EngineCacheHandle<'a> {
                 }
                 self.cache.compact_keep_positions(&keep, 0)?;
                 self.cache.set_current_pos(keep.len());
+                // Every head kept the same slots, so the geometry is uniform again.
+                self.cache.clear_head_starts();
                 self.mutated = true;
             }
             Some(Compaction::KeepPerHead(heads)) => {
@@ -231,12 +234,7 @@ impl<'a> EngineCacheHandle<'a> {
                         self.n_layers,
                     );
                 }
-                let new_pos = heads.first().map_or(0, |h| h.len());
-                for (kv_head, keep) in heads.iter().enumerate() {
-                    self.cache
-                        .compact_keep_positions_for_head(kv_head, keep, 0)?;
-                }
-                self.cache.set_current_pos(new_pos);
+                commit_per_head_keep(self.cache, &heads)?;
                 self.mutated = true;
             }
             Some(Compaction::Offload(prefix)) => {
@@ -259,9 +257,78 @@ impl<'a> EngineCacheHandle<'a> {
     }
 }
 
+/// Apply a per-head keep to one layer: right-align every head on the longest one.
+///
+/// `P = max_h keep[h].len()` becomes the shared cursor; head `h` lands on `[P - n_h, P)` and its
+/// first `P - n_h` slots become a hole (`KVCache::head_start`). Equal counts give `P - n_h == 0`
+/// for every head — the uniform commit, byte-identical to what it always was.
+fn commit_per_head_keep(cache: &mut KVCache, heads: &[Vec<usize>]) -> Result<()> {
+    commit_per_head_keep_at(cache, heads, None)
+}
+
+/// [`commit_per_head_keep`] onto a caller-chosen cursor: every head is right-aligned on `cursor`
+/// instead of on the layer's own longest head. `None` is the layer's own longest head. A selector
+/// that applies one per-head keep to every layer passes the longest head of ANY layer, so the
+/// layers keep one `current_pos` — the frame the QCF metric and the decode loop's occupancy
+/// watch are written against — at the price of a few more hole slots in the shorter layers.
+fn commit_per_head_keep_at(
+    cache: &mut KVCache,
+    heads: &[Vec<usize>],
+    cursor: Option<usize>,
+) -> Result<()> {
+    let longest = heads.iter().map(|h| h.len()).max().unwrap_or(0);
+    let new_pos = match cursor {
+        Some(c) if c >= longest && c <= cache.current_pos() => c,
+        Some(c) => anyhow::bail!(
+            "per-head keep cursor {c} is outside [{longest}, {}] for this layer",
+            cache.current_pos()
+        ),
+        None => longest,
+    };
+    let starts: Vec<usize> = heads.iter().map(|h| new_pos - h.len()).collect();
+    for (kv_head, keep) in heads.iter().enumerate() {
+        cache.compact_keep_positions_for_head(kv_head, keep, starts[kv_head])?;
+    }
+    cache.set_current_pos(new_pos);
+    cache.set_head_starts(&starts);
+    Ok(())
+}
+
+/// Apply a per-head keep to one layer, right-aligned on `cursor` (see [`commit_per_head_keep_at`]).
+/// The keep is validated through the transactional handle exactly as a committed `keep_per_head`
+/// is, then executed by the same code — the only difference from `commit` is the cursor.
+pub(crate) fn apply_per_head_keep_at(
+    cache: &mut KVCache,
+    layer_idx: usize,
+    n_layers: usize,
+    heads: &[Vec<usize>],
+    cursor: usize,
+) -> Result<()> {
+    {
+        let mut handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
+        let borrowed: Vec<&[usize]> = heads.iter().map(|v| v.as_slice()).collect();
+        handle
+            .keep_per_head(&borrowed)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        // Dropped without commit: the staged intent was only a validation pass.
+    }
+    if crate::kv::eviction::keepset_dump::is_active() {
+        crate::kv::eviction::keepset_dump::record(
+            cache,
+            &KeepSpec::PerHead(heads.to_vec()),
+            layer_idx,
+            n_layers,
+        );
+    }
+    commit_per_head_keep_at(cache, heads, Some(cursor))
+}
+
 impl CacheHandle for EngineCacheHandle<'_> {
     fn current_pos(&self) -> usize {
         self.entry_pos
+    }
+    fn head_start(&self, kv_head: usize) -> usize {
+        self.cache.head_start(kv_head)
     }
     fn n_kv_heads(&self) -> usize {
         self.cache.kv_heads()
@@ -282,6 +349,17 @@ impl CacheHandle for EngineCacheHandle<'_> {
 
     fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
         self.validate_keep(keep)?;
+        // A layer-wide keep names the same slots for every head, so on a ragged cache it must stay
+        // inside the shortest head's range — a slot in some head's hole is not that head's token.
+        if self.cache.is_ragged() {
+            let floor = (0..self.cache.kv_heads())
+                .map(|h| self.cache.head_start(h))
+                .max()
+                .unwrap_or(0);
+            if keep.first().is_some_and(|&p| p < floor) {
+                return Err(CacheOpError::NotResident);
+            }
+        }
         self.set_compaction(Compaction::Keep(keep.to_vec()))
     }
 
@@ -294,14 +372,21 @@ impl CacheHandle for EngineCacheHandle<'_> {
         if keep.len() != self.cache.kv_heads() {
             return Err(CacheOpError::InvalidKeep);
         }
-        // All heads keep the same NUMBER of tokens (the single shared current_pos invariant), and each
-        // list is ascending + unique + in-range. Validate ALL before staging any (T-8 atomicity).
-        let new_pos = keep.first().map_or(0, |h| h.len());
-        for head in keep {
-            if head.len() != new_pos {
-                return Err(CacheOpError::InvalidKeep);
-            }
+        // Each list is ascending + unique + in-range, and names only slots its head still holds.
+        // Validate ALL before staging any (T-8 atomicity).
+        for (kv_head, head) in keep.iter().enumerate() {
             self.validate_keep(head)?;
+            if head
+                .first()
+                .is_some_and(|&p| p < self.cache.head_start(kv_head))
+            {
+                return Err(CacheOpError::NotResident);
+            }
+        }
+        // Unequal counts leave the cache ragged, which only a HeadMajor typed store can hold.
+        let uniform = keep.windows(2).all(|w| w[0].len() == w[1].len());
+        if !uniform && !self.cache.supports_ragged() {
+            return Err(CacheOpError::WrongContainer);
         }
         self.set_compaction(Compaction::KeepPerHead(
             keep.iter().map(|h| h.to_vec()).collect(),
@@ -463,6 +548,15 @@ impl<'a> EngineModelCacheHandle<'a> {
         Ok(())
     }
 
+    /// The first slot every layer's head `kv_head` holds — a keep below it names a hole somewhere.
+    fn resident_floor(&self, kv_head: usize) -> usize {
+        self.caches
+            .iter()
+            .map(|c| c.head_start(kv_head))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Stage the single compaction, rejecting a second one (T-2).
     fn set_compaction(&mut self, c: Compaction) -> Result<(), CacheOpError> {
         if self.compaction.is_some() {
@@ -492,11 +586,11 @@ impl<'a> EngineModelCacheHandle<'a> {
                     }
                     cache.compact_keep_positions(&keep, 0)?;
                     cache.set_current_pos(keep.len());
+                    cache.clear_head_starts();
                 }
                 self.mutated = true;
             }
             Some(Compaction::KeepPerHead(heads)) => {
-                let new_pos = heads.first().map_or(0, |h| h.len());
                 for (layer_idx, cache) in self.caches.iter_mut().enumerate() {
                     if crate::kv::eviction::keepset_dump::is_active() {
                         crate::kv::eviction::keepset_dump::record(
@@ -506,10 +600,7 @@ impl<'a> EngineModelCacheHandle<'a> {
                             n_layers,
                         );
                     }
-                    for (kv_head, keep) in heads.iter().enumerate() {
-                        cache.compact_keep_positions_for_head(kv_head, keep, 0)?;
-                    }
-                    cache.set_current_pos(new_pos);
+                    commit_per_head_keep(cache, &heads)?;
                 }
                 self.mutated = true;
             }
@@ -524,6 +615,9 @@ impl<'a> EngineModelCacheHandle<'a> {
 impl CacheHandle for EngineModelCacheHandle<'_> {
     fn current_pos(&self) -> usize {
         self.entry_pos
+    }
+    fn head_start(&self, kv_head: usize) -> usize {
+        self.resident_floor(kv_head)
     }
     fn n_kv_heads(&self) -> usize {
         self.n_kv_heads
@@ -542,6 +636,13 @@ impl CacheHandle for EngineModelCacheHandle<'_> {
 
     fn keep(&mut self, keep: &[usize]) -> Result<(), CacheOpError> {
         self.validate_keep(keep)?;
+        let floor = (0..self.n_kv_heads)
+            .map(|h| self.resident_floor(h))
+            .max()
+            .unwrap_or(0);
+        if keep.first().is_some_and(|&p| p < floor) {
+            return Err(CacheOpError::NotResident);
+        }
         self.set_compaction(Compaction::Keep(keep.to_vec()))
     }
 
@@ -549,22 +650,29 @@ impl CacheHandle for EngineModelCacheHandle<'_> {
         if keep.len() != self.n_kv_heads {
             return Err(CacheOpError::InvalidKeep);
         }
-        // All heads keep the same NUMBER of tokens (single shared current_pos), each ascending +
-        // unique + in-range. Validate ALL (across heads) before staging (T-8).
-        let new_pos = keep.first().map_or(0, |h| h.len());
-        for head in keep {
-            if head.len() != new_pos {
-                return Err(CacheOpError::InvalidKeep);
-            }
+        // Each list ascending + unique + in-range, naming only slots its head holds in EVERY
+        // layer. Validate ALL (across heads) before staging (T-8).
+        for (kv_head, head) in keep.iter().enumerate() {
             self.validate_keep(head)?;
+            if head
+                .first()
+                .is_some_and(|&p| p < self.resident_floor(kv_head))
+            {
+                return Err(CacheOpError::NotResident);
+            }
         }
         // Per-head compaction requires HeadMajor layout in EVERY layer; reject the whole fan-out if any
-        // layer is SeqMajor (atomicity — never half-apply).
+        // layer is SeqMajor (atomicity — never half-apply). Unequal counts additionally need a
+        // typed store in every layer.
         if self
             .caches
             .iter()
             .any(|c| c.layout() != KVLayout::HeadMajor)
         {
+            return Err(CacheOpError::WrongContainer);
+        }
+        let uniform = keep.windows(2).all(|w| w[0].len() == w[1].len());
+        if !uniform && self.caches.iter().any(|c| !c.supports_ragged()) {
             return Err(CacheOpError::WrongContainer);
         }
         self.set_compaction(Compaction::KeepPerHead(
@@ -860,6 +968,7 @@ mod tests {
         assert_eq!(
             h.keep_top_k(
                 KeepTopK {
+                    start: 0,
                     current: 8,
                     prefix: 2,
                     recent: 2,

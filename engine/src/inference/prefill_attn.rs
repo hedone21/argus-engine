@@ -52,13 +52,17 @@ impl PrefillAttn {
     /// `keep[j]`; the retained positions at or past `prefix_len` are the decode tail this capture
     /// never covered, and they drop off the end where they already were.
     ///
+    /// Heads may keep different NUMBERS of prompt positions (a ragged keep): the container then
+    /// right-aligns every head on the longest one, so the new prompt width is the longest head's
+    /// count and a shorter head's row starts with as many `0.0` columns as it has holes in front
+    /// of its first resident slot (`KVCache::head_start`) — exactly where its keys are not.
+    ///
     /// `None` when the capture cannot be carried, and the caller must then drop it rather than
     /// keep a buffer whose columns no longer name the keys they measured:
     ///
-    /// - a layer whose heads disagree on how many prompt positions survived. The rows are laid out
-    ///   at one `prefix_len` per layer, so per-head prefixes of different lengths have no
-    ///   representation here — the [`KeepSets`](crate::aperturb::KeepSets) raggedness wall in the
-    ///   capture's own terms.
+    /// - a layer whose heads disagree on how many decode-tail positions they kept. The tail is
+    ///   what the engine appends after the prompt for every head alike; heads that kept different
+    ///   amounts of it do not share a prompt/tail boundary, so no single width describes them.
     /// - a layer that kept no prompt position at all, or one the caller had no keep-set for. There
     ///   is nothing left to rank, so the capture has stopped describing anything.
     pub fn gather<'k>(
@@ -81,19 +85,32 @@ impl PrefillAttn {
             // layer, and finding it half-way through would leave rows already written at a width
             // the rest cannot match. `partition_point` is exact because the list is ascending.
             let mut kept: Vec<&[usize]> = Vec::with_capacity(n_kv_heads);
+            let mut tails: Vec<usize> = Vec::with_capacity(n_kv_heads);
             for h in 0..n_kv_heads {
                 let full = keep(layer, h)?;
-                kept.push(&full[..full.partition_point(|&p| p < prefix_len)]);
+                let prompt = full.partition_point(|&p| p < prefix_len);
+                kept.push(&full[..prompt]);
+                tails.push(full.len() - prompt);
             }
-            let new_prefix = kept[0].len();
-            if new_prefix == 0 || kept.iter().any(|k| k.len() != new_prefix) {
+            // The new prompt width is what the compaction left in front of the shared tail —
+            // `occupancy - tail` — which a ragged commit sets model-wide (the longest head of any
+            // layer), so a layer whose own longest head is shorter still right-aligns onto it.
+            let tail = tails[0];
+            let new_prefix = occupancy.checked_sub(tail)?;
+            if new_prefix == 0
+                || tails.iter().any(|&t| t != tail)
+                || kept.iter().any(|k| k.len() > new_prefix)
+            {
                 return None;
             }
             let mut next = vec![0.0f32; n_heads_q * new_prefix];
             for q in 0..n_heads_q {
                 let src = &row[q * prefix_len..(q + 1) * prefix_len];
                 let dst = &mut next[q * new_prefix..(q + 1) * new_prefix];
-                for (slot, &p) in dst.iter_mut().zip(kept[q / group]) {
+                // A shorter head is right-aligned: its hole columns stay at 0.0.
+                let list = kept[q / group];
+                let start = new_prefix - list.len();
+                for (slot, &p) in dst[start..].iter_mut().zip(list) {
                     *slot = src[p];
                 }
             }
@@ -167,10 +184,29 @@ mod tests {
         );
     }
 
-    /// Heads that keep different NUMBERS of prompt positions have no representation: the rows are
-    /// one `prefix_len` per layer. Dropping the capture is the honest answer.
+    /// Heads that keep different NUMBERS of prompt positions are right-aligned like the cache: the
+    /// width is the longest head's count and a shorter head's first columns are holes at `0.0`.
+    /// Head 0 keeps prompt `[0, 2, 4]` + tail `5`; head 1 keeps prompt `[1]` + tail `5` → width 3,
+    /// head 1's row is `[0, 0, 101]` (query head 1 reads KV head 1 under `group = 1`).
+    ///
+    /// Mutation-proof: left-aligning (`start = 0`) gives head 1 `[101, 0, 0]`, which would rank
+    /// the hole at slot 1 with a real key's score.
     #[test]
-    fn heads_that_disagree_on_the_prompt_cannot_be_carried() {
+    fn heads_with_different_prompt_counts_are_right_aligned_with_holes_in_front() {
+        let pfa = PrefillAttn::captured(vec![stamped(2, 5)]);
+        let (long, short) = ([0usize, 2, 4, 5], [1usize, 5]);
+        let g = pfa
+            .gather(4, 2, 2, |_, h| {
+                Some(if h == 0 { &long[..] } else { &short[..] })
+            })
+            .expect("a ragged keep-set carries");
+        assert_eq!(g.rows()[0], vec![0.0, 2.0, 4.0, 0.0, 0.0, 101.0]);
+    }
+
+    /// Heads that keep different amounts of the decode TAIL share no prompt/tail boundary, so no
+    /// single width describes them. Dropping the capture is the honest answer.
+    #[test]
+    fn heads_that_disagree_on_the_tail_cannot_be_carried() {
         let pfa = PrefillAttn::captured(vec![stamped(2, 6)]);
         // Both heads keep 3 positions, but head 1 spends one of them on the decode tail, so only
         // 2 of its columns are prompt. Equal keep lengths, unequal prompt prefixes.

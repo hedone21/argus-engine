@@ -411,6 +411,168 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Single-query attention over a *ragged* KV cache: KV head `h` is resident over
+    /// `[kv_start[h], cache_seq_len)` and the slots in front of it are holes (see
+    /// `KVCache::head_start`). Same contract as [`attention_gen`](Self::attention_gen) otherwise,
+    /// with one addition for `scores_out`: column `c` of a head's row is slot `kv_base + c`
+    /// (`kv_base` is the sliding-window floor the caller already clamped `kv_start` to, `0` without a
+    /// window), the row is `cache_seq_len - kv_base` long, and the columns below the head's own
+    /// start are written as `0.0` — so an accumulator that adds every column sees nothing from a
+    /// hole and a hole's stale column is never left standing.
+    ///
+    /// The default is a host f32/f16 HeadMajor kernel. A backend whose KV lives device-only must
+    /// override it; until it does, a ragged cache on that backend is an error here rather than a
+    /// silent read of the holes.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_gen_ragged(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        kv_start: &[usize],
+        // The cache's persistent device mirror of `kv_start` (`KVCache::head_start_device`), for a
+        // backend whose kernel reads it from device memory; `None` on a host cache. It holds the
+        // raw starts, so it stands in for `kv_start` only when `kv_base == 0`.
+        kv_start_dev: Option<&Tensor>,
+        kv_base: usize,
+        cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
+    ) -> Result<()> {
+        use crate::buffer::DType;
+        use rayon::prelude::*;
+        let _ = kv_start_dev;
+        if k_cache.buffer().is_gpu_buffer() || v_cache.buffer().is_gpu_buffer() {
+            anyhow::bail!(
+                "attention_gen_ragged: backend '{}' has no device kernel for a ragged KV cache",
+                self.name()
+            );
+        }
+        // A ragged cache is HeadMajor by construction (`KVCache::supports_ragged`), so the head
+        // stride is the buffer's capacity in positions — derived from the byte size rather than
+        // sniffed from the shape, which tests build in either order.
+        let kv_dtype = k_cache.dtype();
+        let elem = match kv_dtype {
+            DType::F32 => 4,
+            DType::F16 => 2,
+            _ => anyhow::bail!(
+                "attention_gen_ragged: unsupported KV dtype {:?} (a ragged cache is f32/f16)",
+                kv_dtype
+            ),
+        };
+        let capacity = k_cache.size() / elem / (num_heads_kv.max(1) * head_dim.max(1));
+        if kv_start.len() != num_heads_kv || kv_base > cache_seq_len || cache_seq_len > capacity {
+            anyhow::bail!(
+                "attention_gen_ragged: kv_start has {} entries for {} KV heads (kv_base {kv_base}, n {cache_seq_len}, capacity {capacity})",
+                kv_start.len(),
+                num_heads_kv
+            );
+        }
+        // Row reader: dequantize one `(kv_head, slot)` row into `dst`.
+        let read_row = |t: &Tensor, kv_h: usize, slot: usize, dst: &mut [f32]| {
+            let off = (kv_h * capacity + slot) * head_dim;
+            match kv_dtype {
+                DType::F32 => {
+                    let d = unsafe {
+                        std::slice::from_raw_parts(t.as_ptr() as *const f32, t.size() / 4)
+                    };
+                    dst.copy_from_slice(&d[off..off + head_dim]);
+                }
+                DType::F16 => {
+                    let d = unsafe {
+                        std::slice::from_raw_parts(t.as_ptr() as *const half::f16, t.size() / 2)
+                    };
+                    for (o, x) in dst.iter_mut().zip(&d[off..off + head_dim]) {
+                        *o = x.to_f32();
+                    }
+                }
+                _ => unreachable!("checked below"),
+            }
+        };
+        let q_data = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const f32, q.size() / 4) };
+        let out_data =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut f32, out.size() / 4) };
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let gqa_ratio = (num_heads_q / num_heads_kv).max(1);
+        let row_len = cache_seq_len - kv_base;
+        let scores_stride = scores_out
+            .as_ref()
+            .map(|s| s.len() / num_heads_q)
+            .unwrap_or(0);
+        #[derive(Clone, Copy)]
+        struct SendPtr(*mut f32);
+        unsafe impl Send for SendPtr {}
+        unsafe impl Sync for SendPtr {}
+        let scores_ptr = scores_out.map(|s| SendPtr(s.as_mut_ptr()));
+
+        out_data
+            .par_chunks_mut(head_dim)
+            .enumerate()
+            .for_each(|(h, out_h)| {
+                let kv_h = h / gqa_ratio;
+                let start = kv_start[kv_h].max(kv_base).min(cache_seq_len);
+                let q_vec = &q_data[h * head_dim..(h + 1) * head_dim];
+                let mut row = vec![0.0f32; head_dim];
+                let mut logits = vec![f32::NEG_INFINITY; row_len];
+                for slot in start..cache_seq_len {
+                    read_row(k_cache, kv_h, slot, &mut row);
+                    let dot: f32 = q_vec.iter().zip(row.iter()).map(|(a, b)| a * b).sum();
+                    let v = dot * scale;
+                    logits[slot - kv_base] = if v.is_nan() { f32::NEG_INFINITY } else { v };
+                }
+                let max_v = logits[start - kv_base..]
+                    .iter()
+                    .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let n_valid = cache_seq_len - start;
+                let mut sum_e = 0.0f32;
+                for l in logits[start - kv_base..].iter_mut() {
+                    *l = if max_v == f32::NEG_INFINITY {
+                        1.0
+                    } else {
+                        (*l - max_v).exp()
+                    };
+                    sum_e += *l;
+                }
+                let inv = if n_valid == 0 || sum_e.is_nan() || sum_e <= 0.0 || !sum_e.is_finite() {
+                    if n_valid == 0 {
+                        0.0
+                    } else {
+                        1.0 / n_valid as f32
+                    }
+                } else {
+                    1.0 / sum_e
+                };
+                for l in logits[..start - kv_base].iter_mut() {
+                    *l = 0.0;
+                }
+                for l in logits[start - kv_base..].iter_mut() {
+                    *l = if inv == 0.0 { 0.0 } else { *l * inv };
+                }
+                if let Some(SendPtr(ptr)) = scores_ptr {
+                    unsafe {
+                        let dst =
+                            std::slice::from_raw_parts_mut(ptr.add(h * scores_stride), row_len);
+                        dst.copy_from_slice(&logits);
+                    }
+                }
+                out_h.fill(0.0);
+                for slot in start..cache_seq_len {
+                    let w = logits[slot - kv_base];
+                    if w == 0.0 {
+                        continue;
+                    }
+                    read_row(v_cache, kv_h, slot, &mut row);
+                    for (o, x) in out_h.iter_mut().zip(row.iter()) {
+                        *o += w * x;
+                    }
+                }
+            });
+        Ok(())
+    }
+
     // Memory Ops
     fn copy_from(&self, t: &Tensor) -> Result<Tensor>;
 
@@ -1029,7 +1191,12 @@ pub trait Backend: Send + Sync {
         kv_capacity: usize,
         batch_size: usize,
         is_head_major: bool,
+        // Ragged cache: per-KV-head first resident slot (`KVCache::head_starts`); `None` = uniform.
+        // A backend without a ragged prefill kernel returns `Ok(false)` when some start is non-zero,
+        // and the caller's host path takes the floor.
+        kv_start: Option<&[usize]>,
     ) -> Result<bool> {
+        let _ = kv_start;
         Ok(false)
     }
 

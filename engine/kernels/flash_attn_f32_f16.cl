@@ -92,7 +92,11 @@ __kernel REQD_SUBGROUP_SIZE_64 void flash_attn_f32_f16(
     const int mask_ne2,
     const int mask_ne3,
     const global void* sinks_void,
-    const ulong sinks_offset
+    const ulong sinks_offset,
+    // Ragged KV cache (arg 40): per-KV-head first resident slot; NULL = uniform. Keys below the
+    // head's start are holes — never loaded into the tile, masked to -inf. The causal formula is
+    // untouched: the shared write cursor keeps slot order == position order.
+    const global int * kv_start
 ) {
     const int tid = get_local_id(0);
     const int q_row_in_wg = tid & (BLOCK_M - 1);
@@ -112,6 +116,7 @@ __kernel REQD_SUBGROUP_SIZE_64 void flash_attn_f32_f16(
 
     const int gqa_ratio = n_head / n_head_kv;
     const int head_kv_idx = head_idx / gqa_ratio;
+    const int k_lo = (kv_start != NULL) ? min(kv_start[head_kv_idx], n_kv) : 0;
 
     const global char* q_base = (const global char*)q_void + q_offset;
     const global char* k_base = (const global char*)k_void + k_offset;
@@ -153,13 +158,13 @@ __kernel REQD_SUBGROUP_SIZE_64 void flash_attn_f32_f16(
     // Each K-row pair writes 2 entries/lane, consumed via a single barrier.
     __local ACC_TYPE l_dot[BLOCK_M][2][2]; // [q_row][k_pair_idx 0|1][half 0|1]
 
-    for (int k_start = 0; k_start < n_kv; k_start += BLOCK_N) {
+    for (int k_start = (k_lo / BLOCK_N) * BLOCK_N; k_start < n_kv; k_start += BLOCK_N) {
         // Cooperative K/V tile load. WG_SIZE=2*BLOCK_M lanes share the work.
         for (int i = tid; i < BLOCK_N * DK_VEC; i += WG_SIZE) {
             const int row = i / DK_VEC;
             const int col = i % DK_VEC;
             const int k_row_idx = k_start + row;
-            if (k_row_idx < n_kv) {
+            if (k_row_idx < n_kv && k_row_idx >= k_lo) {
                 const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_row_idx * k_nb1;
                 l_k[row][col] = ((__global KV_DATA_TYPE4*)(k_base + k_row_offset))[col];
             } else {
@@ -170,7 +175,7 @@ __kernel REQD_SUBGROUP_SIZE_64 void flash_attn_f32_f16(
             const int row = i / DV_VEC;
             const int col = i % DV_VEC;
             const int v_row_idx = k_start + row;
-            if (v_row_idx < n_kv) {
+            if (v_row_idx < n_kv && v_row_idx >= k_lo) {
                 const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + v_row_idx * v_nb1;
                 l_v[row][col] = ((__global KV_DATA_TYPE4*)(v_base + v_row_offset))[col];
             } else {
@@ -211,8 +216,8 @@ __kernel REQD_SUBGROUP_SIZE_64 void flash_attn_f32_f16(
                 if (k_row1 > (n_kv - n_q + my_query_row)) score1 = -INFINITY;
             }
 
-            if (k_row0 >= n_kv) score0 = -INFINITY;
-            if (k_row1 >= n_kv) score1 = -INFINITY;
+            if (k_row0 >= n_kv || k_row0 < k_lo) score0 = -INFINITY;
+            if (k_row1 >= n_kv || k_row1 < k_lo) score1 = -INFINITY;
 
             if (mask_base != NULL) {
                 const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base + my_query_row * mask_nb1);
@@ -307,7 +312,11 @@ __kernel void flash_attn_f32_f16(
     const int mask_ne2,
     const int mask_ne3,
     const global void* sinks_void,
-    const ulong sinks_offset
+    const ulong sinks_offset,
+    // Ragged KV cache (arg 40): per-KV-head first resident slot; NULL = uniform. Keys below the
+    // head's start are holes — never loaded into the tile, masked to -inf. The causal formula is
+    // untouched: the shared write cursor keeps slot order == position order.
+    const global int * kv_start
 ) {
     const int tid = get_local_id(0);
     const int block_q_idx = get_group_id(0);
@@ -320,6 +329,7 @@ __kernel void flash_attn_f32_f16(
 
     const int gqa_ratio = n_head / n_head_kv;
     const int head_kv_idx = head_idx / gqa_ratio;
+    const int k_lo = (kv_start != NULL) ? min(kv_start[head_kv_idx], n_kv) : 0;
 
     const global char* q_base = (const global char*)q_void + q_offset;
     const global char* k_base = (const global char*)k_void + k_offset;
@@ -356,12 +366,12 @@ __kernel void flash_attn_f32_f16(
     __local KV_DATA_TYPE4 l_k[BLOCK_N][DK_VEC];
     __local KV_DATA_TYPE4 l_v[BLOCK_N][DV_VEC];
 
-    for (int k_start = 0; k_start < n_kv; k_start += BLOCK_N) {
+    for (int k_start = (k_lo / BLOCK_N) * BLOCK_N; k_start < n_kv; k_start += BLOCK_N) {
         for (int i = tid; i < BLOCK_N * DK_VEC; i += WG_SIZE) {
             const int row = i / DK_VEC;
             const int col = i % DK_VEC;
             const int k_row_idx = k_start + row;
-            if (k_row_idx < n_kv) {
+            if (k_row_idx < n_kv && k_row_idx >= k_lo) {
                 const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_row_idx * k_nb1;
                 l_k[row][col] = ((__global KV_DATA_TYPE4*)(k_base + k_row_offset))[col];
             } else {
@@ -372,7 +382,7 @@ __kernel void flash_attn_f32_f16(
             const int row = i / DV_VEC;
             const int col = i % DV_VEC;
             const int v_row_idx = k_start + row;
-            if (v_row_idx < n_kv) {
+            if (v_row_idx < n_kv && v_row_idx >= k_lo) {
                 const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + v_row_idx * v_nb1;
                 l_v[row][col] = ((__global KV_DATA_TYPE4*)(v_base + v_row_offset))[col];
             } else {
@@ -411,8 +421,8 @@ __kernel void flash_attn_f32_f16(
                 if (k_row1 > (n_kv - n_q + my_query_row)) score1 = -INFINITY;
             }
 
-            if (k_row0 >= n_kv) score0 = -INFINITY;
-            if (k_row1 >= n_kv) score1 = -INFINITY;
+            if (k_row0 >= n_kv || k_row0 < k_lo) score0 = -INFINITY;
+            if (k_row1 >= n_kv || k_row1 < k_lo) score1 = -INFINITY;
 
             if (mask_base != NULL) {
                 const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base + my_query_row * mask_nb1);
@@ -517,7 +527,12 @@ __kernel void flash_attn_f32_f16_q1(
     global float * S,
     const int score_layer_offset,
     const int score_stride,
-    const int write_scores
+    const int write_scores,
+    // Ragged KV cache (arg 44): per-KV-head first resident slot, `kv_start[head_kv_idx]`.
+    // NULL = every head resident from slot 0 (the uniform cache). Slots below the head's
+    // start are holes: never read, and their score columns are written as 0.0 so an
+    // accumulator that folds every column sees nothing from them.
+    const global int * kv_start
 ) {
     const int tid = get_local_id(0);
     const int head_batch_idx = get_global_id(1);
@@ -527,6 +542,7 @@ __kernel void flash_attn_f32_f16_q1(
 
     const int gqa_ratio = n_head / n_head_kv;
     const int head_kv_idx = head_idx / gqa_ratio;
+    const int k_lo = (kv_start != NULL) ? min(kv_start[head_kv_idx], n_kv) : 0;
 
     const global char* q_base = (const global char*)q_void + q_offset;
     const global char* k_base = (const global char*)k_void + k_offset;
@@ -534,6 +550,11 @@ __kernel void flash_attn_f32_f16_q1(
     global char* o_base = (global char*)o_void + o_offset;
 
     const int score_row_base = score_layer_offset + head_idx * score_stride;
+    if (write_scores) {
+        for (int t = tid; t < k_lo; t += Q1_WG_SIZE) {
+            S[score_row_base + t] = 0.0f;
+        }
+    }
 
     const global char* mask_base = NULL;
     if (mask_void != NULL) {
@@ -558,7 +579,7 @@ __kernel void flash_attn_f32_f16_q1(
     }
 
     ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -INFINITY;
-    for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
+    for (int k_idx = k_lo + tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
         const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset);
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
@@ -593,7 +614,7 @@ __kernel void flash_attn_f32_f16_q1(
     for (int i = 0; i < DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
     ACC_TYPE l_i = 0.0f;
 
-    for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
+    for (int k_idx = k_lo + tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
         const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
         const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset);
@@ -649,7 +670,7 @@ __kernel void flash_attn_f32_f16_q1(
     // for coalesced global writes.
     if (write_scores && l_final > 0.0f) {
         const float inv_l = 1.0f / (float)l_final;
-        for (int t = tid; t < n_kv; t += Q1_WG_SIZE) {
+        for (int t = k_lo + tid; t < n_kv; t += Q1_WG_SIZE) {
             S[score_row_base + t] *= inv_l;
         }
     }

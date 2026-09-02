@@ -83,9 +83,13 @@ struct Partition {
 impl Partition {
     /// One head's (or the layer-wide) ascending keep-list: prefix ∪ top-`hh_budget` scorers over the
     /// evictable middle ∪ the `recent`-token recency window. Routed through the engine T1 compiler.
-    fn keep_list(&self, score: impl Fn(usize) -> f32) -> Vec<usize> {
+    ///
+    /// `start` is the head's first resident slot (`0` on a uniform cache; [`StageCtx::head_start`]
+    /// on a ragged one), so the protected prefix is the head's first resident positions.
+    fn keep_list_from(&self, start: usize, score: impl Fn(usize) -> f32) -> Vec<usize> {
         compile_keep_top_k(
             KeepTopK {
+                start,
                 current: self.current,
                 prefix: self.prefix,
                 recent: self.recent,
@@ -95,10 +99,12 @@ impl Partition {
         )
     }
 
-    /// Score-free fallback: give the full evictable budget (`hh_budget + recent`) to recency.
-    fn keep_list_recency(&self) -> Vec<usize> {
+    /// Score-free fallback: give the full evictable budget (`hh_budget + recent`) to recency, from
+    /// the head's first resident slot.
+    fn keep_list_recency_from(&self, start: usize) -> Vec<usize> {
         compile_keep_top_k(
             KeepTopK {
+                start,
                 current: self.current,
                 prefix: self.prefix,
                 recent: self.hh_budget + self.recent,
@@ -141,22 +147,32 @@ impl H2o {
     /// score-free to recency.
     fn keep_spec(&self, ctx: &dyn StageCtx) -> Option<KeepSpec> {
         let p = self.partition(ctx.current_pos())?;
+        // A ragged cache (`StageCtx::head_start`): each head ranks from its own first resident slot.
+        let n_kv_heads = ctx.n_kv_heads().max(1);
+        let head_start: Vec<usize> = (0..n_kv_heads).map(|h| ctx.head_start(h)).collect();
+        let ragged = head_start.iter().any(|&s| s > 0);
 
         // (1) Per-head: each KV head ranks its own heavy hitters; all heads keep the same count.
         if ctx.has_head_scores() {
-            let n_kv_heads = ctx.n_kv_heads().max(1);
             let heads: Vec<Vec<usize>> = (0..n_kv_heads)
-                .map(|kv_h| p.keep_list(|pos| ctx.head_score(kv_h, pos)))
+                .map(|kv_h| p.keep_list_from(head_start[kv_h], |pos| ctx.head_score(kv_h, pos)))
                 .collect();
             return Some(KeepSpec::PerHead(heads));
         }
 
         // (2) Flat fallback: heavy hitters from the layer-wide importance. (3) Score-free: recency.
-        let keep = match ctx.importance() {
-            Some(imp) => p.keep_list(|pos| imp.get(pos).copied().unwrap_or(0.0)),
-            None => p.keep_list_recency(),
+        // On a ragged cache the same list is issued per head from each head's own start.
+        let list = |start: usize| match ctx.importance() {
+            Some(imp) => p.keep_list_from(start, |pos| imp.get(pos).copied().unwrap_or(0.0)),
+            None => p.keep_list_recency_from(start),
         };
-        Some(KeepSpec::LayerWide(keep))
+        if ragged {
+            Some(KeepSpec::PerHead(
+                head_start.iter().map(|&s| list(s)).collect(),
+            ))
+        } else {
+            Some(KeepSpec::LayerWide(list(0)))
+        }
     }
 }
 
@@ -238,6 +254,7 @@ mod tests {
         stride: usize,
         head_scores: Option<Vec<f32>>, // [n_kv_heads * stride]
         importance: Option<Vec<f32>>,
+        head_start: Vec<usize>,
     }
     struct ScoresHandle<'a> {
         data: &'a [f32],
@@ -266,6 +283,9 @@ mod tests {
     impl StageCtx for Ctx {
         fn current_pos(&self) -> usize {
             self.current
+        }
+        fn head_start(&self, kv_head: usize) -> usize {
+            self.head_start.get(kv_head).copied().unwrap_or(0)
         }
         fn target_len(&self) -> usize {
             0
@@ -390,6 +410,7 @@ mod tests {
             stride: 0,
             head_scores: None,
             importance: None,
+            head_start: vec![],
         };
         assert!(s.keep_spec(&ctx).is_none());
     }
@@ -404,6 +425,7 @@ mod tests {
             stride: 0,
             head_scores: None,
             importance: None,
+            head_start: vec![],
         };
         match s.keep_spec(&ctx) {
             Some(KeepSpec::LayerWide(keep)) => assert_eq!(keep, (10..20).collect::<Vec<_>>()),
@@ -426,6 +448,7 @@ mod tests {
             stride: 0,
             head_scores: None,
             importance: Some(imp),
+            head_start: vec![],
         };
         match s.keep_spec(&ctx) {
             Some(KeepSpec::LayerWide(keep)) => {
@@ -455,6 +478,7 @@ mod tests {
             stride,
             head_scores: Some(hs),
             importance: None,
+            head_start: vec![],
         };
         let expected = match s.keep_spec(&ctx).unwrap() {
             KeepSpec::PerHead(h) => h,
@@ -492,6 +516,7 @@ mod tests {
                 stride: 0,
                 head_scores: None,
                 importance: None,
+                head_start: vec![],
             }, // within budget -> no-op
             Ctx {
                 current: 20,
@@ -499,6 +524,7 @@ mod tests {
                 stride: 0,
                 head_scores: None,
                 importance: Some(imp),
+                head_start: vec![],
             }, // score-based layer-wide
         ];
         for ctx in &cases {
@@ -542,11 +568,61 @@ mod tests {
             stride: 0,
             head_scores: None,
             importance: Some(imp),
+            head_start: vec![],
         };
         let actuator_keep = match s.keep_spec(&ctx).unwrap() {
             KeepSpec::LayerWide(k) => k,
             KeepSpec::PerHead(_) => unreachable!(),
         };
         assert_eq!(retained, actuator_keep);
+    }
+
+    /// On a ragged cache (`StageCtx::head_start`) the per-head and the layer-wide branches both
+    /// rank from each head's own first resident slot, so no keep names a hole and the protected
+    /// prefix is the head's first resident positions. Mutation-proof: ranking from 0 keeps `[0, 4)`
+    /// for head 1, inside its hole.
+    #[test]
+    fn a_ragged_cache_is_ranked_from_each_heads_own_start() {
+        let stage = H2o {
+            hh_size: 8,
+            recent_size: 8,
+            protected_prefix: 4,
+        };
+        let (current, n_kv, stride) = (64usize, 2usize, 64usize);
+        let scores: Vec<f32> = (0..n_kv * stride).map(|i| ((i * 7) % 13) as f32).collect();
+        let starts = vec![0usize, 20];
+        let ctx = Ctx {
+            current,
+            n_kv_heads: n_kv,
+            stride,
+            head_scores: Some(scores.clone()),
+            importance: None,
+            head_start: starts.clone(),
+        };
+        let Some(KeepSpec::PerHead(heads)) = stage.keep_spec(&ctx) else {
+            panic!("expected a per-head keep")
+        };
+        for (h, k) in heads.iter().enumerate() {
+            assert!(
+                k.iter().all(|&p| p >= starts[h]),
+                "head {h} names a hole: {k:?}"
+            );
+            assert_eq!(&k[..4], &(starts[h]..starts[h] + 4).collect::<Vec<_>>());
+            assert_eq!(k.len(), 4 + 8 + 8);
+        }
+        // Layer-wide branch on a ragged cache: issued per head from each head's start.
+        let ctx = Ctx {
+            current,
+            n_kv_heads: n_kv,
+            stride,
+            head_scores: None,
+            importance: Some(scores[..current].to_vec()),
+            head_start: starts.clone(),
+        };
+        let Some(KeepSpec::PerHead(heads)) = stage.keep_spec(&ctx) else {
+            panic!("expected a per-head keep on a ragged cache")
+        };
+        assert!(heads[1].iter().all(|&p| p >= 20));
+        assert_eq!(&heads[1][..4], &[20, 21, 22, 23]);
     }
 }

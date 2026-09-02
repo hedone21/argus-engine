@@ -136,6 +136,16 @@ pub trait StageCtx {
     /// Engine impl source: `KVCache::current_pos()`.
     fn current_pos(&self) -> usize;
 
+    /// First resident position of KV head `kv_head` — `0` unless a per-head keep left the cache
+    /// *ragged*, in which case head `h` holds `[head_start(h), current_pos())` and the slots in
+    /// front are holes a keep must not name (see [`CacheHandle::head_start`]). A technique that
+    /// protects a prefix on a ragged cache protects `[head_start(h), head_start(h) + prefix)`
+    /// ([`KeepTopK::start`]). Default `0`.
+    fn head_start(&self, kv_head: usize) -> usize {
+        let _ = kv_head;
+        0
+    }
+
     /// The resolved budget — the absolute number of tokens to retain. ratio→len conversion is the engine's responsibility (`EvictionHandler`), so
     /// the plugin reads only the converted value. score-free or head-relative budget techniques (no_eviction/h2o_plus) may
     /// not call it at all.
@@ -336,7 +346,9 @@ impl MergeAxis {
 pub enum KeepSpec {
     /// sliding/h2o/streaming/no_eviction/d2o. **ascending**, prefix included.
     LayerWide(Vec<usize>),
-    /// h2o_plus. `[n_kv_heads][keep]`, each ascending and of equal length (the engine asserts this).
+    /// h2o_plus / SnapKV family / AdaKV. `[n_kv_heads][keep]`, each ascending. The lengths may
+    /// differ (AdaKV): the engine then right-aligns every head and the cache becomes ragged
+    /// (see [`CacheHandle::head_start`]); a HeadMajor typed (f32/f16) cache is required for that.
     PerHead(Vec<Vec<usize>>),
 }
 
@@ -523,6 +535,13 @@ pub enum CacheOpError {
     /// Rejected eagerly so the op never stages alongside a byte-mutating op that would then be
     /// orphaned by a commit-time failure.
     NoResidencyBackend,
+    /// A keep named a position some KV head no longer holds. On a *ragged* cache (a per-head keep
+    /// left the heads with different lengths) head `h` is resident over
+    /// `[head_start(h), current_pos)` only; the slots in front are holes. A layer-wide keep must
+    /// stay inside every head's range and a per-head list inside its own — a keep that reaches
+    /// into a hole is rejected rather than silently trimmed, so a technique that ranked the wrong
+    /// slots hears about it instead of shipping a smaller keep-set under its own name.
+    NotResident,
 }
 
 impl core::fmt::Display for CacheOpError {
@@ -536,6 +555,11 @@ impl core::fmt::Display for CacheOpError {
             CacheOpError::InvalidKeep => write!(
                 f,
                 "keep/evict list is not ascending + unique + in-range (T-10)"
+            ),
+            CacheOpError::NotResident => write!(
+                f,
+                "keep names a position a KV head no longer holds (ragged cache: head h is \
+                 resident over [head_start(h), current_pos) only)"
             ),
             CacheOpError::GeometryImmutable => write!(
                 f,
@@ -601,6 +625,17 @@ pub trait CacheHandle {
 
     /// Current number of valid tokens (the compaction starting point). Pre-callback frame.
     fn current_pos(&self) -> usize;
+    /// First resident position of KV head `kv_head` (pre-callback frame). `0` on a uniform cache.
+    ///
+    /// After a per-head keep with unequal lengths the container right-aligns every head: head `h`
+    /// is resident over `[head_start(h), current_pos())` and the slots in front of it are holes
+    /// that a keep must not name ([`CacheOpError::NotResident`]). The write cursor stays shared,
+    /// so a token appended since is resident in every head. Default `0` — a container that cannot
+    /// be ragged.
+    fn head_start(&self, kv_head: usize) -> usize {
+        let _ = kv_head;
+        0
+    }
     /// Number of KV heads.
     fn n_kv_heads(&self) -> usize;
     /// Dimension per head.
@@ -626,8 +661,12 @@ pub trait CacheHandle {
         self.keep(&keep)
     }
 
-    /// Stage a per-head keep-set (`[n_kv_heads][keep]`, each ascending + unique + in-range, all heads
-    /// equal length — the engine's single shared `current_pos` invariant). Requires HeadMajor layout.
+    /// Stage a per-head keep-set (`[n_kv_heads][keep]`, each ascending + unique + resident for its
+    /// head). Requires HeadMajor layout. The heads may keep different counts: the engine then
+    /// right-aligns every head on the shared write cursor and the cache becomes ragged — head `h`
+    /// resident over `[head_start(h), current_pos)` (see [`head_start`](Self::head_start)); a
+    /// container that cannot hold that (SeqMajor, block-quantized, offloaded) rejects an unequal
+    /// keep with [`CacheOpError::WrongContainer`].
     fn keep_per_head(&mut self, keep: &[&[usize]]) -> Result<(), CacheOpError>;
 
     /// Stage weighted merges (summed in the pre-compaction frame, then compacted by a paired
@@ -787,9 +826,12 @@ pub trait KVMutationStage: Send + Sync {
     }
 }
 
-/// The canonical 3-partition keep-set shape (T1): `[0..prefix)` (protected) + the top-`heavy`
-/// scorers over `[prefix..recent_start)` (re-sorted ascending) + `[recent_start..current)` (recent
-/// window), where `recent_start = current.saturating_sub(recent).max(prefix)`.
+/// The canonical 3-partition keep-set shape (T1): `[start..start+prefix)` (protected) + the
+/// top-`heavy` scorers over `[start+prefix..recent_start)` (re-sorted ascending) +
+/// `[recent_start..current)` (recent window), where
+/// `recent_start = current.saturating_sub(recent).max(start + prefix)`. `start` is `0` on a
+/// uniform cache; on a ragged one it is the head's [`StageCtx::head_start`], so the protected
+/// prefix is the head's first resident positions rather than the holes in front of them.
 ///
 /// This is the SINGLE shape the dominant score-based eviction class (H2O / StreamingLLM / sliding /
 /// H2O+ / SnapKV / PyramidKV / …) reduces to. A policy supplies only the budgets (and a per-position
@@ -797,6 +839,8 @@ pub trait KVMutationStage: Send + Sync {
 /// the ascending re-sort — so the policy is "score → budgets", not "hand-roll a keep-list".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeepTopK {
+    /// First resident position of the head (`0` unless the cache is ragged — [`StageCtx::head_start`]).
+    pub start: usize,
     /// Resident token count (the entry frame).
     pub current: usize,
     /// Protected prefix length (always kept; attention sinks / system prompt).
@@ -817,10 +861,11 @@ pub fn compile_keep_top_k(spec: KeepTopK, score: impl Fn(usize) -> f32) -> Vec<u
     // e.g. early in decode, or a prefix configured above the current occupancy) the correct keep-set is
     // the whole resident range, NOT a list containing indices >= current that the T-10 keep validator
     // would later reject as InvalidKeep. With prefix <= current this clamp is a no-op (byte-identical).
-    let prefix = spec.prefix.min(spec.current);
-    let recent_start = spec.current.saturating_sub(spec.recent).max(prefix);
+    let start = spec.start.min(spec.current);
+    let prefix_end = start.saturating_add(spec.prefix).min(spec.current);
+    let recent_start = spec.current.saturating_sub(spec.recent).max(prefix_end);
     // (pos, score) over the evictable middle, STABLE sort desc, take top-`heavy`, re-sort ascending.
-    let mut token_scores: Vec<(usize, f32)> = (prefix..recent_start)
+    let mut token_scores: Vec<(usize, f32)> = (prefix_end..recent_start)
         .map(|pos| (pos, score(pos)))
         .collect();
     token_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
@@ -830,7 +875,7 @@ pub fn compile_keep_top_k(spec: KeepTopK, score: impl Fn(usize) -> f32) -> Vec<u
         .map(|(pos, _)| *pos)
         .collect();
     heavy.sort_unstable();
-    let mut keep: Vec<usize> = (0..prefix).collect();
+    let mut keep: Vec<usize> = (start..prefix_end).collect();
     keep.extend_from_slice(&heavy);
     keep.extend(recent_start..spec.current);
     keep
@@ -859,6 +904,22 @@ pub fn keep_union(sets: &[&[usize]]) -> Vec<usize> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// `F.max_pool1d(kernel_size=kernel, padding=kernel/2, stride=1)` over one row (the AdaKV /
+/// Ada-SnapKV pooling of FFY0's `update_kv`): a sliding window of `kernel` positions, padding
+/// implicit at `-inf` (so an edge window is the max over the positions that exist). `kernel` must be
+/// odd for the length to be preserved; `out.len() == input.len()`.
+pub fn max_pool1d(input: &[f32], kernel: usize, out: &mut [f32]) {
+    let n = input.len();
+    let pad = kernel / 2;
+    for (i, o) in out.iter_mut().enumerate().take(n) {
+        let lo = i.saturating_sub(pad);
+        let hi = (i + pad + 1).min(n);
+        *o = input[lo..hi]
+            .iter()
+            .fold(f32::NEG_INFINITY, |m, &x| m.max(x));
+    }
 }
 
 /// `F.avg_pool1d(input, kernel_size, padding=kernel_size/2, stride=1, count_include_pad=True)`.
@@ -927,6 +988,18 @@ pub fn snapkv_per_head_keep(
     spec: SnapKvSelect,
     read_qhead: impl Fn(usize, &mut [f32]),
 ) -> Vec<Vec<usize>> {
+    snapkv_per_head_keep_from(spec, read_qhead, &[])
+}
+
+/// [`snapkv_per_head_keep`] on a ragged cache: `head_start[h]` is KV head `h`'s first resident slot
+/// ([`StageCtx::head_start`]; an empty slice or `0` = the whole range). The protected prefix becomes
+/// the head's first resident positions and the holes in front never rank — the same pipeline
+/// otherwise, so on a uniform cache the two functions are identical.
+pub fn snapkv_per_head_keep_from(
+    spec: SnapKvSelect,
+    read_qhead: impl Fn(usize, &mut [f32]),
+    head_start: &[usize],
+) -> Vec<Vec<usize>> {
     let groups = (spec.n_q_heads / spec.n_kv_heads.max(1)).max(1);
     // Scoring region [0, current − window); the window itself is force-kept.
     let heavy_len = spec.current.saturating_sub(spec.window);
@@ -960,6 +1033,7 @@ pub fn snapkv_per_head_keep(
             // overlap and every head keeps an equal count.
             compile_keep_top_k(
                 KeepTopK {
+                    start: head_start.get(kvh).copied().unwrap_or(0),
                     current: spec.current,
                     prefix: spec.protected,
                     recent: spec.window,
@@ -3257,6 +3331,7 @@ mod tests {
         scores[14] = 7.0;
         let keep = compile_keep_top_k(
             KeepTopK {
+                start: 0,
                 current: 20,
                 prefix: 4,
                 recent: 4,
@@ -3269,6 +3344,7 @@ mod tests {
         // score-free: heavy=0 => prefix + recent only.
         let keep = compile_keep_top_k(
             KeepTopK {
+                start: 0,
                 current: 20,
                 prefix: 4,
                 recent: 6,
@@ -3286,6 +3362,7 @@ mod tests {
     fn compile_keep_top_k_stable_tie_breaks_by_position() {
         let keep = compile_keep_top_k(
             KeepTopK {
+                start: 0,
                 current: 8,
                 prefix: 2,
                 recent: 2,
@@ -3306,6 +3383,7 @@ mod tests {
         // current=2, prefix=4 (> current): keep everything in range, no index >= current.
         let keep = compile_keep_top_k(
             KeepTopK {
+                start: 0,
                 current: 2,
                 prefix: 4,
                 recent: 2,
@@ -3319,6 +3397,7 @@ mod tests {
         // current=0, prefix=4: empty resident -> empty keep (no panic, no out-of-range).
         let keep = compile_keep_top_k(
             KeepTopK {
+                start: 0,
                 current: 0,
                 prefix: 4,
                 recent: 2,

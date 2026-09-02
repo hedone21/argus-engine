@@ -157,6 +157,7 @@ fn run_gpu_prefill(
             capacity,
             1,
             true, // is_head_major
+            None,
         )
         .expect("prefill flash call");
     if !dispatched {
@@ -211,6 +212,7 @@ fn run_cpu_reference(
         32,
         32,
         None, // no sliding window
+        None, // uniform cache (no per-head resident floor)
     );
     out
 }

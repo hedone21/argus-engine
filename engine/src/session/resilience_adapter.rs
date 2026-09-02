@@ -116,7 +116,7 @@ impl ResilienceAdapter {
     fn build_kv_snapshot(&self) -> KVSnapshot {
         match &self.kv_handle {
             Some(h) => KVSnapshot {
-                total_tokens: h.current_pos(),
+                total_tokens: h.resident_tokens(),
                 total_bytes: self.resident_kv_bytes(),
                 budget_bytes: (h.capacity() as u64)
                     .saturating_mul(self.uncompressed_bytes_per_token as u64),

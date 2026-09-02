@@ -93,6 +93,7 @@ impl Tova {
                 .map(|kv_h| {
                     compile_keep_top_k(
                         KeepTopK {
+                            start: 0,
                             current,
                             prefix,
                             recent: 0,
@@ -110,6 +111,7 @@ impl Tova {
         let keep = match ctx.importance() {
             Some(imp) => compile_keep_top_k(
                 KeepTopK {
+                    start: 0,
                     current,
                     prefix,
                     recent: 0,
@@ -119,6 +121,7 @@ impl Tova {
             ),
             None => compile_keep_top_k(
                 KeepTopK {
+                    start: 0,
                     current,
                     prefix,
                     recent: self.cache_size,

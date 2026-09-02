@@ -55,7 +55,7 @@
 use argus_extension_api::{
     CacheHandle, CacheOpError, KVMutationStage, KeepSpec, KeepTopK, MutationPhase, SignalId,
     SnapKvSelect, StageArgs, StageCaps, StageCtx, StageParams, TensorKind, compile_keep_top_k,
-    register_kv_mutation_stage, snapkv_per_head_keep,
+    register_kv_mutation_stage, snapkv_per_head_keep_from,
 };
 
 /// The caps for the registration: SnapKV reads the prefill attention; protects no prefix
@@ -192,12 +192,36 @@ impl SnapKv {
         // kvpress-faithful (the default); a non-zero value is ADDITIVE to the budget, so it only ever
         // keeps MORE.
         let protected = ctx.protected_prefix().min(current);
+        // A ragged cache (`StageCtx::head_start`): each head ranks from its own first resident slot.
+        let head_start: Vec<usize> = (0..ctx.n_kv_heads().max(1))
+            .map(|h| ctx.head_start(h))
+            .collect();
         if n_kept <= window {
             // At or below the observation window: the `n_kept` most recent, layer-wide (identical
             // across heads — valid on any cache layout), with the protected prefix unioned in front.
-            let mut keep: Vec<usize> = (0..protected).collect();
-            keep.extend((current - n_kept..current).filter(|&p| p >= protected));
-            return Some(KeepSpec::LayerWide(keep));
+            if head_start.iter().all(|&s| s == 0) {
+                let mut keep: Vec<usize> = (0..protected).collect();
+                keep.extend((current - n_kept..current).filter(|&p| p >= protected));
+                return Some(KeepSpec::LayerWide(keep));
+            }
+            // Ragged cache: the same shape per head, from each head's own first resident slot.
+            return Some(KeepSpec::PerHead(
+                head_start
+                    .iter()
+                    .map(|&start| {
+                        compile_keep_top_k(
+                            KeepTopK {
+                                start,
+                                current,
+                                prefix: protected,
+                                recent: n_kept,
+                                heavy: 0,
+                            },
+                            |_| 0.0,
+                        )
+                    })
+                    .collect(),
+            ));
         }
         let heavy = n_kept - window;
 
@@ -211,7 +235,7 @@ impl SnapKv {
             let n_kv = ctx.n_kv_heads().max(1);
             let heavy_len = current - window;
             if n_q >= n_kv && n_q % n_kv == 0 && cols >= heavy_len {
-                let heads = snapkv_per_head_keep(
+                let heads = snapkv_per_head_keep_from(
                     SnapKvSelect {
                         n_q_heads: n_q,
                         n_kv_heads: n_kv,
@@ -223,6 +247,7 @@ impl SnapKv {
                         protected,
                     },
                     |qh, out| pfa.read_row(qh, 0, out), // PFA is per_head:false → kv_head ignored
+                    &head_start,
                 );
                 return Some(KeepSpec::PerHead(heads));
             }
@@ -232,9 +257,10 @@ impl SnapKv {
         //     per-head SnapKV. The SAME budget layer-wide, heavy hitters ranked by flat
         //     `importance()` (H2O-style), else recency. Not kvpress's per-head selection, but always
         //     safe on any layout.
-        let keep = match ctx.importance() {
+        let list = |start: usize| match ctx.importance() {
             Some(imp) => compile_keep_top_k(
                 KeepTopK {
+                    start,
                     current,
                     prefix: protected,
                     recent: window,
@@ -244,6 +270,7 @@ impl SnapKv {
             ),
             None => compile_keep_top_k(
                 KeepTopK {
+                    start,
                     current,
                     prefix: protected,
                     recent: n_kept, // recency: keep the most-recent n_kept
@@ -252,7 +279,13 @@ impl SnapKv {
                 |_| 0.0,
             ),
         };
-        Some(KeepSpec::LayerWide(keep))
+        if head_start.iter().all(|&s| s == 0) {
+            Some(KeepSpec::LayerWide(list(0)))
+        } else {
+            Some(KeepSpec::PerHead(
+                head_start.iter().map(|&s| list(s)).collect(),
+            ))
+        }
     }
 }
 

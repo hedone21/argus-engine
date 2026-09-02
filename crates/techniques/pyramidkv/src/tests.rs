@@ -13,6 +13,7 @@
 //!   sub-window budget path (`lib.rs` D3) is covered by `sub_window_budget_keeps_raw_count`.
 
 use super::*;
+use argus_extension_api::snapkv_per_head_keep;
 use argus_extension_api::{TensorDtype, TensorHandle, TensorKind, TensorShape};
 
 // ── shared deterministic attention generator (mirrors reference/pyramidkv_select_ref.py) ──
@@ -69,6 +70,7 @@ struct Ctx {
     pfa: Option<PfaHandle>,
     importance: Option<Vec<f32>>,
     protected: usize,
+    head_start: Vec<usize>,
 }
 impl Default for Ctx {
     fn default() -> Self {
@@ -81,12 +83,16 @@ impl Default for Ctx {
             pfa: None,
             importance: None,
             protected: 0,
+            head_start: Vec::new(),
         }
     }
 }
 impl StageCtx for Ctx {
     fn current_pos(&self) -> usize {
         self.current
+    }
+    fn head_start(&self, kv_head: usize) -> usize {
+        self.head_start.get(kv_head).copied().unwrap_or(0)
     }
     fn target_len(&self) -> usize {
         self.target
@@ -435,6 +441,7 @@ fn v3_native_layerwide_and_noop_arms() {
         pfa: None,
         importance: Some((0..64).map(|i| (i % 11) as f32).collect()),
         protected: 0,
+        head_start: Vec::new(),
     };
     let expected_lw = match keep_spec_for(&blob_args, &lw_ctx).unwrap() {
         KeepSpec::LayerWide(k) => k,
@@ -460,6 +467,7 @@ fn v3_native_layerwide_and_noop_arms() {
         pfa: None,
         importance: None,
         protected: 0,
+        head_start: Vec::new(),
     };
     assert!(keep_spec_for(&[], &noop_ctx).is_none(), "cr==0 → no-op");
     let mut h2 = CaptureHandle {
@@ -760,5 +768,44 @@ fn window_only_keep_when_budget_equals_window() {
     match keep_spec_for(&cr_args("0.9", 8, 5, 20), &ctx).expect("keep Some") {
         KeepSpec::LayerWide(k) => assert_eq!(k, (72..80).collect::<Vec<_>>()),
         KeepSpec::PerHead(_) => panic!("budget==window is the layer-wide window-only keep"),
+    }
+}
+
+/// On a ragged cache (`StageCtx::head_start`) every head ranks from its own first resident slot:
+/// no keep names a hole and the protected prefix is the head's first resident positions.
+/// Mutation-proof: ranking from 0 keeps `[0, 4)` for head 1, which is inside its hole.
+#[test]
+fn a_ragged_cache_is_ranked_from_each_heads_own_start() {
+    let (n_kv, n_q, k_len) = (2usize, 4usize, 200usize);
+    let stage = PyramidKv::new(PyramidKvConfig {
+        compression_ratio: 0.5,
+        ..Default::default()
+    });
+    let starts = vec![0usize, 40];
+    let ctx = Ctx {
+        current: k_len,
+        target: 100,
+        layer_idx: 0,
+        n_layers: 4,
+        n_kv_heads: n_kv,
+        pfa: Some(PfaHandle {
+            data: synth_attn(n_q, k_len, 93),
+            rows: n_q,
+            cols: k_len,
+        }),
+        protected: 4,
+        head_start: starts.clone(),
+        ..Default::default()
+    };
+    let Some(KeepSpec::PerHead(heads)) = stage.keep_spec(&ctx) else {
+        panic!("expected a per-head keep")
+    };
+    for (h, k) in heads.iter().enumerate() {
+        assert!(
+            k.iter().all(|&p| p >= starts[h]),
+            "head {h} names a hole: {k:?}"
+        );
+        assert_eq!(&k[..4], &(starts[h]..starts[h] + 4).collect::<Vec<_>>());
+        assert!(k.windows(2).all(|w| w[0] < w[1]));
     }
 }

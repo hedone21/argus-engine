@@ -270,6 +270,13 @@ impl OutputBasis {
 pub trait LayerSource {
     /// Post-RoPE query rows of the trailing `R` positions, `[n_heads_q][rows][head_dim]`.
     fn query_rows(&self, layer: usize) -> &[f32];
+    /// First resident position of `(layer, kv_head)` — `0` unless the cache is ragged
+    /// (`KVCache::head_start`). The reference the candidates are measured against retains
+    /// `[start, current_pos)` per head, and a candidate reaching below it is rejected.
+    fn head_start(&self, layer: usize, kv_head: usize) -> usize {
+        let _ = (layer, kv_head);
+        0
+    }
     /// Keys, `[n_kv_heads][current_pos][head_dim]`, dequantized to f32.
     fn keys(&self, layer: usize) -> &[f32];
     /// Values, same shape.
@@ -283,8 +290,9 @@ pub struct Scored {
     pub scores: ReadoutSet,
     /// Query rows that saw a retained key in every layer and head, as a bitmask.
     pub visible_rows: u32,
-    /// `true` when the candidate's per-head lengths differ within a layer. Such a candidate can be
-    /// *measured* but not applied: the cache gives every KV head of a layer one length.
+    /// `true` when the candidate's per-head lengths differ within a layer. Applying it leaves the
+    /// cache ragged (heads right-aligned on the longest, `KVCache::head_start`), which only a
+    /// HeadMajor f32/f16 cache can hold.
     pub ragged: bool,
     /// The per-cell grid, kept when [`Config::keep_cells`] asks for it — the tightest thing a parity
     /// comparison can look at.
@@ -432,10 +440,15 @@ pub fn decide(
     let r = basis.rank();
     let n_c = pool.len();
 
+    // The reference is what is resident now — on a ragged cache that is less than `[0, current_pos)`
+    // per head, and no candidate may reach below it.
+    let identity = KeepSets::resident(g.n_layers, g.n_kv_heads, g.current_pos, |l, h| {
+        src.head_start(l, h)
+    });
     for (_, keep) in pool {
         keep.validate(g.current_pos)?;
+        keep.validate_within(&identity)?;
     }
-    let identity = KeepSets::identity(g.n_layers, g.n_kv_heads, g.current_pos);
 
     let mut grids: Vec<CellGrid> = (0..n_c)
         .map(|_| CellGrid::new(g.n_layers, g.rows))

@@ -27,6 +27,9 @@ pub(crate) struct NaiveModel {
     pub v: Vec<Vec<Vec<f32>>>,
     pub n_kv_heads: usize,
     pub head_dim: usize,
+    /// First resident position of each head (`[0; n_kv_heads]` unless a per-head keep with unequal
+    /// counts right-aligned the heads — the independent statement of `KVCache::head_start`).
+    pub head_start: Vec<usize>,
 }
 
 impl NaiveModel {
@@ -49,6 +52,7 @@ impl NaiveModel {
             v,
             n_kv_heads,
             head_dim,
+            head_start: cache.head_starts(),
         }
     }
 
@@ -83,22 +87,28 @@ impl NaiveModel {
         }
     }
 
-    /// Gather the kept positions to the front (the independent compaction). Returns the expected
+    /// Gather the kept positions (the independent compaction). Returns the expected
     /// post-compaction model. For [`KeepSpec::LayerWide`] every head gathers the same list; for
-    /// [`KeepSpec::PerHead`] each head gathers its own (all equal length, the engine's single
-    /// `current_pos` invariant).
+    /// [`KeepSpec::PerHead`] each head gathers its own. The new length is the LONGEST head's count
+    /// and every head is right-aligned on it — head `h` lands on `[new_pos - n_h, new_pos)` and the
+    /// slots in front are holes (zero here, never compared) — which is the container's ragged
+    /// contract stated independently of `commit_per_head_keep`. Equal counts put every head at
+    /// `0`, the uniform gather this always was.
     pub(crate) fn gather(&self, keep: &KeepSpec) -> NaiveModel {
         let per_head: Vec<Vec<usize>> = match keep {
             KeepSpec::LayerWide(list) => vec![list.clone(); self.n_kv_heads],
             KeepSpec::PerHead(heads) => heads.clone(),
         };
-        let new_pos = per_head.first().map_or(0, |h| h.len());
+        let new_pos = per_head.iter().map(|h| h.len()).max().unwrap_or(0);
         let mut k = vec![vec![vec![0.0f32; self.head_dim]; self.n_kv_heads]; new_pos];
         let mut v = vec![vec![vec![0.0f32; self.head_dim]; self.n_kv_heads]; new_pos];
+        let mut head_start = vec![0usize; self.n_kv_heads];
         for (head, keeps) in per_head.iter().enumerate() {
+            let start = new_pos - keeps.len();
+            head_start[head] = start;
             for (new_i, &src) in keeps.iter().enumerate() {
-                k[new_i][head].copy_from_slice(&self.k[src][head]);
-                v[new_i][head].copy_from_slice(&self.v[src][head]);
+                k[start + new_i][head].copy_from_slice(&self.k[src][head]);
+                v[start + new_i][head].copy_from_slice(&self.v[src][head]);
             }
         }
         NaiveModel {
@@ -106,6 +116,7 @@ impl NaiveModel {
             v,
             n_kv_heads: self.n_kv_heads,
             head_dim: self.head_dim,
+            head_start,
         }
     }
 
@@ -117,6 +128,7 @@ impl NaiveModel {
             v: self.v.clone(),
             n_kv_heads: self.n_kv_heads,
             head_dim: self.head_dim,
+            head_start: self.head_start.clone(),
         };
         merged.apply_merges(merges);
         merged.gather(keep)
@@ -134,10 +146,18 @@ pub(crate) fn assert_cache_matches(cache: &KVCache, expected: &NaiveModel, tol: 
         "naive reference: current_pos mismatch (expected {} survivors)",
         expected.k.len()
     );
+    assert_eq!(
+        cache.head_starts(),
+        expected.head_start,
+        "naive reference: per-head first resident position mismatch"
+    );
     let head_dim = cache.head_dim();
     let mut row = vec![0.0f32; head_dim];
     for pos in 0..expected.k.len() {
         for head in 0..expected.n_kv_heads {
+            if pos < expected.head_start[head] {
+                continue; // a hole: not resident for this head, never compared
+            }
             dequantize_k(cache, pos, head, head_dim, &mut row);
             for d in 0..head_dim {
                 let (got, want) = (row[d], expected.k[pos][head][d]);

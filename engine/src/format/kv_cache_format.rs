@@ -99,6 +99,13 @@ pub trait KVCacheFormat: Send + Sync {
     /// 현재 캐시에 유효한 토큰 수.
     fn current_pos(&self) -> usize;
 
+    /// Resident tokens as a per-head mean — equal to [`current_pos`](Self::current_pos) unless a
+    /// per-head keep left the cache ragged (`KVCache::head_start`), where `current_pos` is only
+    /// the longest head. The figure a budget report or a bench line should quote.
+    fn resident_tokens(&self) -> usize {
+        self.current_pos()
+    }
+
     /// 물리 버퍼 용량 (토큰 단위).
     fn capacity(&self) -> usize;
 

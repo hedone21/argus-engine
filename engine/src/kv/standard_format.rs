@@ -115,12 +115,25 @@ impl StandardFormat {
     /// `execute<C>` 가 레이어 진입부에서 호출하던 4개 `KVCacheOps` getter 를 1 lock 으로 통합.
     /// standard 는 residual/quantized partition 부재라 `res_pos`/`q2_tokens` = 0.
     pub(crate) fn plan_geometry(&self) -> crate::backend::opencl::plan::PlanGeometry {
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
+        // The per-head start buffer is uploaded here, under the same lock, on the queue the plan
+        // dispatches on — so a ragged commit is visible to the very next step's kernels. An upload
+        // that fails would leave the kernels reading the holes; that is not a state to run in.
+        let head_start = g
+            .cache
+            .head_start_device()
+            .expect("uploading the ragged KV head starts to the device")
+            .and_then(|t| {
+                crate::backend::opencl::get_cl_mem(t.buffer().as_ref())
+                    .ok()
+                    .cloned()
+            });
         crate::backend::opencl::plan::PlanGeometry {
             current_pos: g.cache.current_pos(),
             capacity: g.cache.capacity(),
             res_pos: 0,
             q2_tokens: 0,
+            head_start,
         }
     }
 
@@ -402,6 +415,10 @@ impl KVCacheFormat for StandardFormat {
         self.inner.lock().unwrap().cache.current_pos()
     }
 
+    fn resident_tokens(&self) -> usize {
+        self.inner.lock().unwrap().cache.resident_tokens()
+    }
+
     fn capacity(&self) -> usize {
         self.inner.lock().unwrap().cache.capacity()
     }
@@ -519,6 +536,7 @@ impl KVCacheFormat for StandardFormat {
                                 cache.layout(),
                                 q_start_pos,
                                 dims.window,
+                                None,
                                 backend,
                                 prefill_scores,
                             );
@@ -586,6 +604,7 @@ impl KVCacheFormat for StandardFormat {
                         kv_layout,
                         q_start_pos,
                         dims.window,
+                        None,
                         &*cpu,
                         prefill_scores,
                     )?;
@@ -630,6 +649,7 @@ impl KVCacheFormat for StandardFormat {
                     kv_layout,
                     q_start_pos,
                     dims.window,
+                    None,
                     backend,
                     prefill_scores,
                 );
@@ -662,6 +682,7 @@ impl KVCacheFormat for StandardFormat {
             let kv_layout = cache.layout();
             let batch_size = q.shape().dims()[0];
             let q_start_pos = cache_seq_len - seq_len;
+            let ragged_starts = cache.is_ragged().then(|| cache.head_starts());
             let (k_cache, v_cache) = cache.view();
             let _ = scores;
             return prefill_attention(
@@ -679,6 +700,7 @@ impl KVCacheFormat for StandardFormat {
                 kv_layout,
                 q_start_pos,
                 dims.window,
+                ragged_starts.as_deref(),
                 backend,
                 prefill_scores,
             );
@@ -723,6 +745,31 @@ impl KVCacheFormat for StandardFormat {
                 capacity,
                 need_scores,
                 backend,
+            );
+        }
+
+        // Ragged cache (a per-head keep left the heads with different lengths): head `h` is
+        // resident over `[head_start(h), n)`. A sliding window composes with it — the head sees
+        // `[max(head_start(h), n - w), n)` — and the score row keeps the window's own column base.
+        if cache.is_ragged() {
+            let win_start = cache_seq_len - effective_cache_len;
+            let kv_start: Vec<usize> = (0..n_heads_kv)
+                .map(|h| cache.head_start(h).max(win_start))
+                .collect();
+            let kv_start_dev = cache.head_start_device()?;
+            return backend.attention_gen_ragged(
+                q,
+                &k_cache,
+                &v_cache,
+                out,
+                dims.n_heads_q,
+                n_heads_kv,
+                head_dim,
+                &kv_start,
+                kv_start_dev.as_ref(),
+                win_start,
+                cache_seq_len,
+                scores,
             );
         }
 
@@ -1106,6 +1153,8 @@ pub(crate) fn prefill_attention(
     kv_layout: crate::kv_cache_ops::KVLayout,
     q_start_pos: usize,
     window: Option<usize>,
+    // Ragged cache: per-KV-head first resident slot (`KVCache::head_starts`); `None` = uniform.
+    kv_start: Option<&[usize]>,
     backend: &dyn Backend,
     // R-P1-1 + IMP-4 PFA side-channel: `Some(PrefillScores { .. })` 면 trailing q_window attention
     // 확률을 `sum`(caller pre-zeroed `[n_heads_q * cache_seq_len]`, SUM-누적) 그리고/또는 `per_row`
@@ -1117,6 +1166,8 @@ pub(crate) fn prefill_attention(
 
     let is_gpu = backend.is_gpu();
     // GPU flash attention prefill — KV 버퍼가 실제 GPU 버퍼일 때만(CPU-only cache 는 fallback).
+    // A ragged cache (`kv_start`) goes to the backend too; one that has no device kernel for it
+    // declines (`Ok(false)`) and the host path below takes the per-head floor.
     let kv_is_gpu = k_cache.buffer().is_gpu_buffer();
     let gpu_dispatched = if is_gpu && kv_is_gpu {
         backend.flash_attention_prefill(
@@ -1132,6 +1183,7 @@ pub(crate) fn prefill_attention(
             kv_capacity,
             batch_size,
             kv_layout == KVLayout::HeadMajor,
+            kv_start,
         )?
     } else {
         false
@@ -1175,6 +1227,7 @@ pub(crate) fn prefill_attention(
                 q_start_pos,
                 ps.q_window,
                 window,
+                kv_start,
                 ps.sum,
                 ps.per_row,
             );
@@ -1314,6 +1367,7 @@ pub(crate) fn prefill_attention(
                 32,
                 32,
                 window,
+                kv_start,
             );
         }
 
@@ -1341,6 +1395,7 @@ pub(crate) fn prefill_attention(
                 q_start_pos,
                 ps.q_window,
                 window,
+                kv_start,
                 ps.sum,
                 ps.per_row,
             );
@@ -1418,6 +1473,9 @@ fn prefill_attention_scores(
     q_start_pos: usize,
     q_window: usize,
     window: Option<usize>,
+    // Ragged cache: keys below `kv_start[kv_head]` are holes and get no attention (their columns
+    // stay at the caller's zero).
+    kv_start: Option<&[usize]>,
     mut sum_out: Option<&mut [f32]>,
     mut per_row: Option<PerRowScores<'_>>,
 ) {
@@ -1468,6 +1526,7 @@ fn prefill_attention_scores(
                 Some(w) => p.saturating_sub(w.saturating_sub(1)),
                 None => 0,
             };
+            let lo = lo.max(kv_start.map_or(0, |s| s[kv_head]));
             let q_base = r * q_row_stride + h * head_dim;
             // 1) logits over key_pos in lo..=p (causal + optional SWA band), scalar dot (no SIMD).
             let mut maxv = f32::NEG_INFINITY;
@@ -1599,6 +1658,7 @@ pub fn faithful_h2o_pfa_host_mirror_selfcheck(
             1,
             KVLayout::HeadMajor,
             0,
+            None,
             None,
             backend.as_ref(),
             Some(PrefillScores {
@@ -3490,6 +3550,7 @@ mod tests {
                     q_start_pos,
                     q_window,
                     window,
+                    None,
                     Some(&mut got),
                     None,
                 );
@@ -3557,6 +3618,7 @@ mod tests {
                     q_start_pos,
                     q_window,
                     window,
+                    None,
                     Some(&mut got),
                     None,
                 );
@@ -3615,6 +3677,7 @@ mod tests {
                 kv_head_stride,
                 0,
                 q_window,
+                None,
                 None,
                 Some(&mut out),
                 None,
@@ -3698,6 +3761,7 @@ mod tests {
                     q_start_pos,
                     q_window,
                     window,
+                    None,
                     Some(&mut sum_buf),
                     Some(PerRowScores {
                         out: &mut per_row_buf,
@@ -3763,6 +3827,7 @@ mod tests {
                     q_start_pos,
                     q_window,
                     window,
+                    None,
                     Some(&mut sum_buf),
                     Some(PerRowScores {
                         out: &mut per_row_buf,
@@ -3823,6 +3888,7 @@ mod tests {
             q_window,
             None,
             None,
+            None,
             Some(PerRowScores {
                 out: &mut ph,
                 per_head: true,
@@ -3853,6 +3919,7 @@ mod tests {
             kv_head_stride,
             0,
             q_window,
+            None,
             None,
             None,
             Some(PerRowScores {
@@ -3909,6 +3976,7 @@ mod tests {
                     gold_len,
                     window,
                     None,
+                    None,
                     Some(PerRowScores {
                         out: &mut decode,
                         per_head: true,
@@ -3929,6 +3997,7 @@ mod tests {
                     0,
                     seq_len,
                     window,
+                    None,
                     None,
                     Some(PerRowScores {
                         out: &mut full,

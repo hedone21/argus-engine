@@ -57,6 +57,20 @@ pub struct KVCache {
     kv_heads: usize,
     head_dim: usize,
     pub(crate) layout: KVLayout,
+    /// First resident position of each KV head — the ragged (per-head) geometry.
+    ///
+    /// Empty means uniform: every head is resident over `[0, current_pos)`, the shape every path
+    /// in the engine assumed before per-head keeps could differ in length. After a per-head keep
+    /// with unequal counts the heads are right-aligned on the shared write cursor, so head `h`
+    /// holds `[head_start[h], current_pos)` and the slots in front of it are holes: never read by
+    /// attention, never a legal keep position, and (host buffers) released back to the OS by
+    /// `release_unused_pages`. Appends still land at `current_pos` for every head, which is what
+    /// keeps the write path, the RoPE clock and the causal mask exactly as they were.
+    head_start: Vec<usize>,
+    /// Device mirror of `head_start` (`i32` per KV head) for the GPU attention kernels, created on
+    /// the first ragged commit of a device-resident cache and re-uploaded when `head_start_dirty`.
+    head_start_dev: Option<Tensor>,
+    head_start_dirty: bool,
     memory: Option<Arc<dyn Memory>>,
 }
 
@@ -112,6 +126,10 @@ impl KVCache {
             kv_heads: self.kv_heads,
             head_dim: self.head_dim,
             layout: self.layout,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: None,
         })
     }
@@ -132,6 +150,38 @@ impl KVCache {
             kv_heads,
             head_dim,
             layout: KVLayout::SeqMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
+            memory: None,
+        }
+    }
+
+    /// Create a fully pre-allocated cache with an explicit geometry and layout, for buffers whose
+    /// shape is already in the layout's own order (HeadMajor: `[1, kv_heads, capacity, head_dim]`).
+    /// `new` infers `kv_heads`/`head_dim` from a SeqMajor-shaped tensor; this one does not infer.
+    pub fn new_with_geometry(
+        k: Tensor,
+        v: Tensor,
+        max_seq_len: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        layout: KVLayout,
+    ) -> Self {
+        Self {
+            k_buffer: k,
+            v_buffer: v,
+            current_pos: 0,
+            high_water_pos: 0,
+            max_seq_len,
+            capacity: max_seq_len,
+            kv_heads,
+            head_dim,
+            layout,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
             memory: None,
         }
     }
@@ -158,6 +208,10 @@ impl KVCache {
             kv_heads,
             head_dim,
             layout: KVLayout::SeqMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: Some(memory),
         }
     }
@@ -887,7 +941,17 @@ impl KVCache {
         if remaining == 0 {
             self.current_pos = 0;
             self.high_water_pos = 0;
+            self.head_start.clear();
             return Ok(());
+        }
+        // The prefix leaves every head; a ragged head's hole shrinks by the same amount.
+        if self.is_ragged() {
+            let starts: Vec<usize> = self
+                .head_starts()
+                .iter()
+                .map(|s| s.saturating_sub(count))
+                .collect();
+            self.set_head_starts(&starts);
         }
 
         let backend = self.k_buffer.backend().clone();
@@ -995,8 +1059,10 @@ impl KVCache {
             let block_size = std::mem::size_of::<crate::quant::BlockQ4_0>();
             self.current_pos * blocks_per_pos * block_size
         } else {
+            // `resident_positions` is `current_pos * kv_heads` on a uniform cache; on a ragged
+            // one the holes are not counted.
             let type_size = self.k_buffer.dtype().size();
-            self.current_pos * self.kv_heads * self.head_dim * type_size
+            self.resident_positions() * self.head_dim * type_size
         };
 
         per_buffer * 2 // K + V
@@ -1240,6 +1306,14 @@ impl KVCache {
                     let to = base + hwm_per_head_bytes;
                     total_released += madvise_dontneed(self.k_buffer.as_ptr(), from, to);
                     total_released += madvise_dontneed(self.v_buffer.as_ptr(), from, to);
+                    // A ragged head's hole sits in FRONT of its resident run — a second range.
+                    let hole_bytes = self.head_start(h) * self.head_dim * type_size;
+                    if hole_bytes > 0 {
+                        total_released +=
+                            madvise_dontneed(self.k_buffer.as_ptr(), base, base + hole_bytes);
+                        total_released +=
+                            madvise_dontneed(self.v_buffer.as_ptr(), base, base + hole_bytes);
+                    }
                 }
             }
         }
@@ -1322,37 +1396,41 @@ impl KVCache {
             return Ok(());
         }
 
-        let mut write_pos = write_start;
-        let mut batch_src_start = keep[0];
-        let mut batch_dst_start = write_pos;
-        let mut batch_count = 1usize;
-        write_pos += 1;
-
-        for &src_pos in &keep[1..] {
-            if src_pos == batch_src_start + batch_count {
-                // Extend current batch
-                batch_count += 1;
+        // Coalesce the ascending keep-list into `(src, dst, count)` runs of consecutive positions.
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut src0 = keep[0];
+        let mut dst0 = write_start;
+        let mut n = 1usize;
+        for (i, &p) in keep.iter().enumerate().skip(1) {
+            if p == src0 + n {
+                n += 1;
             } else {
-                // Flush current batch
-                if batch_src_start != batch_dst_start {
-                    self.shift_positions_for_head(
-                        head,
-                        batch_src_start,
-                        batch_dst_start,
-                        batch_count,
-                    )?;
-                }
-                // Start new batch
-                batch_src_start = src_pos;
-                batch_dst_start = write_pos;
-                batch_count = 1;
+                runs.push((src0, dst0, n));
+                src0 = p;
+                dst0 = write_start + i;
+                n = 1;
             }
-            write_pos += 1;
         }
+        runs.push((src0, dst0, n));
 
-        // Flush final batch
-        if batch_src_start != batch_dst_start {
-            self.shift_positions_for_head(head, batch_src_start, batch_dst_start, batch_count)?;
+        // With `write_start == 0` every run moves down or stays, and flushing them first-to-last
+        // is what the layer-wide compaction has always done. A right-aligning `write_start` moves
+        // some runs UP. Along ascending runs `dst - src` never increases (the keep-list is
+        // strictly ascending), so the up-movers form a prefix; an up-mover's destination lies
+        // above an earlier up-mover's source and below every later run's source, so the prefix
+        // is flushed last-to-first and the rest first-to-last, and no run is read after it has
+        // been overwritten.
+        let split = runs
+            .iter()
+            .position(|&(src, dst, _)| dst <= src)
+            .unwrap_or(runs.len());
+        for &(src, dst, count) in runs[..split].iter().rev() {
+            self.shift_positions_for_head(head, src, dst, count)?;
+        }
+        for &(src, dst, count) in &runs[split..] {
+            if src != dst {
+                self.shift_positions_for_head(head, src, dst, count)?;
+            }
         }
 
         Ok(())
@@ -1370,11 +1448,133 @@ impl KVCache {
     }
 
     /// Override the current position counter (pos==0 도 high_water 리셋).
+    ///
+    /// A ragged geometry cannot outlive the frame it was computed in: `0` clears it, and any other
+    /// value clamps every head start to the new cursor (a caller that renumbers positions itself
+    /// — layer-wide compaction, swap recall — restores the uniform shape explicitly).
     pub fn set_current_pos(&mut self, pos: usize) {
         self.current_pos = pos;
         if pos == 0 {
             self.high_water_pos = 0;
+            self.head_start.clear();
+        } else {
+            for s in self.head_start.iter_mut() {
+                *s = (*s).min(pos);
+            }
         }
+    }
+
+    // ── ragged (per-head) geometry ──────────────────────────────────────────
+
+    /// First resident position of KV head `h`: `0` on a uniform cache.
+    #[inline]
+    pub fn head_start(&self, h: usize) -> usize {
+        self.head_start.get(h).copied().unwrap_or(0)
+    }
+
+    /// Per-head first resident positions, `kv_heads` long (all `0` on a uniform cache).
+    pub fn head_starts(&self) -> Vec<usize> {
+        (0..self.kv_heads).map(|h| self.head_start(h)).collect()
+    }
+
+    /// `true` when some KV head holds fewer positions than the cursor says — the shape a per-head
+    /// keep with unequal lengths leaves behind.
+    #[inline]
+    pub fn is_ragged(&self) -> bool {
+        self.head_start.iter().any(|&s| s > 0)
+    }
+
+    /// Resident positions of KV head `h`: `current_pos - head_start(h)`.
+    #[inline]
+    pub fn head_len(&self, h: usize) -> usize {
+        self.current_pos.saturating_sub(self.head_start(h))
+    }
+
+    /// Resident positions summed over the KV heads — `current_pos * kv_heads` on a uniform cache.
+    pub fn resident_positions(&self) -> usize {
+        (0..self.kv_heads).map(|h| self.head_len(h)).sum()
+    }
+
+    /// Resident tokens as a per-head mean (rounded up) — the number a budget, a Manager report or a
+    /// bench line should quote for a ragged cache, where `current_pos` is only the longest head.
+    pub fn resident_tokens(&self) -> usize {
+        if self.kv_heads == 0 {
+            return self.current_pos;
+        }
+        self.resident_positions().div_ceil(self.kv_heads)
+    }
+
+    /// Whether this container can hold a ragged geometry: a HeadMajor typed (f32/f16) cache. The
+    /// block-quantized and opaque stores share their layout state across heads, and SeqMajor
+    /// interleaves heads per position, so none of them can right-align one head on its own.
+    pub fn supports_ragged(&self) -> bool {
+        self.layout == KVLayout::HeadMajor
+            && !self.is_opaque()
+            && matches!(self.k_buffer.dtype(), DType::F32 | DType::F16)
+    }
+
+    /// Install per-head first positions (`kv_heads` long, each `<= current_pos`). All-zero restores
+    /// the uniform shape.
+    pub fn set_head_starts(&mut self, starts: &[usize]) {
+        debug_assert_eq!(starts.len(), self.kv_heads);
+        if starts.iter().all(|&s| s == 0) {
+            self.head_start.clear();
+        } else {
+            self.head_start = starts.iter().map(|&s| s.min(self.current_pos)).collect();
+        }
+        self.head_start_dirty = true;
+    }
+
+    /// Restore the uniform shape (every head resident over `[0, current_pos)`).
+    pub fn clear_head_starts(&mut self) {
+        if !self.head_start.is_empty() {
+            self.head_start_dirty = true;
+        }
+        self.head_start.clear();
+    }
+
+    /// The device mirror of the per-head first positions, for a GPU attention kernel: an `i32`
+    /// per KV head. `None` for a host cache, or for a device cache that was never ragged (the
+    /// kernels take NULL as "every head from slot 0"). Once a ragged commit has created the
+    /// buffer it stays and is re-uploaded whenever the starts change — including back to all
+    /// zero — so the plan can bind it every step without knowing whether the cache is ragged.
+    pub(crate) fn head_start_device(&mut self) -> Result<Option<Tensor>> {
+        // Gated on the BACKEND: a zero-copy (host-mapped) GPU buffer still needs a device-side
+        // mirror the kernel can bind, and a per-call upload in its place costs an allocation per
+        // layer per token.
+        if !self.k_buffer.backend().is_gpu() {
+            return Ok(None);
+        }
+        if self.head_start_dev.is_none() && !self.is_ragged() {
+            return Ok(None);
+        }
+        let backend = self.k_buffer.backend().clone();
+        let mut bytes = Vec::with_capacity(self.kv_heads * 4);
+        for h in 0..self.kv_heads {
+            bytes.extend_from_slice(&(self.head_start(h) as i32).to_ne_bytes());
+        }
+        match self.head_start_dev.as_mut() {
+            None => {
+                let host_buf = Arc::new(crate::memory::host::shared::SharedBuffer::new(
+                    bytes.len(),
+                    DType::U8,
+                ));
+                let mut host = Tensor::new(
+                    crate::shape::Shape::new(vec![bytes.len()]),
+                    host_buf,
+                    backend.clone(),
+                );
+                host.as_mut_slice::<u8>().copy_from_slice(&bytes);
+                let dev = backend.copy_from(&host)?;
+                self.head_start_dev = Some(dev);
+            }
+            Some(dev) if self.head_start_dirty => {
+                backend.write_buffer(dev, &bytes)?;
+            }
+            Some(_) => {}
+        }
+        self.head_start_dirty = false;
+        Ok(self.head_start_dev.clone())
     }
 
     /// The DType that the caller should pass to `update()`.
@@ -1940,6 +2140,10 @@ mod tests {
             kv_heads: heads,
             head_dim: dim,
             layout: KVLayout::HeadMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: None,
         }
     }
@@ -1975,6 +2179,10 @@ mod tests {
             kv_heads: heads,
             head_dim: dim,
             layout: KVLayout::HeadMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: Some(memory),
         }
     }
@@ -2433,6 +2641,10 @@ mod tests {
             kv_heads: heads,
             head_dim: dim,
             layout: KVLayout::HeadMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: None,
         }
     }
@@ -3026,6 +3238,10 @@ mod tests {
             kv_heads: heads,
             head_dim: dim,
             layout: KVLayout::HeadMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: None,
         };
 

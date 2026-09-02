@@ -227,6 +227,7 @@ fn run_prefill_case(
             br,
             bc,
             window_size,
+            None,
         );
     }
 
@@ -445,6 +446,7 @@ fn test_prefill_flash_nan_inject() {
             32,
             32,
             None,
+            None,
         );
     }
 
@@ -530,6 +532,7 @@ fn test_prefill_flash_causal_mask_strict() {
             0,
             32,
             32,
+            None,
             None,
         );
     }

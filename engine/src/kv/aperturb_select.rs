@@ -246,6 +246,7 @@ impl Selector {
         );
         let c0 = &caches[0];
         let current_pos = c0.current_pos();
+        let tokens_before_resident = c0.resident_tokens();
         let n_kv_heads = c0.kv_heads();
         let head_dim = c0.head_dim();
         let q_dim = self.n_heads_q * head_dim;
@@ -342,13 +343,27 @@ impl Selector {
             })
             .collect();
 
-        // Apply the winner from the set that was scored, not by re-running the stage.
+        // Apply the winner from the set that was scored, not by re-running the stage. A per-head
+        // winner is right-aligned on ONE cursor for every layer — the longest head of any layer —
+        // so the layers keep a shared `current_pos` (the frame this metric, the next decision's
+        // validation and the decode loop's occupancy watch are written against).
         let winner = dec.winner;
+        let shared_cursor = plans[winner]
+            .iter()
+            .map(|p| match p {
+                PlannedKeep::PerHead(h) => h.iter().map(|k| k.len()).max(),
+                PlannedKeep::LayerWide(_) => None,
+            })
+            .collect::<Option<Vec<usize>>>()
+            .and_then(|v| v.into_iter().max())
+            .filter(|&c| caches.iter().all(|cache| c <= cache.current_pos()));
         for (l, cache) in caches.iter_mut().enumerate() {
-            apply_planned(cache, l, n_layers, &plans[winner][l])
+            apply_planned(cache, l, n_layers, &plans[winner][l], shared_cursor)
                 .with_context(|| format!("applying '{}' to layer {l}", pool[winner].0))?;
         }
-        let tokens_after = caches[0].current_pos();
+        // Quoted as a per-head mean: a ragged winner leaves `current_pos` at the longest head.
+        let tokens_after = caches[0].resident_tokens();
+        let cursor_after = caches[0].current_pos();
 
         // Carry the prompt attention into the numbering the compaction just imposed. It belongs to
         // the session and not to whoever won, so it is carried whenever the cache actually moved —
@@ -358,10 +373,10 @@ impl Selector {
         // `gather` maps from.
         let prefill_attn = signals
             .prefill_attn
-            .filter(|_| tokens_after < current_pos)
+            .filter(|_| cursor_after < current_pos)
             .and_then(|pfa| {
                 let plan = &plans[winner];
-                pfa.gather(tokens_after, self.n_heads_q, n_kv_heads, |l, h| {
+                pfa.gather(cursor_after, self.n_heads_q, n_kv_heads, |l, h| {
                     plan.get(l).and_then(|p| p.head(h))
                 })
             });
@@ -370,7 +385,7 @@ impl Selector {
             winner: pool[winner].0.clone(),
             arms,
             excluded,
-            tokens_before: current_pos,
+            tokens_before: tokens_before_resident,
             tokens_after,
             budget_total,
             target_len,
@@ -597,8 +612,14 @@ fn apply_planned(
     layer_idx: usize,
     n_layers: usize,
     plan: &PlannedKeep,
+    shared_cursor: Option<usize>,
 ) -> Result<()> {
     use argus_extension_api::CacheHandle;
+    if let (PlannedKeep::PerHead(h), Some(cursor)) = (plan, shared_cursor) {
+        return crate::kv::cache_handle::apply_per_head_keep_at(
+            cache, layer_idx, n_layers, h, cursor,
+        );
+    }
     let mut handle = EngineCacheHandle::new(cache, layer_idx, n_layers);
     match plan {
         PlannedKeep::LayerWide(k) => handle.keep(k).map_err(|e| anyhow::anyhow!("{e:?}"))?,
@@ -619,6 +640,8 @@ struct HostLayers {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
     rows: usize,
+    /// Per-layer, per-KV-head first resident position (`KVCache::head_starts`).
+    starts: Vec<Vec<usize>>,
 }
 
 impl HostLayers {
@@ -636,6 +659,7 @@ impl HostLayers {
             k: Vec::with_capacity(n_layers),
             v: Vec::with_capacity(n_layers),
             rows: q_snap.rows,
+            starts: Vec::with_capacity(n_layers),
         };
         for (l, cache) in caches.iter().enumerate() {
             out.q.push(q_snap.layer_head_major(l, head_dim));
@@ -643,6 +667,7 @@ impl HostLayers {
                 .with_context(|| format!("reading layer {l}'s K/V for the decision"))?;
             out.k.push(k);
             out.v.push(v);
+            out.starts.push(cache.head_starts());
         }
         Ok(out)
     }
@@ -651,6 +676,9 @@ impl HostLayers {
 impl LayerSource for HostLayers {
     fn query_rows(&self, layer: usize) -> &[f32] {
         &self.q[layer]
+    }
+    fn head_start(&self, layer: usize, kv_head: usize) -> usize {
+        self.starts[layer].get(kv_head).copied().unwrap_or(0)
     }
     fn keys(&self, layer: usize) -> &[f32] {
         &self.k[layer]

@@ -3281,8 +3281,14 @@ impl OpenCLBackend {
         kv_capacity: usize,
         batch_size: usize,
         is_head_major: bool,
+        // Ragged cache: device `i32` per KV head (first resident slot); `None` = uniform. Only the
+        // `flash_attn_f32_f16` programs take it (arg 40); the F32-KV programs decline a ragged ask.
+        kv_start: Option<&ocl::core::Mem>,
     ) -> Result<bool> {
         let kv_dtype = k_cache.dtype();
+        if kv_start.is_some() && kv_dtype != DType::F16 {
+            return Ok(false);
+        }
         let kernels = unsafe { &*self.kernels.get() };
         let kernel = match kv_dtype {
             DType::F32 => match head_dim {
@@ -3414,6 +3420,14 @@ impl OpenCLBackend {
             // sinks = NULL (args 38-39)
             ocl::core::set_kernel_arg(kernel, 38, ocl::core::ArgVal::mem_null())?;
             ocl::core::set_kernel_arg(kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
+            // Ragged-cache head starts (arg 40, f32_f16 programs only)
+            if kv_dtype == DType::F16 {
+                let val = match kv_start {
+                    Some(m) => ocl::core::ArgVal::mem(m),
+                    None => ocl::core::ArgVal::mem_null(),
+                };
+                ocl::core::set_kernel_arg(kernel, 40, val)?;
+            }
 
             // Work size: [ceil(n_q/block_m) * lanes_per_wg, n_heads_q * batch_size, 1]
             // BLOCK_M = Q-rows per WG (matches the -DBLOCK_M compile-time macro).
@@ -3466,6 +3480,28 @@ impl OpenCLBackend {
     /// are not met and the caller should fall back to the legacy attention kernel.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    /// Upload a ragged cache's per-KV-head first resident slots as a device `i32` buffer for the
+    /// attention kernels (`kv_start` argument). A small per-call allocation on the non-plan paths;
+    /// the fused plan binds the cache's own persistent mirror instead (`KVCache::head_start_device`).
+    pub(crate) fn upload_kv_start(&self, starts: &[usize]) -> Result<Tensor> {
+        let mut bytes = Vec::with_capacity(starts.len() * 4);
+        for &s in starts {
+            bytes.extend_from_slice(&(s as i32).to_ne_bytes());
+        }
+        let host_buf = Arc::new(crate::memory::host::shared::SharedBuffer::new(
+            bytes.len(),
+            DType::U8,
+        ));
+        let mut host = Tensor::new(
+            crate::shape::Shape::new(vec![bytes.len()]),
+            host_buf,
+            self.cpu_companion.clone(),
+        );
+        host.as_mut_slice::<u8>().copy_from_slice(&bytes);
+        self.copy_from(&host)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn flash_attention_decode_gpu(
         &self,
         q: &Tensor,
@@ -3482,6 +3518,8 @@ impl OpenCLBackend {
         // `GpuScoreAccumulator` layout in `gpu_score.rs`). `None` forces the
         // dummy buffer + `write_scores=0` fast path.
         score_buf: Option<(&ocl::core::Mem, i32, i32)>,
+        // Ragged cache: device `i32` per KV head (first resident slot); `None` = uniform.
+        kv_start: Option<&ocl::core::Mem>,
     ) -> Result<bool> {
         // Only F16 KV on HeadMajor GPU buffer is supported.
         if k_cache.dtype() != DType::F16 {
@@ -3611,6 +3649,12 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 41, ocl::core::ArgVal::scalar(&s_layer_offset))?;
             ocl::core::set_kernel_arg(kernel, 42, ocl::core::ArgVal::scalar(&s_stride))?;
             ocl::core::set_kernel_arg(kernel, 43, ocl::core::ArgVal::scalar(&write_scores))?;
+            // Ragged-cache head starts (arg 44)
+            let kv_start_val = match kv_start {
+                Some(m) => ocl::core::ArgVal::mem(m),
+                None => ocl::core::ArgVal::mem_null(),
+            };
+            ocl::core::set_kernel_arg(kernel, 44, kv_start_val)?;
 
             // Q1_WG_SIZE = 64 (compile-time constant in the kernel)
             const Q1_WG_SIZE: usize = 64;
@@ -5336,7 +5380,17 @@ impl Backend for OpenCLBackend {
         kv_capacity: usize,
         batch_size: usize,
         is_head_major: bool,
+        kv_start: Option<&[usize]>,
     ) -> Result<bool> {
+        let ragged = kv_start.filter(|s| s.iter().any(|&x| x > 0));
+        let start_dev = match ragged {
+            Some(s) => Some(self.upload_kv_start(s)?),
+            None => None,
+        };
+        let start_mem = match start_dev.as_ref() {
+            Some(t) => Some(get_cl_mem(t.buffer().as_ref())?),
+            None => None,
+        };
         self.flash_attention_prefill_gpu(
             q,
             k_cache,
@@ -5350,6 +5404,7 @@ impl Backend for OpenCLBackend {
             kv_capacity,
             batch_size,
             is_head_major,
+            start_mem,
         )
     }
 
@@ -6040,6 +6095,73 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
+    /// Ragged-cache decode: the Q1 flash kernel with its per-head `kv_start` argument. The score
+    /// columns are absolute slots (the GPU accumulator's layout), the kernel zeroes the hole
+    /// columns itself, and `kv_base` is already folded into `kv_start` by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_gen_ragged(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        kv_start: &[usize],
+        kv_start_dev: Option<&Tensor>,
+        kv_base: usize,
+        cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
+    ) -> Result<()> {
+        let gpu_acc_score_triple: Option<(ocl::core::Mem, i32, i32)> = {
+            let gpu_acc = unsafe { &*self.gpu_score_acc.get() };
+            gpu_acc.as_ref().and_then(|acc| {
+                acc.is_active().then(|| {
+                    let offset = acc.layer_offset_elems(acc.current_layer_idx()) as i32;
+                    let stride = acc.score_stride() as i32;
+                    (acc.score_buf_mem().clone(), offset, stride)
+                })
+            })
+        };
+        if gpu_acc_score_triple.is_none() && scores_out.is_some() {
+            anyhow::bail!(
+                "ragged-cache decode on OpenCL writes scores only into the GPU score accumulator; \
+                 a host score readback has no ragged kernel"
+            );
+        }
+        let flash_score_arg = gpu_acc_score_triple
+            .as_ref()
+            .map(|(buf, off, stride)| (buf, *off, *stride));
+        // The cache's own mirror holds the raw starts; a sliding window folds its floor into
+        // `kv_start`, which then needs a per-call upload.
+        let uploaded = match kv_start_dev {
+            Some(_) if kv_base == 0 => None,
+            _ => Some(self.upload_kv_start(kv_start)?),
+        };
+        let start_tensor = uploaded.as_ref().or(kv_start_dev).expect("one of the two");
+        let start_mem = get_cl_mem(start_tensor.buffer().as_ref())?;
+        if self.flash_attention_decode_gpu(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            num_heads_q,
+            num_heads_kv,
+            head_dim,
+            cache_seq_len,
+            flash_score_arg,
+            Some(start_mem),
+        )? {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "ragged-cache decode on OpenCL needs the f16 HeadMajor flash kernel (head_dim 64/128); \
+             this layer has KV dtype {:?}, head_dim {head_dim}",
+            k_cache.dtype()
+        )
+    }
+
     fn attention_gen(
         &self,
         q: &Tensor,
@@ -6100,6 +6222,7 @@ impl Backend for OpenCLBackend {
                 head_dim,
                 cache_seq_len,
                 flash_score_arg,
+                None,
             )?
         {
             // Flash attention succeeded. For GPU acc path, scores are written
@@ -6217,6 +6340,9 @@ impl Backend for OpenCLBackend {
                 15,
                 ocl::core::ArgVal::local::<f32>(&local_mem_size),
             )?;
+            // Ragged-cache head starts (arg 16): the legacy path is reached only by a uniform ask
+            // (`attention_gen_ragged` routes a ragged cache to the flash kernel).
+            ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::mem_null())?;
 
             let global_work_size: [usize; 3] = [num_heads_q * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];

@@ -877,6 +877,9 @@ pub(crate) struct PlanGeometry {
     pub capacity: usize,
     pub res_pos: usize,
     pub q2_tokens: usize,
+    /// Per-KV-head first resident slot (`i32` per head) of a ragged cache
+    /// (`KVCache::head_start_device`); `None` binds NULL = every head from slot 0.
+    pub head_start: Option<ocl::core::Mem>,
 }
 
 /// Execution plan for the full model decode pass.
@@ -1292,8 +1295,19 @@ impl FullKernelPlan {
             }
 
             // Step 8: Attention — uses attn_seq_len (includes just-scattered token)
+            // A ragged cache hands the kernel its per-head first resident slots (NULL = uniform).
+            let bind_kv_start = |kernel: &ocl::core::Kernel, arg_idx: u32| {
+                let val = match g.head_start.as_ref() {
+                    Some(m) => ocl::core::ArgVal::mem(m),
+                    None => ocl::core::ArgVal::mem_null(),
+                };
+                if let Err(e) = unsafe { ocl::core::set_kernel_arg(kernel, arg_idx, val) } {
+                    log::error!("Plan set kv_start arg failed: layer={i} arg_idx={arg_idx}: {e}");
+                }
+            };
             match &layer_plan.attention {
                 AttentionVariant::Standard(step) => {
+                    bind_kv_start(&step.kernel, 16);
                     if debug_sync {
                         eprintln!(
                             "[Plan] L{} attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
@@ -1324,6 +1338,7 @@ impl FullKernelPlan {
                     }
                 }
                 AttentionVariant::StandardFlash(step) => {
+                    bind_kv_start(&step.kernel, 44);
                     if debug_sync {
                         eprintln!(
                             "[Plan] L{} flash attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
@@ -2172,6 +2187,8 @@ fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVaria
         )?;
         ocl::core::set_kernel_arg(&kernel, 42, ocl::core::ArgVal::scalar(&score_stride_val))?;
         ocl::core::set_kernel_arg(&kernel, 43, ocl::core::ArgVal::scalar(&write_scores))?;
+        // Ragged-cache head starts (arg 44): rebound per layer step from `PlanGeometry::head_start`.
+        ocl::core::set_kernel_arg(&kernel, 44, ocl::core::ArgVal::mem_null())?;
     }
 
     const Q1_WG_SIZE: usize = 64;
@@ -2683,6 +2700,8 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
                 15,
                 ocl::core::ArgVal::local::<f32>(&local_mem_bytes),
             )?;
+            // Ragged-cache head starts (arg 16): rebound per layer step from `PlanGeometry`.
+            ocl::core::set_kernel_arg(&kernel, 16, ocl::core::ArgVal::mem_null())?;
         }
         AttentionVariant::Standard(KernelStep {
             kernel,

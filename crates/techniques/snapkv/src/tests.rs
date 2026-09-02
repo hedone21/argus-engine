@@ -65,6 +65,7 @@ struct Ctx {
     pfa: Option<PfaHandle>,
     importance: Option<Vec<f32>>,
     protected: usize,
+    head_start: Vec<usize>,
 }
 impl Default for Ctx {
     fn default() -> Self {
@@ -75,12 +76,16 @@ impl Default for Ctx {
             pfa: None,
             importance: None,
             protected: 0,
+            head_start: Vec::new(),
         }
     }
 }
 impl StageCtx for Ctx {
     fn current_pos(&self) -> usize {
         self.current
+    }
+    fn head_start(&self, kv_head: usize) -> usize {
+        self.head_start.get(kv_head).copied().unwrap_or(0)
     }
     fn target_len(&self) -> usize {
         self.target
@@ -595,4 +600,54 @@ fn even_kernel_is_forced_odd() {
     };
     assert_eq!(mk(2), mk(3), "kernel_size=2 must be forced to 3");
     assert_ne!(mk(3), mk(5));
+}
+
+/// On a ragged cache (`StageCtx::head_start`) every head ranks from its own first resident slot:
+/// no keep names a hole, the protected prefix is the head's first resident positions, and the
+/// count per head is still uniform (SnapKV). Mutation-proof: ranking from 0 keeps `[0, 4)` for
+/// head 1, which is inside its hole.
+#[test]
+fn a_ragged_cache_is_ranked_from_each_heads_own_start() {
+    let (n_kv, n_q, k_len, window, kernel) = (2usize, 4usize, 200usize, 16usize, 5usize);
+    let stage = SnapKv::new(SnapKvConfig {
+        compression_ratio: 0.0,
+        window_size: window,
+        kernel_size: kernel,
+    });
+    let starts = vec![0usize, 40];
+    let ctx = Ctx {
+        current: k_len,
+        target: 80,
+        n_kv_heads: n_kv,
+        pfa: pfa(n_q, k_len, 91),
+        protected: 4,
+        head_start: starts.clone(),
+        ..Default::default()
+    };
+    let Some(KeepSpec::PerHead(heads)) = stage.keep_spec(&ctx) else {
+        panic!("expected a per-head keep")
+    };
+    assert_eq!(heads[0].len(), heads[1].len(), "uniform budget per head");
+    for (h, k) in heads.iter().enumerate() {
+        assert!(
+            k.iter().all(|&p| p >= starts[h]),
+            "head {h} names a hole: {k:?}"
+        );
+        assert_eq!(&k[..4], &(starts[h]..starts[h] + 4).collect::<Vec<_>>());
+        assert!(k.windows(2).all(|w| w[0] < w[1]));
+    }
+    // Sub-window budget on a ragged cache: per-head recency from each start.
+    let ctx = Ctx {
+        current: k_len,
+        target: 10,
+        n_kv_heads: n_kv,
+        protected: 2,
+        head_start: starts.clone(),
+        ..Default::default()
+    };
+    let Some(KeepSpec::PerHead(heads)) = stage.keep_spec(&ctx) else {
+        panic!("expected a per-head recency keep")
+    };
+    assert_eq!(heads[1], (40..42).chain(190..200).collect::<Vec<_>>());
+    assert_eq!(heads[0], (0..2).chain(190..200).collect::<Vec<_>>());
 }

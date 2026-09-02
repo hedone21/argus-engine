@@ -313,6 +313,8 @@ pub(crate) fn dequant_snapshot(
 /// exists on that path, so there is no aliasing to avoid). `value_cell` caches that lazy snapshot.
 pub struct SnapshotStageCtx<'a> {
     current_pos: usize,
+    /// Per-head first resident position (`KVCache::head_starts`); all zero on a uniform cache.
+    head_starts: Vec<usize>,
     target_len: usize,
     layer_idx: usize,
     n_layers: usize,
@@ -350,6 +352,7 @@ impl<'a> SnapshotStageCtx<'a> {
     ) -> Self {
         Self {
             current_pos: cache.current_pos(),
+            head_starts: cache.head_starts(),
             target_len,
             layer_idx,
             n_layers,
@@ -443,6 +446,14 @@ impl<'a> SnapshotStageCtx<'a> {
 impl StageCtx for SnapshotStageCtx<'_> {
     fn current_pos(&self) -> usize {
         self.current_pos
+    }
+    fn head_start(&self, kv_head: usize) -> usize {
+        // Clamped to the frame the ctx shows (a prefill-attention ctx is narrower than the cache).
+        self.head_starts
+            .get(kv_head)
+            .copied()
+            .unwrap_or(0)
+            .min(self.current_pos)
     }
     fn target_len(&self) -> usize {
         self.target_len
@@ -721,6 +732,7 @@ fn run_mutation_layer<T>(
         want_value.then(|| dequant_snapshot(cache, current_pos, n_kv_heads, head_dim, false));
     let sctx = SnapshotStageCtx {
         current_pos,
+        head_starts: cache.head_starts(),
         target_len,
         layer_idx,
         n_layers,

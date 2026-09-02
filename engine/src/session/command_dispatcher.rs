@@ -306,7 +306,7 @@ impl CommandDispatcher {
     /// answer (no handle to measure with, or an empty cache to begin with).
     fn compress_outcome(&self, p: &PendingCompress) -> Option<CommandResult> {
         use crate::format::KVCacheFormat;
-        let after = self.kv_handles.first()?.current_pos();
+        let after = self.kv_handles.first()?.resident_tokens();
         if p.logical_len == 0 {
             return None;
         }
@@ -436,7 +436,7 @@ impl CommandDispatcher {
         // The budget is a fraction of what this context would occupy **uncompressed**, not of
         // what is resident now. Against the resident length a repeated budget would compound;
         // against this one it restates, which is what makes the command idempotent.
-        let resident = h0.current_pos();
+        let resident = h0.resident_tokens();
         let target_len = ((self.logical_len as f32 * budget) as usize).max(1);
         if target_len >= resident {
             // The cache already fits. Nothing to remove, so nothing to score — and scoring is

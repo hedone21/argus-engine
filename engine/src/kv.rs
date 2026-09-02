@@ -56,6 +56,9 @@ pub(crate) mod dequant;
 // EngineCacheHandle, so it is a non-tautological reference once the v2 plan executor is deleted).
 #[cfg(test)]
 pub(crate) mod naive_reference;
+// The ragged (per-head) geometry, pinned against the naive oracle and scalar references.
+#[cfg(test)]
+mod ragged_tests;
 // Pressure pipeline handlers (구 core/pressure/ 내용 flat 병합)
 pub mod eviction_handler;
 pub mod quantize_handler;

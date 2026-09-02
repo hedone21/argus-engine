@@ -78,7 +78,7 @@
 use argus_extension_api::{
     CacheHandle, CacheOpError, KVMutationStage, KeepSpec, KeepTopK, MutationPhase, SignalId,
     SnapKvSelect, StageArgs, StageCaps, StageCtx, StageParams, TensorKind, compile_keep_top_k,
-    register_kv_mutation_stage, snapkv_per_head_keep,
+    register_kv_mutation_stage, snapkv_per_head_keep_from,
 };
 
 /// The caps for the v3 registration: PyramidKV reads the prefill attention (SnapKV score
@@ -284,15 +284,39 @@ impl PyramidKv {
         // generation, so a caller that hits that sets `--protected-prefix 4` to trade a hair of budget
         // faithfulness for coherence.
         let protected = ctx.protected_prefix().min(current);
+        // A ragged cache (`StageCtx::head_start`): each head ranks from its own first resident slot.
+        let head_start: Vec<usize> = (0..ctx.n_kv_heads().max(1))
+            .map(|h| ctx.head_start(h))
+            .collect();
         if n_kept <= window {
             // At or below the observation window: keep the `n_kept` most-recent. At `n_kept == window`
             // this is kvpress's window-forced set (faithful); below it, only the COUNT is faithful —
             // the SET is the recency resolution of the max-score tie (see the comment above). Layer-wide
             // (identical across heads) — valid on any cache layout. Union the protected prefix in front
             // (dropping any recent positions that fall inside it, so the list stays ascending + unique).
-            let mut keep: Vec<usize> = (0..protected).collect();
-            keep.extend((current - n_kept..current).filter(|&p| p >= protected));
-            return Some(KeepSpec::LayerWide(keep));
+            if head_start.iter().all(|&s| s == 0) {
+                let mut keep: Vec<usize> = (0..protected).collect();
+                keep.extend((current - n_kept..current).filter(|&p| p >= protected));
+                return Some(KeepSpec::LayerWide(keep));
+            }
+            // Ragged cache: the same shape per head, from each head's own first resident slot.
+            return Some(KeepSpec::PerHead(
+                head_start
+                    .iter()
+                    .map(|&start| {
+                        compile_keep_top_k(
+                            KeepTopK {
+                                start,
+                                current,
+                                prefix: protected,
+                                recent: n_kept,
+                                heavy: 0,
+                            },
+                            |_| 0.0,
+                        )
+                    })
+                    .collect(),
+            ));
         }
         let heavy = n_kept - window;
 
@@ -306,7 +330,7 @@ impl PyramidKv {
             let n_kv = ctx.n_kv_heads().max(1);
             let heavy_len = current - window;
             if n_q >= n_kv && n_q % n_kv == 0 && cols >= heavy_len {
-                let heads = snapkv_per_head_keep(
+                let heads = snapkv_per_head_keep_from(
                     SnapKvSelect {
                         n_q_heads: n_q,
                         n_kv_heads: n_kv,
@@ -318,6 +342,7 @@ impl PyramidKv {
                         protected,
                     },
                     |qh, out| pfa.read_row(qh, 0, out), // PFA is per_head:false → kv_head ignored
+                    &head_start,
                 );
                 return Some(KeepSpec::PerHead(heads));
             }
@@ -328,9 +353,10 @@ impl PyramidKv {
         //     small). Apply the SAME pyramid budget layer-wide, ranking heavy hitters by flat
         //     `importance()` (H2O-style), else recency. Not byte-identical to kvpress (which is
         //     per-head SnapKV) but keeps the pyramid allocation and is always safe on any layout.
-        let keep = match ctx.importance() {
+        let list = |start: usize| match ctx.importance() {
             Some(imp) => compile_keep_top_k(
                 KeepTopK {
+                    start,
                     current,
                     prefix: protected,
                     recent: window,
@@ -340,6 +366,7 @@ impl PyramidKv {
             ),
             None => compile_keep_top_k(
                 KeepTopK {
+                    start,
                     current,
                     prefix: protected,
                     recent: n_kept, // recency: keep the most-recent n_kept
@@ -348,7 +375,13 @@ impl PyramidKv {
                 |_| 0.0,
             ),
         };
-        Some(KeepSpec::LayerWide(keep))
+        if head_start.iter().all(|&s| s == 0) {
+            Some(KeepSpec::LayerWide(list(0)))
+        } else {
+            Some(KeepSpec::PerHead(
+                head_start.iter().map(|&s| list(s)).collect(),
+            ))
+        }
     }
 }
 

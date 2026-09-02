@@ -386,7 +386,7 @@ fn the_ragged_candidate_is_measured_and_flagged() {
         .expect("present");
     assert!(
         ragged.ragged,
-        "per-head lengths differ, so this cannot be committed even though it scores"
+        "per-head lengths differ: committing it right-aligns the heads and leaves the cache ragged"
     );
     assert!(dec.scored.iter().filter(|s| s.ragged).count() == 1);
 }
