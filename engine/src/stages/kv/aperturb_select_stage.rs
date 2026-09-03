@@ -169,14 +169,21 @@ impl AperturbSelectStage {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                let pt = &choice.decide_times;
                 eprintln!(
                     "[aperturb-select] budget={:.3} {} → {} tokens, chose '{}' [{arms}] \
-                     decide={:.3}s read={:.3}s window={:.3}s",
+                     decide={:.3}s (logits {:.3} keypos {:.3} attend {:.3} project {:.3} \
+                     readout {:.3}) read={:.3}s window={:.3}s",
                     target_ratio,
                     choice.tokens_before,
                     choice.tokens_after,
                     choice.winner,
                     choice.decide_s,
+                    pt.logits_s,
+                    pt.keypos_s,
+                    pt.attend_s,
+                    pt.project_s,
+                    pt.readout_s,
                     choice.read_s,
                     choice.window_s,
                 );

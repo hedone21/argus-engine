@@ -145,6 +145,9 @@ pub struct Choice {
     pub target_len: usize,
     /// Seconds inside [`aperturb::decide`].
     pub decide_s: f64,
+    /// How that split across the decision's phases — the same buckets the `[dump:aperturb]` line
+    /// reports, surfaced on the production path so a stall can be attributed without a dump run.
+    pub decide_times: crate::aperturb::PhaseTimes,
     /// Wall time of [`window_attention`] over every layer — the prefill-end candidates' input
     /// (`0.0` when none is in the pool).
     pub window_s: f64,
@@ -464,6 +467,7 @@ impl Selector {
             budget_total,
             target_len,
             decide_s: dec.times.total_s(),
+            decide_times: dec.times,
             window_s,
             read_s,
             prefill_attn,
