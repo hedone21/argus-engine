@@ -787,6 +787,38 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Read a sub-range of a backend buffer into host bytes, starting `src_offset` bytes in.
+    ///
+    /// The read counterpart of [`write_buffer_range`](Self::write_buffer_range), and used for the
+    /// same reason: a caller that keeps a max-capacity buffer but only needs the currently-resident
+    /// prefix should pay for what is resident, not for the allocation
+    /// (`KVCache::host_snapshot_rows` — a KV mirror whose transfer scales with `current_pos`
+    /// instead of `capacity`).
+    ///
+    /// Default: memcpy from the tensor's mapped pointer at `src_offset`. Device backends override
+    /// with a bounded DMA read.
+    fn read_buffer_range(&self, t: &Tensor, dst: &mut [u8], src_offset: usize) -> Result<()> {
+        let src_ptr = t.buffer().as_ptr();
+        if src_ptr.is_null() {
+            anyhow::bail!("Cannot read null buffer (not mapped)");
+        }
+        let end = src_offset
+            .checked_add(dst.len())
+            .ok_or_else(|| anyhow::anyhow!("read_buffer_range: offset+len overflow"))?;
+        if end > t.size() {
+            anyhow::bail!(
+                "read_buffer_range: out of bounds ({} + {} > {})",
+                src_offset,
+                dst.len(),
+                t.size()
+            );
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_ptr.add(src_offset), dst.as_mut_ptr(), dst.len());
+        }
+        Ok(())
+    }
+
     /// Non-blocking variant of `read_buffer`. Enqueues a DMA read and returns
     /// an opaque event handle that can be awaited via `wait_event`. Backends
     /// that support true async reads (OpenCL) override this. The default

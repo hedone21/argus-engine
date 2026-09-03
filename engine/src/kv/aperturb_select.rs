@@ -1175,7 +1175,9 @@ pub(crate) fn read_layer_kv(
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     if cache.k_buffer.buffer().is_gpu_buffer() {
         cache.k_buffer.backend().synchronize()?;
-        let host = cache.host_snapshot()?;
+        // `rows`-bounded mirror: both dequants below read only `[0, rows)` per head, so the
+        // capacity-sized tail never needs to cross the bus (`host_snapshot_rows`).
+        let host = cache.host_snapshot_rows(rows)?;
         Ok((
             dequant_snapshot(&host, rows, n_kv_heads, head_dim, true),
             dequant_snapshot(&host, rows, n_kv_heads, head_dim, false),

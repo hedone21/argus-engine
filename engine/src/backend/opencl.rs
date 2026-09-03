@@ -4991,6 +4991,44 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
+    fn read_buffer_range(&self, t: &Tensor, dst: &mut [u8], src_offset: usize) -> Result<()> {
+        let end = src_offset
+            .checked_add(dst.len())
+            .ok_or_else(|| anyhow::anyhow!("read_buffer_range: offset+len overflow"))?;
+        if end > t.size() {
+            anyhow::bail!(
+                "read_buffer_range: out of bounds ({} + {} > {})",
+                src_offset,
+                dst.len(),
+                t.size()
+            );
+        }
+        if let Ok(buf) = get_cl_mem(t.buffer().as_ref()) {
+            // Partial blocking read starting at `src_offset` bytes into the buffer.
+            unsafe {
+                ocl::core::enqueue_read_buffer(
+                    &self.queue,
+                    buf,
+                    true,
+                    src_offset,
+                    dst,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        } else {
+            // Mapped / host-ptr buffer: direct offset memcpy (mirrors `write_buffer_range`).
+            let src_ptr = t.buffer().as_ptr();
+            if src_ptr.is_null() {
+                anyhow::bail!("read_buffer_range: null pointer in source tensor");
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_ptr.add(src_offset), dst.as_mut_ptr(), dst.len());
+            }
+        }
+        Ok(())
+    }
+
     fn enqueue_read_buffer_async(
         &self,
         t: &Tensor,

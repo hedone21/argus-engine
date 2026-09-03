@@ -266,7 +266,8 @@ fn dequant_key_host_mirrored(
     if cache.k_buffer.buffer().is_gpu_buffer() {
         // Flush pending device writes so the readback observes this round's K (host_snapshot precondition).
         cache.k_buffer.backend().synchronize()?;
-        let host = cache.host_snapshot()?;
+        // `rows`-bounded mirror — the dequant below reads only `[0, rows)` per head.
+        let host = cache.host_snapshot_rows(rows)?;
         Ok(dequant_snapshot(&host, rows, n_kv_heads, head_dim, true))
     } else {
         Ok(dequant_snapshot(cache, rows, n_kv_heads, head_dim, true))
@@ -284,19 +285,26 @@ pub(crate) fn dequant_snapshot(
     head_dim: usize,
     is_k: bool,
 ) -> Vec<f32> {
+    use rayon::prelude::*;
     let mut out = vec![0.0f32; n_kv_heads * rows * head_dim];
-    let mut tmp = vec![0.0f32; head_dim];
-    for kv_head in 0..n_kv_heads {
-        for row in 0..rows {
-            if is_k {
-                dequantize_k(cache, row, kv_head, head_dim, &mut tmp);
-            } else {
-                dequantize_v(cache, row, kv_head, head_dim, &mut tmp);
-            }
-            let base = (kv_head * rows + row) * head_dim;
-            out[base..base + head_dim].copy_from_slice(&tmp);
-        }
+    if rows == 0 || head_dim == 0 {
+        return out;
     }
+    // One chunk per `(kv_head, row)`, dequantized straight into its place in the output — the
+    // per-row scratch buffer this replaces cost a second store and a copy of every element. The
+    // rows are independent reads of the cache, so rayon splits them; on the decision path this is
+    // 28 layers x K and V of it, and it was the whole of what the readback cost once the transfer
+    // itself was cut down to the resident rows.
+    out.par_chunks_mut(head_dim)
+        .enumerate()
+        .for_each(|(i, dst)| {
+            let (kv_head, row) = (i / rows, i % rows);
+            if is_k {
+                dequantize_k(cache, row, kv_head, head_dim, dst);
+            } else {
+                dequantize_v(cache, row, kv_head, head_dim, dst);
+            }
+        });
     out
 }
 

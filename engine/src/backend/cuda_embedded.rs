@@ -2907,6 +2907,33 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    fn read_buffer_range(&self, t: &Tensor, dst: &mut [u8], src_offset: usize) -> Result<()> {
+        self.synchronize()?;
+        let end = src_offset
+            .checked_add(dst.len())
+            .ok_or_else(|| anyhow!("read_buffer_range: offset+len overflow"))?;
+        if end > t.size() {
+            anyhow::bail!(
+                "read_buffer_range: out of bounds ({} + {} > {})",
+                src_offset,
+                dst.len(),
+                t.size()
+            );
+        }
+        if let Some(db) = t.buffer().as_any().downcast_ref::<CudaDeviceBuffer>() {
+            db.copy_to_host_at(dst.as_mut_ptr(), dst.len(), src_offset)?;
+            return Ok(());
+        }
+        let src_ptr = t.buffer().as_ptr();
+        if src_ptr.is_null() {
+            anyhow::bail!("Cannot read null buffer");
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_ptr.add(src_offset), dst.as_mut_ptr(), dst.len());
+        }
+        Ok(())
+    }
+
     fn copy_from(&self, src: &Tensor) -> Result<Tensor> {
         self.synchronize()?;
         let size = src.size();
