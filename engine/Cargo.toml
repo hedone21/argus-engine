@@ -72,6 +72,11 @@ path = "src/bin/test_faithful_h2o_gpu_seed_device.rs"
 required-features = ["opencl"]
 
 [[bin]]
+name = "test_window_attn_gpu_device"
+path = "src/bin/test_window_attn_gpu_device.rs"
+required-features = ["opencl"]
+
+[[bin]]
 name = "test_cross_layer_host_mirror_device"
 path = "src/bin/test_cross_layer_host_mirror_device.rs"
 required-features = ["opencl"]

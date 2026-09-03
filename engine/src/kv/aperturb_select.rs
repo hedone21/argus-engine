@@ -337,10 +337,9 @@ impl Selector {
                 current_pos,
                 rows: src.window_rows,
             };
-            let rows = (0..n_layers)
-                .map(|l| window_attention(&src, l, gw))
-                .collect::<Result<Vec<_>>>()?;
-            Some(PrefillAttn::captured(rows))
+            Some(PrefillAttn::captured(window_attention_layers(
+                caches, &src, gw,
+            )?))
         } else {
             None
         };
@@ -753,6 +752,161 @@ fn trailing_rows(all: &[f32], all_rows: usize, rows: usize, head_dim: usize) -> 
     out
 }
 
+/// Every layer's observation-window attention, on the device when the cache is there.
+///
+/// The GPU path reads the live K cache in place, so it also skips the host mirror the CPU path
+/// re-walks — but it does not make that mirror unnecessary: [`aperturb::decide`] consumes host K
+/// *and* V for the metric on the same decision, so `read_layer_kv` stays.
+///
+/// Falls back to [`window_attention`] whenever the device path cannot express the cache exactly
+/// (non-F16 K, a SeqMajor layout, a non-OpenCL backend, a kernel that failed to compile, mixed
+/// capacities across layers). `ARGUS_WINDOW_GPU_OFF` forces the fallback;
+/// `ARGUS_WINDOW_GPU_VERIFY` runs both and reports the divergence.
+fn window_attention_layers(caches: &[KVCache], src: &HostLayers, g: Geom) -> Result<Vec<Vec<f32>>> {
+    let cpu = || -> Result<Vec<Vec<f32>>> {
+        (0..g.n_layers)
+            .map(|l| window_attention(src, l, g))
+            .collect()
+    };
+    #[cfg(feature = "opencl")]
+    if window_gpu_enabled() {
+        // A dispatch that the device refuses (a work-group shape it cannot schedule, a register
+        // spill) must cost the run a slower decision, not the decision itself. Latch it off after
+        // the first refusal so a broken device does not pay the probe 18 times.
+        match window_attention_layers_opencl(caches, src, g) {
+            Ok(Some(gpu)) => {
+                if std::env::var("ARGUS_WINDOW_GPU_VERIFY").is_ok() {
+                    let host = cpu()?;
+                    report_window_divergence(&host, &gpu, g);
+                }
+                return Ok(gpu);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                if !WINDOW_GPU_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[aperturb-select] the GPU window attention failed, so this run computes \
+                         it on the CPU: {e:#}"
+                    );
+                }
+            }
+        }
+    }
+    let _ = caches;
+    cpu()
+}
+
+/// Set once the device path has refused a dispatch — see [`window_attention_layers`].
+#[cfg(feature = "opencl")]
+static WINDOW_GPU_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "opencl")]
+fn window_gpu_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ARGUS_WINDOW_GPU_OFF").is_err())
+        && !WINDOW_GPU_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `Ok(None)` = this cache is not one the kernel can read; the caller runs the CPU path.
+#[cfg(feature = "opencl")]
+fn window_attention_layers_opencl(
+    caches: &[KVCache],
+    src: &HostLayers,
+    g: Geom,
+) -> Result<Option<Vec<Vec<f32>>>> {
+    use crate::backend::opencl::{OpenCLBackend, WindowAttnGeom, get_cl_mem};
+    use crate::kv_cache_ops::KVLayout;
+
+    if caches.is_empty() || caches.len() != g.n_layers {
+        return Ok(None);
+    }
+    let backend = caches[0].k_buffer.backend().clone();
+    let Some(ocl_be) = backend.as_any().downcast_ref::<OpenCLBackend>() else {
+        return Ok(None);
+    };
+    let capacity = caches[0].capacity();
+    let ok = caches.iter().all(|c| {
+        c.layout() == KVLayout::HeadMajor
+            && c.k_buffer.dtype() == crate::buffer::DType::F16
+            && c.k_buffer.buffer().is_gpu_buffer()
+            && c.capacity() == capacity
+            && c.kv_heads() == g.n_kv_heads
+            && c.head_dim() == g.head_dim
+    });
+    if !ok || capacity < g.current_pos {
+        return Ok(None);
+    }
+    let mems: Vec<&ocl::core::Mem> = match caches
+        .iter()
+        .map(|c| get_cl_mem(c.k_buffer.buffer().as_ref()))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    // The decode loop wrote K through the same queue, but say so rather than assume it.
+    backend.synchronize()?;
+    let starts: Vec<Vec<usize>> = (0..g.n_layers)
+        .map(|l| (0..g.n_kv_heads).map(|h| src.head_start(l, h)).collect())
+        .collect();
+    let qwin: Vec<&[f32]> = (0..g.n_layers).map(|l| src.window_q(l)).collect();
+    let geom = WindowAttnGeom {
+        n_heads_q: g.n_heads_q,
+        n_kv_heads: g.n_kv_heads,
+        head_dim: g.head_dim,
+        current_pos: g.current_pos,
+        rows: g.rows,
+        capacity,
+    };
+    let Some(flat) = ocl_be.window_attention_sum(&mems, &starts, &qwin, geom)? else {
+        return Ok(None);
+    };
+    // Fail loud the way the CPU path does: a NaN column sorts as "equal" in the candidates'
+    // top-k and would silently pick a different keep-set.
+    anyhow::ensure!(
+        flat.iter().all(|v| v.is_finite()),
+        "the GPU window attention produced a non-finite score"
+    );
+    let per_layer = g.n_heads_q * g.current_pos;
+    Ok(Some(flat.chunks(per_layer).map(<[f32]>::to_vec).collect()))
+}
+
+/// What `ARGUS_WINDOW_GPU_VERIFY` prints: the worst absolute and relative gap, and — the property
+/// that actually matters — whether the two agree on the ranking each candidate reads.
+#[cfg(feature = "opencl")]
+fn report_window_divergence(host: &[Vec<f32>], gpu: &[Vec<f32>], g: Geom) {
+    let (mut max_abs, mut max_rel, mut rank_mismatch) = (0.0f32, 0.0f32, 0usize);
+    for (a, b) in host.iter().zip(gpu) {
+        for (x, y) in a.iter().zip(b) {
+            let d = (x - y).abs();
+            max_abs = max_abs.max(d);
+            max_rel = max_rel.max(d / x.abs().max(1e-6));
+        }
+        for h in 0..g.n_heads_q {
+            let (ha, hb) = (
+                &a[h * g.current_pos..(h + 1) * g.current_pos],
+                &b[h * g.current_pos..(h + 1) * g.current_pos],
+            );
+            let arg = |v: &[f32]| {
+                v.iter()
+                    .enumerate()
+                    .max_by(|p, q| p.1.partial_cmp(q.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+            };
+            if arg(ha) != arg(hb) {
+                rank_mismatch += 1;
+            }
+        }
+    }
+    eprintln!(
+        "[window-gpu-verify] layers={} heads={} cols={} max_abs={max_abs:.3e} \
+         max_rel={max_rel:.3e} argmax_mismatch={rank_mismatch}",
+        host.len(),
+        g.n_heads_q,
+        g.current_pos,
+    );
+}
+
 /// The observation-window attention over the resident cache, in the prefill capture's format.
 ///
 /// `[n_heads_q][current_pos]`, SUM-pooled over the ring's `g.rows` query rows: row `t`, at
@@ -815,6 +969,198 @@ impl LayerSource for HostLayers {
     fn values(&self, layer: usize) -> &[f32] {
         &self.v[layer]
     }
+}
+
+/// What one [`window_attention_selfcheck`] run found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowSelfcheck {
+    /// `false` when the device path declined (no OpenCL, kernel absent, cache not F16 HeadMajor)
+    /// and both sides ran the same CPU code — a PASS that proves nothing.
+    pub gpu_ran: bool,
+    pub max_abs: f32,
+    pub max_rel: f32,
+    /// Per (layer, query head) disagreements on which column scores highest. This — not the float
+    /// gap — is what a candidate's top-k actually reads.
+    pub argmax_mismatch: usize,
+    /// Columns whose relative gap exceeds 1e-3, over every layer and head.
+    pub loose_cols: usize,
+    /// Wall time of one whole-model CPU pass — the number `window=` reports today.
+    pub cpu_s: f64,
+    /// Wall time of one whole-model device pass, upload and readback included. `0.0` when the
+    /// device path declined.
+    pub gpu_s: f64,
+}
+
+/// Run the decision-time window pass on the device and on the CPU over the same synthetic cache,
+/// and report how far apart they land.
+///
+/// The inputs are regenerated from a fixed LCG on both sides rather than stored, the way
+/// [`crate::aperturb::tests`] does it, so a drift in the generator fails loudly instead of
+/// silently comparing different data. `ragged` gives head `h` a first resident slot of
+/// `h * current_pos / (2 * n_kv_heads)`, which is what a per-head keep leaves behind.
+///
+/// Device-gated by nature: with no OpenCL backend it returns `gpu_ran: false`.
+#[allow(clippy::too_many_arguments)]
+pub fn window_attention_selfcheck(
+    backend: &Arc<dyn crate::backend::Backend>,
+    memory: &dyn crate::memory::Memory,
+    n_layers: usize,
+    n_heads_q: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    capacity: usize,
+    current_pos: usize,
+    rows: usize,
+    ragged: bool,
+) -> Result<WindowSelfcheck> {
+    use crate::buffer::DType;
+    use crate::kv_cache_ops::KVLayout;
+    use crate::shape::Shape;
+    use crate::tensor::Tensor;
+
+    let mut lcg: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = || {
+        lcg = lcg
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((lcg >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+
+    let starts: Vec<Vec<usize>> = (0..n_layers)
+        .map(|_| {
+            (0..n_kv_heads)
+                .map(|h| {
+                    if ragged {
+                        h * current_pos / (2 * n_kv_heads)
+                    } else {
+                        0
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut caches = Vec::with_capacity(n_layers);
+    let mut host_k = Vec::with_capacity(n_layers);
+    let mut window_q = Vec::with_capacity(n_layers);
+    let mut q = Vec::with_capacity(n_layers);
+    for layer_starts in &starts {
+        // Device K: HeadMajor `[1, kv_heads, capacity, head_dim]` F16, holes included — the host
+        // mirror dequantizes them too, and only `head_start` keeps them out of the softmax.
+        let mut bits = vec![0u16; n_kv_heads * capacity * head_dim];
+        let mut k32 = vec![0.0f32; n_kv_heads * current_pos * head_dim];
+        for h in 0..n_kv_heads {
+            for p in 0..capacity {
+                for d in 0..head_dim {
+                    let v = half::f16::from_f32(next());
+                    bits[(h * capacity + p) * head_dim + d] = v.to_bits();
+                    if p < current_pos {
+                        k32[(h * current_pos + p) * head_dim + d] = v.to_f32();
+                    }
+                }
+            }
+        }
+        let mk_f16 = |data: &[u16]| -> Result<Tensor> {
+            let buf = memory.alloc(data.len() * 2, DType::F16)?;
+            let mut t = Tensor::new(
+                Shape::new(vec![1, n_kv_heads, capacity, head_dim]),
+                buf,
+                backend.clone(),
+            );
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+            backend.write_buffer(&mut t, bytes)?;
+            Ok(t)
+        };
+        let k = mk_f16(&bits)?;
+        let v = mk_f16(&bits)?;
+        let mut cache =
+            KVCache::new_with_geometry(k, v, capacity, n_kv_heads, head_dim, KVLayout::HeadMajor);
+        cache.set_current_pos(current_pos);
+        cache.set_head_starts(layer_starts);
+        caches.push(cache);
+        host_k.push(k32);
+        let qw: Vec<f32> = (0..n_heads_q * rows * head_dim).map(|_| next()).collect();
+        q.push(trailing_rows(&qw, rows, rows, head_dim));
+        window_q.push(qw);
+    }
+    let src = HostLayers {
+        q,
+        k: host_k,
+        v: vec![Vec::new(); n_layers],
+        rows,
+        window_q,
+        window_rows: rows,
+        starts,
+    };
+    let g = Geom {
+        n_layers,
+        n_heads_q,
+        n_kv_heads,
+        head_dim,
+        current_pos,
+        rows,
+    };
+
+    let t_cpu = std::time::Instant::now();
+    let host = (0..n_layers)
+        .map(|l| window_attention(&src, l, g))
+        .collect::<Result<Vec<_>>>()?;
+    let cpu_s = t_cpu.elapsed().as_secs_f64();
+    // Go through the device entry point directly rather than through `window_attention_layers`:
+    // a silent decline there would compare the CPU against itself and report a perfect score.
+    let t_gpu = std::time::Instant::now();
+    #[cfg(feature = "opencl")]
+    let device = window_attention_layers_opencl(&caches, &src, g)?;
+    #[cfg(not(feature = "opencl"))]
+    let device: Option<Vec<Vec<f32>>> = None;
+    let gpu_ran = device.is_some();
+    let gpu_s = if gpu_ran {
+        t_gpu.elapsed().as_secs_f64()
+    } else {
+        0.0
+    };
+    let got = match device {
+        Some(v) => v,
+        None => host.clone(),
+    };
+    let mut out = WindowSelfcheck {
+        gpu_ran,
+        max_abs: 0.0,
+        max_rel: 0.0,
+        argmax_mismatch: 0,
+        loose_cols: 0,
+        cpu_s,
+        gpu_s,
+    };
+    for (a, b) in host.iter().zip(&got) {
+        anyhow::ensure!(
+            a.len() == b.len(),
+            "window selfcheck: layer length mismatch"
+        );
+        for (x, y) in a.iter().zip(b) {
+            let d = (x - y).abs();
+            let rel = d / x.abs().max(1e-6);
+            out.max_abs = out.max_abs.max(d);
+            out.max_rel = out.max_rel.max(rel);
+            if rel > 1e-3 {
+                out.loose_cols += 1;
+            }
+        }
+        for h in 0..n_heads_q {
+            let arg = |v: &[f32]| {
+                v[h * current_pos..(h + 1) * current_pos]
+                    .iter()
+                    .enumerate()
+                    .max_by(|p, q| p.1.partial_cmp(q.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+            };
+            if arg(a) != arg(b) {
+                out.argmax_mismatch += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Dequantize one layer's resident K and V to host f32, `[n_kv_heads][rows][head_dim]`.
