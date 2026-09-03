@@ -301,20 +301,29 @@ pub struct Scored {
 
 /// Wall-clock split of one decision.
 ///
-/// The closed-form cost model charges a decision one attention pass and one projection per
-/// `(candidate, layer)`. These buckets are what it takes to check that against a clock: `logits_s`
-/// and `attend_s` are the two halves of the attention term — split because only the second is paid
-/// per candidate — and `keypos_s` is the per-candidate bookkeeping the model does not charge at all.
+/// Three of the five buckets are paid ONCE PER LAYER and two once per `(candidate, layer)`; that
+/// split is the whole point of measuring them separately, because it is what decides whether a
+/// bigger pool costs anything. Since the readout was fused
+/// ([`kernel::project_values_into`](kernel::project_values_into)) the projection moved from the
+/// per-candidate side to the per-layer side, and what remains per candidate is a contraction
+/// against `r` components rather than `head_dim`.
+///
+/// These are also what the production `[aperturb-select]` line reports, so read the coverage note
+/// on each field before attributing a stall to one of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PhaseTimes {
-    /// Shared `Q K^T` over the whole resident cache. Once per layer, **not** once per candidate.
+    /// Shared `Q K^T` over the whole resident cache. **Once per layer.**
     pub logits_s: f64,
+    /// `V` through the output projection. **Once per layer** — it is candidate-independent, which
+    /// is exactly what lets `attend_s` contract against `r` instead of `head_dim`. (Before the
+    /// fusion this bucket held the per-candidate `R × d` projection instead, so a stall recorded
+    /// against an older build is not comparable here.)
+    pub project_s: f64,
     /// Per-head admitted-prefix bookkeeping, once per `(candidate, layer)` plus the baseline.
     pub keypos_s: f64,
-    /// Softmax over the admitted columns and the `V` contraction. Baseline and every candidate.
+    /// Softmax over the admitted columns and the contraction against the projected values, which
+    /// together produce the readout vector. Baseline and every candidate.
     pub attend_s: f64,
-    /// The rank-`r` projection, same coverage as `attend_s`.
-    pub project_s: f64,
     /// Per-cell relative change, plus the closing RMS aggregate.
     pub readout_s: f64,
 }
@@ -456,7 +465,10 @@ pub fn decide(
     let mut visible = vec![u32::MAX; n_c];
 
     let mut z = vec![0.0f32; g.logit_len()];
-    let mut x = vec![0.0f32; g.x_len()];
+    // The values seen through the output projection — see [`kernel::project_values_into`]. Built
+    // once per layer and shared by the baseline and every candidate, which is what makes a
+    // candidate cost `r` per retained column instead of `head_dim`.
+    let mut vb = vec![0.0f32; g.n_heads_q * g.current_pos * r];
     let mut w_base = vec![0.0f32; g.rows * r];
     let mut w_cand = vec![0.0f32; g.rows * r];
 
@@ -466,6 +478,9 @@ pub fn decide(
         let t = Instant::now();
         kernel::logits_into(q, k, &mut z, g)?;
         times.logits_s += t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        kernel::project_values_into(v, basis.layer(l), &mut vb, g, r)?;
+        times.project_s += t.elapsed().as_secs_f64();
 
         // The reference: the same operator over the untouched cache, so common-mode rounding
         // cancels and an identity candidate lands on exactly zero.
@@ -473,11 +488,8 @@ pub fn decide(
         let kp_base = KeyPos::for_layer(&identity, l, g.current_pos, g.rows);
         times.keypos_s += t.elapsed().as_secs_f64();
         let t = Instant::now();
-        kernel::attend_into(&z, &identity, l, &kp_base, v, &mut x, g)?;
+        kernel::attend_project_into(&z, &identity, l, &kp_base, &vb, &mut w_base, g)?;
         times.attend_s += t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        kernel::project_into(&x, basis.layer(l), &mut w_base, g.rows, d, r);
-        times.project_s += t.elapsed().as_secs_f64();
 
         for (c, (_, keep)) in pool.iter().enumerate() {
             let t = Instant::now();
@@ -485,11 +497,8 @@ pub fn decide(
             times.keypos_s += t.elapsed().as_secs_f64();
             visible[c] &= kp.visible_rows();
             let t = Instant::now();
-            kernel::attend_into(&z, keep, l, &kp, v, &mut x, g)?;
+            kernel::attend_project_into(&z, keep, l, &kp, &vb, &mut w_cand, g)?;
             times.attend_s += t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            kernel::project_into(&x, basis.layer(l), &mut w_cand, g.rows, d, r);
-            times.project_s += t.elapsed().as_secs_f64();
             let t = Instant::now();
             grids[c].fill_layer(l, &w_base, &w_cand, r)?;
             times.readout_s += t.elapsed().as_secs_f64();

@@ -136,18 +136,42 @@ pub fn logits_into(q: &[f32], k: &[f32], z: &mut [f32], g: Geom) -> Result<(), K
     let (dh, s, rows, n_rep) = (g.head_dim, g.current_pos, g.rows, g.n_rep());
     // The reference divides by √d_h; a reciprocal multiply is a different float.
     let denom = (dh as f32).sqrt();
+    // A block of `TB` query rows is scored against one key at a time, `VW` components wide. The
+    // scalar form this replaces was a reduction with a single accumulator, so every FMA waited on
+    // the one before it — 128 links of latency for 128 products. Here each key row is loaded once
+    // per `TB` outputs and there are `TB * VW` partial sums for the FMA units to interleave.
+    // (Measured on an S25 at the decision's geometry: 2.9-3.8x over the scalar reduction.)
+    //
+    // The summation order changes, so this is NOT bit-identical to the scalar form. It does not
+    // need to be: `z` feeds the baseline and every candidate alike, and the parity gate is a
+    // tolerance (`REL_L2 = 1e-5`), two orders above a recombination's ~1e-7.
+    const TB: usize = 8;
+    const VW: usize = 4;
+    let d_blocked = dh - dh % VW;
     z.par_chunks_mut(rows * s).enumerate().for_each(|(h, zh)| {
         let kh = &k[(h / n_rep) * s * dh..(h / n_rep + 1) * s * dh];
-        for t in 0..rows {
-            let qv = &q[(h * rows + t) * dh..(h * rows + t + 1) * dh];
-            let zr = &mut zh[t * s..(t + 1) * s];
-            for (p, zp) in zr.iter_mut().enumerate() {
-                let kv = &kh[p * dh..(p + 1) * dh];
-                let mut acc = 0.0f32;
-                for e in 0..dh {
-                    acc += qv[e] * kv[e];
+        let qh = &q[h * rows * dh..(h + 1) * rows * dh];
+        for t0 in (0..rows).step_by(TB) {
+            let nb = TB.min(rows - t0);
+            for (p, kv) in kh.chunks_exact(dh).enumerate() {
+                let mut acc = [[0.0f32; VW]; TB];
+                for c in (0..d_blocked).step_by(VW) {
+                    let kc = &kv[c..c + VW];
+                    for (i, a) in acc.iter_mut().take(nb).enumerate() {
+                        let qc = &qh[(t0 + i) * dh + c..(t0 + i) * dh + c + VW];
+                        for e in 0..VW {
+                            a[e] += qc[e] * kc[e];
+                        }
+                    }
                 }
-                *zp = acc / denom;
+                for (i, a) in acc.iter().take(nb).enumerate() {
+                    let mut sum = (a[0] + a[1]) + (a[2] + a[3]);
+                    // The components a `VW`-wide block cannot cover.
+                    for e in d_blocked..dh {
+                        sum += qh[(t0 + i) * dh + e] * kv[e];
+                    }
+                    zh[(t0 + i) * s + p] = sum / denom;
+                }
             }
         }
     });
@@ -155,6 +179,11 @@ pub fn logits_into(q: &[f32], k: &[f32], z: &mut [f32], g: Geom) -> Result<(), K
 }
 
 /// One `(candidate, layer)` pre-projection output from the shared logits.
+///
+/// **The definition, not the path a decision takes.** [`decide`](super::decide) fuses this with
+/// [`project_into`] into [`attend_project_into`], which never materializes the `R × d` rows. Both
+/// remain here as the executable statement of what the readout means, and
+/// `the_fused_readout_agrees_with_attend_then_project` is what holds the fast path to it.
 ///
 /// `x[t * q_dim + h * head_dim + e]` — head-major within a row, the layout the output projection
 /// consumes and the layout the reference's `X` has.
@@ -245,9 +274,208 @@ pub fn attend_into(
     Ok(())
 }
 
+/// `vb[(h * current_pos + p) * r + k] = Σ_e v[h / n_rep][p][e] · basis[(h * head_dim + e) * r + k]`
+///
+/// The output projection applied to the VALUES instead of to the attention output — the third
+/// identity this file rests on, and the one that decides what a candidate costs.
+///
+/// The readout only ever wants `w = X · basis`, and `X`'s head block is `Σ_j a_j v[p_j]`. Since
+/// `basis` does not depend on the candidate, the two contractions commute:
+///
+/// ```text
+/// w[t] = Σ_h Σ_e (Σ_j a^h_tj · v[p_j][e]) · basis[h·d_h + e]
+///      = Σ_h Σ_j a^h_tj · (Σ_e v[p_j][e] · basis[h·d_h + e])
+///      = Σ_h Σ_j a^h_tj · vb_h[p_j]
+/// ```
+///
+/// Projecting first costs `n_heads_q · current_pos · head_dim · r` ONCE per layer; every candidate
+/// then contracts against `r` components instead of `head_dim` — 6 against 128 at the paper's rank,
+/// and it absorbs [`project_into`] entirely. The `R × d` rows the module header says are never
+/// materialized now really never are.
+///
+/// - `v` — `[n_kv_heads][current_pos][head_dim]`
+/// - `basis` — `[d][r]` row-major, `d = q_dim`
+pub fn project_values_into(
+    v: &[f32],
+    basis: &[f32],
+    vb: &mut [f32],
+    g: Geom,
+    r: usize,
+) -> Result<(), KernelError> {
+    check_len("v", v.len(), g.n_kv_heads * g.current_pos * g.head_dim)?;
+    check_len("basis", basis.len(), g.q_dim() * r)?;
+    check_len(
+        "projected values",
+        vb.len(),
+        g.n_heads_q * g.current_pos * r,
+    )?;
+    let (dh, s, n_rep) = (g.head_dim, g.current_pos, g.n_rep());
+    vb.par_chunks_mut(s * r).enumerate().for_each(|(h, vbh)| {
+        let vh = &v[(h / n_rep) * s * dh..(h / n_rep + 1) * s * dh];
+        // Query head `h` reads the `head_dim` rows of `basis` its own block of `X` would have hit.
+        let bh = &basis[h * dh * r..(h + 1) * dh * r];
+        // The rank is small — 6 at the paper's truncation — and a `0..r` inner loop with a RUNTIME
+        // bound is the worst case for it: the accumulators cannot stay in registers across the
+        // sweep over `head_dim`, and whether LLVM vectorizes it at all turns out to depend on
+        // unrelated code. (Measured on an S25 at rank 6: the same runtime-bounded loop came out at
+        // 238 us and at 923 us in two builds that differed elsewhere, while the constant-bounded
+        // one held 139-205 us.) So the ranks a truncation actually produces get a constant.
+        match r {
+            4 => project_head::<4>(vh, bh, vbh, dh),
+            6 => project_head::<6>(vh, bh, vbh, dh),
+            8 => project_head::<8>(vh, bh, vbh, dh),
+            12 => project_head::<12>(vh, bh, vbh, dh),
+            16 => project_head::<16>(vh, bh, vbh, dh),
+            24 => project_head::<24>(vh, bh, vbh, dh),
+            32 => project_head::<32>(vh, bh, vbh, dh),
+            _ => project_head_dyn(vh, bh, vbh, dh, r),
+        }
+    });
+    Ok(())
+}
+
+/// One query head of [`project_values_into`], with the rank a compile-time constant.
+///
+/// Bit-identical to [`project_head_dyn`]: the sum over `e` runs in the same order, and `acc` is the
+/// same accumulator moved from memory into registers.
+#[inline(always)]
+fn project_head<const R: usize>(vh: &[f32], bh: &[f32], vbh: &mut [f32], dh: usize) {
+    let rows = bh.as_chunks::<R>().0;
+    for (p, out) in vbh.as_chunks_mut::<R>().0.iter_mut().enumerate() {
+        let vr = &vh[p * dh..(p + 1) * dh];
+        let mut acc = [0.0f32; R];
+        for (e, br) in rows.iter().enumerate() {
+            let ve = vr[e];
+            for (a, b) in acc.iter_mut().zip(br) {
+                *a += ve * b;
+            }
+        }
+        *out = acc;
+    }
+}
+
+/// [`project_head`] for a rank no specialization covers — including the untruncated arm, whose rank
+/// is `q_dim` and whose inner loop is long enough to vectorize on its own.
+fn project_head_dyn(vh: &[f32], bh: &[f32], vbh: &mut [f32], dh: usize, r: usize) {
+    for (p, out) in vbh.chunks_exact_mut(r).enumerate() {
+        let vr = &vh[p * dh..(p + 1) * dh];
+        out.fill(0.0);
+        for (e, br) in bh.chunks_exact(r).enumerate() {
+            let ve = vr[e];
+            for (o, b) in out.iter_mut().zip(br) {
+                *o += ve * b;
+            }
+        }
+    }
+}
+
+/// One `(candidate, layer)` readout straight from the shared logits and the projected values —
+/// [`attend_into`] followed by [`project_into`], with the `R × d` intermediate skipped.
+///
+/// Same softmax, same admitted prefixes, same blind-row clamp; only the contraction is against
+/// [`project_values_into`]'s `vb` rather than raw `V`, which is what the commuting identity above
+/// buys. Not bit-identical to the two-step form — the sums over `e` and over `j` swap — but the
+/// difference is a recombination of the same terms, two orders of magnitude inside the parity gate.
+///
+/// The identity candidate still lands on exactly zero: it reaches this with the same keep list and
+/// the same boundary as the baseline, so it runs the identical arithmetic.
+pub fn attend_project_into(
+    z: &[f32],
+    keep_layer: &KeepSets,
+    layer: usize,
+    kp: &KeyPos,
+    vb: &[f32],
+    w: &mut [f32],
+    g: Geom,
+) -> Result<(), KernelError> {
+    check_len("logits", z.len(), g.logit_len())?;
+    // The destination states the rank: `w` is `[rows][r]`, and `vb` must have been projected to it.
+    if g.rows == 0 || !w.len().is_multiple_of(g.rows) {
+        return Err(KernelError::BadLen {
+            what: "readout",
+            got: w.len(),
+            want: g.rows,
+        });
+    }
+    let r = w.len() / g.rows;
+    check_len(
+        "projected values",
+        vb.len(),
+        g.n_heads_q * g.current_pos * r,
+    )?;
+
+    let (s, rows, n_rep) = (g.current_pos, g.rows, g.n_rep());
+    let heads: Vec<Result<Vec<f32>, KernelError>> = (0..g.n_heads_q)
+        .into_par_iter()
+        .map(|h| {
+            let kv_h = h / n_rep;
+            let list = keep_layer.head(layer, kv_h);
+            if list.is_empty() {
+                return Err(KernelError::NoAdmittedKeys {
+                    kv_head: kv_h,
+                    row: 0,
+                });
+            }
+            let vbh = &vb[h * s * r..(h + 1) * s * r];
+            let zh = &z[h * rows * s..(h + 1) * rows * s];
+            let mut out = vec![0.0f32; rows * r];
+            // Row at a time. The projected values are what make this cheap: after
+            // [`project_values_into`] a retained column is `r` floats, so one head's `vb` is
+            // `current_pos * r * 4` bytes — 29 KB at the decision's geometry, against 627 KB for
+            // the raw `V` this used to contract. It is cache-resident, so blocking the rows to read
+            // it fewer times buys nothing and costs the scratch to hold every row's coefficients
+            // (measured on an S25: an 8-row block was slower than this).
+            let mut a = Vec::with_capacity(list.len());
+            for t in 0..rows {
+                // A blind row is clamped to one column, not skipped — see [`attend_into`].
+                let n_adm = kp.admitted(kv_h, t).max(1);
+                let zr = &zh[t * s..(t + 1) * s];
+                let mut m = f32::NEG_INFINITY;
+                for &p in &list[..n_adm] {
+                    let zp = zr[p as usize];
+                    if zp > m {
+                        m = zp;
+                    }
+                }
+                if !m.is_finite() {
+                    return Err(KernelError::NonFinite { what: "logit" });
+                }
+                a.clear();
+                let mut sum = 0.0f32;
+                for &p in &list[..n_adm] {
+                    let e = (zr[p as usize] - m).exp();
+                    a.push(e);
+                    sum += e;
+                }
+                let inv = 1.0 / sum;
+                let o = &mut out[t * r..(t + 1) * r];
+                for (j, &p) in list[..n_adm].iter().enumerate() {
+                    let c = a[j] * inv;
+                    let vr = &vbh[p as usize * r..(p as usize + 1) * r];
+                    for (ok, b) in o.iter_mut().zip(vr) {
+                        *ok += c * b;
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .collect();
+
+    // Ascending head order, which is the order [`project_into`] walked `e` in.
+    w.fill(0.0);
+    for hr in heads {
+        for (wi, o) in w.iter_mut().zip(hr?) {
+            *wi += o;
+        }
+    }
+    Ok(())
+}
+
 /// `w[t * r + k] = Σ_e x[t * d + e] · basis[e * r + k]`, with `basis = V_r Σ_r`.
 ///
 /// The only projection the readout needs (see the module header). `basis` is `[d][r]` row-major.
+/// Like [`attend_into`], this is the definition rather than the path a decision takes —
+/// [`project_values_into`] applies the same `basis` to `V` instead, once per layer.
 pub fn project_into(x: &[f32], basis: &[f32], w: &mut [f32], rows: usize, d: usize, r: usize) {
     debug_assert_eq!(x.len(), rows * d);
     debug_assert_eq!(basis.len(), d * r);
@@ -360,6 +588,129 @@ mod tests {
         assert_eq!(
             xa, xb,
             "column gather must be bit-identical to a real gather"
+        );
+    }
+
+    /// The fused readout must agree with the two-step definition it replaces.
+    ///
+    /// [`attend_into`] and [`project_into`] stay in the file for exactly this: they are the
+    /// executable statement of what the readout means, and this test is what keeps
+    /// [`attend_project_into`] honest to it. The two differ only in the order the sums over `e` and
+    /// `j` are taken, so the bar is a tolerance, not equality — but a tight one, far below the
+    /// parity gate the decision is actually judged by.
+    ///
+    /// Mutation-proof: reading `basis` with the KV head instead of the query head, dropping the
+    /// per-head accumulation into `w`, sweeping a row past its own boundary, or projecting `V` at
+    /// the wrong offset all break it.
+    #[test]
+    fn the_fused_readout_agrees_with_attend_then_project() {
+        let g = Geom {
+            n_layers: 1,
+            n_heads_q: 6,
+            n_kv_heads: 2,
+            head_dim: 9,
+            current_pos: 17,
+            // Past `attend_project_into`'s row block, so the last block is a partial one.
+            rows: 11,
+        };
+        let (d, s) = (g.q_dim(), g.current_pos);
+        let q = ramp(g.n_heads_q * g.rows * g.head_dim, 0.7);
+        let k = ramp(g.n_kv_heads * s * g.head_dim, 1.9);
+        let v = ramp(g.n_kv_heads * s * g.head_dim, 3.1);
+        let mut z = vec![0.0; g.logit_len()];
+        logits_into(&q, &k, &mut z, g).unwrap();
+
+        let keeps: [Vec<u32>; 3] = [
+            (0..s as u32).collect(),
+            (0..s as u32).filter(|p| p % 3 != 1).collect(),
+            vec![0, 4, 9, 16],
+        ];
+        // Both sides of `project_values_into`'s rank dispatch: 6 is one of the specialized
+        // constants, 9 falls through to the runtime-bounded sweep. They must agree with the
+        // definition, and with each other's shape.
+        for r in [6usize, 9] {
+            let basis = ramp(d * r, 5.5);
+            for keep_list in &keeps {
+                let keep = KeepSets::uniform(1, g.n_kv_heads, keep_list);
+                let kp = KeyPos::for_layer(&keep, 0, s, g.rows);
+
+                let mut x = vec![0.0; g.x_len()];
+                let mut want = vec![0.0; g.rows * r];
+                attend_into(&z, &keep, 0, &kp, &v, &mut x, g).unwrap();
+                project_into(&x, &basis, &mut want, g.rows, d, r);
+
+                let mut vb = vec![0.0; g.n_heads_q * s * r];
+                let mut got = vec![0.0; g.rows * r];
+                project_values_into(&v, &basis, &mut vb, g, r).unwrap();
+                attend_project_into(&z, &keep, 0, &kp, &vb, &mut got, g).unwrap();
+
+                // Relative in L2, the way the readout itself reads `w` — a per-element ratio would
+                // report a component that is near zero by cancellation as a large error.
+                let (num, den) = got
+                    .iter()
+                    .zip(&want)
+                    .fold((0.0f64, 0.0f64), |(n, dd), (a, b)| {
+                        (n + ((a - b) as f64).powi(2), dd + (*b as f64).powi(2))
+                    });
+                let rel = (num / den.max(f64::MIN_POSITIVE)).sqrt();
+                // The bar the decision is actually judged by (`REL_L2` in this module's parity
+                // tests). The two orders reach ~1.5e-6 apart at this deliberately small geometry,
+                // and on the parity fixture the fused order is the CLOSER of the two to the
+                // external reference (1.23e-6 against 1.86e-6) — the gap is f32 recombination, not
+                // a defect. Any structural mistake lands orders above this.
+                assert!(
+                    rel < 1e-5,
+                    "rank {r}, {} kept columns: the fused readout must reproduce \
+                     attend→project (rel L2 {rel:e})",
+                    keep_list.len()
+                );
+            }
+        }
+    }
+
+    /// `logits_into` against the scalar reduction it replaces, at a geometry that reaches every
+    /// corner of the row/component blocking.
+    ///
+    /// Nothing else here does: this module's `geom()` has `head_dim = 3` (below `VW`, so all tail)
+    /// and the parity fixture has `head_dim = 8`, `rows = 6` (no tail, and never a full `TB` block).
+    /// `head_dim = 41` is ten `VW` blocks plus a 1-wide remainder, and `rows = 11` is one full `TB`
+    /// block plus a 3-row partial. Mutation-proof: dropping the remainder, indexing the query block
+    /// from the wrong row, or writing `z` at the wrong stride all show up here.
+    #[test]
+    fn logits_matches_the_scalar_reduction_across_the_blocking() {
+        let g = Geom {
+            n_layers: 1,
+            n_heads_q: 6,
+            n_kv_heads: 3,
+            head_dim: 41,
+            current_pos: 19,
+            rows: 11,
+        };
+        let (dh, s, rows, n_rep) = (g.head_dim, g.current_pos, g.rows, g.n_rep());
+        let q = ramp(g.n_heads_q * rows * dh, 0.4);
+        let k = ramp(g.n_kv_heads * s * dh, 2.1);
+        let mut got = vec![0.0; g.logit_len()];
+        logits_into(&q, &k, &mut got, g).unwrap();
+
+        let denom = (dh as f32).sqrt();
+        let mut worst = 0.0f32;
+        for h in 0..g.n_heads_q {
+            for t in 0..rows {
+                let qv = &q[(h * rows + t) * dh..(h * rows + t + 1) * dh];
+                for p in 0..s {
+                    let kv = &k[((h / n_rep) * s + p) * dh..((h / n_rep) * s + p + 1) * dh];
+                    let mut acc = 0.0f32;
+                    for e in 0..dh {
+                        acc += qv[e] * kv[e];
+                    }
+                    let want = acc / denom;
+                    worst = worst.max((got[(h * rows + t) * s + p] - want).abs());
+                }
+            }
+        }
+        assert!(
+            worst < 1e-6,
+            "the blocked logits must reproduce the scalar reduction (worst abs {worst:e})"
         );
     }
 
