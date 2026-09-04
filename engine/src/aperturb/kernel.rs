@@ -419,12 +419,15 @@ pub fn attend_project_into(
             let vbh = &vb[h * s * r..(h + 1) * s * r];
             let zh = &z[h * rows * s..(h + 1) * rows * s];
             let mut out = vec![0.0f32; rows * r];
-            // Row at a time. The projected values are what make this cheap: after
-            // [`project_values_into`] a retained column is `r` floats, so one head's `vb` is
-            // `current_pos * r * 4` bytes — 29 KB at the decision's geometry, against 627 KB for
-            // the raw `V` this used to contract. It is cache-resident, so blocking the rows to read
-            // it fewer times buys nothing and costs the scratch to hold every row's coefficients
-            // (measured on an S25: an 8-row block was slower than this).
+            // Row at a time, straight off `vb` where it lies. The projected values are what make
+            // this cheap: after [`project_values_into`] a retained column is `r` floats, so one
+            // head's `vb` is `current_pos * r * 4` bytes — 29 KB at the decision's geometry,
+            // against 627 KB for the raw `V` this used to contract. Two ways of reading it fewer
+            // or more sequentially were measured on an S25 and both cost more than they saved: an
+            // 8-row block (scratch for every row's coefficients), and gathering the retained
+            // columns into a compacted buffer once per `(candidate, layer, head)` so the rows
+            // stream over it (-9% at 4.2k resident, where the compacted copy no longer fits a
+            // core's cache either). The scattered read is not the bottleneck this loop has.
             let mut a = Vec::with_capacity(list.len());
             for t in 0..rows {
                 // A blind row is clamped to one column, not skipped — see [`attend_into`].
@@ -449,12 +452,23 @@ pub fn attend_project_into(
                 }
                 let inv = 1.0 / sum;
                 let o = &mut out[t * r..(t + 1) * r];
-                for (j, &p) in list[..n_adm].iter().enumerate() {
-                    let c = a[j] * inv;
-                    let vr = &vbh[p as usize * r..(p as usize + 1) * r];
-                    for (ok, b) in o.iter_mut().zip(vr) {
-                        *ok += c * b;
-                    }
+                let li = &list[..n_adm];
+                // The bottleneck it does have is that `o` is a slice: the row's `r` accumulators
+                // are reloaded from memory and stored back once per retained column, six loads and
+                // six stores around six FMAs. With the rank a compile-time constant they are an
+                // array instead, and stay in registers for the whole sweep over `j` — measured on
+                // an S25 at rank 6, 1.26x on `attend` at 1.6k resident and 1.40x at 4.2k (six
+                // order-interleaved cells per arm). Same reason [`project_values_into`] wants a
+                // constant, one step further in.
+                match r {
+                    4 => contract_row::<4>(&a, vbh, li, inv, o),
+                    6 => contract_row::<6>(&a, vbh, li, inv, o),
+                    8 => contract_row::<8>(&a, vbh, li, inv, o),
+                    12 => contract_row::<12>(&a, vbh, li, inv, o),
+                    16 => contract_row::<16>(&a, vbh, li, inv, o),
+                    24 => contract_row::<24>(&a, vbh, li, inv, o),
+                    32 => contract_row::<32>(&a, vbh, li, inv, o),
+                    _ => contract_row_dyn(&a, vbh, li, inv, o, r),
                 }
             }
             Ok(out)
@@ -469,6 +483,35 @@ pub fn attend_project_into(
         }
     }
     Ok(())
+}
+
+/// One query row's contraction against the projected values, rank a compile-time constant.
+///
+/// Bit-identical to [`contract_row_dyn`]: the same terms in the same `j` order into an accumulator
+/// that started at zero either way — only where the accumulator lives changes.
+#[inline(always)]
+fn contract_row<const R: usize>(a: &[f32], vbh: &[f32], list: &[u32], inv: f32, o: &mut [f32]) {
+    let mut acc = [0.0f32; R];
+    for (&aj, &p) in a.iter().zip(list) {
+        let c = aj * inv;
+        let vr = &vbh[p as usize * R..p as usize * R + R];
+        for (x, b) in acc.iter_mut().zip(vr) {
+            *x += c * b;
+        }
+    }
+    o.copy_from_slice(&acc);
+}
+
+/// [`contract_row`] for a rank no specialization covers — including the untruncated arm, whose
+/// rank is `q_dim` and whose accumulator would not fit registers anyway.
+fn contract_row_dyn(a: &[f32], vbh: &[f32], list: &[u32], inv: f32, o: &mut [f32], r: usize) {
+    for (&aj, &p) in a.iter().zip(list) {
+        let c = aj * inv;
+        let vr = &vbh[p as usize * r..(p as usize + 1) * r];
+        for (ok, b) in o.iter_mut().zip(vr) {
+            *ok += c * b;
+        }
+    }
 }
 
 /// `w[t * r + k] = Σ_e x[t * d + e] · basis[e * r + k]`, with `basis = V_r Σ_r`.
@@ -662,6 +705,113 @@ mod tests {
                     rel < 1e-5,
                     "rank {r}, {} kept columns: the fused readout must reproduce \
                      attend→project (rel L2 {rel:e})",
+                    keep_list.len()
+                );
+            }
+        }
+    }
+
+    /// The readout the way it was written before the rank became a constant: the row's `r`
+    /// accumulators are the destination slice, touched once per retained column.
+    ///
+    /// This is what [`attend_project_into`] must still reproduce *exactly*. Only layer 0, which is
+    /// all the test below asks for.
+    fn readout_with_a_slice_accumulator(
+        z: &[f32],
+        keep: &KeepSets,
+        kp: &KeyPos,
+        vb: &[f32],
+        g: Geom,
+        r: usize,
+    ) -> Vec<f32> {
+        let (s, rows, n_rep) = (g.current_pos, g.rows, g.n_rep());
+        let mut w = vec![0.0f32; rows * r];
+        for h in 0..g.n_heads_q {
+            let kv_h = h / n_rep;
+            let list = keep.head(0, kv_h);
+            let vbh = &vb[h * s * r..(h + 1) * s * r];
+            let zh = &z[h * rows * s..(h + 1) * rows * s];
+            let mut out = vec![0.0f32; rows * r];
+            for t in 0..rows {
+                let n_adm = kp.admitted(kv_h, t).max(1);
+                let zr = &zh[t * s..(t + 1) * s];
+                let mut m = f32::NEG_INFINITY;
+                for &p in &list[..n_adm] {
+                    if zr[p as usize] > m {
+                        m = zr[p as usize];
+                    }
+                }
+                let mut a = Vec::new();
+                let mut sum = 0.0f32;
+                for &p in &list[..n_adm] {
+                    let e = (zr[p as usize] - m).exp();
+                    a.push(e);
+                    sum += e;
+                }
+                let inv = 1.0 / sum;
+                let o = &mut out[t * r..(t + 1) * r];
+                for (j, &p) in list[..n_adm].iter().enumerate() {
+                    let c = a[j] * inv;
+                    let vr = &vbh[p as usize * r..(p as usize + 1) * r];
+                    for (ok, b) in o.iter_mut().zip(vr) {
+                        *ok += c * b;
+                    }
+                }
+            }
+            for (wi, o) in w.iter_mut().zip(out) {
+                *wi += o;
+            }
+        }
+        w
+    }
+
+    /// Moving the row's accumulators into registers must not move a single bit.
+    ///
+    /// The tolerance test above would not catch it: it compares two *different* contraction orders
+    /// and passes anything below `1e-5`. These two are meant to be the same order, so the bar is
+    /// equality — that is what keeps the identity candidate at exactly zero and §6-1's winner where
+    /// it was. Mutation-proof: a specialized rank that sums `j` in another order, a partial
+    /// accumulator left in `o` from a previous row, or a rank dispatched to the wrong constant all
+    /// break it.
+    #[test]
+    fn the_constant_rank_contraction_is_bit_identical_to_the_slice_accumulator() {
+        let g = Geom {
+            n_layers: 1,
+            n_heads_q: 6,
+            n_kv_heads: 2,
+            head_dim: 9,
+            current_pos: 17,
+            rows: 11,
+        };
+        let (d, s) = (g.q_dim(), g.current_pos);
+        let q = ramp(g.n_heads_q * g.rows * g.head_dim, 0.7);
+        let k = ramp(g.n_kv_heads * s * g.head_dim, 1.9);
+        let v = ramp(g.n_kv_heads * s * g.head_dim, 3.1);
+        let mut z = vec![0.0; g.logit_len()];
+        logits_into(&q, &k, &mut z, g).unwrap();
+
+        let keeps: [Vec<u32>; 3] = [
+            (0..s as u32).collect(),
+            (0..s as u32).filter(|p| p % 3 != 1).collect(),
+            // Ends well before the last query row, so the boundary differs across the rows.
+            vec![0, 4, 9],
+        ];
+        // 6 takes the specialized arm, 9 the runtime-bounded one.
+        for r in [6usize, 9] {
+            let basis = ramp(d * r, 5.5);
+            let mut vb = vec![0.0; g.n_heads_q * s * r];
+            project_values_into(&v, &basis, &mut vb, g, r).unwrap();
+            for keep_list in &keeps {
+                let keep = KeepSets::uniform(1, g.n_kv_heads, keep_list);
+                let kp = KeyPos::for_layer(&keep, 0, s, g.rows);
+                let want = readout_with_a_slice_accumulator(&z, &keep, &kp, &vb, g, r);
+                let mut got = vec![0.0; g.rows * r];
+                attend_project_into(&z, &keep, 0, &kp, &vb, &mut got, g).unwrap();
+                assert_eq!(
+                    got,
+                    want,
+                    "rank {r}, {} kept columns: the constant-rank contraction must be \
+                     bit-identical to the slice accumulator",
                     keep_list.len()
                 );
             }
