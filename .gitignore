@@ -26,6 +26,8 @@ engine/kernels/kernels
 **/HANDOFF*.md
 *.handoff.md
 .cursor/
+# Planner ↔ implementer tickets (local working artifacts)
+/tickets/
 # Local scratch / analysis notes
 /experiments/
 
