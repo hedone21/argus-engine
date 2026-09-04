@@ -123,6 +123,8 @@ pub struct Arm {
     /// The per-layer budget this candidate was finally asked for. Equal to the Manager's
     /// `target_len` unless [`Selector::plan_calibrated`] had to ask for less.
     pub asked: usize,
+    /// Seconds spent planning this candidate's keep set.
+    pub plan_s: f64,
 }
 
 /// A decision, and what it cost.
@@ -153,6 +155,12 @@ pub struct Choice {
     pub window_s: f64,
     /// Seconds spent putting the cache where the metric can reach it (device mirror + dequantize).
     pub read_s: f64,
+    /// Seconds spent planning all candidates across the pool (including budget calibration).
+    pub plan_s: f64,
+    /// Seconds spent applying the winning candidate's keep set across all layers.
+    pub apply_s: f64,
+    /// Seconds spent carrying state forward (q_rows renumbered + prefill_attn gather).
+    pub carry_s: f64,
     /// What the prompt-attention capture must become now that the winner has been applied.
     ///
     /// The compaction renumbered the cache under it, so the capture the caller holds is about to
@@ -357,8 +365,11 @@ impl Selector {
         let mut pool: Vec<(String, KeepSets)> = Vec::with_capacity(self.candidates.len());
         let mut plans: Vec<Vec<PlannedKeep>> = Vec::with_capacity(self.candidates.len());
         let mut asked: Vec<usize> = Vec::with_capacity(self.candidates.len());
+        let mut cand_plan_times: Vec<f64> = Vec::with_capacity(self.candidates.len());
         let mut excluded: Vec<(String, String)> = Vec::new();
+        let t_plan = std::time::Instant::now();
         for cand in &self.candidates {
+            let t_cand = std::time::Instant::now();
             match self.plan_calibrated(
                 cand,
                 caches,
@@ -368,6 +379,7 @@ impl Selector {
                 plan_signals,
             ) {
                 Ok(Ok((keep, layers, ask))) => {
+                    let cand_s = t_cand.elapsed().as_secs_f64();
                     if let Err(e) = keep.validate(current_pos) {
                         excluded.push((cand.name.clone(), e.to_string()));
                         continue;
@@ -375,6 +387,7 @@ impl Selector {
                     pool.push((cand.name.clone(), keep));
                     plans.push(layers);
                     asked.push(ask);
+                    cand_plan_times.push(cand_s);
                 }
                 Ok(Err(why)) => excluded.push((cand.name.clone(), why)),
                 // A stage that errors is excluded, not fatal: one broken plugin must not take the
@@ -382,6 +395,7 @@ impl Selector {
                 Err(e) => excluded.push((cand.name.clone(), format!("{e:#}"))),
             }
         }
+        let plan_s = t_plan.elapsed().as_secs_f64();
         if pool.is_empty() {
             return Ok(Err(NoChoice::AllExcluded(excluded)));
         }
@@ -407,11 +421,13 @@ impl Selector {
             .iter()
             .zip(&pool)
             .zip(&asked)
-            .map(|((s, (_, keep)), ask)| Arm {
+            .zip(&cand_plan_times)
+            .map(|(((s, (_, keep)), ask), cand_plan_s)| Arm {
                 name: s.name.clone(),
                 score: s.scores.get(self.readout),
                 kept_total: keep.total(),
                 asked: *ask,
+                plan_s: *cand_plan_s,
             })
             .collect();
 
@@ -419,6 +435,7 @@ impl Selector {
         // winner is right-aligned on ONE cursor for every layer — the longest head of any layer —
         // so the layers keep a shared `current_pos` (the frame this metric, the next decision's
         // validation and the decode loop's occupancy watch are written against).
+        let t_apply = std::time::Instant::now();
         let winner = dec.winner;
         let shared_cursor = plans[winner]
             .iter()
@@ -433,6 +450,9 @@ impl Selector {
             apply_planned(cache, l, n_layers, &plans[winner][l], shared_cursor)
                 .with_context(|| format!("applying '{}' to layer {l}", pool[winner].0))?;
         }
+        let apply_s = t_apply.elapsed().as_secs_f64();
+
+        let t_carry = std::time::Instant::now();
         // Quoted as a per-head mean: a ragged winner leaves `current_pos` at the longest head.
         let tokens_after = caches[0].resident_tokens();
         let cursor_after = caches[0].current_pos();
@@ -457,6 +477,7 @@ impl Selector {
                     plan.get(l).and_then(|p| p.head(h))
                 })
             });
+        let carry_s = t_carry.elapsed().as_secs_f64();
 
         Ok(Ok(Choice {
             winner: pool[winner].0.clone(),
@@ -470,6 +491,9 @@ impl Selector {
             decide_times: dec.times,
             window_s,
             read_s,
+            plan_s,
+            apply_s,
+            carry_s,
             prefill_attn,
         }))
     }
@@ -1510,6 +1534,11 @@ mod tests {
         for c in &cs {
             assert_eq!(survivors(c), vec![3.0, 4.0]);
         }
+        assert!(choice.plan_s >= 0.0);
+        assert!(choice.apply_s >= 0.0);
+        assert!(choice.carry_s >= 0.0);
+        assert!(edge.plan_s >= 0.0);
+        assert!(mid.plan_s >= 0.0);
     }
 
     /// A candidate that retains more than the budget is not a cheaper answer to the request, it is

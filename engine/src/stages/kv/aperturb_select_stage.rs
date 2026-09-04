@@ -75,6 +75,7 @@ impl AperturbSelectStage {
     /// other compression: the Manager is told what the cache actually did through the dispatcher's
     /// read-back, and substituting an unscored technique here would make that answer a fiction.
     fn run_selection(&self) -> anyhow::Result<()> {
+        let t_stage = std::time::Instant::now();
         let mut guard = self.q_rows.lock().unwrap_or_else(|e| e.into_inner());
         let Some(q_rows) = guard.as_mut() else {
             eprintln!(
@@ -84,6 +85,7 @@ impl AperturbSelectStage {
             return Ok(());
         };
 
+        let t_prep = std::time::Instant::now();
         // Scores may have accumulated on-device; the same sync `EvictionStage` does before reading.
         if let Some(be) = self.backend.as_ref() {
             let mut cell = self
@@ -129,6 +131,7 @@ impl AperturbSelectStage {
         };
 
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
+        let prep_s = t_prep.elapsed().as_secs_f64();
         // The fraction the candidates are asked for, against the cache as it stands NOW — an
         // earlier directive this step may already have compacted it (see `target_len`).
         let resident = temp.first().map_or(0, |c| c.resident_tokens());
@@ -155,6 +158,7 @@ impl AperturbSelectStage {
 
         match outcome? {
             Ok(mut choice) => {
+                let stage_s = t_stage.elapsed().as_secs_f64();
                 let arms = choice
                     .arms
                     .iter()
@@ -169,11 +173,18 @@ impl AperturbSelectStage {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                let plan_arms = choice
+                    .arms
+                    .iter()
+                    .map(|a| format!("{} {:.3}", a.name, a.plan_s))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let pt = &choice.decide_times;
                 eprintln!(
                     "[aperturb-select] budget={:.3} {} → {} tokens, chose '{}' [{arms}] \
                      decide={:.3}s (logits {:.3} keypos {:.3} attend {:.3} project {:.3} \
-                     readout {:.3}) read={:.3}s window={:.3}s",
+                     readout {:.3}) read={:.3}s window={:.3}s plan={:.3}s [{plan_arms}] \
+                     apply={:.3}s carry={:.3}s prep={:.3}s stage={:.3}s",
                     target_ratio,
                     choice.tokens_before,
                     choice.tokens_after,
@@ -186,6 +197,11 @@ impl AperturbSelectStage {
                     pt.readout_s,
                     choice.read_s,
                     choice.window_s,
+                    choice.plan_s,
+                    choice.apply_s,
+                    choice.carry_s,
+                    prep_s,
+                    stage_s,
                 );
                 for (name, why) in &choice.excluded {
                     eprintln!("[aperturb-select]   excluded '{name}': {why}");
