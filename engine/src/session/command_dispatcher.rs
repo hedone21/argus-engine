@@ -340,6 +340,9 @@ impl CommandDispatcher {
     ///   시 초기화하되, sticky 필드(throttle/tbt/quant/partition)는 carry. v1 `ExecutionPlan::default`
     ///   에서 시작 후 sticky carry 하던 것과 등가.
     /// - **suspend override**: suspended 면 evict 미submit + device seam clear (v1 :344-352 등가).
+    /// - **batch fold**: 한 스텝에 복수 `KvCompress` 가 도착하면 (프리필 동안 적체된 지시가
+    ///   한 스텝에 함께 도착하는 등), `RestoreDefaults` 로 구분된 구간별로 가장 조인(최소) budget 1건만
+    ///   `submit_compress` 로 stage 를 제출하고, 나머지는 stage 없이 `CommandResult::Ok` 로 접는다.
     pub fn dispatch(&mut self, cmds: Vec<EngineCommand>) -> &LoopControl {
         // 이 호출이 곧 「디코드 한 스텝」이다 (decode_loop 가 명령 유무와 무관하게 매 step
         // 부른다) — 문맥 길이를 여기서 표집한다. 이번 step 이 제출할 압축보다 **먼저** 봐야
@@ -350,15 +353,76 @@ impl CommandDispatcher {
         self.control.resumed = false;
         self.control.restore_defaults = false;
 
+        let mut is_folded = vec![false; cmds.len()];
+
+        if self.can_compress() {
+            // RestoreDefaults 기준으로 구간을 나눈다 (RestoreDefaults 가 last_evict_ratio 를 재무장하므로).
+            let mut seg_start = 0;
+            for i in 0..=cmds.len() {
+                if i == cmds.len() || matches!(cmds[i], EngineCommand::RestoreDefaults) {
+                    let seg = seg_start..i;
+                    seg_start = i + 1;
+
+                    let compress_indices: Vec<(usize, f32)> = seg
+                        .filter_map(|idx| match cmds[idx] {
+                            EngineCommand::KvCompress { budget } => Some((idx, budget)),
+                            _ => None,
+                        })
+                        .collect();
+
+                    if compress_indices.len() > 1 {
+                        let mut chosen_idx = compress_indices[0].0;
+                        let mut min_budget = compress_indices[0].1;
+                        for &(idx, budget) in &compress_indices[1..] {
+                            if budget.total_cmp(&min_budget).is_le() {
+                                chosen_idx = idx;
+                                min_budget = budget;
+                            }
+                        }
+
+                        let mut folded_budgets = Vec::new();
+                        for &(idx, budget) in &compress_indices {
+                            if idx != chosen_idx {
+                                is_folded[idx] = true;
+                                folded_budgets.push(budget);
+                            }
+                        }
+
+                        let folded_str = folded_budgets
+                            .iter()
+                            .map(|b| format!("{:.3}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+
+                        eprintln!(
+                            "[dispatch] {} kv.compress directives arrived in one step; folded to budget={:.3} ({} answered Ok)",
+                            compress_indices.len(),
+                            min_budget,
+                            folded_str,
+                        );
+                    }
+                }
+            }
+        }
+
         self.last_results = Vec::with_capacity(cmds.len());
         self.pending_compress = None;
-        for cmd in &cmds {
+        for (i, cmd) in cmds.iter().enumerate() {
             self.result_idx = self.last_results.len();
-            let r = self.apply(cmd);
+            let r = if is_folded[i] {
+                CommandResult::Ok
+            } else {
+                self.apply(cmd)
+            };
             self.last_results.push(r);
         }
 
         &self.control
+    }
+
+    /// 현재 구성에서 KV 압축이 가능한 상태인지 판정한다.
+    fn can_compress(&self) -> bool {
+        !self.kv_handles.is_empty() && (self.aperturb.is_some() || self.cache_manager.is_some())
     }
 
     /// 단일 command 분배 + 그 결과 판정.
@@ -874,5 +938,68 @@ mod tests {
         assert!(matches!(r[0], CommandResult::Ok));
         assert!(is_accepted(&r[1]));
         assert!(matches!(r[2], CommandResult::Ok));
+    }
+
+    /// 한 배치 안의 복수 `KvCompress` 는 가장 조인(최소) budget 하나만 stage 를 submit 하고,
+    /// 나머지는 stage 없이 Ok 로 접힌다 (프리필 동안 적체된 복수 지시의 단일 결정 축약).
+    #[test]
+    fn a_batch_of_budgets_submits_one_stage_for_the_tightest() {
+        let (mut d, registry, _h) = make_dispatcher();
+        d.dispatch(vec![compress(0.75), compress(0.6), compress(0.5)]);
+        assert_eq!(registry.len(), 1, "3건 중 최소 예산 1건만 stage submit");
+        assert_eq!(
+            d.pending_compress.as_ref().map(|p| p.budget),
+            Some(0.5),
+            "제출된 stage 의 목표가 0.5 기준이어야 한다"
+        );
+        assert_eq!(
+            d.last_evict_ratio,
+            Some(0.5),
+            "last_evict_ratio 는 제출된 최소값"
+        );
+        let r = d.finalize_results();
+        assert_eq!(r.len(), 3, "결과 3건 일대일 대응");
+        assert!(r.iter().all(is_accepted), "3개 모두 accepted: {r:?}");
+    }
+
+    /// 도착 순서가 조임→느슨이어도 최소 budget 하나만 submit 된다.
+    #[test]
+    fn a_batch_of_budgets_is_order_independent() {
+        let (mut d, registry, _h) = make_dispatcher();
+        d.dispatch(vec![compress(0.5), compress(0.75)]);
+        assert_eq!(registry.len(), 1, "역순이어도 0.5 하나만 submit");
+        assert_eq!(
+            d.pending_compress.as_ref().map(|p| p.budget),
+            Some(0.5),
+            "제출된 stage 의 목표가 0.5 기준"
+        );
+        assert_eq!(d.last_evict_ratio, Some(0.5));
+        let r = d.finalize_results();
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().all(is_accepted), "모두 accepted: {r:?}");
+    }
+
+    /// 배치 중간에 `RestoreDefaults` 가 있으면 앞뒤를 별개 구간으로 보고 각각 최소를 취한다.
+    #[test]
+    fn batch_compression_split_by_restore_defaults() {
+        let (mut d, registry, _h) = make_dispatcher();
+        let r = results_of(
+            &mut d,
+            vec![
+                compress(0.75),
+                compress(0.6),
+                EngineCommand::RestoreDefaults,
+                compress(0.5),
+                compress(0.4),
+            ],
+        );
+        assert_eq!(
+            registry.len(),
+            2,
+            "RestoreDefaults 앞뒤 구간에서 각각 1건씩 submit"
+        );
+        assert_eq!(r.len(), 5);
+        assert!(r.iter().all(is_accepted), "모두 accepted: {r:?}");
+        assert_eq!(d.last_evict_ratio, Some(0.4));
     }
 }
