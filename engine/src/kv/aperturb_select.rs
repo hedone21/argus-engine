@@ -288,7 +288,12 @@ impl Selector {
         );
         let c0 = &caches[0];
         let current_pos = c0.current_pos();
-        let tokens_before_resident = c0.resident_tokens();
+        // A-1': the length the whole model holds, not layer 0's. Its twin `tokens_after` below is
+        // taken the same way, and `AperturbSelectStage` compares the two as a **behaviour** branch
+        // (score reset + prefill-attention carry), so they must be one unit. Rounded up, as
+        // `crate::kv::layer_mean_resident` documents.
+        let tokens_before_resident =
+            crate::kv::layer_mean_resident(caches.iter().map(|c| c.resident_tokens()));
         let n_kv_heads = c0.kv_heads();
         let head_dim = c0.head_dim();
         let q_dim = self.n_heads_q * head_dim;
@@ -453,8 +458,14 @@ impl Selector {
         let apply_s = t_apply.elapsed().as_secs_f64();
 
         let t_carry = std::time::Instant::now();
-        // Quoted as a per-head mean: a ragged winner leaves `current_pos` at the longest head.
-        let tokens_after = caches[0].resident_tokens();
+        // Quoted as a per-head mean over every layer: a ragged winner leaves `current_pos` at the
+        // longest head, and a per-LAYER budget (pyramidkv) leaves layer 0 the longest layer. Same
+        // unit and same rounding as `tokens_before_resident` above — the pair is compared in
+        // `AperturbSelectStage`.
+        let tokens_after =
+            crate::kv::layer_mean_resident(caches.iter().map(|c| c.resident_tokens()));
+        // A CURSOR, not a length: it numbers ring slots, so it stays layer 0's and is never
+        // averaged. The q-row ring and the prefill-attention gather are written against it.
         let cursor_after = caches[0].current_pos();
         // Tell the ring now, not when the decode loop next notices: the next budget may arrive
         // before that step.
@@ -1355,6 +1366,29 @@ mod tests {
         }
     }
 
+    /// A stage that retains a DIFFERENT set per layer, read off `ctx.layer_idx()`.
+    ///
+    /// [`FixedKeep`] cannot do this — it holds one `keep` and applies it to every layer, so the
+    /// layers always end at the same length and a layer-0 read-back is indistinguishable from the
+    /// layer mean. That is exactly the confusion this stage exists to expose.
+    struct PerLayerKeep {
+        name: &'static str,
+        keep: Vec<Vec<usize>>,
+    }
+
+    impl KVMutationStage for PerLayerKeep {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn on_phase(
+            &self,
+            ctx: &dyn StageCtx,
+            cache: &mut dyn CacheHandle,
+        ) -> Result<(), CacheOpError> {
+            cache.keep(&self.keep[ctx.layer_idx()])
+        }
+    }
+
     /// A stage that stages nothing at all — the "declined to answer" arm.
     struct Silent;
 
@@ -1491,6 +1525,10 @@ mod tests {
         )
     }
 
+    fn per_layer(name: &'static str, keep: Vec<Vec<usize>>) -> Candidate {
+        Candidate::new(name, Box::new(PerLayerKeep { name, keep }), caps())
+    }
+
     fn selector(candidates: Vec<Candidate>) -> Selector {
         Selector::new(candidates, identity_basis(), HEADS).expect("selector")
     }
@@ -1500,6 +1538,205 @@ mod tests {
         (0..c.current_pos())
             .map(|p| c.v_buffer.as_slice::<f32>()[c.offset(p, 0)])
             .collect()
+    }
+
+    /// **T4 (ticket 008).** Both halves of the read-back are the mean over the layers, not layer 0.
+    ///
+    /// The cache is deliberately ragged BEFORE the decision as well as after it, because a set-up
+    /// where every layer is the same length cannot tell the two readings apart:
+    ///
+    /// | | layer 0 | layer 1 | mean (round up) |
+    /// |---|---|---|---|
+    /// | before | 8 | 4 (`head_start` 4) | `ceil(12/2)` = **6** |
+    /// | after | 4 (`keep` 4 slots) | 2 (`keep` 2 slots) | `ceil(6/2)` = **3** |
+    ///
+    /// Mutation-proof in both directions: reading `caches[0]` for `tokens_after` gives 4 and for
+    /// `tokens_before` gives 8, and the `assert_ne!`s pin those two values out. Leaving either one
+    /// on layer 0 also makes `AperturbSelectStage`'s `tokens_after < tokens_before` branch compare
+    /// a layer mean against a layer-0 figure, which is a live behaviour branch (score reset,
+    /// prefill-attention carry) and not a log.
+    ///
+    /// The tail of the test (ⓖ, 7차 수리) pins the converse for the third quantity this block
+    /// computes: `cursor_after` is a cursor and stays layer 0's, so the same ragged cache is what
+    /// tells a mean apart from it.
+    #[test]
+    fn the_reported_tokens_after_is_the_layer_mean_not_layer_zero() {
+        const L0_BEFORE: usize = RESIDENT; // 8
+        const L1_BEFORE: usize = 4;
+        const MEAN_BEFORE: usize = 6; // ceil((8 + 4) / 2)
+        const L0_AFTER: usize = 4;
+        const MEAN_AFTER: usize = 3; // ceil((4 + 2) / 2)
+
+        let mut cs = caches();
+        // Layer 1 starts SHORTER than layer 0: one KV head right-aligned onto its last 4 slots.
+        cs[1].set_head_starts(&[RESIDENT - L1_BEFORE]);
+        assert_eq!(cs[0].resident_tokens(), L0_BEFORE);
+        assert_eq!(cs[1].resident_tokens(), L1_BEFORE);
+
+        // Layer 1's keep must stay inside its resident window `[4, 8)`; layer 0 is uniform.
+        let s = selector(vec![per_layer(
+            "ragged",
+            vec![vec![2, 3, 4, 5], vec![5, 6]],
+        )]);
+        let mut q = armed_q_rows();
+        // `target_len = (8 * 0.5) = 4` per layer, so the 4 + 2 the stage retains is inside budget.
+        let choice = s
+            .choose_and_apply(&mut cs, 0.5, &mut q, Signals::default())
+            .expect("decide")
+            .expect("a choice");
+
+        assert_eq!(choice.winner, "ragged");
+        assert_eq!(cs[0].resident_tokens(), L0_AFTER);
+        assert_eq!(cs[1].resident_tokens(), 2);
+
+        assert_eq!(
+            choice.tokens_before, MEAN_BEFORE,
+            "tokens_before is the layer mean"
+        );
+        assert_ne!(
+            choice.tokens_before, L0_BEFORE,
+            "tokens_before must not be layer 0's resident length"
+        );
+        assert_eq!(
+            choice.tokens_after, MEAN_AFTER,
+            "tokens_after is the layer mean"
+        );
+        assert_ne!(
+            choice.tokens_after, L0_AFTER,
+            "tokens_after must not be layer 0's resident length"
+        );
+
+        // ── ⓖ (ticket 008, 7차 수리): the CURSOR is not averaged ──────────────────────────
+        //
+        // The two lengths above are layer means; `cursor_after` beside them is not, and that is a
+        // stated invariant of this ticket (task A-1) rather than an oversight — it numbers ring
+        // slots, so a mean of two layers' cursors names a slot in neither. Averaging it left all
+        // eight acceptance criteria green and a fresh host run byte-identical (adversarial pass,
+        // 2026-09-10). A later edit sweeping "everything here is a layer mean" through this
+        // function lands exactly on it.
+        //
+        // `Choice` does not carry `cursor_after`, so what is asserted here is its nearest
+        // observable consequence: the decision hands it to `q_rows.renumbered_to`, which sets the
+        // ring's drift as `own clock - cursor_after`. This ring's clock is 8 (positions 0..8 were
+        // captured) and it retains `ROWS = 2` of them, {6, 7}, so afterwards exactly one resident
+        // count can be served — the one whose trailing window ends at 8. Left on layer 0 that
+        // count is layer 0's own `current_pos`, which is what every later reader passes in;
+        // averaged (`ceil((4 + 2) / 2) = 3`) the drift is one too large and the ring refuses the
+        // very cache it was just renumbered for, the S25 symptom `renumbered_to` exists to remove.
+        //
+        // What this does NOT cover: `cursor_after`'s two other uses in the same block — the
+        // `cursor_after < current_pos` guard on the prefill-attention carry and the position it
+        // is gathered into. Both need a `Signals::prefill_attn` this test does not build, and on
+        // a cache this shallow the guard holds either way. Their live check stays where ticket
+        // 008 put the rest of the on-device confirmations: ticket 011's logs.
+        assert_eq!(
+            cs[0].current_pos(),
+            L0_AFTER,
+            "layer 0's cursor after the apply"
+        );
+        assert_eq!(
+            cs[1].current_pos(),
+            2,
+            "layer 1's, shorter — the cache is ragged"
+        );
+        assert!(
+            q.covers(cs[0].current_pos()),
+            "the q-row ring was renumbered to layer 0's cursor ({}), so it still serves it",
+            cs[0].current_pos()
+        );
+        assert!(
+            !q.covers(MEAN_AFTER),
+            "…and NOT to the layer mean of the cursors ({MEAN_AFTER}): a ring renumbered to the \
+             mean would serve that count instead of layer 0's {L0_AFTER}"
+        );
+
+        // ── ⓘ (ticket 008, 8차 라운드): the STAGE forms its ratio against layer 0's cursor ──
+        //
+        // `AperturbSelectStage` divides the Manager's `target_len` by a cursor of its own before
+        // handing the quotient to `choose_and_apply`, which multiplies it back out by
+        // `caches[0].current_pos()`. The two are inverses only while the stage's cursor IS layer
+        // 0's, which is why that binding is a cursor and not the layer mean beside it. Averaging
+        // it is not a log-only slip: the product is the per-layer budget every candidate is
+        // planned for and the winner is applied at, and until this clause nothing in the suite
+        // read it (1241 tests passed with the mean substituted, clippy and fmt clean).
+        //
+        // The cache is ragged in its CURSORS here, not in `head_start` as the halves above are:
+        // `resident_tokens` and `current_pos` part company under a head-start, but the cursors
+        // stay equal and a mean of them cannot be told from layer 0's. Cursors 8 and 4 give a
+        // mean of `ceil(12/2)` = 6, so an ask of 4 forms 4/8 = 0.5 against layer 0 and 4/6 = 0.667
+        // against the mean — a per-layer budget of 4 against one of `(8 * 0.667) as usize` = 5.
+        //
+        // `KeepAsked` retains exactly what it is asked for, so the resident length after the
+        // stage runs IS the budget it formed: 4 where the cursor is layer 0's, 5 where it is the
+        // mean. Both apply — the difference is the number, which is the point.
+        struct KeepAsked;
+        impl KVMutationStage for KeepAsked {
+            fn name(&self) -> &str {
+                "keep_asked"
+            }
+            fn on_phase(
+                &self,
+                ctx: &dyn StageCtx,
+                cache: &mut dyn CacheHandle,
+            ) -> Result<(), CacheOpError> {
+                let pos = ctx.current_pos();
+                let keep: Vec<usize> = (pos.saturating_sub(ctx.target_len())..pos).collect();
+                cache.keep(&keep)
+            }
+        }
+
+        use crate::format::KVCacheFormat;
+        use crate::kv::standard_format::StandardFormat;
+        use crate::observability::profile::OpProfiler;
+        use crate::pipeline::{LifecyclePhase, PipelineStage, StageContext, StepInfo};
+        use crate::stages::kv::aperturb_select_stage::AperturbSelectStage;
+
+        const STAGE_TARGET: usize = 4;
+        const L1_CURSOR: usize = 4;
+
+        let mut cs = caches();
+        cs[1].set_current_pos(L1_CURSOR);
+        let handles: Vec<Arc<StandardFormat>> = cs
+            .into_iter()
+            .enumerate()
+            .map(|(l, c)| Arc::new(StandardFormat::new(l, c)))
+            .collect();
+        assert_eq!(handles[0].current_pos(), RESIDENT, "layer 0's cursor");
+        assert_eq!(handles[1].current_pos(), L1_CURSOR, "layer 1's, shorter");
+
+        let stage = AperturbSelectStage::new(
+            handles.clone(),
+            Arc::new(selector(vec![Candidate::new(
+                "keep_asked",
+                Box::new(KeepAsked),
+                caps(),
+            )])),
+            Arc::new(std::sync::Mutex::new(Some(armed_q_rows()))),
+            STAGE_TARGET,
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+        );
+        let mut profiler = OpProfiler::new();
+        let mut sctx = StageContext {
+            step: StepInfo {
+                pos: 0,
+                decode_step: 0,
+                pressure: crate::pipeline::Pressure::new(0),
+                prev_token: 0,
+            },
+            profiler: &mut profiler,
+        };
+        stage
+            .on_phase(&LifecyclePhase::KvMutate, &mut sctx)
+            .expect("the selection stage runs");
+        assert_eq!(
+            handles[0].resident_tokens(),
+            STAGE_TARGET,
+            "the stage applied the budget the Manager named ({STAGE_TARGET} tokens), which it \
+             gets only by forming the ratio against layer 0's cursor ({RESIDENT}); against the \
+             layer mean of the cursors (6) the same directive would have applied 5"
+        );
     }
 
     /// The pool is ranked by measured deviation, not by pool order. `{3,4}` averages 3.5 against a

@@ -72,6 +72,27 @@ pub use eviction_handler::{EvictionHandler, MIN_EVICT_TOKENS};
 pub use quantize_handler::target_bits_for_pressure;
 pub use swap_handler::SwapHandler;
 
+/// A whole model's resident length: the mean of its layers' `resident_tokens()`, **rounded up**.
+///
+/// A read-back taken off layer 0 alone is not the model's length once a winner budgets per layer —
+/// pyramidkv clamps layer 0 at `q - window` and leaves the deeper layers far shorter, so layer 0 is
+/// the least representative layer there and reports a compression that landed on budget as one that
+/// removed almost nothing (camera 8K decision #12, `1121 -> 1061` where the 28-layer mean was 816).
+///
+/// Rounding is UP, the direction [`kv_cache::KVCache::resident_tokens`] already rounds its own
+/// per-head mean. Every site that reports or gates on a whole-model resident length calls this, so
+/// the two means compose in one direction and no comparison mixes a floor with a ceiling.
+///
+/// A cursor (`current_pos`) is a different unit and is never averaged through here: it numbers ring
+/// slots, and the code that renumbers a capture or validates a shared cursor needs the real one.
+pub(crate) fn layer_mean_resident(per_layer: impl ExactSizeIterator<Item = usize>) -> usize {
+    let n_layers = per_layer.len();
+    if n_layers == 0 {
+        return 0;
+    }
+    per_layer.sum::<usize>().div_ceil(n_layers)
+}
+
 // ── Pressure level ─────────────────────────────────────────────────
 
 /// Memory pressure severity.
@@ -631,5 +652,30 @@ mod tests {
         assert_eq!(c1.load(Ordering::SeqCst), 1);
         assert_eq!(c2.load(Ordering::SeqCst), 1);
         assert_eq!(results.len(), 2);
+    }
+    /// The layer mean rounds UP, and every ticket-008 read-back site shares this one helper.
+    ///
+    /// The direction is pinned HERE rather than only at a call site: a later change that inlines
+    /// the mean somewhere (`sum / len` is three characters shorter) would drift that site a token
+    /// away from the heartbeat's, and the caller-level assertions all use layer lengths that
+    /// divide exactly, so none of them can tell a ceiling from a floor.
+    #[test]
+    fn layer_mean_resident_rounds_up() {
+        assert_eq!(layer_mean_resident([3, 4].into_iter()), 4, "3.5 reads 4");
+        assert_eq!(
+            layer_mean_resident([8, 4].into_iter()),
+            6,
+            "exact stays exact"
+        );
+        assert_eq!(
+            layer_mean_resident([7].into_iter()),
+            7,
+            "one layer is itself"
+        );
+        assert_eq!(
+            layer_mean_resident(std::iter::empty()),
+            0,
+            "no layers: no length to report, and never a division by zero"
+        );
     }
 }

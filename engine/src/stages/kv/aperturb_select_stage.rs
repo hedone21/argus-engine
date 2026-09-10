@@ -134,7 +134,12 @@ impl AperturbSelectStage {
         let prep_s = t_prep.elapsed().as_secs_f64();
         // The fraction the candidates are asked for, against the cache as it stands NOW — an
         // earlier directive this step may already have compacted it (see `target_len`).
-        let resident = temp.first().map_or(0, |c| c.resident_tokens());
+        // The whole model's resident length, rounded up — the same unit `Choice::tokens_before`
+        // and the dispatcher's own gate are in, so no comparison here mixes layer 0 against a
+        // layer mean.
+        let resident = crate::kv::layer_mean_resident(temp.iter().map(|c| c.resident_tokens()));
+        // A cursor, not a length: `target_ratio` below renumbers against ring slots, so this one
+        // stays layer 0's.
         let cursor = temp.first().map_or(0, |c| c.current_pos());
         if self.target_len >= resident || cursor == 0 {
             for (f, c) in self.handles.iter().zip(temp) {
@@ -208,6 +213,8 @@ impl AperturbSelectStage {
                 }
                 // The KV geometry moved, so every accumulated score is now indexed by positions
                 // that no longer exist — the same reset `EvictionStage` does after a real eviction.
+                // Both operands are the whole-model layer mean (`crate::kv::layer_mean_resident`),
+                // so this reads "the cache actually moved" and not "layer 0 moved".
                 if choice.tokens_after < choice.tokens_before {
                     let mut cell = self
                         .score_cell

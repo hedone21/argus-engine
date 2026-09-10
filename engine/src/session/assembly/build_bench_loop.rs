@@ -548,6 +548,14 @@ pub fn build_bench_loop(
                     })
                     .collect(),
             );
+            // 008: the heartbeat's token count is the whole model's, not layer 0's — same vector,
+            // coerced to the token-bearing trait.
+            adapter.set_kv_token_handles(
+                kv_handles
+                    .iter()
+                    .map(|h| h.clone() as Arc<dyn crate::format::KVCacheFormat>)
+                    .collect(),
+            );
             Some(adapter)
         }
         (other, _) => other,
