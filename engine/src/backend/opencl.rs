@@ -164,7 +164,18 @@ pub struct WindowAttnGeom {
     pub rows: usize,
     /// Physical tokens per head in the K buffer (the HeadMajor head stride).
     pub capacity: usize,
+    /// Trailing query rows whose raw logits come back alongside the pooled scores — the metric's
+    /// own rows, which are the window's tail. `0` asks for no export at all.
+    ///
+    /// A parameter rather than a constant: production passes `HostLayers::rows`, which a short
+    /// query capture clamps below `APERTURB_ROWS`, and the selfcheck sweeps it.
+    pub export_rows: usize,
 }
+
+/// What one whole-model window pass hands back: the pooled `[n_layers][n_heads_q][current_pos]`
+/// scores, and A1's exported metric logits — `Some` only when a readback actually filled a block,
+/// and a shared handle on the backend's own reused host buffer rather than a fresh copy.
+pub type WindowAttnPass = (Vec<f32>, Option<Arc<Vec<f32>>>);
 
 /// Helper function to get the OpenCL memory handle from a tensor buffer.
 /// Works with both UnifiedBuffer and legacy OpenCLBuffer.
@@ -502,11 +513,11 @@ pub struct OpenCLBackend {
 
     // Persistent device scratch for `window_attention_sum`: the packed query
     // window uploaded once per decision, the per-layer output, the per-row
-    // logit scratch and the ragged head starts. Stored as
-    // `(q, acc, zrow, kv_start, q_elems, acc_elems, zrow_elems, start_elems)`
-    // and grown on demand — the decision runs ~18 times per 4k-token run, so the
-    // point is to stop re-creating four `cl_mem` objects each time rather than to
-    // save bytes.
+    // logit scratch and the ragged head starts. Stored as `(q, acc, zrow,
+    // kv_start, q_elems, acc_elems, zrow_elems, start_elems)` and grown on
+    // demand — the decision runs ~18 times per 4k-token run, so the point is to
+    // stop re-creating four `cl_mem` objects each time rather than to save bytes.
+    // All four are sized by `capacity`, so a longer cache does not grow them.
     #[allow(clippy::type_complexity)]
     window_attn_bufs: UnsafeCell<
         Option<(
@@ -520,6 +531,26 @@ pub struct OpenCLBackend {
             usize,
         )>,
     >,
+
+    // The exported metric logits, in a slot of their own as `(zout, zout_elems)`.
+    // Separate from the four above because ZOUT is the one buffer sized by
+    // `current_pos` rather than `capacity` (an extra `export_rows` factor would
+    // pin 176 MB at capacity 8192), so it is the one that grows mid-run — and
+    // sharing their grow flag would drag all four into every such reallocation,
+    // which is exactly what the `capacity` sizing exists to prevent.
+    window_attn_zout: UnsafeCell<Option<(ocl::core::Mem, usize)>>,
+
+    // The HOST landing zone for that scratch's exported metric logits, kept here for the same
+    // reason the device buffers are: the block is 21.5 KB per resident token on Qwen2.5-1.5B
+    // (28 layers x 12 heads x 16 rows x 4 B), so a fresh `vec![0.0; n]` per decision is 88 MB of
+    // allocate-touch-free at `current_pos` 4096 and 176 MB at 8192. Commit `dcb2dee` measured that
+    // host allocation — not the transfer, which is a UMA copy — as what the mirror costs.
+    //
+    // An `Arc` rather than a bare `Vec` so the buffer can outlive the call that fills it without
+    // being copied: `window_attention_sum` hands the reader a second handle and keeps this one, so
+    // the next decision reuses the same allocation once the reader has dropped its handle (and
+    // starts a fresh buffer, rather than corrupting a live one, when it has not).
+    window_attn_host_z: UnsafeCell<Option<Arc<Vec<f32>>>>,
 
     // Per-layer cache key for the transposed activation above: `(a_buf_ptr,
     // m, k)`. When a matmul reuses the same activation pointer and shape
@@ -1620,6 +1651,8 @@ impl OpenCLBackend {
             noshuffle_soa_registry: UnsafeCell::new(HashMap::new()),
             gemm_act_trans_buf: UnsafeCell::new(None),
             window_attn_bufs: UnsafeCell::new(None),
+            window_attn_zout: UnsafeCell::new(None),
+            window_attn_host_z: UnsafeCell::new(None),
             gemm_act_trans_key: UnsafeCell::new(None),
             profile_events_enabled,
             profile_events: UnsafeCell::new(Vec::new()),
@@ -3600,13 +3633,23 @@ impl OpenCLBackend {
     ///
     /// One upload, `n_layers` enqueues on the in-order queue, one readback. `Ok(None)` means the
     /// kernel is not available (program failed to compile) and the caller must run the CPU path.
+    ///
+    /// The second half of the pair is the exported raw logits of the window's trailing
+    /// `g.export_rows` rows, `[n_layers][n_heads_q][export_rows][current_pos]` — pass A's own z,
+    /// which is bit-for-bit the quantity `aperturb::decide` would otherwise recompute on the CPU.
+    ///
+    /// It is `Some` **only when a readback actually put a block in it**: `None` says the export
+    /// did not happen (`g.export_rows == 0`), and is the one signal a caller has that is not a
+    /// restatement of "the device path ran" — see [`WindowAttnGeom::export_rows`]. The handle is
+    /// shared because the buffer behind it is this backend's, reused decision after decision
+    /// rather than reallocated (`window_attn_host_z`).
     pub fn window_attention_sum(
         &self,
         k_mems: &[&ocl::core::Mem],
         head_starts: &[Vec<usize>],
         qwin: &[&[f32]],
         g: WindowAttnGeom,
-    ) -> Result<Option<Vec<f32>>> {
+    ) -> Result<Option<WindowAttnPass>> {
         let kernels = unsafe { &*self.kernels.get() };
         let Some(kernel) = kernels.kernel_window_attn_sum_half.as_ref() else {
             return Ok(None);
@@ -3628,7 +3671,14 @@ impl OpenCLBackend {
             "window_attention_sum: head_dim {} is not a multiple of 4",
             g.head_dim
         );
+        anyhow::ensure!(
+            g.export_rows <= g.rows,
+            "window_attention_sum: cannot export {} trailing rows of a {}-row window",
+            g.export_rows,
+            g.rows
+        );
         let acc_elems = n_layers * g.n_heads_q * g.current_pos;
+        let zout_elems = acc_elems * g.export_rows;
         let row_blk = window_attn_row_block();
         let start_elems = n_layers * g.n_kv_heads;
         // Size the two `current_pos`-shaped buffers by `capacity` — the physical KV width, and an
@@ -3637,8 +3687,23 @@ impl OpenCLBackend {
         // is ~400 us of driver bookkeeping each plus the fragmentation of freeing 11 MB repeatedly.
         let acc_cap = n_layers * g.n_heads_q * g.capacity;
         let zrow_cap = g.n_heads_q * row_blk * g.capacity;
+        // ZOUT is the one slot NOT sized by `capacity`. It carries an extra `export_rows` factor,
+        // so the same rule would pin 176 MB on the device for a 28-layer model at capacity 8192 —
+        // 16x the whole rest of this scratch, resident for the run, in the regime the 8K cell is
+        // already throttled in. `current_pos` it is, then, plus the ratchet below.
 
-        // Persistent, grown on demand: 18 decisions per run, four `cl_mem` each.
+        let mk = |n: usize| -> Result<ocl::core::Mem> {
+            Ok(unsafe {
+                ocl::core::create_buffer::<_, f32>(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_WRITE,
+                    n.max(1),
+                    None,
+                )?
+            })
+        };
+        // Persistent, grown on demand: 18 decisions per run, four `cl_mem` each. Every bound here
+        // is `capacity`-shaped, so in a run these are created once and never again.
         let slot = unsafe { &mut *self.window_attn_bufs.get() };
         let need = match slot {
             Some((_, _, _, _, qc, ac, zc, sc)) => {
@@ -3647,16 +3712,6 @@ impl OpenCLBackend {
             None => true,
         };
         if need {
-            let mk = |n: usize| -> Result<ocl::core::Mem> {
-                Ok(unsafe {
-                    ocl::core::create_buffer::<_, f32>(
-                        self.context.as_core(),
-                        ocl::core::MEM_READ_WRITE,
-                        n.max(1),
-                        None,
-                    )?
-                })
-            };
             *slot = Some((
                 mk(q_elems)?,
                 mk(acc_cap)?,
@@ -3668,8 +3723,23 @@ impl OpenCLBackend {
                 start_elems,
             ));
         }
+        // ZOUT grows on a flag of its own. It is the `current_pos`-sized buffer, so it does grow
+        // mid-run — every decision that reaches a new maximum resident length — and folding that
+        // into the flag above would re-create the four `capacity`-sized buffers alongside it,
+        // ~400 us of Adreno driver bookkeeping for buffers whose contents and size are unchanged.
+        // The high-water ratchet is what keeps the growth one-way: `current_pos` falls at a
+        // compaction, and without it the buffer would be freed and re-created on the way back up.
+        let zslot = unsafe { &mut *self.window_attn_zout.get() };
+        let (zout_cap, zout_need) = match zslot {
+            Some((_, zoc)) => (zout_elems.max(*zoc), *zoc < zout_elems),
+            None => (zout_elems, true),
+        };
+        if zout_need {
+            *zslot = Some((mk(zout_cap)?, zout_cap));
+        }
         let (q_buf, acc_buf, zrow_buf, start_buf, ..) =
             slot.as_ref().expect("window scratch just allocated");
+        let (zout_buf, _) = zslot.as_ref().expect("window z scratch just allocated");
 
         // One upload per layer for the decision's query window (no host concat), one for the
         // ragged bounds. `offset` counts elements, not bytes.
@@ -3771,6 +3841,15 @@ impl OpenCLBackend {
                 ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&denom))?;
                 ocl::core::set_kernel_arg(kernel, 15, ocl::core::ArgVal::local::<f32>(&local_mem))?;
                 ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::local::<f32>(&qblk_mem))?;
+                // 17/18, after the two `__local` slots rather than before them: 15 and 16 are
+                // where the kernel declares `scratch` and `qblk`, and an unset argument at either
+                // index is CL_INVALID_KERNEL_ARGS at enqueue.
+                ocl::core::set_kernel_arg(kernel, 17, ocl::core::ArgVal::mem(zout_buf))?;
+                ocl::core::set_kernel_arg(
+                    kernel,
+                    18,
+                    ocl::core::ArgVal::scalar(&(g.export_rows as i32)),
+                )?;
                 self.enqueue_kernel_labeled(kernel, "window_attn", 1, &gws, Some(lws))?;
             }
         }
@@ -3786,7 +3865,42 @@ impl OpenCLBackend {
                 None::<&mut ocl::core::Event>,
             )?;
         }
-        Ok(Some(out))
+        // The kernel zero-fills every exported column it does not compute, so a hole here reads
+        // 0.0 the way ACC's does rather than the previous decision's leftovers.
+        //
+        // Into the persistent host buffer, never a fresh `vec![0.0; zout_elems]`: that allocation
+        // is the 88 MB (at `current_pos` 4096) this decision would otherwise pay to zero and then
+        // immediately overwrite. `resize` grows it on demand and only truncates on the way down,
+        // so a cache that shrank past a compaction and grew back does not reallocate either.
+        let z_out = if zout_elems > 0 {
+            let host = unsafe { &mut *self.window_attn_host_z.get() };
+            let mut buf = host.take().unwrap_or_default();
+            if Arc::get_mut(&mut buf).is_none() {
+                // A previous decision's reader still holds this block. Leave it intact and start
+                // a new buffer rather than writing under it.
+                buf = Arc::new(Vec::new());
+            }
+            {
+                let v = Arc::get_mut(&mut buf).expect("sole owner of the export buffer");
+                v.resize(zout_elems, 0.0);
+                unsafe {
+                    ocl::core::enqueue_read_buffer(
+                        &self.queue,
+                        zout_buf,
+                        true,
+                        0,
+                        v.as_mut_slice(),
+                        None::<ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )?;
+                }
+            }
+            *host = Some(Arc::clone(&buf));
+            Some(buf)
+        } else {
+            None
+        };
+        Ok(Some((out, z_out)))
     }
 
     #[allow(clippy::too_many_arguments)]

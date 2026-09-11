@@ -164,6 +164,14 @@ __kernel void kernel_score_only_half(
 //   denom:        sqrt(head_dim) — a DIVISION, matching the CPU reference
 //   scratch:      __local float[local_size]
 //   qblk:         __local float[WATT_B * head_dim]
+//   ZOUT:         [n_layers][n_heads_q][export_rows][current_pos] F32, the raw logits of the
+//                 window's TRAILING `export_rows` rows — pass A's own z, before pass B turns it
+//                 into exp(z - m). `aperturb::decide` scores its metric rows from exactly this
+//                 quantity, so exporting it here is what lets the decision skip a second Q·Kᵀ.
+//                 Its layer offset is derived, not passed: ACC packs [l][h][p] and ZOUT packs
+//                 [l][h][t][p] over the same `h` and `p`, so `acc_off * export_rows` names it.
+//   export_rows:  how many trailing rows to export. 0 disables the export entirely (the CPU
+//                 fallback path, and any caller that has no metric to feed).
 
 // The host always passes `-DWATT_B`; this default only matters to a direct compile of the file,
 // and matches what the host picks (8 — above that an Adreno 830 spills).
@@ -188,7 +196,11 @@ __kernel void kernel_window_attn_sum_half(
     int start_off,
     float denom,
     __local float * scratch,
-    __local float * qblk
+    __local float * qblk,
+    // Appended AFTER the two `__local` arguments on purpose: the host sets `scratch`/`qblk` at
+    // indices 15/16, and moving them would leave those indices unset (CL_INVALID_KERNEL_ARGS).
+    __global float * ZOUT,
+    int export_rows
 ) {
     const int h = get_group_id(0);
     const int lid = get_local_id(0);
@@ -218,6 +230,38 @@ __kernel void kernel_window_attn_sum_half(
     }
 
     const int first_pos = current_pos - rows;
+    // Window row `t0 + i` is metric row `t0 + i - (rows - export_rows)`: the metric reads the
+    // window's TAIL, so the mapping is an offset, not the identity and not a whole row block.
+    const int first_export = rows - export_rows;
+
+    // The export's holes need the same treatment as ACC's, and for a second reason: a row block
+    // whose causal bound falls below `start` never runs pass A at all (`continue` below), so
+    // without this its rows would hand the host whatever the previous decision left in the buffer.
+    //
+    // Only the holes, though — zeroing the whole `export_rows x current_pos` block and then
+    // copying `[start, end_max)` back over it doubles this kernel's global write traffic in
+    // exactly the production geometry (16 rows x `current_pos`, of which the copy overwrites all
+    // but the ragged head). So each exported row zeroes `[0, start)` and `[end_max, current_pos)`
+    // for ITS OWN block's `end_max` — the same arithmetic the block loop below does — and a row
+    // whose block never runs (`end_max <= start`) zeroes end to end. Every column the host can
+    // read is still written exactly once, by exactly one thread: the three ranges are disjoint, so
+    // no zero can land on a column the copy owns, whatever the group width.
+    const int zob = acc_off * export_rows + h * export_rows * current_pos;
+    for (int i = 0; i < export_rows; ++i) {
+        const int tw = first_export + i;              // this metric row's window row
+        const int bt0 = (tw / WATT_B) * WATT_B;       // and the block that computes it
+        const int bnb = min(WATT_B, rows - bt0);
+        int bend = first_pos + bt0 + bnb;             // the block's widest causal bound
+        if (bend > current_pos) bend = current_pos;
+        if (bend < start) bend = start;               // block skipped: nothing is copied in
+        const int zor = zob + i * current_pos;
+        for (int p = lid; p < start; p += ls) {
+            ZOUT[zor + p] = 0.0f;
+        }
+        for (int p = bend + lid; p < current_pos; p += ls) {
+            ZOUT[zor + p] = 0.0f;
+        }
+    }
 
     for (int t0 = 0; t0 < rows; t0 += WATT_B) {
         const int nb = min(WATT_B, rows - t0);
@@ -267,6 +311,21 @@ __kernel void kernel_window_attn_sum_half(
                         mx[i] = fmax(mx[i], z);
                     }
                 }
+            }
+        }
+
+        // ── A1: copy out the raw z before passes B/C overwrite it with exp(z - m) ──
+        // Deliberately the SAME column partition as pass A above: a thread reads back only the
+        // ZROW slots it wrote itself, so this needs no global fence between the two — the same
+        // property the rest of this kernel is built on.
+        for (int i = 0; i < WATT_B; ++i) {
+            const int te = t0 + i - first_export;
+            if (i >= nb || te < 0) {
+                continue;
+            }
+            const int zor = zob + te * current_pos;
+            for (int p = start + lid; p < end_max; p += ls) {
+                ZOUT[zor + p] = ZROW[zb + i * current_pos + p];
             }
         }
 

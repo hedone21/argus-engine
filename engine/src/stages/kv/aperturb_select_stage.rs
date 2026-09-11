@@ -189,7 +189,8 @@ impl AperturbSelectStage {
                     "[aperturb-select] budget={:.3} {} → {} tokens, chose '{}' [{arms}] \
                      decide={:.3}s (logits {:.3} keypos {:.3} attend {:.3} project {:.3} \
                      readout {:.3}) read={:.3}s window={:.3}s plan={:.3}s [{plan_arms}] \
-                     apply={:.3}s carry={:.3}s prep={:.3}s stage={:.3}s",
+                     apply={:.3}s carry={:.3}s prep={:.3}s stage={:.3}s \
+                     folded={} attend_n={} logits_n={}",
                     target_ratio,
                     choice.tokens_before,
                     choice.tokens_after,
@@ -207,6 +208,11 @@ impl AperturbSelectStage {
                     choice.carry_s,
                     prep_s,
                     stage_s,
+                    // Appended, never interleaved: `analyze_trace.py` reads the fields before this
+                    // point by name and position, so a new field goes on the end or not at all.
+                    pt.folded,
+                    pt.attend_n,
+                    pt.logits_n,
                 );
                 for (name, why) in &choice.excluded {
                     eprintln!("[aperturb-select]   excluded '{name}': {why}");

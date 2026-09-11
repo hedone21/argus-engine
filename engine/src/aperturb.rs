@@ -281,6 +281,17 @@ pub trait LayerSource {
     fn keys(&self, layer: usize) -> &[f32];
     /// Values, same shape.
     fn values(&self, layer: usize) -> &[f32];
+    /// This layer's logit block, `[n_heads_q][rows][current_pos]`, when something upstream already
+    /// computed it — A1 (ticket 010): the observation-window kernel's pass A produces exactly this
+    /// quantity on the device and then overwrites it, so a source that exported it first saves
+    /// [`decide`] a whole second `Q Kᵀ` over the resident cache.
+    ///
+    /// Defaulted to `None` so a source that has nothing to offer stays a source. That silence is
+    /// also why [`PhaseTimes::logits_n`] exists: this seam cannot report a fallback by failing.
+    fn logits(&self, layer: usize) -> Option<&[f32]> {
+        let _ = layer;
+        None
+    }
 }
 
 /// A candidate and the score it earned.
@@ -299,7 +310,7 @@ pub struct Scored {
     pub cells: Option<CellGrid>,
 }
 
-/// Wall-clock split of one decision.
+/// Wall-clock split of one decision, plus the call counts a wall clock cannot stand in for.
 ///
 /// Three of the five buckets are paid ONCE PER LAYER and two once per `(candidate, layer)`; that
 /// split is the whole point of measuring them separately, because it is what decides whether a
@@ -326,6 +337,18 @@ pub struct PhaseTimes {
     pub attend_s: f64,
     /// Per-cell relative change, plus the closing RMS aggregate.
     pub readout_s: f64,
+    /// How many times [`kernel::attend_project_into`] actually ran — incremented AT the two call
+    /// sites, never derived from the pool size, so that a fold which quietly stops folding shows
+    /// up here instead of being papered over by the arithmetic that was supposed to predict it.
+    pub attend_n: usize,
+    /// DEPENDENT candidates whose keep-set was byte-identical to an earlier one and which
+    /// therefore took its readout instead of being scored again. A group of three contributes
+    /// two, not one: it counts the scorings skipped, not the groups found.
+    pub folded: usize,
+    /// How many times [`kernel::logits_into`] actually ran. `logits_s` cannot answer the same
+    /// question — a build that merely stopped timing the call and a build where the call no
+    /// longer happens both report a small number of seconds, and only the count tells them apart.
+    pub logits_n: usize,
 }
 
 impl PhaseTimes {
@@ -464,6 +487,19 @@ pub fn decide(
         .collect();
     let mut visible = vec![u32::MAX; n_c];
 
+    // Two candidates that retain the same columns cannot deviate differently: the readout is a
+    // function of the keep-set alone, so the second scoring reproduces the first bit for bit.
+    // `rep[c]` names the earliest candidate holding `c`'s keep-set — `c` itself when it is the
+    // first — and only representatives enter the per-layer loop below.
+    //
+    // The pool keeps its order and its length. That is not cosmetic: the tie-break at the end of
+    // this function is the pool order, so a fold that reordered or dropped an entry could move the
+    // winner. Every dependent still gets its own `Scored` entry, built from the representative's
+    // grid.
+    let rep: Vec<usize> = (0..n_c)
+        .map(|c| (0..c).find(|&p| pool[p].1 == pool[c].1).unwrap_or(c))
+        .collect();
+
     let mut z = vec![0.0f32; g.logit_len()];
     // The values seen through the output projection — see [`kernel::project_values_into`]. Built
     // once per layer and shared by the baseline and every candidate, which is what makes a
@@ -472,11 +508,25 @@ pub fn decide(
     let mut w_base = vec![0.0f32; g.rows * r];
     let mut w_cand = vec![0.0f32; g.rows * r];
 
-    let mut times = PhaseTimes::default();
+    let mut times = PhaseTimes {
+        folded: rep.iter().enumerate().filter(|&(c, &p)| p != c).count(),
+        ..PhaseTimes::default()
+    };
     for l in 0..g.n_layers {
         let (q, k, v) = (src.query_rows(l), src.keys(l), src.values(l));
         let t = Instant::now();
-        kernel::logits_into(q, k, &mut z, g)?;
+        // A1 (ticket 010): the observation-window pass already computed this block on the device
+        // and the source kept it, so borrow it instead of recomputing it. The two are not
+        // bit-identical — the kernel reads F16 keys directly where this reads a dequantized f32
+        // mirror — which is the trade the ticket's on-device winner-parity gate exists to watch.
+        let zl: &[f32] = match src.logits(l) {
+            Some(exported) if exported.len() == z.len() => exported,
+            _ => {
+                kernel::logits_into(q, k, &mut z, g)?;
+                times.logits_n += 1;
+                &z
+            }
+        };
         times.logits_s += t.elapsed().as_secs_f64();
         let t = Instant::now();
         kernel::project_values_into(v, basis.layer(l), &mut vb, g, r)?;
@@ -488,20 +538,36 @@ pub fn decide(
         let kp_base = KeyPos::for_layer(&identity, l, g.current_pos, g.rows);
         times.keypos_s += t.elapsed().as_secs_f64();
         let t = Instant::now();
-        kernel::attend_project_into(&z, &identity, l, &kp_base, &vb, &mut w_base, g)?;
+        kernel::attend_project_into(zl, &identity, l, &kp_base, &vb, &mut w_base, g)?;
         times.attend_s += t.elapsed().as_secs_f64();
+        times.attend_n += 1;
 
         for (c, (_, keep)) in pool.iter().enumerate() {
+            if rep[c] != c {
+                continue;
+            }
             let t = Instant::now();
             let kp = KeyPos::for_layer(keep, l, g.current_pos, g.rows);
             times.keypos_s += t.elapsed().as_secs_f64();
             visible[c] &= kp.visible_rows();
             let t = Instant::now();
-            kernel::attend_project_into(&z, keep, l, &kp, &vb, &mut w_cand, g)?;
+            kernel::attend_project_into(zl, keep, l, &kp, &vb, &mut w_cand, g)?;
             times.attend_s += t.elapsed().as_secs_f64();
+            times.attend_n += 1;
             let t = Instant::now();
             grids[c].fill_layer(l, &w_base, &w_cand, r)?;
             times.readout_s += t.elapsed().as_secs_f64();
+        }
+    }
+
+    // Hand each dependent the representative's finished readout. Copying here rather than at
+    // aggregation time leaves the scoring loop and the tie-break below untouched, which is what
+    // keeps the whole `arms` line — scores included — bit-identical to an unfolded run.
+    for c in 0..n_c {
+        let p = rep[c];
+        if p != c {
+            visible[c] = visible[p];
+            grids[c] = grids[p].clone();
         }
     }
 

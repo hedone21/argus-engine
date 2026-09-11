@@ -334,7 +334,7 @@ impl Selector {
         // first and save the round trip when every candidate is excluded; the paper's pool is
         // not that pool.)
         let t_read = std::time::Instant::now();
-        let src = HostLayers::read(
+        let mut src = HostLayers::read(
             caches,
             current_pos,
             n_kv_heads,
@@ -353,9 +353,18 @@ impl Selector {
                 current_pos,
                 rows: src.window_rows,
             };
-            Some(PrefillAttn::captured(window_attention_layers(
-                caches, &src, gw,
-            )?))
+            let (acc, z) = window_attention_layers(caches, &src, gw)?;
+            // A1: hand `decide` the logits the window pass just computed on the device instead of
+            // letting it recompute them. Accepted only at exactly the length the metric geometry
+            // implies — a short export is a geometry disagreement, and the CPU path is the right
+            // answer to one of those, not a partially filled `z`. Past `A1_EXPORT_MAX_POS` there
+            // is deliberately nothing to accept and this decision pays the CPU dot product.
+            let stride = self.n_heads_q * src.rows * current_pos;
+            if stride > 0 && z.as_ref().is_some_and(|z| z.len() == n_layers * stride) {
+                src.logits = z;
+                src.logit_stride = stride;
+            }
+            Some(PrefillAttn::captured(acc))
         } else {
             None
         };
@@ -735,6 +744,16 @@ struct HostLayers {
     window_rows: usize,
     /// Per-layer, per-KV-head first resident position (`KVCache::head_starts`).
     starts: Vec<Vec<usize>>,
+    /// A1 (ticket 010): the window kernel's exported raw logits for the metric's rows, flat over
+    /// layers — `[n_layers][n_heads_q][rows][current_pos]`, `logit_stride` elements per layer.
+    ///
+    /// Pass A of the window kernel computes exactly what [`aperturb::decide`] would recompute in
+    /// `kernel::logits_into`, then overwrites it with `exp(z - m)`; this is that value copied out
+    /// first. `None` whenever the window pass did not run on the device — no prefill-end candidate
+    /// in the pool, a cache the kernel cannot read, the env kill switch — and `decide` then pays
+    /// the CPU dot product exactly as before.
+    logits: Option<Arc<Vec<f32>>>,
+    logit_stride: usize,
 }
 
 impl HostLayers {
@@ -757,6 +776,8 @@ impl HostLayers {
             window_q: Vec::with_capacity(n_layers),
             window_rows: q_snap.rows,
             starts: Vec::with_capacity(n_layers),
+            logits: None,
+            logit_stride: 0,
         };
         for (l, cache) in caches.iter().enumerate() {
             let all = q_snap.layer_head_major(l, head_dim);
@@ -791,6 +812,65 @@ fn trailing_rows(all: &[f32], all_rows: usize, rows: usize, head_dim: usize) -> 
     out
 }
 
+/// What a window pass yields: the pooled `[n_layers][n_heads_q][current_pos]` scores, and A1's
+/// exported raw logits for the metric's rows, flat over layers.
+///
+/// The z half is `Some` only when a device readback actually filled a block — never as a
+/// restatement of "the device path ran", which is what makes it worth reporting separately. It is
+/// `None` on every CPU fallback (there [`aperturb::decide`] computes the identical quantity
+/// itself) and whenever nothing was asked to be exported. The `Arc` is the backend's own reused
+/// host buffer, shared rather than copied.
+type WindowPass = (Vec<Vec<f32>>, Option<Arc<Vec<f32>>>);
+
+/// The largest `current_pos` at which a production decision still asks the window kernel to export
+/// its raw logits (A1, ticket 010). Above it [`window_attention_layers`] asks for 0 rows, the
+/// kernel writes nothing, [`HostLayers::logits`] answers `None`, and [`aperturb::decide`] rebuilds
+/// the block with `kernel::logits_into` — the pre-010 path exactly. Which of the two happened is
+/// readable off the decision line: `logits_n=0` is the export, `logits_n=<n_layers>` the fallback.
+///
+/// Why the export is worth gating at all, and why here:
+///
+/// * **The gain is proven only below it.** A 10-cell order-interleaved on-device A/B (5 runs per
+///   arm, 4 decisions at `current_pos` 1121-1225) measured `read`+`window`+`logits` summed over
+///   the four decisions at 0.932 s → 0.774 s, **−17.0 %**.
+/// * **Above it the time gain goes away.** A cool-device sweep driven by PROMPT length — so the
+///   decision falls early in the run and throttling cannot confound it — measured, per 1000
+///   resident tokens, a CONSTANT `window` cost of 0.026 / 0.026 / 0.030 s at `current_pos`
+///   1125 / 2147 / 4193 against a SHRINKING `logits` saving of 0.046 / 0.034 / 0.030 s. The two
+///   lines cross at `current_pos` ~4200, and above roughly 2000 the margin is already inside
+///   single-pair noise. (The one measured point past that, `current_pos` 3925, was a net loss:
+///   `window` +0.146 s against `logits` −0.133 s.)
+/// * **What does not go away is memory.** The export is
+///   `n_layers 28 × n_heads_q 12 × export_rows 16 × current_pos` floats = 21.5 KB per resident
+///   token, held on the device AND again on the host: 44+44 MB at 2048, 88+88 at 4096,
+///   **176+176 MB at 8192**. Paying 352 MB for a measured gain of about zero is the trade this
+///   threshold removes, and the 8K cell is the one this engine is aimed at.
+/// * **Falling back cannot be worse than the baseline: it IS the baseline.** The gate costs a
+///   decision nothing it was not already paying before A1 existed.
+///
+/// 2048 is the conservative end of the interval that was not measured, not a measured break-even:
+/// the gain side is four decisions bunched at `current_pos` 1121-1225 and the loss side is a
+/// single decision at 3925. Moving it wants pairs at 2000 / 2500 / 3000 first.
+///
+/// Scoped with the device path because only the device path exports anything.
+#[cfg(feature = "opencl")]
+const A1_EXPORT_MAX_POS: usize = 2048;
+
+/// How many trailing rows a production decision at `current_pos` asks the window kernel to export.
+///
+/// The policy [`A1_EXPORT_MAX_POS`] documents, in one place so that the decision path and the
+/// selfcheck differ by exactly this call: [`window_attention_selfcheck`] asks for its rows
+/// unconditionally, because it is measuring the export machinery rather than running under this
+/// policy, and gating it there would blind the selfcheck's own long-cache cases.
+#[cfg(feature = "opencl")]
+fn a1_export_rows(current_pos: usize, metric_rows: usize) -> usize {
+    if current_pos <= A1_EXPORT_MAX_POS {
+        metric_rows
+    } else {
+        0
+    }
+}
+
 /// Every layer's observation-window attention, on the device when the cache is there.
 ///
 /// The GPU path reads the live K cache in place, so it also skips the host mirror the CPU path
@@ -801,7 +881,14 @@ fn trailing_rows(all: &[f32], all_rows: usize, rows: usize, head_dim: usize) -> 
 /// (non-F16 K, a SeqMajor layout, a non-OpenCL backend, a kernel that failed to compile, mixed
 /// capacities across layers). `ARGUS_WINDOW_GPU_OFF` forces the fallback;
 /// `ARGUS_WINDOW_GPU_VERIFY` runs both and reports the divergence.
-fn window_attention_layers(caches: &[KVCache], src: &HostLayers, g: Geom) -> Result<Vec<Vec<f32>>> {
+///
+/// The second half of the pair is the device's exported raw logits for the metric's rows
+/// ([`HostLayers::logits`]), `None` on every fallback above — there is no CPU twin to build it
+/// from, because on that path [`aperturb::decide`] computes the same quantity itself anyway — and
+/// `None` again past `A1_EXPORT_MAX_POS`, where this function stops asking for the export. This
+/// is the production decision path's only entry to the window pass; the selfcheck goes straight to
+/// the device function below, which is why the threshold lives here and not inside it.
+fn window_attention_layers(caches: &[KVCache], src: &HostLayers, g: Geom) -> Result<WindowPass> {
     let cpu = || -> Result<Vec<Vec<f32>>> {
         (0..g.n_layers)
             .map(|l| window_attention(src, l, g))
@@ -812,13 +899,20 @@ fn window_attention_layers(caches: &[KVCache], src: &HostLayers, g: Geom) -> Res
         // A dispatch that the device refuses (a work-group shape it cannot schedule, a register
         // spill) must cost the run a slower decision, not the decision itself. Latch it off after
         // the first refusal so a broken device does not pay the probe 18 times.
-        match window_attention_layers_opencl(caches, src, g) {
-            Ok(Some(gpu)) => {
+        match window_attention_layers_opencl(
+            caches,
+            src,
+            g,
+            a1_export_rows(g.current_pos, src.rows),
+        ) {
+            Ok(Some((gpu, z))) => {
                 if std::env::var("ARGUS_WINDOW_GPU_VERIFY").is_ok() {
                     let host = cpu()?;
                     report_window_divergence(&host, &gpu, g);
                 }
-                return Ok(gpu);
+                // `z` is passed through exactly as the backend reported it: a device pass that
+                // exported nothing arrives here as `None` even though the device path ran.
+                return Ok((gpu, z));
             }
             Ok(None) => {}
             Err(e) => {
@@ -832,7 +926,7 @@ fn window_attention_layers(caches: &[KVCache], src: &HostLayers, g: Geom) -> Res
         }
     }
     let _ = caches;
-    cpu()
+    Ok((cpu()?, None))
 }
 
 /// Set once the device path has refused a dispatch — see [`window_attention_layers`].
@@ -847,12 +941,20 @@ fn window_gpu_enabled() -> bool {
 }
 
 /// `Ok(None)` = this cache is not one the kernel can read; the caller runs the CPU path.
+///
+/// `Some((acc, z))`: `acc` is the pooled window attention, `z` the raw logits of the window's
+/// trailing `export_rows` rows, flat over layers — `Some` only when the device really read a block
+/// back, which is a strictly stronger statement than this function returning `Some` at all.
+///
+/// `export_rows` is the caller's, not this function's: the production path applies
+/// [`a1_export_rows`] to it and the selfcheck does not. Machinery here, policy there.
 #[cfg(feature = "opencl")]
 fn window_attention_layers_opencl(
     caches: &[KVCache],
     src: &HostLayers,
     g: Geom,
-) -> Result<Option<Vec<Vec<f32>>>> {
+    export_rows: usize,
+) -> Result<Option<WindowPass>> {
     use crate::backend::opencl::{OpenCLBackend, WindowAttnGeom, get_cl_mem};
     use crate::kv_cache_ops::KVLayout;
 
@@ -896,8 +998,14 @@ fn window_attention_layers_opencl(
         current_pos: g.current_pos,
         rows: g.rows,
         capacity,
+        // What the caller asked for, clamped to what a window this wide can hold. `g.rows` here is
+        // the WINDOW's row count (`window_rows`), so a capture short enough that
+        // `HostLayers::read` clamped the metric asks for fewer than `APERTURB_ROWS` — and the two
+        // are equal in the selfcheck's first family, which is why that family cannot tell a tail
+        // export from a head one.
+        export_rows: export_rows.min(g.rows),
     };
-    let Some(flat) = ocl_be.window_attention_sum(&mems, &starts, &qwin, geom)? else {
+    let Some((flat, z)) = ocl_be.window_attention_sum(&mems, &starts, &qwin, geom)? else {
         return Ok(None);
     };
     // Fail loud the way the CPU path does: a NaN column sorts as "equal" in the candidates'
@@ -906,8 +1014,21 @@ fn window_attention_layers_opencl(
         flat.iter().all(|v| v.is_finite()),
         "the GPU window attention produced a non-finite score"
     );
+    // Same reason, one level down: `decide` softmaxes these, and a NaN logit poisons a candidate's
+    // whole readout rather than one column of it. This is the ONLY host pass over the export — the
+    // block is read straight into the backend's reused buffer and handed on by reference, so
+    // nothing copies or re-zeroes those 88 MB on the way here.
+    if let Some(z) = z.as_deref() {
+        anyhow::ensure!(
+            z.iter().all(|v| v.is_finite()),
+            "the GPU window attention produced a non-finite exported logit"
+        );
+    }
     let per_layer = g.n_heads_q * g.current_pos;
-    Ok(Some(flat.chunks(per_layer).map(<[f32]>::to_vec).collect()))
+    Ok(Some((
+        flat.chunks(per_layer).map(<[f32]>::to_vec).collect(),
+        z,
+    )))
 }
 
 /// What `ARGUS_WINDOW_GPU_VERIFY` prints: the worst absolute and relative gap, and — the property
@@ -1008,6 +1129,14 @@ impl LayerSource for HostLayers {
     fn values(&self, layer: usize) -> &[f32] {
         &self.v[layer]
     }
+    fn logits(&self, layer: usize) -> Option<&[f32]> {
+        // `get` rather than an index: a stride that does not cover the layer means the export and
+        // the metric geometry disagree, and the honest answer to that is the CPU path, not a
+        // panic in the middle of a decision.
+        self.logits
+            .as_ref()?
+            .get(layer * self.logit_stride..(layer + 1) * self.logit_stride)
+    }
 }
 
 /// What one [`window_attention_selfcheck`] run found.
@@ -1028,6 +1157,28 @@ pub struct WindowSelfcheck {
     /// Wall time of one whole-model device pass, upload and readback included. `0.0` when the
     /// device path declined.
     pub gpu_s: f64,
+    /// A1 (ticket 010): `true` only when the device actually returned an exported z block.
+    ///
+    /// NOT derived from `gpu_ran`. `gpu_ran` exists because a declined device path compared the
+    /// CPU against itself and reported a perfect score; an export that never happened, or one the
+    /// host recomputed itself, is the same failure one level down.
+    pub z_gpu_ran: bool,
+    /// A1: `(layer, query head, metric row)` triples actually compared. `0` means nothing was checked.
+    pub z_rows_compared: usize,
+    /// A1: rows where the exported z and `kernel::logits_into`'s z rank a different column top.
+    /// RECORDED, never gated — a 2-ULP separation cannot survive a change of summation order
+    /// (contract §3′, measured in `tickets/010-evidence/z_tie_diagnostic_2026-09-11.log`).
+    pub z_argmax_mismatch: usize,
+    /// A1: mismatches the observed per-column deviations CANNOT account for. **This is the gate.**
+    pub z_argmax_unexplained: usize,
+    /// A1: largest ABSOLUTE gap over the compared range. **This is the other gate** (§3′): unlike
+    /// the relative one it is bounded — 1.49e-8 measured on a correct export, against O(0.1) for
+    /// one that carries the wrong rows or leaves columns unwritten.
+    pub z_max_abs: f32,
+    /// A1: largest relative gap over the compared range. RECORDED, never gated — raw logits pass
+    /// through zero, so a 1-ULP absolute error on a near-zero logit is an unbounded relative one
+    /// (measured 8.7e-3 to 3.8e-2 on a CORRECT implementation).
+    pub z_max_rel: f32,
 }
 
 /// Run the decision-time window pass on the device and on the CPU over the same synthetic cache,
@@ -1037,6 +1188,11 @@ pub struct WindowSelfcheck {
 /// [`crate::aperturb::tests`] does it, so a drift in the generator fails loudly instead of
 /// silently comparing different data. `ragged` gives head `h` a first resident slot of
 /// `h * current_pos / (2 * n_kv_heads)`, which is what a per-head keep leaves behind.
+///
+/// `rows` is the observation window (production 64); `metric_rows` is the metric's own trailing
+/// rows inside it (production 16, `APERTURB_ROWS`). They are separate arguments because A1's whole
+/// seam lives in the gap between them: with one value filling both, `trailing_rows` hands back its
+/// input unchanged and an export that took the window's HEAD passes every check below.
 ///
 /// Device-gated by nature: with no OpenCL backend it returns `gpu_ran: false`.
 #[allow(clippy::too_many_arguments)]
@@ -1050,6 +1206,7 @@ pub fn window_attention_selfcheck(
     capacity: usize,
     current_pos: usize,
     rows: usize,
+    metric_rows: usize,
     ragged: bool,
 ) -> Result<WindowSelfcheck> {
     use crate::buffer::DType;
@@ -1057,6 +1214,9 @@ pub fn window_attention_selfcheck(
     use crate::shape::Shape;
     use crate::tensor::Tensor;
 
+    // `HostLayers::read`'s own clamp, restated: a capture shorter than the metric asks for still
+    // has to produce at least one row.
+    let mrows = metric_rows.min(rows).max(1);
     let mut lcg: u64 = 0x2545_F491_4F6C_DD1D;
     let mut next = || {
         lcg = lcg
@@ -1120,17 +1280,20 @@ pub fn window_attention_selfcheck(
         caches.push(cache);
         host_k.push(k32);
         let qw: Vec<f32> = (0..n_heads_q * rows * head_dim).map(|_| next()).collect();
-        q.push(trailing_rows(&qw, rows, rows, head_dim));
+        // The metric's rows are the window's tail — the same clamp `HostLayers::read` applies.
+        q.push(trailing_rows(&qw, rows, mrows, head_dim));
         window_q.push(qw);
     }
     let src = HostLayers {
         q,
         k: host_k,
         v: vec![Vec::new(); n_layers],
-        rows,
+        rows: mrows,
         window_q,
         window_rows: rows,
         starts,
+        logits: None,
+        logit_stride: 0,
     };
     let g = Geom {
         n_layers,
@@ -1148,20 +1311,25 @@ pub fn window_attention_selfcheck(
     let cpu_s = t_cpu.elapsed().as_secs_f64();
     // Go through the device entry point directly rather than through `window_attention_layers`:
     // a silent decline there would compare the CPU against itself and report a perfect score.
+    // The export width is therefore asked for outright, NOT through `a1_export_rows` — this
+    // function checks the export machinery, and half its cases stand at a `current_pos` past
+    // `A1_EXPORT_MAX_POS`, where the production policy declines to export at all.
     let t_gpu = std::time::Instant::now();
     #[cfg(feature = "opencl")]
-    let device = window_attention_layers_opencl(&caches, &src, g)?;
+    let device = window_attention_layers_opencl(&caches, &src, g, mrows)?;
     #[cfg(not(feature = "opencl"))]
-    let device: Option<Vec<Vec<f32>>> = None;
+    let device: Option<WindowPass> = None;
     let gpu_ran = device.is_some();
     let gpu_s = if gpu_ran {
         t_gpu.elapsed().as_secs_f64()
     } else {
         0.0
     };
-    let got = match device {
-        Some(v) => v,
-        None => host.clone(),
+    // `device_z` is the device's own answer to "was there an export", not a second reading of
+    // `gpu_ran`: a device pass that exported nothing leaves it `None` here.
+    let (got, device_z) = match device {
+        Some((v, z)) => (v, z),
+        None => (host.clone(), None),
     };
     let mut out = WindowSelfcheck {
         gpu_ran,
@@ -1171,6 +1339,12 @@ pub fn window_attention_selfcheck(
         loose_cols: 0,
         cpu_s,
         gpu_s,
+        z_gpu_ran: false,
+        z_rows_compared: 0,
+        z_argmax_mismatch: 0,
+        z_argmax_unexplained: 0,
+        z_max_abs: 0.0,
+        z_max_rel: 0.0,
     };
     for (a, b) in host.iter().zip(&got) {
         anyhow::ensure!(
@@ -1196,6 +1370,84 @@ pub fn window_attention_selfcheck(
             };
             if arg(a) != arg(b) {
                 out.argmax_mismatch += 1;
+            }
+        }
+    }
+
+    // ── A1: the exported raw z against the very call `aperturb::decide` skips ──
+    //
+    // The comparison is deliberately narrow. `kernel::logits_into` fills every column of every
+    // row, and the host K mirror dequantizes a ragged head's holes too; the kernel writes only
+    // `[start, end_max)`. So a hole column holds a real dot product on one side and a zero on the
+    // other, and comparing all columns would fail a CORRECT export. The pooled comparison above
+    // survives it only because both sides *define* a hole as 0 after the softmax.
+    if let Some(zdev) = device_z {
+        out.z_gpu_ran = true;
+        let g_metric = Geom {
+            n_layers,
+            n_heads_q,
+            n_kv_heads,
+            head_dim,
+            current_pos,
+            rows: mrows,
+        };
+        let n_rep = g_metric.n_rep();
+        let stride = n_heads_q * mrows * current_pos;
+        anyhow::ensure!(
+            zdev.len() == n_layers * stride,
+            "window selfcheck: the exported z is {} elements, expected {}",
+            zdev.len(),
+            n_layers * stride
+        );
+        let mut z_ref = vec![0.0f32; g_metric.logit_len()];
+        let arg = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|p, q| p.1.partial_cmp(q.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+        };
+        for l in 0..n_layers {
+            logits_into(src.query_rows(l), src.keys(l), &mut z_ref, g_metric)
+                .map_err(|e| anyhow::anyhow!("layer {l}: {e}"))?;
+            let zl = &zdev[l * stride..(l + 1) * stride];
+            for h in 0..n_heads_q {
+                let start = src.head_start(l, h / n_rep).min(current_pos);
+                for t in 0..mrows {
+                    // Causal: metric row `t` sees the keys at or before its own position, and
+                    // nothing below its KV head's ragged start. A row with nothing between the
+                    // two is blind on both sides and is skipped, not counted.
+                    let end = (g_metric.row_pos(t) + 1).min(current_pos);
+                    if end <= start {
+                        continue;
+                    }
+                    let base = (h * mrows + t) * current_pos;
+                    let (a, b) = (
+                        &z_ref[base + start..base + end],
+                        &zl[base + start..base + end],
+                    );
+                    for (x, y) in a.iter().zip(b) {
+                        let d = (x - y).abs();
+                        out.z_max_abs = out.z_max_abs.max(d);
+                        out.z_max_rel = out.z_max_rel.max(d / x.abs().max(1e-6));
+                    }
+                    if let (Some(ia), Some(ib)) = (arg(a), arg(b))
+                        && ia != ib
+                    {
+                        out.z_argmax_mismatch += 1;
+                        // Contract §3′: the flip is EXPLAINED when the two columns' own observed
+                        // CPU-vs-GPU deviations, taken at their worst, cover the gap the CPU saw
+                        // between them — two columns 2 ULP apart cannot keep their order across a
+                        // change of summation order, and this ticket gave up bit-identity on
+                        // purpose. No constant, no tolerance: only a flip the deviations cannot
+                        // account for is a real disagreement.
+                        let gap = (a[ia] - a[ib]).abs();
+                        let dev = (a[ia] - b[ia]).abs() + (a[ib] - b[ib]).abs();
+                        if gap > dev {
+                            out.z_argmax_unexplained += 1;
+                        }
+                    }
+                    out.z_rows_compared += 1;
+                }
             }
         }
     }
@@ -2037,6 +2289,28 @@ mod tests {
         assert_eq!(all.query_rows(0), all.window_q(0));
     }
 
+    /// A1's export is a production policy, not a property of the export machinery. Past
+    /// `A1_EXPORT_MAX_POS` a decision asks for no rows at all — that is what leaves the kernel
+    /// with nothing to write, `HostLayers::logits` answering `None`, and `decide` back on
+    /// `kernel::logits_into`. `window_attention_selfcheck` deliberately does NOT go through this,
+    /// because half of its cases stand above the threshold and would stop exercising the export.
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn the_export_is_asked_for_only_up_to_the_threshold() {
+        assert_eq!(a1_export_rows(1, 16), 16);
+        assert_eq!(
+            a1_export_rows(A1_EXPORT_MAX_POS, 16),
+            16,
+            "the bound is inclusive"
+        );
+        assert_eq!(a1_export_rows(A1_EXPORT_MAX_POS + 1, 16), 0);
+        assert_eq!(a1_export_rows(8192, 16), 0, "the 8K cell exports nothing");
+        // Not the digit but the evidence behind it: the threshold has to sit above every decision
+        // the on-device A/B measured a gain at (1121-1225) and below the one it measured a loss at
+        // (3925). Moving it outside that bracket is a claim this tree has no measurement for.
+        assert!((1225..3925).contains(&A1_EXPORT_MAX_POS));
+    }
+
     /// A capture is carried only when the cache actually moved. A decision that retains everything
     /// leaves the numbering alone, so re-stamping the capture would hand the decode loop's shrink
     /// detector an excuse for a compaction that never happened.
@@ -2153,4 +2427,88 @@ mod tests {
     fn an_empty_pool_is_refused_at_construction() {
         assert!(Selector::new(Vec::new(), identity_basis(), HEADS).is_err());
     }
+    // === BEGIN FROZEN 010-A3 — tickets/010-evidence/a3_fold_test.rs, 그대로 붙일 것 ===
+    /// **A3 (티켓 010).** keep-set 이 바이트 동일한 후보는 결정 1회에 한 번만 채점된다.
+    ///
+    /// (a) 채점 횟수 `attend_n` 과 (b) `folded` 가 이 기준의 게이트다. (c) 의 비트 동일은
+    /// 접기를 한 줄도 구현하지 않은 트리에서 **이미 참**이라 단독으로는 아무것도 막지 못한다 —
+    /// 남겨 둔 이유는 접기가 결과를 바꾸는 회귀를 잡기 위해서다.
+    ///
+    /// `folded` 는 그룹 수가 아니라 **종속 후보 수**다: 같은 keep-set 이 3개면 2다.
+    #[test]
+    fn byte_identical_keep_sets_are_scored_once() {
+        let run = |cands: Vec<Candidate>| {
+            let s = selector(cands);
+            let mut cs = caches();
+            let mut q = armed_q_rows();
+            s.choose_and_apply(&mut cs, 0.25, &mut q, Signals::default())
+                .expect("decide")
+                .expect("a choice")
+        };
+
+        let dup = run(vec![
+            fixed("a", &[3, 4]),
+            fixed("b", &[3, 4]),
+            fixed("mid", &[0, 1]),
+        ]);
+        let distinct = run(vec![
+            fixed("a", &[3, 4]),
+            fixed("b", &[2, 4]),
+            fixed("mid", &[0, 1]),
+        ]);
+        let triple = run(vec![
+            fixed("a", &[3, 4]),
+            fixed("b", &[3, 4]),
+            fixed("c", &[3, 4]),
+        ]);
+        let single = run(vec![fixed("a", &[3, 4]), fixed("mid", &[0, 1])]);
+
+        // ── (a) 채점 횟수 — 접기를 안 하면 여기서 떨어진다 ──
+        assert_eq!(
+            dup.decide_times.attend_n,
+            (3 + 1 - 1) * LAYERS,
+            "dup pool: 바이트 동일한 두 후보는 한 번만 채점돼야 한다"
+        );
+        assert_eq!(
+            distinct.decide_times.attend_n,
+            (3 + 1) * LAYERS,
+            "distinct pool: 접을 것이 없으면 채점 횟수는 그대로다"
+        );
+        assert_eq!(
+            triple.decide_times.attend_n,
+            (3 + 1 - 2) * LAYERS,
+            "triple pool: 세 후보가 한 그룹이면 종속 둘이 빠진다"
+        );
+
+        // ── (b) 접힌 수의 표면 ──
+        assert_eq!(dup.decide_times.folded, 1, "dup pool folded");
+        assert_eq!(distinct.decide_times.folded, 0, "distinct pool folded");
+        assert_eq!(
+            triple.decide_times.folded, 2,
+            "triple pool folded = 종속 후보 수"
+        );
+
+        // ── (c) 안전성 — 접힌 결과가 비트 동일 ──
+        assert_eq!(
+            dup.arms.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "mid"],
+            "arms 는 pool 순서 그대로 셋 다 보고된다"
+        );
+        let a_bits = dup.arms[0].score.to_bits();
+        assert_eq!(
+            a_bits,
+            dup.arms[1].score.to_bits(),
+            "같은 keep-set 의 두 팔은 비트 동일한 점수를 받는다"
+        );
+        assert_eq!(
+            dup.arms[0].kept_total, dup.arms[1].kept_total,
+            "종속 후보의 kept_total 도 대표와 같다"
+        );
+        assert_eq!(
+            a_bits,
+            single.arms[0].score.to_bits(),
+            "접기가 점수를 바꾸면 안 된다 (단일 채점 풀의 'a' 와 비트 동일)"
+        );
+    }
+    // === END FROZEN 010-A3 ===
 }
