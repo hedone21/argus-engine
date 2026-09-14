@@ -780,6 +780,7 @@ impl CudaBackend {
 }
 
 impl CudaBackend {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_gen_impl(
         &self,
         q: &Tensor,
@@ -1057,10 +1058,7 @@ impl Backend for CudaBackend {
             }
             None => None,
         };
-        let kv_lo_dptr: u64 = kv_lo_buf
-            .as_ref()
-            .map(|b| b.device_ptr() as u64)
-            .unwrap_or(0);
+        let kv_lo_dptr: u64 = kv_lo_buf.as_ref().map(|b| b.device_ptr()).unwrap_or(0);
         let kv_dtype = k_cache.dtype();
 
         // The CUDA prefill kernel assumes a HeadMajor KV layout ([kv_heads, capacity, head_dim]).
@@ -1975,8 +1973,7 @@ impl Backend for CudaBackend {
             anyhow!("ragged-cache decode on CUDA needs the device head-start mirror")
         })?;
         let kv_lo_dptr = Self::get_device_ptr(dev.buffer().as_ref())
-            .ok_or_else(|| anyhow!("the head-start mirror is not a CUDA buffer"))?
-            as u64;
+            .ok_or_else(|| anyhow!("the head-start mirror is not a CUDA buffer"))?;
         let kv_dtype = k_cache.dtype();
         let all_ptrs = Self::get_device_ptr(q.buffer().as_ref()).is_some()
             && Self::get_device_ptr(k_cache.buffer().as_ref()).is_some()
