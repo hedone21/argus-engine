@@ -543,6 +543,16 @@ impl CommandDispatcher {
                 self.control.restore_defaults = true;
                 // 재무장: 다음 KvCompress 가 새 OneShot submit 가능.
                 self.last_evict_ratio = None;
+                crate::yield_policy::restore_default_yield_every();
+                CommandResult::Ok
+            }
+
+            // ④ gpu.share → yield_policy setter (tickets/015). 의도(foreground)를 손잡이 값
+            // (EVERY)으로 번역하는 것은 `every_for_share` 뿐이다 — dispatcher 는 사다리를 모른다.
+            EngineCommand::GpuShare { foreground } => {
+                crate::yield_policy::set_yield_every(crate::yield_policy::every_for_share(
+                    *foreground,
+                ));
                 CommandResult::Ok
             }
         }
@@ -1083,6 +1093,23 @@ mod tests {
         let r = results_of(&mut d, vec![EngineCommand::RestoreDefaults]);
         assert!(matches!(r[..], [CommandResult::Ok]));
         assert!(d.control().restore_defaults);
+    }
+
+    /// `GpuShare` touches `yield_policy` global state directly (tickets/015 T2-c), same as
+    /// `yield_policy::tests::LOCK` — serialize against those tests too. No cache manager
+    /// needed: `bare_dispatcher` proves the command doesn't route through KV at all.
+    #[test]
+    fn gpu_share_sets_the_yield_and_restore_releases_it() {
+        let _g = crate::yield_policy::TEST_LOCK.lock().unwrap();
+        let (mut d, _registry) = bare_dispatcher();
+
+        let r = results_of(&mut d, vec![EngineCommand::GpuShare { foreground: 1.0 }]);
+        assert!(matches!(r[..], [CommandResult::Ok]));
+        assert_eq!(crate::yield_policy::yield_every(), 2);
+
+        let r = results_of(&mut d, vec![EngineCommand::RestoreDefaults]);
+        assert!(matches!(r[..], [CommandResult::Ok]));
+        assert_eq!(crate::yield_policy::yield_every(), 0);
     }
 
     /// `finalize_results` 는 비운다 — 다음 dispatch 가 이전 결과를 물려받지 않는다.
