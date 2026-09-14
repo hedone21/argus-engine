@@ -547,12 +547,10 @@ impl CommandDispatcher {
                 CommandResult::Ok
             }
 
-            // ④ gpu.share → yield_policy setter (tickets/015). 의도(foreground)를 손잡이 값
-            // (EVERY)으로 번역하는 것은 `every_for_share` 뿐이다 — dispatcher 는 사다리를 모른다.
-            EngineCommand::GpuShare { foreground } => {
-                crate::yield_policy::set_yield_every(crate::yield_policy::every_for_share(
-                    *foreground,
-                ));
+            // ④ gpu.yield → yield_policy setter (tickets/016). 간격 N 은 매니저 정책이 정하고
+            // 엔진은 받은 값을 그대로 쓴다 — 범위(0..=64)는 argus-shared 역직렬화가 이미 검사했다.
+            EngineCommand::GpuYield { every } => {
+                crate::yield_policy::set_yield_every(*every as usize);
                 CommandResult::Ok
             }
         }
@@ -1095,20 +1093,28 @@ mod tests {
         assert!(d.control().restore_defaults);
     }
 
-    /// `GpuShare` touches `yield_policy` global state directly (tickets/015 T2-c), same as
+    /// `GpuYield` touches `yield_policy` global state directly (tickets/016 T2), same as
     /// `yield_policy::tests::LOCK` — serialize against those tests too. No cache manager
     /// needed: `bare_dispatcher` proves the command doesn't route through KV at all.
     #[test]
-    fn gpu_share_sets_the_yield_and_restore_releases_it() {
+    fn gpu_yield_sets_the_interval_and_restore_releases_it() {
         let _g = crate::yield_policy::TEST_LOCK.lock().unwrap();
         let (mut d, _registry) = bare_dispatcher();
 
-        let r = results_of(&mut d, vec![EngineCommand::GpuShare { foreground: 1.0 }]);
+        let r = results_of(&mut d, vec![EngineCommand::GpuYield { every: 4 }]);
         assert!(matches!(r[..], [CommandResult::Ok]));
-        assert_eq!(crate::yield_policy::yield_every(), 2);
+        assert_eq!(crate::yield_policy::yield_every(), 4);
 
+        let r = results_of(&mut d, vec![EngineCommand::GpuYield { every: 0 }]);
+        assert!(matches!(r[..], [CommandResult::Ok]));
+        assert_eq!(crate::yield_policy::yield_every(), 0);
+        assert!(!crate::yield_policy::intra_token_yield_enabled());
+
+        let r = results_of(&mut d, vec![EngineCommand::GpuYield { every: 4 }]);
+        assert!(matches!(r[..], [CommandResult::Ok]));
         let r = results_of(&mut d, vec![EngineCommand::RestoreDefaults]);
         assert!(matches!(r[..], [CommandResult::Ok]));
+        // The test process runs with no LLMRS_DECODE_YIELD_EVERY set, so the env seed is 0.
         assert_eq!(crate::yield_policy::yield_every(), 0);
     }
 
