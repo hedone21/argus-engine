@@ -7,9 +7,9 @@
 //! token's kernel chain.
 //!
 //! `yield_every` starts at an env seed but can be changed for the life of the process via
-//! [`set_yield_every`] (tickets/015: a Manager `gpu.share` command translates its intent
-//! into a rung through [`every_for_share`] and calls the setter). [`restore_default_yield_every`]
-//! puts it back to the env seed.
+//! [`set_yield_every`] (tickets/016: a Manager `gpu.yield` command carries the interval and
+//! the dispatcher calls the setter with it). [`restore_default_yield_every`] puts it back to
+//! the env seed.
 //!
 //! Env vars (each read once, to seed the atomic and to seed `yield_us`):
 //!
@@ -63,17 +63,6 @@ pub fn restore_default_yield_every() {
     every_cell().store(env_seed_every(), Ordering::Relaxed);
 }
 
-/// Translate a `gpu.share` intent (`foreground` in `[0.0, 1.0]`) into a layer interval.
-///
-/// Two rungs only — `0` (off) and `2` (012's `e2s0` arm) — because 012 measured exactly
-/// three points (`EVERY ∈ {0, 8, 2}`) and `EVERY=8` fell short of its own `2D` bar
-/// (tickets/012 §Result). Interpolating a value 012 never measured is out of scope
-/// (tickets/015 §3): add a rung only after measuring it.
-#[inline]
-pub fn every_for_share(foreground: f32) -> usize {
-    if foreground > 0.0 { 2 } else { 0 }
-}
-
 /// Sleep microseconds per yield (`0` = `thread::yield_now` instead of sleep).
 #[inline]
 pub fn yield_us() -> u64 {
@@ -94,7 +83,7 @@ pub fn intra_token_yield_enabled() -> bool {
 }
 
 /// Serializes tests that mutate the process-global yield state. Shared beyond this
-/// module: `command_dispatcher`'s `gpu_share_sets_the_yield_and_restore_releases_it` test
+/// module: `command_dispatcher`'s `gpu_yield_sets_the_interval_and_restore_releases_it` test
 /// drives the same statics through `set_yield_every`/`restore_default_yield_every` and
 /// must not interleave with the tests below.
 #[cfg(test)]
@@ -134,14 +123,6 @@ mod tests {
         assert_eq!(yield_every(), 0);
         restore_default_yield_every();
         assert_eq!(yield_every(), 0);
-    }
-
-    #[test]
-    fn share_ladder_has_two_rungs() {
-        assert_eq!(every_for_share(0.0), 0);
-        assert_eq!(every_for_share(0.01), 2);
-        assert_eq!(every_for_share(0.5), 2);
-        assert_eq!(every_for_share(1.0), 2);
     }
 
     #[test]
