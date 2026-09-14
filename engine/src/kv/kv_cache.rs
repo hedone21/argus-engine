@@ -57,6 +57,20 @@ pub struct KVCache {
     kv_heads: usize,
     head_dim: usize,
     pub(crate) layout: KVLayout,
+    /// First resident position of each KV head — the ragged (per-head) geometry.
+    ///
+    /// Empty means uniform: every head is resident over `[0, current_pos)`, the shape every path
+    /// in the engine assumed before per-head keeps could differ in length. After a per-head keep
+    /// with unequal counts the heads are right-aligned on the shared write cursor, so head `h`
+    /// holds `[head_start[h], current_pos)` and the slots in front of it are holes: never read by
+    /// attention, never a legal keep position, and (host buffers) released back to the OS by
+    /// `release_unused_pages`. Appends still land at `current_pos` for every head, which is what
+    /// keeps the write path, the RoPE clock and the causal mask exactly as they were.
+    head_start: Vec<usize>,
+    /// Device mirror of `head_start` (`i32` per KV head) for the GPU attention kernels, created on
+    /// the first ragged commit of a device-resident cache and re-uploaded when `head_start_dirty`.
+    head_start_dev: Option<Tensor>,
+    head_start_dirty: bool,
     memory: Option<Arc<dyn Memory>>,
 }
 
@@ -81,6 +95,75 @@ pub(crate) fn read_device_tensor_to_host(t: &Tensor) -> Result<Tensor> {
     t.backend().read_buffer(t, dst)?;
     Ok(Tensor::new(
         t.shape().clone(),
+        Arc::new(host_buf),
+        Arc::new(CpuBackend::new()),
+    ))
+}
+
+/// [`read_device_tensor_to_host`], but only the RESIDENT `[0, rows)` of each head crosses the bus —
+/// and the host tensor is allocated at `rows`, not at the source's capacity.
+///
+/// The result is therefore a COMPACTED mirror: the same bytes in the same layout, but with the
+/// capacity-sized holes squeezed out, so a `KVCache` built over it must declare `capacity = rows`
+/// for `offset()`/`q4_block_offset()` to land on them. That is the whole point — the capacity-sized
+/// mirror costs an allocation and a zero-fill proportional to `--max-seq-len` on every call, which
+/// is why the decision's readback was flat against how much was actually resident.
+///
+/// The layouts differ only in how many bounded reads it takes:
+/// - `SeqMajor` `[1, capacity, kv_heads, head_dim]` — the resident rows are ONE contiguous prefix,
+///   and squeezing changes nothing, so it is a single read.
+/// - `HeadMajor` `[1, kv_heads, capacity, head_dim]` — each head's resident rows are contiguous but
+///   the heads are `capacity` apart, so it is one read per KV head, landing them `rows` apart.
+///
+/// Falls back to the full mirror whenever the byte geometry cannot be derived from the declared
+/// shape (a strided view, an unexpected element packing, or `rows` already covering capacity).
+fn read_device_tensor_resident_to_host(
+    t: &Tensor,
+    rows: usize,
+    kv_heads: usize,
+    capacity: usize,
+    head_dim: usize,
+    layout: KVLayout,
+) -> Result<Tensor> {
+    use crate::backend::cpu::CpuBackend;
+    use crate::memory::host::shared::SharedBuffer;
+    let bytes = t.size();
+    let slots = kv_heads * capacity;
+    // `bytes / slots` is only the per-(pos, head) stride if the buffer holds exactly the declared
+    // geometry and nothing else — check that before dividing, and bail to the full read otherwise.
+    if rows == 0
+        || rows >= capacity
+        || slots == 0
+        || !bytes.is_multiple_of(slots)
+        || t.shape().numel() != slots * head_dim
+    {
+        return read_device_tensor_to_host(t);
+    }
+    let row_bytes = bytes / slots;
+    let out_bytes = kv_heads * rows * row_bytes;
+    let host_buf = SharedBuffer::new(out_bytes, t.dtype());
+    // SAFETY: `host_buf` was just allocated with exactly `out_bytes` bytes and is not aliased yet;
+    // every read below writes a sub-slice of it and does not retain the pointer past the call.
+    let dst = unsafe { std::slice::from_raw_parts_mut(host_buf.as_mut_ptr(), out_bytes) };
+    let dims = match layout {
+        KVLayout::SeqMajor => {
+            t.backend().read_buffer_range(t, dst, 0)?;
+            vec![1, rows, kv_heads, head_dim]
+        }
+        KVLayout::HeadMajor => {
+            let n = rows * row_bytes;
+            for h in 0..kv_heads {
+                t.backend().read_buffer_range(
+                    t,
+                    &mut dst[h * n..(h + 1) * n],
+                    h * capacity * row_bytes,
+                )?;
+            }
+            vec![1, kv_heads, rows, head_dim]
+        }
+    };
+    Ok(Tensor::new(
+        Shape::new(dims),
         Arc::new(host_buf),
         Arc::new(CpuBackend::new()),
     ))
@@ -112,8 +195,61 @@ impl KVCache {
             kv_heads: self.kv_heads,
             head_dim: self.head_dim,
             layout: self.layout,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: None,
         })
+    }
+
+    /// [`host_snapshot`](Self::host_snapshot) restricted — and COMPACTED — to the resident `rows`.
+    ///
+    /// The full mirror is sized by the ALLOCATION, not by what is resident: on the
+    /// compression-decision path a `--max-seq-len 8192` cache allocates, zero-fills and receives
+    /// both K and V in full for every layer on every decision, so a cache holding 1559 of 8192
+    /// slots still paid the 8192-slot price. Hence a readback cost that was flat against
+    /// `current_pos`.
+    ///
+    /// This mirrors only `[0, rows)` of each head and squeezes the holes out, so the returned cache
+    /// declares `capacity = rows` and its `offset()` strides by `rows`. **It is therefore not
+    /// geometry-verbatim** the way [`host_snapshot`](Self::host_snapshot) is: it is valid for a
+    /// reader bounded by `rows` and nothing else. `dequant_snapshot(&mirror, rows, ..)` is exactly
+    /// such a reader, and produces floats identical to the same call on the full mirror.
+    ///
+    /// `rows` must be `<= current_pos`; anything at or above `capacity` falls back to the full
+    /// mirror (which is already geometry-verbatim, and has no holes left to squeeze).
+    pub(crate) fn host_snapshot_rows(&self, rows: usize) -> Result<KVCache> {
+        let mirror = |t: &Tensor| {
+            read_device_tensor_resident_to_host(
+                t,
+                rows,
+                self.kv_heads,
+                self.capacity,
+                self.head_dim,
+                self.layout,
+            )
+        };
+        let k_host = mirror(&self.k_buffer)?;
+        let v_host = mirror(&self.v_buffer)?;
+        // The fallback above returns the source geometry verbatim, so the mirror's capacity is
+        // whichever of the two it actually produced.
+        let capacity = if rows == 0 || rows >= self.capacity {
+            self.capacity
+        } else {
+            rows
+        };
+        let mut out = KVCache::new_with_geometry(
+            k_host,
+            v_host,
+            capacity,
+            self.kv_heads,
+            self.head_dim,
+            self.layout,
+        );
+        out.set_current_pos(self.current_pos.min(capacity));
+        out.max_seq_len = self.max_seq_len;
+        Ok(out)
     }
 
     /// Create a KVCache with full pre-allocation (capacity = max_seq_len).
@@ -132,6 +268,38 @@ impl KVCache {
             kv_heads,
             head_dim,
             layout: KVLayout::SeqMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
+            memory: None,
+        }
+    }
+
+    /// Create a fully pre-allocated cache with an explicit geometry and layout, for buffers whose
+    /// shape is already in the layout's own order (HeadMajor: `[1, kv_heads, capacity, head_dim]`).
+    /// `new` infers `kv_heads`/`head_dim` from a SeqMajor-shaped tensor; this one does not infer.
+    pub fn new_with_geometry(
+        k: Tensor,
+        v: Tensor,
+        max_seq_len: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        layout: KVLayout,
+    ) -> Self {
+        Self {
+            k_buffer: k,
+            v_buffer: v,
+            current_pos: 0,
+            high_water_pos: 0,
+            max_seq_len,
+            capacity: max_seq_len,
+            kv_heads,
+            head_dim,
+            layout,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
             memory: None,
         }
     }
@@ -158,6 +326,10 @@ impl KVCache {
             kv_heads,
             head_dim,
             layout: KVLayout::SeqMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: Some(memory),
         }
     }
@@ -887,7 +1059,17 @@ impl KVCache {
         if remaining == 0 {
             self.current_pos = 0;
             self.high_water_pos = 0;
+            self.head_start.clear();
             return Ok(());
+        }
+        // The prefix leaves every head; a ragged head's hole shrinks by the same amount.
+        if self.is_ragged() {
+            let starts: Vec<usize> = self
+                .head_starts()
+                .iter()
+                .map(|s| s.saturating_sub(count))
+                .collect();
+            self.set_head_starts(&starts);
         }
 
         let backend = self.k_buffer.backend().clone();
@@ -995,8 +1177,10 @@ impl KVCache {
             let block_size = std::mem::size_of::<crate::quant::BlockQ4_0>();
             self.current_pos * blocks_per_pos * block_size
         } else {
+            // `resident_positions` is `current_pos * kv_heads` on a uniform cache; on a ragged
+            // one the holes are not counted.
             let type_size = self.k_buffer.dtype().size();
-            self.current_pos * self.kv_heads * self.head_dim * type_size
+            self.resident_positions() * self.head_dim * type_size
         };
 
         per_buffer * 2 // K + V
@@ -1240,6 +1424,14 @@ impl KVCache {
                     let to = base + hwm_per_head_bytes;
                     total_released += madvise_dontneed(self.k_buffer.as_ptr(), from, to);
                     total_released += madvise_dontneed(self.v_buffer.as_ptr(), from, to);
+                    // A ragged head's hole sits in FRONT of its resident run — a second range.
+                    let hole_bytes = self.head_start(h) * self.head_dim * type_size;
+                    if hole_bytes > 0 {
+                        total_released +=
+                            madvise_dontneed(self.k_buffer.as_ptr(), base, base + hole_bytes);
+                        total_released +=
+                            madvise_dontneed(self.v_buffer.as_ptr(), base, base + hole_bytes);
+                    }
                 }
             }
         }
@@ -1322,37 +1514,41 @@ impl KVCache {
             return Ok(());
         }
 
-        let mut write_pos = write_start;
-        let mut batch_src_start = keep[0];
-        let mut batch_dst_start = write_pos;
-        let mut batch_count = 1usize;
-        write_pos += 1;
-
-        for &src_pos in &keep[1..] {
-            if src_pos == batch_src_start + batch_count {
-                // Extend current batch
-                batch_count += 1;
+        // Coalesce the ascending keep-list into `(src, dst, count)` runs of consecutive positions.
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut src0 = keep[0];
+        let mut dst0 = write_start;
+        let mut n = 1usize;
+        for (i, &p) in keep.iter().enumerate().skip(1) {
+            if p == src0 + n {
+                n += 1;
             } else {
-                // Flush current batch
-                if batch_src_start != batch_dst_start {
-                    self.shift_positions_for_head(
-                        head,
-                        batch_src_start,
-                        batch_dst_start,
-                        batch_count,
-                    )?;
-                }
-                // Start new batch
-                batch_src_start = src_pos;
-                batch_dst_start = write_pos;
-                batch_count = 1;
+                runs.push((src0, dst0, n));
+                src0 = p;
+                dst0 = write_start + i;
+                n = 1;
             }
-            write_pos += 1;
         }
+        runs.push((src0, dst0, n));
 
-        // Flush final batch
-        if batch_src_start != batch_dst_start {
-            self.shift_positions_for_head(head, batch_src_start, batch_dst_start, batch_count)?;
+        // With `write_start == 0` every run moves down or stays, and flushing them first-to-last
+        // is what the layer-wide compaction has always done. A right-aligning `write_start` moves
+        // some runs UP. Along ascending runs `dst - src` never increases (the keep-list is
+        // strictly ascending), so the up-movers form a prefix; an up-mover's destination lies
+        // above an earlier up-mover's source and below every later run's source, so the prefix
+        // is flushed last-to-first and the rest first-to-last, and no run is read after it has
+        // been overwritten.
+        let split = runs
+            .iter()
+            .position(|&(src, dst, _)| dst <= src)
+            .unwrap_or(runs.len());
+        for &(src, dst, count) in runs[..split].iter().rev() {
+            self.shift_positions_for_head(head, src, dst, count)?;
+        }
+        for &(src, dst, count) in &runs[split..] {
+            if src != dst {
+                self.shift_positions_for_head(head, src, dst, count)?;
+            }
         }
 
         Ok(())
@@ -1370,11 +1566,133 @@ impl KVCache {
     }
 
     /// Override the current position counter (pos==0 도 high_water 리셋).
+    ///
+    /// A ragged geometry cannot outlive the frame it was computed in: `0` clears it, and any other
+    /// value clamps every head start to the new cursor (a caller that renumbers positions itself
+    /// — layer-wide compaction, swap recall — restores the uniform shape explicitly).
     pub fn set_current_pos(&mut self, pos: usize) {
         self.current_pos = pos;
         if pos == 0 {
             self.high_water_pos = 0;
+            self.head_start.clear();
+        } else {
+            for s in self.head_start.iter_mut() {
+                *s = (*s).min(pos);
+            }
         }
+    }
+
+    // ── ragged (per-head) geometry ──────────────────────────────────────────
+
+    /// First resident position of KV head `h`: `0` on a uniform cache.
+    #[inline]
+    pub fn head_start(&self, h: usize) -> usize {
+        self.head_start.get(h).copied().unwrap_or(0)
+    }
+
+    /// Per-head first resident positions, `kv_heads` long (all `0` on a uniform cache).
+    pub fn head_starts(&self) -> Vec<usize> {
+        (0..self.kv_heads).map(|h| self.head_start(h)).collect()
+    }
+
+    /// `true` when some KV head holds fewer positions than the cursor says — the shape a per-head
+    /// keep with unequal lengths leaves behind.
+    #[inline]
+    pub fn is_ragged(&self) -> bool {
+        self.head_start.iter().any(|&s| s > 0)
+    }
+
+    /// Resident positions of KV head `h`: `current_pos - head_start(h)`.
+    #[inline]
+    pub fn head_len(&self, h: usize) -> usize {
+        self.current_pos.saturating_sub(self.head_start(h))
+    }
+
+    /// Resident positions summed over the KV heads — `current_pos * kv_heads` on a uniform cache.
+    pub fn resident_positions(&self) -> usize {
+        (0..self.kv_heads).map(|h| self.head_len(h)).sum()
+    }
+
+    /// Resident tokens as a per-head mean (rounded up) — the number a budget, a Manager report or a
+    /// bench line should quote for a ragged cache, where `current_pos` is only the longest head.
+    pub fn resident_tokens(&self) -> usize {
+        if self.kv_heads == 0 {
+            return self.current_pos;
+        }
+        self.resident_positions().div_ceil(self.kv_heads)
+    }
+
+    /// Whether this container can hold a ragged geometry: a HeadMajor typed (f32/f16) cache. The
+    /// block-quantized and opaque stores share their layout state across heads, and SeqMajor
+    /// interleaves heads per position, so none of them can right-align one head on its own.
+    pub fn supports_ragged(&self) -> bool {
+        self.layout == KVLayout::HeadMajor
+            && !self.is_opaque()
+            && matches!(self.k_buffer.dtype(), DType::F32 | DType::F16)
+    }
+
+    /// Install per-head first positions (`kv_heads` long, each `<= current_pos`). All-zero restores
+    /// the uniform shape.
+    pub fn set_head_starts(&mut self, starts: &[usize]) {
+        debug_assert_eq!(starts.len(), self.kv_heads);
+        if starts.iter().all(|&s| s == 0) {
+            self.head_start.clear();
+        } else {
+            self.head_start = starts.iter().map(|&s| s.min(self.current_pos)).collect();
+        }
+        self.head_start_dirty = true;
+    }
+
+    /// Restore the uniform shape (every head resident over `[0, current_pos)`).
+    pub fn clear_head_starts(&mut self) {
+        if !self.head_start.is_empty() {
+            self.head_start_dirty = true;
+        }
+        self.head_start.clear();
+    }
+
+    /// The device mirror of the per-head first positions, for a GPU attention kernel: an `i32`
+    /// per KV head. `None` for a host cache, or for a device cache that was never ragged (the
+    /// kernels take NULL as "every head from slot 0"). Once a ragged commit has created the
+    /// buffer it stays and is re-uploaded whenever the starts change — including back to all
+    /// zero — so the plan can bind it every step without knowing whether the cache is ragged.
+    pub(crate) fn head_start_device(&mut self) -> Result<Option<Tensor>> {
+        // Gated on the BACKEND: a zero-copy (host-mapped) GPU buffer still needs a device-side
+        // mirror the kernel can bind, and a per-call upload in its place costs an allocation per
+        // layer per token.
+        if !self.k_buffer.backend().is_gpu() {
+            return Ok(None);
+        }
+        if self.head_start_dev.is_none() && !self.is_ragged() {
+            return Ok(None);
+        }
+        let backend = self.k_buffer.backend().clone();
+        let mut bytes = Vec::with_capacity(self.kv_heads * 4);
+        for h in 0..self.kv_heads {
+            bytes.extend_from_slice(&(self.head_start(h) as i32).to_ne_bytes());
+        }
+        match self.head_start_dev.as_mut() {
+            None => {
+                let host_buf = Arc::new(crate::memory::host::shared::SharedBuffer::new(
+                    bytes.len(),
+                    DType::U8,
+                ));
+                let mut host = Tensor::new(
+                    crate::shape::Shape::new(vec![bytes.len()]),
+                    host_buf,
+                    backend.clone(),
+                );
+                host.as_mut_slice::<u8>().copy_from_slice(&bytes);
+                let dev = backend.copy_from(&host)?;
+                self.head_start_dev = Some(dev);
+            }
+            Some(dev) if self.head_start_dirty => {
+                backend.write_buffer(dev, &bytes)?;
+            }
+            Some(_) => {}
+        }
+        self.head_start_dirty = false;
+        Ok(self.head_start_dev.clone())
     }
 
     /// The DType that the caller should pass to `update()`.
@@ -1504,6 +1822,158 @@ mod tests {
             backend.clone(),
         );
         KVCache::new(k, v, max_seq_len)
+    }
+
+    /// A device-shaped cache whose EVERY slot (resident prefix and never-read tail alike) holds a
+    /// distinct byte pattern, so a mirror that transfers the wrong range is visible either as wrong
+    /// dequantized floats or as a tail that failed to narrow.
+    fn make_patterned_cache(
+        layout: KVLayout,
+        dtype: DType,
+        cap: usize,
+        kvh: usize,
+        hd: usize,
+    ) -> KVCache {
+        let elems = cap * kvh * hd;
+        let esz = if dtype == DType::F16 { 2 } else { 4 };
+        let backend = Arc::new(CpuBackend::new());
+        let dims = match layout {
+            KVLayout::SeqMajor => vec![1, cap, kvh, hd],
+            KVLayout::HeadMajor => vec![1, kvh, cap, hd],
+        };
+        let mk = |seed: f32| {
+            let mut t = Tensor::new(
+                Shape::new(dims.clone()),
+                Arc::new(SharedBuffer::new(elems * esz, dtype)),
+                backend.clone(),
+            );
+            // Nonzero everywhere: 0.0 would make "tail was not transferred" indistinguishable from
+            // "tail was transferred and happened to be zero".
+            if dtype == DType::F16 {
+                let d = t.as_mut_slice::<half::f16>();
+                for (i, x) in d.iter_mut().enumerate() {
+                    *x = half::f16::from_f32(seed + (i % 977) as f32 * 0.3 + 0.7);
+                }
+            } else {
+                let d = t.as_mut_slice::<f32>();
+                for (i, x) in d.iter_mut().enumerate() {
+                    *x = seed + i as f32 * 0.3 + 0.7;
+                }
+            }
+            t
+        };
+        let mut c = KVCache::new_with_geometry(mk(0.0), mk(10_000.0), cap, kvh, hd, layout);
+        c.set_current_pos(cap / 2);
+        c
+    }
+
+    /// `host_snapshot_rows(rows)` must be indistinguishable from the full `host_snapshot()` to any
+    /// `rows`-bounded reader — and must actually have shrunk.
+    ///
+    /// Mutation-proof in both directions: delegating straight to `host_snapshot` leaves the mirror
+    /// capacity-sized and trips the size assertion; getting the compaction wrong (an off-by-one on
+    /// the per-head span, reading head `h` from head 0's offset, or forgetting that the mirror's
+    /// `offset()` now strides by `rows`) changes the dequantized floats and trips the first.
+    #[test]
+    fn host_snapshot_rows_matches_full_snapshot_over_resident_rows() {
+        use crate::stages::kv::mutation::dequant_snapshot;
+        const CAP: usize = 64;
+        const KVH: usize = 3;
+        const HD: usize = 8;
+        const ROWS: usize = 17;
+
+        for layout in [KVLayout::SeqMajor, KVLayout::HeadMajor] {
+            for dtype in [DType::F32, DType::F16] {
+                let c = make_patterned_cache(layout, dtype, CAP, KVH, HD);
+                let full = c.host_snapshot().expect("full mirror");
+                let ranged = c.host_snapshot_rows(ROWS).expect("ranged mirror");
+
+                for is_k in [true, false] {
+                    assert_eq!(
+                        dequant_snapshot(&ranged, ROWS, KVH, HD, is_k),
+                        dequant_snapshot(&full, ROWS, KVH, HD, is_k),
+                        "{layout:?}/{dtype:?} is_k={is_k}: the compacted mirror must dequantize \
+                         identically over [0, {ROWS})"
+                    );
+                }
+                assert_eq!(
+                    ranged.k_buffer.size() * CAP,
+                    full.k_buffer.size() * ROWS,
+                    "{layout:?}/{dtype:?}: the mirror must be sized by the resident rows, not by \
+                     capacity"
+                );
+            }
+        }
+    }
+
+    /// `rows` at or above capacity has nothing to squeeze out, so it falls back to the full mirror
+    /// rather than emitting a degenerate range.
+    #[test]
+    fn host_snapshot_rows_falls_back_at_full_capacity() {
+        const CAP: usize = 32;
+        let c = make_patterned_cache(KVLayout::HeadMajor, DType::F32, CAP, 2, 4);
+        let full = c.host_snapshot().expect("full mirror");
+        let ranged = c.host_snapshot_rows(CAP).expect("ranged mirror");
+        assert_eq!(
+            ranged.k_buffer.as_slice::<u8>(),
+            full.k_buffer.as_slice::<u8>(),
+            "rows == capacity must mirror the whole buffer"
+        );
+    }
+
+    /// The same property over a REAL device buffer, where the range is a bounded
+    /// `clEnqueueReadBuffer` rather than a memcpy — the offset argument the host test cannot reach.
+    ///
+    /// Skips cleanly on a host with no OpenCL driver.
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn host_snapshot_rows_matches_full_snapshot_on_device() {
+        use crate::backend::Backend;
+        use crate::backend::opencl::OpenCLBackend;
+        use crate::backend::opencl::memory::OpenCLMemory;
+        use crate::stages::kv::mutation::dequant_snapshot;
+        const CAP: usize = 512;
+        const KVH: usize = 2;
+        const HD: usize = 128;
+        const ROWS: usize = 199; // not a divisor of CAP, and not workgroup-aligned
+
+        let Ok(cl) = OpenCLBackend::new() else {
+            eprintln!("Skipping: no OpenCL driver");
+            return;
+        };
+        let memory = OpenCLMemory::new(cl.context.clone(), cl.queue.clone(), true);
+        let backend: Arc<dyn Backend> = Arc::new(cl);
+
+        let elems = KVH * CAP * HD;
+        let bits: Vec<u16> = (0..elems)
+            .map(|i| half::f16::from_f32((i % 977) as f32 * 0.3 + 0.7).to_bits())
+            .collect();
+        let mk = || {
+            let buf = memory.alloc(elems * 2, DType::F16).expect("device alloc");
+            let mut t = Tensor::new(Shape::new(vec![1, KVH, CAP, HD]), buf, Arc::clone(&backend));
+            let bytes =
+                unsafe { std::slice::from_raw_parts(bits.as_ptr() as *const u8, bits.len() * 2) };
+            backend.write_buffer(&mut t, bytes).expect("device upload");
+            t
+        };
+        let mut c = KVCache::new_with_geometry(mk(), mk(), CAP, KVH, HD, KVLayout::HeadMajor);
+        c.set_current_pos(ROWS);
+        backend.synchronize().expect("flush uploads");
+
+        let full = c.host_snapshot().expect("full mirror");
+        let ranged = c.host_snapshot_rows(ROWS).expect("ranged mirror");
+        // Head 1 is the one a wrong source offset silently corrupts: read from head 0's offset it
+        // would come back holding head 0's keys, which this comparison catches.
+        assert_eq!(
+            dequant_snapshot(&ranged, ROWS, KVH, HD, true),
+            dequant_snapshot(&full, ROWS, KVH, HD, true),
+            "device compacted mirror must dequantize identically over [0, {ROWS})"
+        );
+        assert_eq!(
+            ranged.k_buffer.size(),
+            KVH * ROWS * HD * 2,
+            "device mirror must be sized by the resident rows"
+        );
     }
 
     fn make_dynamic_cache(
@@ -1940,6 +2410,10 @@ mod tests {
             kv_heads: heads,
             head_dim: dim,
             layout: KVLayout::HeadMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: None,
         }
     }
@@ -1975,6 +2449,10 @@ mod tests {
             kv_heads: heads,
             head_dim: dim,
             layout: KVLayout::HeadMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: Some(memory),
         }
     }
@@ -2433,6 +2911,10 @@ mod tests {
             kv_heads: heads,
             head_dim: dim,
             layout: KVLayout::HeadMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: None,
         }
     }
@@ -3026,6 +3508,10 @@ mod tests {
             kv_heads: heads,
             head_dim: dim,
             layout: KVLayout::HeadMajor,
+            head_start: Vec::new(),
+            head_start_dev: None,
+            head_start_dirty: false,
+
             memory: None,
         };
 

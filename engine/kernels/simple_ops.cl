@@ -1175,7 +1175,8 @@ kernel void kernel_attn_gen(
     int write_scores,            // 0=skip, 1=write
     int score_stride,            // stride between heads in S
     int score_layer_offset,      // base offset in S for this layer (= layer_idx * num_heads_q * score_stride)
-    local float * scratch        // size = local_size
+    local float * scratch,       // size = local_size
+    global int * kv_start        // ragged KV cache: per-KV-head first resident slot (NULL = uniform)
 ) {
     int head_idx = get_group_id(0);    // which Q head
     int lid = get_local_id(0);
@@ -1185,13 +1186,19 @@ kernel void kernel_attn_gen(
     int gqa_ratio = num_heads_q / num_heads_kv;
     int kv_head = head_idx / gqa_ratio;
     int kv_base = kv_head * kv_head_stride;
+    int k_lo = (kv_start != NULL) ? min(kv_start[kv_head], cache_seq_len) : 0;
+    if (write_scores) {
+        for (int t = lid; t < k_lo; t += local_size) {
+            S[score_layer_offset + head_idx * score_stride + t] = 0.0f;
+        }
+    }
 
     // Pointers
     global float * q_ptr = Q + head_idx * head_dim;
 
     // === PASS 1: Compute max score using online approach ===
     float my_max = -INFINITY;
-    for (int t = lid; t < cache_seq_len; t += local_size) {
+    for (int t = k_lo + lid; t < cache_seq_len; t += local_size) {
         global float * k_ptr = K + kv_base + t * kv_pos_stride;
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {
@@ -1213,7 +1220,7 @@ kernel void kernel_attn_gen(
 
     // Compute exp sum with known max
     float my_sum = 0.0f;
-    for (int t = lid; t < cache_seq_len; t += local_size) {
+    for (int t = k_lo + lid; t < cache_seq_len; t += local_size) {
         global float * k_ptr = K + kv_base + t * kv_pos_stride;
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {
@@ -1243,7 +1250,7 @@ kernel void kernel_attn_gen(
     }
 
     // Each thread processes its subset of tokens
-    for (int t = lid; t < cache_seq_len; t += local_size) {
+    for (int t = k_lo + lid; t < cache_seq_len; t += local_size) {
         global float * k_ptr = K + kv_base + t * kv_pos_stride;
 
         // Compute weight for this token
@@ -1314,7 +1321,8 @@ kernel void kernel_attn_gen_half(
     int write_scores,            // 0=skip, 1=write
     int score_stride,            // stride between heads in S
     int score_layer_offset,      // base offset in S for this layer (= layer_idx * num_heads_q * score_stride)
-    local float * scratch        // size = local_size
+    local float * scratch,       // size = local_size
+    global int * kv_start        // ragged KV cache: per-KV-head first resident slot (NULL = uniform)
 ) {
     int head_idx = get_group_id(0);
     int lid = get_local_id(0);
@@ -1323,12 +1331,18 @@ kernel void kernel_attn_gen_half(
     int gqa_ratio = num_heads_q / num_heads_kv;
     int kv_head = head_idx / gqa_ratio;
     int kv_base = kv_head * kv_head_stride;
+    int k_lo = (kv_start != NULL) ? min(kv_start[kv_head], cache_seq_len) : 0;
+    if (write_scores) {
+        for (int t = lid; t < k_lo; t += local_size) {
+            S[score_layer_offset + head_idx * score_stride + t] = 0.0f;
+        }
+    }
 
     global float * q_ptr = Q + head_idx * head_dim;
 
     // === PASS 1: Compute max score ===
     float my_max = -INFINITY;
-    for (int t = lid; t < cache_seq_len; t += local_size) {
+    for (int t = k_lo + lid; t < cache_seq_len; t += local_size) {
         global half * k_ptr = K + kv_base + t * kv_pos_stride;
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {
@@ -1349,7 +1363,7 @@ kernel void kernel_attn_gen_half(
 
     // Compute exp sum
     float my_sum = 0.0f;
-    for (int t = lid; t < cache_seq_len; t += local_size) {
+    for (int t = k_lo + lid; t < cache_seq_len; t += local_size) {
         global half * k_ptr = K + kv_base + t * kv_pos_stride;
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {
@@ -1373,7 +1387,7 @@ kernel void kernel_attn_gen_half(
         out_local[d] = 0.0f;
     }
 
-    for (int t = lid; t < cache_seq_len; t += local_size) {
+    for (int t = k_lo + lid; t < cache_seq_len; t += local_size) {
         global half * k_ptr = K + kv_base + t * kv_pos_stride;
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {

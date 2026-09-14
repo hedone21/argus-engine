@@ -72,6 +72,11 @@ path = "src/bin/test_faithful_h2o_gpu_seed_device.rs"
 required-features = ["opencl"]
 
 [[bin]]
+name = "test_window_attn_gpu_device"
+path = "src/bin/test_window_attn_gpu_device.rs"
+required-features = ["opencl"]
+
+[[bin]]
 name = "test_cross_layer_host_mirror_device"
 path = "src/bin/test_cross_layer_host_mirror_device.rs"
 required-features = ["opencl"]
@@ -128,6 +133,16 @@ rkv = { path = "../crates/techniques/rkv", optional = true }
 # (build_standard_loop). Default OFF — registering it activates the PFA keep-set path, so it is a
 # build-time opt-in (the caote/rkv precedent). cr is taken from --eviction-target-ratio.
 pyramidkv = { path = "../crates/techniques/pyramidkv", optional = true }
+# SnapKV (uniform per-layer budget over the SnapKV per-head selection, at prefill end). Gated by the
+# `snapkv` feature, force-linked so its PrefillAttention caps register a second PrefillEnd candidate
+# for `--aperturb-select` (next to pyramidkv, at the same 64-query window). Default OFF (the pyramidkv
+# precedent). Budget from --eviction-target-ratio / the pool's ask; cr via `--set compression_ratio`.
+snapkv = { path = "../crates/techniques/snapkv", optional = true }
+# AdaKV (head-adaptive budget over the SnapKV selection, at prefill end — FFY0/AdaKV `update_kv_gqa`
+# parity). Gated by the `adakv` feature, force-linked so its PrefillAttention caps register a third
+# PrefillEnd candidate for `--aperturb-select` (same 64-query window). Its per-head keep is RAGGED
+# (heads keep different counts), which the container right-aligns (`KVCache::head_start`). Default OFF.
+adakv = { path = "../crates/techniques/adakv", optional = true }
 # TriAttention (trigonometric frequency-domain KV eviction, Mao et al. 2026). Gated by the
 # `triattention` feature, force-linked so its `caps.reads ∋ Key` registration is visible to
 # `find_mutation_stage("triattention")`. Default OFF (the caote/rkv/pyramidkv precedent).
@@ -236,6 +251,16 @@ rkv = ["dep:rkv"]
 # prefill-keepset path so PyramidKV runs at prefill end (per-layer pyramid budget + per-head SnapKV
 # selection). Default OFF (registering a PFA stage auto-arms it; opt in at build time).
 pyramidkv = ["dep:pyramidkv"]
+# Links + force-links the `snapkv` technique crate (uniform budget + per-head SnapKV selection at
+# prefill end; kvpress `SnapKVPress` parity). With `pyramidkv` also ON, the standing PrefillEnd
+# consumer is the lexicographically first PFA-reading stage (pyramidkv) — deterministic, not link
+# order — and both are `--aperturb-select` candidates. Default OFF (build-time opt-in).
+snapkv = ["dep:snapkv"]
+# Links + force-links the `adakv` technique crate (FFY0/AdaKV head-adaptive budget over the SnapKV
+# selection at prefill end; ragged per-head keep). With `pyramidkv`/`snapkv` also ON, the standing
+# PrefillEnd consumer is the lexicographically first PFA-reading stage — `adakv` — outside a pool;
+# a `--aperturb-select` pool stands it down and measures all three. Default OFF (build-time opt-in).
+adakv = ["dep:adakv"]
 # Links + force-links the `triattention` technique crate (trigonometric frequency-domain KV
 # eviction). Registers "triattention" with `caps.reads ∋ Key`. Default OFF (build-time opt-in).
 triattention = ["dep:triattention"]

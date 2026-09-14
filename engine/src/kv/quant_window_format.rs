@@ -159,6 +159,7 @@ impl KVCacheFormat for QuantWindowFormat {
                 kv_layout,
                 q_start_pos,
                 dims.window,
+                None,
                 backend,
                 None,
             );

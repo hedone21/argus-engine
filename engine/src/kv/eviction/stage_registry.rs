@@ -78,6 +78,18 @@ use rkv as _;
 #[cfg(feature = "pyramidkv")]
 use pyramidkv as _;
 
+// SnapKV force-link (feature `snapkv`). Registers "snapkv" with `caps.reads ∋ PrefillAttention` at
+// the same 64-query window as pyramidkv — the uniform-budget arm of the SnapKV family, so
+// `--aperturb-select h2o,snapkv,pyramidkv` can admit both. Feature OFF = unlinked (byte-identical).
+#[cfg(feature = "snapkv")]
+use snapkv as _;
+
+// AdaKV force-link (feature `adakv`). Registers "adakv" with `caps.reads ∋ PrefillAttention` at the
+// same 64-query window — the head-adaptive arm of the SnapKV family, whose per-head keep is ragged
+// (`KVCache::head_start`). Feature OFF = unlinked (byte-identical).
+#[cfg(feature = "adakv")]
+use adakv as _;
+
 // TriAttention force-link (feature `triattention`). Registers "triattention" with `caps.reads ∋ Key`
 // (reads POST-RoPE keys, inverts RoPE in-plugin, scores via calibrated query centers). Feature OFF =
 // unlinked = `find_mutation_stage("triattention")` returns None (byte-identical to before).
@@ -407,16 +419,30 @@ pub fn ensure_builtin_stages_registered() -> Result<()> {
     Ok(())
 }
 
-/// R-P1-1: the first registered KV mutation stage that reads `TensorKind::PrefillAttention` (else
+/// R-P1-1: the registered KV mutation stage that reads `TensorKind::PrefillAttention` (else
 /// `None`) — the `build_standard_loop` PFA-producer arming gate, caps-driven (plugin-name agnostic,
 /// the twin of `wants_query_stats`). With no such built-in it is `None` (arming dormant →
 /// byte-identical); a per-head keep-set plugin registered with `caps.reads ∋ PrefillAttention`
-/// (pyramidkv) activates it.
+/// (pyramidkv, snapkv) activates it.
+///
+/// With more than one such stage linked (`--features pyramidkv,snapkv[,adakv]`) the standing
+/// PrefillEnd consumer is the one with the lexicographically FIRST name — `pyramidkv` over
+/// `snapkv`, and `adakv` over both when it is linked. linkme's
+/// slice order is link order, which no build guarantees, so a "first registered" pick would make
+/// argus-cli's prefill-end technique differ from build to build. (A `--aperturb-select` pool stands
+/// the consumer down and measures every PFA candidate itself, so the pick only matters outside a pool.)
 pub fn find_prefill_attn_stage_name() -> Option<String> {
-    argus_extension_api::KV_MUTATION_STAGES
-        .iter()
-        .find(|r| r.caps.reads.contains(&TensorKind::PrefillAttention))
+    prefill_attn_stage_of(argus_extension_api::KV_MUTATION_STAGES.iter())
         .map(|r| r.name.to_string())
+}
+
+/// The deterministic pick behind [`find_prefill_attn_stage_name`]: the PFA-reading registration
+/// with the smallest name, whatever order the slice hands them out in.
+fn prefill_attn_stage_of<'a>(
+    regs: impl Iterator<Item = &'a argus_extension_api::MutationStageReg>,
+) -> Option<&'a argus_extension_api::MutationStageReg> {
+    regs.filter(|r| r.caps.reads.contains(&TensorKind::PrefillAttention))
+        .min_by_key(|r| r.name)
 }
 
 /// R-P1-2: the PFA observation window the registered prefill-attn stage wants — its scoring
@@ -439,8 +465,8 @@ pub fn find_prefill_attn_window() -> Option<usize> {
 
 /// The engine fallback PFA observation window (kvpress convention) for a registered prefill-keepset
 /// stage that declares no preference via [`StageCaps::prefill_attn_window`]
-/// (`prefill_attn_window: None`). PyramidKV declares 64; a stage that declares none (a hypothetical
-/// bare SnapKV) uses this.
+/// (`prefill_attn_window: None`). PyramidKV and SnapKV both declare 64; a stage that declares none
+/// uses this.
 pub const PFA_Q_WINDOW_DEFAULT: usize = 32;
 
 /// The caps-driven prefill-keepset producer-arming decision — the SINGLE place all four loops
@@ -527,7 +553,8 @@ mod tests {
         assert_eq!(stage.name(), "d2o");
     }
 
-    #[cfg(feature = "pyramidkv")]
+    // With `adakv` also linked the smallest-name pick is `adakv` (see the three-stage test).
+    #[cfg(all(feature = "pyramidkv", not(feature = "adakv")))]
     #[test]
     fn pyramidkv_plumbs_prefill_attn_window() {
         // R-P1-2: the PFA producer-arming window is plumbed from the consuming stage's `window_size`
@@ -547,7 +574,145 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "pyramidkv")]
+    /// The standing PrefillEnd consumer must not depend on link order: with two PFA-reading stages
+    /// registered (`--features pyramidkv,snapkv`) linkme hands them out in whatever order the linker
+    /// chose, and a "first registered" pick would make argus-cli's prefill-end technique differ from
+    /// build to build. The pick is the smallest name, whichever order the slice arrives in.
+    /// Mutation-proof: `.find(..)` instead of `.min_by_key(..)` answers "zed" for the first order.
+    #[test]
+    fn prefill_attn_stage_pick_is_link_order_independent() {
+        use argus_extension_api::{
+            CacheOpError, MutationPhase, MutationStageReg, StageArgs, StageCtx,
+        };
+        struct Inert;
+        impl KVMutationStage for Inert {
+            fn name(&self) -> &str {
+                "inert"
+            }
+            fn on_phase(
+                &self,
+                _: &dyn StageCtx,
+                _: &mut dyn CacheHandle,
+            ) -> Result<(), CacheOpError> {
+                Ok(())
+            }
+        }
+        fn make(_: StageParams, _: StageArgs<'_>) -> Box<dyn KVMutationStage> {
+            Box::new(Inert)
+        }
+        const PFA: StageCaps = StageCaps {
+            reads: &[TensorKind::PrefillAttention],
+            reads_signals: &[],
+            default_protected_prefix: 0,
+            produces_merge_plan: false,
+            whole_model: false,
+            prefill_attn_window: Some(64),
+        };
+        let reg = |name: &'static str, caps: StageCaps| MutationStageReg {
+            name,
+            make,
+            caps,
+            phase: MutationPhase::PrefillEnd,
+        };
+        let zed = reg("zed", PFA);
+        let apple = reg("apple", PFA);
+        // Sorts first by name but reads no PFA — must never be picked.
+        let aardvark = reg("aardvark", StageCaps::SCORE_FREE);
+
+        let pick =
+            |regs: [&MutationStageReg; 3]| prefill_attn_stage_of(regs.into_iter()).map(|r| r.name);
+        assert_eq!(pick([&zed, &apple, &aardvark]), Some("apple"));
+        assert_eq!(pick([&aardvark, &apple, &zed]), Some("apple"));
+        assert_eq!(pick([&apple, &zed, &aardvark]), Some("apple"));
+        assert_eq!(
+            prefill_attn_stage_of([&aardvark].into_iter()).map(|r| r.name),
+            None,
+            "no PFA reader registered → no arming"
+        );
+    }
+
+    #[cfg(feature = "snapkv")]
+    #[test]
+    fn snapkv_registered_as_a_prefill_end_pfa_reader() {
+        // The `use snapkv as _;` force-link makes the registration visible: a PrefillEnd stage that
+        // reads the prefill attention at the kvpress 64-query window, buildable as a keep-set stage.
+        let reg =
+            find_mutation_stage("snapkv").expect("snapkv force-linked under --features snapkv");
+        assert_eq!(reg.phase, argus_extension_api::MutationPhase::PrefillEnd);
+        assert!(reg.caps.reads.contains(&TensorKind::PrefillAttention));
+        assert_eq!(reg.caps.prefill_attn_window, Some(64));
+        assert!(make_prefill_keepset_stage("snapkv").is_some());
+    }
+
+    #[cfg(feature = "adakv")]
+    #[test]
+    fn adakv_registered_as_a_prefill_end_pfa_reader() {
+        let reg = find_mutation_stage("adakv").expect("adakv force-linked under --features adakv");
+        assert_eq!(reg.phase, argus_extension_api::MutationPhase::PrefillEnd);
+        assert!(reg.caps.reads.contains(&TensorKind::PrefillAttention));
+        assert_eq!(reg.caps.prefill_attn_window, Some(64));
+        assert!(make_prefill_keepset_stage("adakv").is_some());
+    }
+
+    #[cfg(all(feature = "pyramidkv", feature = "snapkv", feature = "adakv"))]
+    #[test]
+    fn three_pfa_stages_agree_on_the_observation_window() {
+        // The pool admits all three only if they declare one window; and the standing consumer
+        // outside a pool is the smallest name — now `adakv`.
+        let windows: Vec<(&str, Option<usize>)> = argus_extension_api::KV_MUTATION_STAGES
+            .iter()
+            .filter(|r| r.caps.reads.contains(&TensorKind::PrefillAttention))
+            .map(|r| (r.name, r.caps.prefill_attn_window))
+            .collect();
+        for expected in ["adakv", "pyramidkv", "snapkv"] {
+            assert!(
+                windows.iter().any(|(n, _)| *n == expected),
+                "'{expected}' must be a registered PFA reader; got {windows:?}"
+            );
+        }
+        for (name, w) in &windows {
+            assert_eq!(
+                *w,
+                Some(64),
+                "'{name}' must want the shared 64-query window"
+            );
+        }
+        assert_eq!(find_prefill_attn_stage_name().as_deref(), Some("adakv"));
+        assert_eq!(find_prefill_attn_window(), Some(64));
+    }
+
+    #[cfg(all(feature = "pyramidkv", feature = "snapkv", not(feature = "adakv")))]
+    #[test]
+    fn pfa_stages_agree_on_the_observation_window() {
+        // `--aperturb-select` refuses a pool whose prefill-attention candidates want different
+        // windows (the forward SUMs over one; the loser would rank heavy hitters it did not declare),
+        // so the two shipped PFA stages must declare the same one. Mutation-proof: change either
+        // crate's `prefill_attn_window` and this fails.
+        let windows: Vec<(&str, Option<usize>)> = argus_extension_api::KV_MUTATION_STAGES
+            .iter()
+            .filter(|r| r.caps.reads.contains(&TensorKind::PrefillAttention))
+            .map(|r| (r.name, r.caps.prefill_attn_window))
+            .collect();
+        for expected in ["pyramidkv", "snapkv"] {
+            assert!(
+                windows.iter().any(|(n, _)| *n == expected),
+                "'{expected}' must be a registered PFA reader; got {windows:?}"
+            );
+        }
+        for (name, w) in &windows {
+            assert_eq!(
+                *w,
+                Some(64),
+                "'{name}' must want the 64-query window every other PFA stage wants"
+            );
+        }
+        // And the standing consumer is the deterministic pick (smallest name), not link order.
+        assert_eq!(find_prefill_attn_stage_name().as_deref(), Some("pyramidkv"));
+        assert_eq!(find_prefill_attn_window(), Some(64));
+    }
+
+    // With `adakv` also linked the smallest-name pick is `adakv` (see the three-stage test).
+    #[cfg(all(feature = "pyramidkv", not(feature = "adakv")))]
     #[test]
     fn shared_arming_resolves_pyramidkv_at_window_64() {
         // Direction-B root-cause fix: the SINGLE caps-driven arming decision all four loops

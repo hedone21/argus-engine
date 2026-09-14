@@ -66,3 +66,25 @@ registration surface.
 ## License
 
 Contributions are dual licensed `MIT OR Apache-2.0`.
+
+## Ticket workflow (planning agent ↔ implementing agent)
+
+Planning and implementation are done by different agents. The only interface between
+them is a ticket file under `tickets/`.
+
+- **File:** `tickets/NNN-slug.md` (NNN = three-digit sequence). The header carries
+  `Status · Created · Depends on · Related docs`. Status moves `open → in-progress → done`,
+  or `blocked`.
+- **Required sections:** `Intent` (why; which number should move) · `Background` (current
+  state, evidence, `file:line`) · `Tasks` (scope) · `Out of scope` · `Acceptance criteria`
+  (runnable commands and numbers, including the measurement rules) · `Result` (filled in
+  by the implementer).
+- **Implementer rules:** edit only `Status` and `Result`. If the scope has to change or an
+  acceptance criterion cannot hold, write why under `Result`, set `blocked`, and stop. Do
+  nothing the ticket does not ask for.
+- **Acceptance criteria are commands and numbers,** not "it works": a `cargo test ...`
+  invocation, a parity test name, an on-device A/B ratio. On-device performance counts only
+  as a ratio inside an order-interleaved batch; never compare absolute values across batches.
+- **`file:line` references are as of writing.** Check them against the current code first.
+- `tickets/` is git-ignored: tickets are local working artifacts handed between agents on
+  one machine, not part of the public repository.

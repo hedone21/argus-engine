@@ -266,7 +266,8 @@ fn dequant_key_host_mirrored(
     if cache.k_buffer.buffer().is_gpu_buffer() {
         // Flush pending device writes so the readback observes this round's K (host_snapshot precondition).
         cache.k_buffer.backend().synchronize()?;
-        let host = cache.host_snapshot()?;
+        // `rows`-bounded mirror — the dequant below reads only `[0, rows)` per head.
+        let host = cache.host_snapshot_rows(rows)?;
         Ok(dequant_snapshot(&host, rows, n_kv_heads, head_dim, true))
     } else {
         Ok(dequant_snapshot(cache, rows, n_kv_heads, head_dim, true))
@@ -284,19 +285,26 @@ pub(crate) fn dequant_snapshot(
     head_dim: usize,
     is_k: bool,
 ) -> Vec<f32> {
+    use rayon::prelude::*;
     let mut out = vec![0.0f32; n_kv_heads * rows * head_dim];
-    let mut tmp = vec![0.0f32; head_dim];
-    for kv_head in 0..n_kv_heads {
-        for row in 0..rows {
-            if is_k {
-                dequantize_k(cache, row, kv_head, head_dim, &mut tmp);
-            } else {
-                dequantize_v(cache, row, kv_head, head_dim, &mut tmp);
-            }
-            let base = (kv_head * rows + row) * head_dim;
-            out[base..base + head_dim].copy_from_slice(&tmp);
-        }
+    if rows == 0 || head_dim == 0 {
+        return out;
     }
+    // One chunk per `(kv_head, row)`, dequantized straight into its place in the output — the
+    // per-row scratch buffer this replaces cost a second store and a copy of every element. The
+    // rows are independent reads of the cache, so rayon splits them; on the decision path this is
+    // 28 layers x K and V of it, and it was the whole of what the readback cost once the transfer
+    // itself was cut down to the resident rows.
+    out.par_chunks_mut(head_dim)
+        .enumerate()
+        .for_each(|(i, dst)| {
+            let (kv_head, row) = (i / rows, i % rows);
+            if is_k {
+                dequantize_k(cache, row, kv_head, head_dim, dst);
+            } else {
+                dequantize_v(cache, row, kv_head, head_dim, dst);
+            }
+        });
     out
 }
 
@@ -313,6 +321,8 @@ pub(crate) fn dequant_snapshot(
 /// exists on that path, so there is no aliasing to avoid). `value_cell` caches that lazy snapshot.
 pub struct SnapshotStageCtx<'a> {
     current_pos: usize,
+    /// Per-head first resident position (`KVCache::head_starts`); all zero on a uniform cache.
+    head_starts: Vec<usize>,
     target_len: usize,
     layer_idx: usize,
     n_layers: usize,
@@ -350,6 +360,7 @@ impl<'a> SnapshotStageCtx<'a> {
     ) -> Self {
         Self {
             current_pos: cache.current_pos(),
+            head_starts: cache.head_starts(),
             target_len,
             layer_idx,
             n_layers,
@@ -443,6 +454,14 @@ impl<'a> SnapshotStageCtx<'a> {
 impl StageCtx for SnapshotStageCtx<'_> {
     fn current_pos(&self) -> usize {
         self.current_pos
+    }
+    fn head_start(&self, kv_head: usize) -> usize {
+        // Clamped to the frame the ctx shows (a prefill-attention ctx is narrower than the cache).
+        self.head_starts
+            .get(kv_head)
+            .copied()
+            .unwrap_or(0)
+            .min(self.current_pos)
     }
     fn target_len(&self) -> usize {
         self.target_len
@@ -599,10 +618,10 @@ fn planned_keep_of(h: &EngineCacheHandle<'_>) -> Option<PlannedKeep> {
 /// apply_prefill_keepset) drives, and then drops the handle instead of committing it (T-1), so the
 /// cache is byte-identical afterwards and the answer is the stage's real decision.
 ///
-/// `prefix_len` is the width of `pfa`, which is also the `current_pos` the stage is shown. Mid-decode
-/// that is smaller than the cache: the stage is asked only about the prefix its prefill attention
-/// covers, and what to do with the positions appended since is the caller's decision, not the
-/// technique's (see [`PlannedKeep::keep_tail`]).
+/// `prefix_len` is the width of `pfa`, which is also the `current_pos` the stage is shown. The
+/// engine's own chooser hands it the window attention over the resident cache, so the two agree
+/// and the stage ranks every resident position; a narrower capture shows the stage only the prefix
+/// it covers.
 ///
 /// `Ok(None)` = the stage staged no keep for this layer.
 #[allow(clippy::too_many_arguments)]
@@ -666,23 +685,6 @@ impl PlannedKeep {
             Self::PerHead(h) => h.get(kv_head).map(|v| v.as_slice()),
         }
     }
-
-    /// Force-keep `[from, to)` on top of what the stage staged.
-    ///
-    /// A prefill-end technique ranks only the positions its prefill attention covers. Asked
-    /// mid-decode, the tokens appended since sit outside that window entirely — they have no
-    /// measured attention, not a low one. Keeping them is the engine's call and it is stated as
-    /// such: the alternative is to let them fall to a score the technique never computed, which
-    /// would drop the newest tokens first and report the result as the technique's own.
-    ///
-    /// Every staged position is `< from` (the stage was shown a cache exactly `from` long), so
-    /// appending preserves the ascending order a keep-set requires.
-    pub(crate) fn keep_tail(&mut self, from: usize, to: usize) {
-        match self {
-            Self::LayerWide(k) => k.extend(from..to),
-            Self::PerHead(h) => h.iter_mut().for_each(|v| v.extend(from..to)),
-        }
-    }
 }
 
 /// Build the read ctx + handle, run the stage's callback, and hand the still-uncommitted handle to
@@ -721,6 +723,7 @@ fn run_mutation_layer<T>(
         want_value.then(|| dequant_snapshot(cache, current_pos, n_kv_heads, head_dim, false));
     let sctx = SnapshotStageCtx {
         current_pos,
+        head_starts: cache.head_starts(),
         target_len,
         layer_idx,
         n_layers,

@@ -60,6 +60,7 @@ impl SlidingWindow {
         // prefix + recent window, score-free (heavy 0) — routed through the T1 compiler.
         compile_keep_top_k(
             KeepTopK {
+                start: 0,
                 current,
                 prefix: self.protected_prefix,
                 recent: tokens_to_keep_after_prefix,

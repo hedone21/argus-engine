@@ -391,6 +391,34 @@ impl CudaDeviceBuffer {
         Ok(())
     }
 
+    /// Copy a sub-range of this device buffer to host, starting `src_offset` bytes in.
+    ///
+    /// The bounded counterpart of [`copy_to_host`](Self::copy_to_host); backs
+    /// `Backend::read_buffer_range` so a caller mirroring only the resident prefix of a
+    /// max-capacity buffer transfers just that prefix.
+    pub fn copy_to_host_at(&self, dst: *mut u8, len: usize, src_offset: usize) -> Result<()> {
+        let end = src_offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("CudaDeviceBuffer::copy_to_host_at: offset+len overflow"))?;
+        if end > self.size {
+            return Err(anyhow!(
+                "CudaDeviceBuffer::copy_to_host_at: {src_offset} + {len} > size {}",
+                self.size
+            ));
+        }
+        unsafe {
+            let res = cuda_sys::cuMemcpyDtoH_v2(
+                dst as *mut std::ffi::c_void,
+                self.dev_ptr + src_offset as cuda_sys::CUdeviceptr,
+                len,
+            );
+            if res != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuMemcpyDtoH failed: {:?}", res));
+            }
+        }
+        Ok(())
+    }
+
     pub fn device_ptr(&self) -> cuda_sys::CUdeviceptr {
         self.dev_ptr
     }

@@ -13,6 +13,7 @@
 //!   sub-window budget path (`lib.rs` D3) is covered by `sub_window_budget_keeps_raw_count`.
 
 use super::*;
+use argus_extension_api::snapkv_per_head_keep;
 use argus_extension_api::{TensorDtype, TensorHandle, TensorKind, TensorShape};
 
 // ── shared deterministic attention generator (mirrors reference/pyramidkv_select_ref.py) ──
@@ -69,6 +70,7 @@ struct Ctx {
     pfa: Option<PfaHandle>,
     importance: Option<Vec<f32>>,
     protected: usize,
+    head_start: Vec<usize>,
 }
 impl Default for Ctx {
     fn default() -> Self {
@@ -81,12 +83,16 @@ impl Default for Ctx {
             pfa: None,
             importance: None,
             protected: 0,
+            head_start: Vec::new(),
         }
     }
 }
 impl StageCtx for Ctx {
     fn current_pos(&self) -> usize {
         self.current
+    }
+    fn head_start(&self, kv_head: usize) -> usize {
+        self.head_start.get(kv_head).copied().unwrap_or(0)
     }
     fn target_len(&self) -> usize {
         self.target
@@ -238,19 +244,21 @@ fn per_head_selection_matches_kvpress_fixture() {
         }
 
         let attn = synth_attn(n_q, k_len, seed);
-        let got = per_head_keep(
+        let got = snapkv_per_head_keep(
+            SnapKvSelect {
+                n_q_heads: n_q,
+                n_kv_heads: n_kv,
+                cols: k_len,
+                current: k_len,
+                window,
+                kernel,
+                heavy: n_kept - window,
+                protected: 0, // protected_prefix (sink guard) off — faithful selection
+            },
             |qh, out| {
                 let base = qh * k_len;
                 out.copy_from_slice(&attn[base..base + k_len]);
             },
-            n_q,
-            n_kv,
-            k_len,
-            k_len,
-            window,
-            kernel,
-            n_kept - window,
-            0, // protected_prefix (sink guard) off — faithful selection
         );
         assert_eq!(
             got, expected,
@@ -271,16 +279,18 @@ fn per_head_keep_hand_traced() {
     // heavy region [0,4) scores ∝ attn (÷window is monotone): attn=[10,50,30,40].
     // ranking 1(50)>3(40)>2(30)>0(10) → top-2 = {1,3}; window=[4,5]. keep={1,3,4,5}.
     let attn = [10.0f32, 50.0, 30.0, 40.0, 7.0, 9.0];
-    let got = per_head_keep(
+    let got = snapkv_per_head_keep(
+        SnapKvSelect {
+            n_q_heads: 1,
+            n_kv_heads: 1,
+            cols: 6,
+            current: 6,
+            window: 2,
+            kernel: 1,
+            heavy: 2,
+            protected: 0,
+        },
         |_qh, out| out.copy_from_slice(&attn),
-        1,
-        1,
-        6,
-        6,
-        2,
-        1,
-        2,
-        0,
     );
     assert_eq!(got, vec![vec![1usize, 3, 4, 5]]);
 }
@@ -374,19 +384,21 @@ fn v3_native_per_head_decision() {
     // Independent oracle: budget (get_layer_budget) × per-head selection (per_head_keep).
     let n_kept = get_layer_budget(current, 0.5, window, beta, n_layers, layer_idx);
     assert!(n_kept > window && n_kept < current, "n_kept={n_kept}");
-    let expected = per_head_keep(
+    let expected = snapkv_per_head_keep(
+        SnapKvSelect {
+            n_q_heads: n_q,
+            n_kv_heads: n_kv,
+            cols: current,
+            current,
+            window,
+            kernel,
+            heavy: n_kept - window,
+            protected: 0, // protected_prefix (sink guard) off — faithful selection
+        },
         |qh, out| {
             let base = qh * current;
             out.copy_from_slice(&attn[base..base + current]);
         },
-        n_q,
-        n_kv,
-        current,
-        current,
-        window,
-        kernel,
-        n_kept - window,
-        0, // protected_prefix (sink guard) off — faithful selection
     );
 
     // v3 decision via a concrete PyramidKv built from the same config.
@@ -429,6 +441,7 @@ fn v3_native_layerwide_and_noop_arms() {
         pfa: None,
         importance: Some((0..64).map(|i| (i % 11) as f32).collect()),
         protected: 0,
+        head_start: Vec::new(),
     };
     let expected_lw = match keep_spec_for(&blob_args, &lw_ctx).unwrap() {
         KeepSpec::LayerWide(k) => k,
@@ -454,6 +467,7 @@ fn v3_native_layerwide_and_noop_arms() {
         pfa: None,
         importance: None,
         protected: 0,
+        head_start: Vec::new(),
     };
     assert!(keep_spec_for(&[], &noop_ctx).is_none(), "cr==0 → no-op");
     let mut h2 = CaptureHandle {
@@ -754,5 +768,44 @@ fn window_only_keep_when_budget_equals_window() {
     match keep_spec_for(&cr_args("0.9", 8, 5, 20), &ctx).expect("keep Some") {
         KeepSpec::LayerWide(k) => assert_eq!(k, (72..80).collect::<Vec<_>>()),
         KeepSpec::PerHead(_) => panic!("budget==window is the layer-wide window-only keep"),
+    }
+}
+
+/// On a ragged cache (`StageCtx::head_start`) every head ranks from its own first resident slot:
+/// no keep names a hole and the protected prefix is the head's first resident positions.
+/// Mutation-proof: ranking from 0 keeps `[0, 4)` for head 1, which is inside its hole.
+#[test]
+fn a_ragged_cache_is_ranked_from_each_heads_own_start() {
+    let (n_kv, n_q, k_len) = (2usize, 4usize, 200usize);
+    let stage = PyramidKv::new(PyramidKvConfig {
+        compression_ratio: 0.5,
+        ..Default::default()
+    });
+    let starts = vec![0usize, 40];
+    let ctx = Ctx {
+        current: k_len,
+        target: 100,
+        layer_idx: 0,
+        n_layers: 4,
+        n_kv_heads: n_kv,
+        pfa: Some(PfaHandle {
+            data: synth_attn(n_q, k_len, 93),
+            rows: n_q,
+            cols: k_len,
+        }),
+        protected: 4,
+        head_start: starts.clone(),
+        ..Default::default()
+    };
+    let Some(KeepSpec::PerHead(heads)) = stage.keep_spec(&ctx) else {
+        panic!("expected a per-head keep")
+    };
+    for (h, k) in heads.iter().enumerate() {
+        assert!(
+            k.iter().all(|&p| p >= starts[h]),
+            "head {h} names a hole: {k:?}"
+        );
+        assert_eq!(&k[..4], &(starts[h]..starts[h] + 4).collect::<Vec<_>>());
+        assert!(k.windows(2).all(|w| w[0] < w[1]));
     }
 }

@@ -1751,6 +1751,9 @@ impl TransformerModel {
                 )?;
             }
 
+            // Intra-token yield (dyn mirror of plan.rs:1509); before the hook whose body syncs.
+            backend.yield_after_layer(i, is_decode);
+
             // §5.9.2 Track B (ENG-ALG-235): layer `i` compute 직후 hook 발화 — IntraForward swap 이
             // 다음 토큰부터 dispatch_at 에 도달한 layer 의 secondary→GPU async swap 을 enqueue 한다.
             // decode(seq_len=1)에서만 동작(hook 내부 seq_len>1 가드, intra_forward_swap.rs:383).

@@ -6,6 +6,12 @@
 //! (`--set hh_size=… --set recent_size=…`), not a ratio of an engine-supplied `target_len` — the
 //! budget IS the policy, so the CLI requires both explicitly (`Args::require_h2o_budgets`).
 //!
+//! The one alternative is `--set budget=target`: the engine's `target_len` split in two, heavy
+//! hitters and recency in equal halves — the "x% heavy + x% recent" the paper states its budgets
+//! in, sized against the cache as it stands at each ask. It is what lets H2O answer a budget that
+//! keeps shrinking (the engine's own compression chooser asks for one), which the absolute form
+//! cannot: asked for less than `hh_size + recent_size` it keeps `hh_size + recent_size`.
+//!
 //! Per-head when the engine supplies per-(kv_head, pos) scores via `ctx.tensor(Scores)` (each KV head
 //! ranks its own heavy hitters, all heads keeping the same count so the single `current_pos`
 //! invariant holds — the original H2O granularity); otherwise the flat layer-wide importance, and
@@ -35,16 +41,28 @@ const H2O_CAPS: StageCaps = StageCaps {
     prefill_attn_window: None,
 };
 
-/// Parse the absolute heavy-hitter / recent budgets from the technique-private `--set` blob.
+/// How the heavy / recent split is sized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Budget {
+    /// `hh_size` heavy hitters + `recent_size` recent tokens, whatever the engine asks for — the
+    /// reference constructor's own knobs.
+    Absolute { hh_size: usize, recent_size: usize },
+    /// The engine's `target_len`, split in equal halves (the odd one to recency). `target_len == 0`
+    /// is no ask, and a no-op.
+    FromTarget,
+}
+
+/// Parse the budget from the technique-private `--set` blob.
 ///
 /// EXPLICIT-REQUIRED: faithful H2O has no meaningful default budget (the budget IS the policy), so a
-/// run that omits `hh_size`/`recent_size` is rejected at the CLI layer ([`Args::require_h2o_budgets`])
-/// with a clean error — not here, since the `make` ABI is infallible. When absent here (e.g. the
-/// registration self-test's empty args) both default to 0: a degenerate keep-prefix-only stage that
-/// production never reaches.
-fn parse_h2o_budgets(args: StageArgs<'_>) -> (usize, usize) {
+/// run that omits `hh_size`/`recent_size` (and does not say `budget=target`) is rejected at the CLI
+/// layer ([`Args::require_h2o_budgets`]) with a clean error — not here, since the `make` ABI is
+/// infallible. When absent here (e.g. the registration self-test's empty args) both default to 0:
+/// a degenerate keep-prefix-only stage that production never reaches.
+fn parse_h2o_budgets(args: StageArgs<'_>) -> Budget {
     let mut hh_size = 0usize;
     let mut recent_size = 0usize;
+    let mut from_target = false;
     for a in args {
         match a.key {
             "hh_size" => {
@@ -57,17 +75,25 @@ fn parse_h2o_budgets(args: StageArgs<'_>) -> (usize, usize) {
                     recent_size = v;
                 }
             }
+            "budget" => from_target = a.val.trim() == "target",
             _ => {}
         }
     }
-    (hh_size, recent_size)
+    if from_target {
+        Budget::FromTarget
+    } else {
+        Budget::Absolute {
+            hh_size,
+            recent_size,
+        }
+    }
 }
 
 /// H2O eviction stage. Absolute `hh_size`/`recent_size` budgets (+ optional `protected_prefix`), with
-/// no clamps — faithful to `H2OKVCache_LayerWise(hh_size, recent_size)`.
+/// no clamps — faithful to `H2OKVCache_LayerWise(hh_size, recent_size)` — or the target-derived
+/// split ([`Budget::FromTarget`]).
 struct H2o {
-    hh_size: usize,
-    recent_size: usize,
+    budget: Budget,
     protected_prefix: usize,
 }
 
@@ -83,9 +109,13 @@ struct Partition {
 impl Partition {
     /// One head's (or the layer-wide) ascending keep-list: prefix ∪ top-`hh_budget` scorers over the
     /// evictable middle ∪ the `recent`-token recency window. Routed through the engine T1 compiler.
-    fn keep_list(&self, score: impl Fn(usize) -> f32) -> Vec<usize> {
+    ///
+    /// `start` is the head's first resident slot (`0` on a uniform cache; [`StageCtx::head_start`]
+    /// on a ragged one), so the protected prefix is the head's first resident positions.
+    fn keep_list_from(&self, start: usize, score: impl Fn(usize) -> f32) -> Vec<usize> {
         compile_keep_top_k(
             KeepTopK {
+                start,
                 current: self.current,
                 prefix: self.prefix,
                 recent: self.recent,
@@ -95,10 +125,12 @@ impl Partition {
         )
     }
 
-    /// Score-free fallback: give the full evictable budget (`hh_budget + recent`) to recency.
-    fn keep_list_recency(&self) -> Vec<usize> {
+    /// Score-free fallback: give the full evictable budget (`hh_budget + recent`) to recency, from
+    /// the head's first resident slot.
+    fn keep_list_recency_from(&self, start: usize) -> Vec<usize> {
         compile_keep_top_k(
             KeepTopK {
+                start,
                 current: self.current,
                 prefix: self.prefix,
                 recent: self.hh_budget + self.recent,
@@ -111,27 +143,39 @@ impl Partition {
 
 impl H2o {
     fn from_args(p: StageParams, args: StageArgs<'_>) -> Self {
-        let (hh_size, recent_size) = parse_h2o_budgets(args);
         Self {
-            hh_size,
-            recent_size,
+            budget: parse_h2o_budgets(args),
             protected_prefix: p.protected_prefix,
         }
     }
 
-    /// Partition by ABSOLUTE budget: keep `protected_prefix + hh_size + recent_size` tokens,
-    /// independent of the engine's `target_len`. `None` when the cache is already within that budget
-    /// (faithful to `H2OKVCache_LayerWise` evicting only past `hh_size + recent_size`).
-    fn partition(&self, current: usize) -> Option<Partition> {
+    /// Partition by budget: keep `protected_prefix + hh + recent` tokens, where `hh`/`recent` are
+    /// the absolute sizes (independent of the engine's `target_len`) or the halves of `target_len`
+    /// less the prefix. `None` when the cache is already within that budget (faithful to
+    /// `H2OKVCache_LayerWise` evicting only past `hh_size + recent_size`).
+    fn partition(&self, current: usize, target_len: usize) -> Option<Partition> {
         let prefix = self.protected_prefix.min(current);
-        let keep_total = prefix + self.hh_size + self.recent_size;
+        let (hh_budget, recent) = match self.budget {
+            Budget::Absolute {
+                hh_size,
+                recent_size,
+            } => (hh_size, recent_size),
+            Budget::FromTarget => {
+                if target_len == 0 {
+                    return None;
+                }
+                let evictable = target_len.min(current).saturating_sub(prefix);
+                (evictable / 2, evictable - evictable / 2)
+            }
+        };
+        let keep_total = prefix + hh_budget + recent;
         if current <= keep_total {
             return None;
         }
         Some(Partition {
             prefix,
-            hh_budget: self.hh_size,
-            recent: self.recent_size,
+            hh_budget,
+            recent,
             current,
         })
     }
@@ -140,23 +184,33 @@ impl H2o {
     /// present (the reference granularity); otherwise layer-wide from the flat importance, and
     /// score-free to recency.
     fn keep_spec(&self, ctx: &dyn StageCtx) -> Option<KeepSpec> {
-        let p = self.partition(ctx.current_pos())?;
+        let p = self.partition(ctx.current_pos(), ctx.target_len())?;
+        // A ragged cache (`StageCtx::head_start`): each head ranks from its own first resident slot.
+        let n_kv_heads = ctx.n_kv_heads().max(1);
+        let head_start: Vec<usize> = (0..n_kv_heads).map(|h| ctx.head_start(h)).collect();
+        let ragged = head_start.iter().any(|&s| s > 0);
 
         // (1) Per-head: each KV head ranks its own heavy hitters; all heads keep the same count.
         if ctx.has_head_scores() {
-            let n_kv_heads = ctx.n_kv_heads().max(1);
             let heads: Vec<Vec<usize>> = (0..n_kv_heads)
-                .map(|kv_h| p.keep_list(|pos| ctx.head_score(kv_h, pos)))
+                .map(|kv_h| p.keep_list_from(head_start[kv_h], |pos| ctx.head_score(kv_h, pos)))
                 .collect();
             return Some(KeepSpec::PerHead(heads));
         }
 
         // (2) Flat fallback: heavy hitters from the layer-wide importance. (3) Score-free: recency.
-        let keep = match ctx.importance() {
-            Some(imp) => p.keep_list(|pos| imp.get(pos).copied().unwrap_or(0.0)),
-            None => p.keep_list_recency(),
+        // On a ragged cache the same list is issued per head from each head's own start.
+        let list = |start: usize| match ctx.importance() {
+            Some(imp) => p.keep_list_from(start, |pos| imp.get(pos).copied().unwrap_or(0.0)),
+            None => p.keep_list_recency_from(start),
         };
-        Some(KeepSpec::LayerWide(keep))
+        if ragged {
+            Some(KeepSpec::PerHead(
+                head_start.iter().map(|&s| list(s)).collect(),
+            ))
+        } else {
+            Some(KeepSpec::LayerWide(list(0)))
+        }
     }
 }
 
@@ -238,6 +292,7 @@ mod tests {
         stride: usize,
         head_scores: Option<Vec<f32>>, // [n_kv_heads * stride]
         importance: Option<Vec<f32>>,
+        head_start: Vec<usize>,
     }
     struct ScoresHandle<'a> {
         data: &'a [f32],
@@ -266,6 +321,9 @@ mod tests {
     impl StageCtx for Ctx {
         fn current_pos(&self) -> usize {
             self.current
+        }
+        fn head_start(&self, kv_head: usize) -> usize {
+            self.head_start.get(kv_head).copied().unwrap_or(0)
         }
         fn target_len(&self) -> usize {
             0
@@ -375,8 +433,13 @@ mod tests {
             &budgets("4", "6"),
         );
         assert_eq!(s.protected_prefix, 0);
-        assert_eq!(s.hh_size, 4);
-        assert_eq!(s.recent_size, 6);
+        assert_eq!(
+            s.budget,
+            Budget::Absolute {
+                hh_size: 4,
+                recent_size: 6
+            }
+        );
     }
 
     /// Within the absolute budget (`prefix + hh_size + recent_size`) → no-op.
@@ -390,6 +453,7 @@ mod tests {
             stride: 0,
             head_scores: None,
             importance: None,
+            head_start: vec![],
         };
         assert!(s.keep_spec(&ctx).is_none());
     }
@@ -404,6 +468,7 @@ mod tests {
             stride: 0,
             head_scores: None,
             importance: None,
+            head_start: vec![],
         };
         match s.keep_spec(&ctx) {
             Some(KeepSpec::LayerWide(keep)) => assert_eq!(keep, (10..20).collect::<Vec<_>>()),
@@ -426,6 +491,7 @@ mod tests {
             stride: 0,
             head_scores: None,
             importance: Some(imp),
+            head_start: vec![],
         };
         match s.keep_spec(&ctx) {
             Some(KeepSpec::LayerWide(keep)) => {
@@ -455,6 +521,7 @@ mod tests {
             stride,
             head_scores: Some(hs),
             importance: None,
+            head_start: vec![],
         };
         let expected = match s.keep_spec(&ctx).unwrap() {
             KeepSpec::PerHead(h) => h,
@@ -492,6 +559,7 @@ mod tests {
                 stride: 0,
                 head_scores: None,
                 importance: None,
+                head_start: vec![],
             }, // within budget -> no-op
             Ctx {
                 current: 20,
@@ -499,6 +567,7 @@ mod tests {
                 stride: 0,
                 head_scores: None,
                 importance: Some(imp),
+                head_start: vec![],
             }, // score-based layer-wide
         ];
         for ctx in &cases {
@@ -532,8 +601,10 @@ mod tests {
         let retained = identify_retained_h2o(&imp, current, hh_size, recent_size, prefix);
 
         let s = H2o {
-            hh_size,
-            recent_size,
+            budget: Budget::Absolute {
+                hh_size,
+                recent_size,
+            },
             protected_prefix: prefix,
         };
         let ctx = Ctx {
@@ -542,11 +613,144 @@ mod tests {
             stride: 0,
             head_scores: None,
             importance: Some(imp),
+            head_start: vec![],
         };
         let actuator_keep = match s.keep_spec(&ctx).unwrap() {
             KeepSpec::LayerWide(k) => k,
             KeepSpec::PerHead(_) => unreachable!(),
         };
         assert_eq!(retained, actuator_keep);
+    }
+
+    /// On a ragged cache (`StageCtx::head_start`) the per-head and the layer-wide branches both
+    /// rank from each head's own first resident slot, so no keep names a hole and the protected
+    /// prefix is the head's first resident positions. Mutation-proof: ranking from 0 keeps `[0, 4)`
+    /// for head 1, inside its hole.
+    #[test]
+    fn a_ragged_cache_is_ranked_from_each_heads_own_start() {
+        let stage = H2o {
+            budget: Budget::Absolute {
+                hh_size: 8,
+                recent_size: 8,
+            },
+            protected_prefix: 4,
+        };
+        let (current, n_kv, stride) = (64usize, 2usize, 64usize);
+        let scores: Vec<f32> = (0..n_kv * stride).map(|i| ((i * 7) % 13) as f32).collect();
+        let starts = vec![0usize, 20];
+        let ctx = Ctx {
+            current,
+            n_kv_heads: n_kv,
+            stride,
+            head_scores: Some(scores.clone()),
+            importance: None,
+            head_start: starts.clone(),
+        };
+        let Some(KeepSpec::PerHead(heads)) = stage.keep_spec(&ctx) else {
+            panic!("expected a per-head keep")
+        };
+        for (h, k) in heads.iter().enumerate() {
+            assert!(
+                k.iter().all(|&p| p >= starts[h]),
+                "head {h} names a hole: {k:?}"
+            );
+            assert_eq!(&k[..4], &(starts[h]..starts[h] + 4).collect::<Vec<_>>());
+            assert_eq!(k.len(), 4 + 8 + 8);
+        }
+        // Layer-wide branch on a ragged cache: issued per head from each head's start.
+        let ctx = Ctx {
+            current,
+            n_kv_heads: n_kv,
+            stride,
+            head_scores: None,
+            importance: Some(scores[..current].to_vec()),
+            head_start: starts.clone(),
+        };
+        let Some(KeepSpec::PerHead(heads)) = stage.keep_spec(&ctx) else {
+            panic!("expected a per-head keep on a ragged cache")
+        };
+        assert!(heads[1].iter().all(|&p| p >= 20));
+        assert_eq!(&heads[1][..4], &[20, 21, 22, 23]);
+    }
+
+    /// `--set budget=target`: the engine's ask split in equal heavy / recent halves, followed as
+    /// it shrinks; no ask (`target_len == 0`) is a no-op.
+    #[test]
+    fn target_budget_splits_the_ask_in_halves_and_follows_it() {
+        struct WithTarget(Ctx, usize);
+        impl StageCtx for WithTarget {
+            fn current_pos(&self) -> usize {
+                self.0.current_pos()
+            }
+            fn head_start(&self, kv_head: usize) -> usize {
+                self.0.head_start(kv_head)
+            }
+            fn target_len(&self) -> usize {
+                self.1
+            }
+            fn layer_idx(&self) -> usize {
+                0
+            }
+            fn importance(&self) -> Option<&[f32]> {
+                self.0.importance()
+            }
+            fn n_kv_heads(&self) -> usize {
+                self.0.n_kv_heads()
+            }
+            fn head_dim(&self) -> usize {
+                4
+            }
+            fn tensor(&self, kind: TensorKind) -> Option<&dyn TensorHandle> {
+                self.0.tensor(kind)
+            }
+        }
+        let s = H2o::from_args(
+            StageParams::default(),
+            &[PluginArg {
+                key: "budget",
+                val: "target",
+            }],
+        );
+        assert_eq!(s.budget, Budget::FromTarget);
+        // Importance: positions 2, 7, 9, 11 are the heavy hitters, in that order.
+        let mut imp = vec![0.0f32; 20];
+        imp[2] = 5.0;
+        imp[7] = 4.0;
+        imp[9] = 3.0;
+        imp[11] = 2.0;
+        let base = Ctx {
+            current: 20,
+            n_kv_heads: 1,
+            stride: 0,
+            head_scores: None,
+            importance: Some(imp),
+            head_start: vec![],
+        };
+        // Asked for 8 of 20: 4 heavy + 4 recent → [2, 7, 9, 11] ∪ [16, 20).
+        let ctx = WithTarget(base, 8);
+        let Some(KeepSpec::LayerWide(keep)) = s.keep_spec(&ctx) else {
+            panic!("a layer-wide keep")
+        };
+        assert_eq!(keep, vec![2, 7, 9, 11, 16, 17, 18, 19]);
+        // Asked for 5 (odd): 2 heavy + 3 recent. The absolute form could not follow this.
+        let ctx = WithTarget(ctx.0, 5);
+        let Some(KeepSpec::LayerWide(keep)) = s.keep_spec(&ctx) else {
+            panic!("a layer-wide keep")
+        };
+        assert_eq!(keep, vec![2, 7, 17, 18, 19]);
+        // No ask → no-op; an ask the cache is within → no-op.
+        assert!(s.keep_spec(&WithTarget(ctx.0, 0)).is_none());
+        let ctx = WithTarget(
+            Ctx {
+                current: 20,
+                n_kv_heads: 1,
+                stride: 0,
+                head_scores: None,
+                importance: None,
+                head_start: vec![],
+            },
+            20,
+        );
+        assert!(s.keep_spec(&ctx).is_none());
     }
 }

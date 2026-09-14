@@ -353,6 +353,12 @@ pub fn build_standard_loop(
             if let Some(h) = kv_pos_handle.clone() {
                 adapter.set_kv_handle(h);
             }
+            adapter.set_kv_token_handles(
+                kv_handles
+                    .iter()
+                    .map(|h| h.clone() as Arc<dyn crate::format::KVCacheFormat>)
+                    .collect(),
+            );
             adapter.set_kv_byte_handles(
                 kv_handles
                     .iter()

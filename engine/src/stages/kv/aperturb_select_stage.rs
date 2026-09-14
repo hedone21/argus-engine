@@ -37,8 +37,14 @@ pub struct AperturbSelectStage {
     prefill_attn: Arc<Mutex<Option<PrefillAttn>>>,
     /// Present when scores may live on-device; the sync before the read is then live.
     backend: Option<Arc<dyn crate::backend::Backend>>,
-    /// The fraction of the resident cache the Manager asked to keep.
-    target_ratio: f32,
+    /// The tokens the Manager's budget comes to, against the uncompressed context. Carried as
+    /// a count, not as a fraction of the resident cache: two directives submitted in one step
+    /// (a ratchet that keeps ticking while a decision stalls the engine) would each have taken
+    /// their fraction against the length at submit time, and the second, run after the first
+    /// had already compacted, applied that stale fraction to the shrunken cache — 0.25 of
+    /// 3,390 became 396 tokens on an S25 (2026-09-02). The fraction is formed here, when the
+    /// stage runs, against what is resident then.
+    target_len: usize,
 }
 
 impl AperturbSelectStage {
@@ -47,7 +53,7 @@ impl AperturbSelectStage {
         handles: Vec<Arc<StandardFormat>>,
         selector: Arc<Selector>,
         q_rows: Arc<Mutex<Option<QRowCapture>>>,
-        target_ratio: f32,
+        target_len: usize,
         score_cell: Arc<Mutex<Option<SignalRuntime>>>,
         prefill_attn: Arc<Mutex<Option<PrefillAttn>>>,
         backend: Option<Arc<dyn crate::backend::Backend>>,
@@ -59,7 +65,7 @@ impl AperturbSelectStage {
             score_cell,
             prefill_attn,
             backend,
-            target_ratio,
+            target_len,
         }
     }
 
@@ -69,8 +75,9 @@ impl AperturbSelectStage {
     /// other compression: the Manager is told what the cache actually did through the dispatcher's
     /// read-back, and substituting an unscored technique here would make that answer a fiction.
     fn run_selection(&self) -> anyhow::Result<()> {
-        let guard = self.q_rows.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(q_rows) = guard.as_ref() else {
+        let t_stage = std::time::Instant::now();
+        let mut guard = self.q_rows.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(q_rows) = guard.as_mut() else {
             eprintln!(
                 "[aperturb-select] declined: the query-row capture is not armed, so there are no \
                  rows to measure the candidates on"
@@ -78,6 +85,7 @@ impl AperturbSelectStage {
             return Ok(());
         };
 
+        let t_prep = std::time::Instant::now();
         // Scores may have accumulated on-device; the same sync `EvictionStage` does before reading.
         if let Some(be) = self.backend.as_ref() {
             let mut cell = self
@@ -123,9 +131,31 @@ impl AperturbSelectStage {
         };
 
         let mut temp: Vec<KVCache> = self.handles.iter().map(|f| f.take_inner()).collect();
+        let prep_s = t_prep.elapsed().as_secs_f64();
+        // The fraction the candidates are asked for, against the cache as it stands NOW — an
+        // earlier directive this step may already have compacted it (see `target_len`).
+        // The whole model's resident length, rounded up — the same unit `Choice::tokens_before`
+        // and the dispatcher's own gate are in, so no comparison here mixes layer 0 against a
+        // layer mean.
+        let resident = crate::kv::layer_mean_resident(temp.iter().map(|c| c.resident_tokens()));
+        // A cursor, not a length: `target_ratio` below renumbers against ring slots, so this one
+        // stays layer 0's.
+        let cursor = temp.first().map_or(0, |c| c.current_pos());
+        if self.target_len >= resident || cursor == 0 {
+            for (f, c) in self.handles.iter().zip(temp) {
+                f.put_inner(c);
+            }
+            eprintln!(
+                "[aperturb-select] budget of {} tokens: the cache already holds {resident}, \
+                 nothing to remove",
+                self.target_len
+            );
+            return Ok(());
+        }
+        let target_ratio = self.target_len as f32 / cursor as f32;
         let outcome = self
             .selector
-            .choose_and_apply(&mut temp, self.target_ratio, q_rows, signals);
+            .choose_and_apply(&mut temp, target_ratio, q_rows, signals);
         for (f, c) in self.handles.iter().zip(temp) {
             f.put_inner(c);
         }
@@ -133,6 +163,7 @@ impl AperturbSelectStage {
 
         match outcome? {
             Ok(mut choice) => {
+                let stage_s = t_stage.elapsed().as_secs_f64();
                 let arms = choice
                     .arms
                     .iter()
@@ -147,21 +178,49 @@ impl AperturbSelectStage {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                let plan_arms = choice
+                    .arms
+                    .iter()
+                    .map(|a| format!("{} {:.3}", a.name, a.plan_s))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let pt = &choice.decide_times;
                 eprintln!(
                     "[aperturb-select] budget={:.3} {} → {} tokens, chose '{}' [{arms}] \
-                     decide={:.3}s read={:.3}s",
-                    self.target_ratio,
+                     decide={:.3}s (logits {:.3} keypos {:.3} attend {:.3} project {:.3} \
+                     readout {:.3}) read={:.3}s window={:.3}s plan={:.3}s [{plan_arms}] \
+                     apply={:.3}s carry={:.3}s prep={:.3}s stage={:.3}s \
+                     folded={} attend_n={} logits_n={}",
+                    target_ratio,
                     choice.tokens_before,
                     choice.tokens_after,
                     choice.winner,
                     choice.decide_s,
+                    pt.logits_s,
+                    pt.keypos_s,
+                    pt.attend_s,
+                    pt.project_s,
+                    pt.readout_s,
                     choice.read_s,
+                    choice.window_s,
+                    choice.plan_s,
+                    choice.apply_s,
+                    choice.carry_s,
+                    prep_s,
+                    stage_s,
+                    // Appended, never interleaved: `analyze_trace.py` reads the fields before this
+                    // point by name and position, so a new field goes on the end or not at all.
+                    pt.folded,
+                    pt.attend_n,
+                    pt.logits_n,
                 );
                 for (name, why) in &choice.excluded {
                     eprintln!("[aperturb-select]   excluded '{name}': {why}");
                 }
                 // The KV geometry moved, so every accumulated score is now indexed by positions
                 // that no longer exist — the same reset `EvictionStage` does after a real eviction.
+                // Both operands are the whole-model layer mean (`crate::kv::layer_mean_resident`),
+                // so this reads "the cache actually moved" and not "layer 0 moved".
                 if choice.tokens_after < choice.tokens_before {
                     let mut cell = self
                         .score_cell

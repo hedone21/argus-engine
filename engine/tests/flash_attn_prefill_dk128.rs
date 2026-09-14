@@ -148,6 +148,7 @@ fn run_prefill_self_consistency(
             capacity,
             1,
             true, // is_head_major
+            None,
         )
         .expect("prefill flash call a");
     if !ok_a {
@@ -173,6 +174,7 @@ fn run_prefill_self_consistency(
             capacity,
             1,
             true,
+            None,
         )
         .expect("prefill flash call b");
     assert!(
@@ -294,6 +296,7 @@ fn prefill_unsupported_head_dim_returns_false() {
             capacity,
             1,
             true,
+            None,
         )
         .expect("prefill call must not error");
     assert!(

@@ -92,6 +92,48 @@ pub fn flash_attention_head(
     bc: usize,
     window_size: Option<usize>,
 ) {
+    flash_attention_head_from(
+        q,
+        q_stride,
+        k,
+        k_stride,
+        v,
+        v_stride,
+        out,
+        out_stride,
+        q_len,
+        kv_len,
+        head_dim,
+        q_start_pos,
+        br,
+        bc,
+        window_size,
+        0,
+    )
+}
+
+/// [`flash_attention_head`] over a KV head that is resident from slot `kv_start` only — the
+/// ragged-cache form (`KVCache::head_start`). Keys below `kv_start` are holes: never scored,
+/// never summed, exactly as if `kv_len` began there. `kv_start == 0` is the plain kernel.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn flash_attention_head_from(
+    q: &[f32],
+    q_stride: usize,
+    k: &[f32],
+    k_stride: usize,
+    v: &[f32],
+    v_stride: usize,
+    out: &mut [f32],
+    out_stride: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    q_start_pos: usize,
+    br: usize,
+    bc: usize,
+    window_size: Option<usize>,
+    kv_start: usize,
+) {
     let scale = 1.0 / (head_dim as f32).sqrt();
     let tr = q_len.div_ceil(br);
     let tc = kv_len.div_ceil(bc);
@@ -119,6 +161,10 @@ pub fn flash_attention_head(
             if c_start > max_global_q_in_block {
                 continue;
             }
+            // Ragged head: every key of this block sits in the hole in front of the head.
+            if c_end <= kv_start {
+                continue;
+            }
             // Sliding window: skip block if all keys are outside the window.
             // Block keys span [c_start, c_end). Min global_q in block = r_start + q_start_pos.
             // All keys out of window iff c_end + window_size - 1 <= r_start + q_start_pos.
@@ -144,8 +190,9 @@ pub fn flash_attention_head(
                         Some(ws) => global_c + ws > global_q,
                         None => true,
                     };
+                    let resident_ok = global_c >= kv_start;
 
-                    if causal_ok && window_ok {
+                    if causal_ok && window_ok && resident_ok {
                         let mut dot = 0.0;
                         let q_ptr = global_r * q_stride;
                         let k_ptr = global_c * k_stride;
@@ -197,7 +244,8 @@ pub fn flash_attention_head(
                             Some(ws) => global_c + ws > global_q,
                             None => true,
                         };
-                        if causal_ok && window_ok {
+                        let resident_ok = global_c >= kv_start;
+                        if causal_ok && window_ok && resident_ok {
                             // v[global_c, d] -> v[global_c * v_stride + d]
                             pv_sum += p_row[c] * v[global_c * v_stride + d];
                         }
@@ -249,7 +297,11 @@ pub fn flash_attention_forward_strided(
     br: usize,
     bc: usize,
     window_size: Option<usize>,
+    kv_start: Option<&[usize]>,
 ) {
+    // A ragged cache (`kv_start[kv_h] > 0` for some head) takes the scalar path below: the NEON
+    // tile kernel has no per-head floor.
+    let ragged = kv_start.is_some_and(|s| s.iter().any(|&x| x > 0));
     // Step 3: NEON tile + online-softmax prefill path.  Used when the input
     // is long enough to amortise dispatch overhead, head_dim is 8-aligned,
     // the GQA ratio is integer, and KV is HeadMajor (kv_head_stride equals
@@ -260,7 +312,8 @@ pub fn flash_attention_forward_strided(
     #[cfg(target_arch = "aarch64")]
     {
         use crate::backend::cpu::neon::{PREFILL_FLASH_THRESHOLD, flash_prefill_forward_f32_neon};
-        if q_len >= PREFILL_FLASH_THRESHOLD
+        if !ragged
+            && q_len >= PREFILL_FLASH_THRESHOLD
             && head_dim.is_multiple_of(8)
             && n_heads_q.is_multiple_of(n_heads_kv)
             && k_stride == head_dim
@@ -306,8 +359,10 @@ pub fn flash_attention_forward_strided(
     let k_total_len = k.len(); // v len same
     let out_total_len = out.len();
 
+    let _ = ragged;
     (0..n_heads_q).into_par_iter().for_each(move |h| {
         let kv_h = h / n_rep;
+        let head_kv_start = kv_start.map_or(0, |s| s[kv_h]);
         let q_head_offset = h * head_dim;
         let k_head_offset = kv_h * kv_head_stride;
         let out_head_offset = h * head_dim;
@@ -329,7 +384,7 @@ pub fn flash_attention_forward_strided(
                 out_total_len - out_head_offset,
             );
 
-            flash_attention_head(
+            flash_attention_head_from(
                 q_slice,
                 q_stride,
                 k_slice,
@@ -345,6 +400,7 @@ pub fn flash_attention_forward_strided(
                 br,
                 bc,
                 window_size,
+                head_kv_start,
             );
         }
     });

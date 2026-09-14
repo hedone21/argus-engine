@@ -176,9 +176,9 @@ pub fn resolve_aperturb_selector(
             );
         }
         // A compression budget arrives mid-decode. A `KvMutate` technique acts there by
-        // construction. A `PrefillEnd` one (PyramidKV/SnapKV) does not — it is admitted only
-        // because it reads the prefill attention, which the forward can keep alive into decode, and
-        // the planner then asks it about the prompt prefix that attention covers.
+        // construction. A `PrefillEnd` one (PyramidKV/SnapKV/AdaKV) does not — it is admitted
+        // because it reads the observation-window attention, which the chooser recomputes over the
+        // resident cache from the query-row ring at every decision.
         anyhow::ensure!(
             reg.phase == MutationPhase::KvMutate || reads_pfa,
             "--aperturb-select: '{name}' fires at {:?}, not KvMutate, and reads no prefill \
@@ -233,17 +233,21 @@ pub fn resolve_aperturb_selector(
     );
     if let Some((name, w)) = &pfa_window {
         eprintln!(
-            "[aperturb-select] '{name}' decides off the prefill attention; the forward will arm a \
-             {w}-query window and the decode positions appended after prefill are force-kept \
-             (see PlannedKeep::keep_tail — an engine-side adaptation, not the paper's placement)"
+            "[aperturb-select] '{name}' decides off a {w}-query observation window; at each \
+             decision the engine recomputes that window's attention over the resident cache from \
+             the query-row ring, so the technique ranks decode positions too (the engine's \
+             placement, not the paper's prefill-end one)"
         );
     }
     Ok(Some(AperturbPool {
-        selector: Arc::new(Selector::new(
-            candidates,
-            Arc::new(basis),
-            model.config.num_attention_heads,
-        )?),
+        selector: Arc::new(
+            Selector::new(
+                candidates,
+                Arc::new(basis),
+                model.config.num_attention_heads,
+            )?
+            .with_metric_rows(crate::session::aperturb_basis::APERTURB_ROWS),
+        ),
         pfa_window: pfa_window.map(|(_, w)| w),
     }))
 }
@@ -493,12 +497,20 @@ pub fn build_bench_loop(
     // and the forward is byte-identical.
     let q_rows_cell: Arc<Mutex<Option<crate::inference::q_rows::QRowCapture>>> =
         Arc::new(Mutex::new(None));
-    if aperturb_pool.is_some() {
+    if let Some(pool) = aperturb_pool.as_ref() {
+        // The ring is the metric's `APERTURB_ROWS` trailing rows, widened to the observation
+        // window a prefill-end candidate declares: that window is what the chooser recomputes the
+        // candidate's attention from, and it must be the one the technique was verified at.
+        let rows = pool
+            .pfa_window
+            .map_or(crate::session::aperturb_basis::APERTURB_ROWS, |w| {
+                w.max(crate::session::aperturb_basis::APERTURB_ROWS)
+            });
         let cap = crate::inference::q_rows::QRowCapture::new(
             Arc::clone(&backend_arc),
             memory_arc.as_ref(),
             n_layers_for_q,
-            crate::session::aperturb_basis::APERTURB_ROWS,
+            rows,
             n_heads_q * head_dim,
         )?;
         *q_rows_cell.lock().expect("q-rows cell poisoned") = Some(cap);
@@ -534,6 +546,14 @@ pub fn build_bench_loop(
                     .map(|h| {
                         h.clone() as Arc<dyn crate::session::resilience_adapter::KvBytesHandle>
                     })
+                    .collect(),
+            );
+            // 008: the heartbeat's token count is the whole model's, not layer 0's — same vector,
+            // coerced to the token-bearing trait.
+            adapter.set_kv_token_handles(
+                kv_handles
+                    .iter()
+                    .map(|h| h.clone() as Arc<dyn crate::format::KVCacheFormat>)
                     .collect(),
             );
             Some(adapter)

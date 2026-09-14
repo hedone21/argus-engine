@@ -213,6 +213,7 @@ impl KVCacheFormat for OffloadFormat {
                 kv_layout,
                 q_start_pos,
                 dims.window,
+                None,
                 backend,
                 None,
             );

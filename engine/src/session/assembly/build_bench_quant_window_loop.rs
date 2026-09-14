@@ -91,6 +91,12 @@ pub fn build_bench_quant_window_loop(
     let resilience = match (resilience, quant_window_handle) {
         (Some(mut adapter), Some(h)) => {
             adapter.set_kv_handle(h.clone() as Arc<dyn crate::format::KVCacheFormat>);
+            adapter.set_kv_token_handles(
+                quant_window_handles
+                    .iter()
+                    .map(|q| q.clone() as Arc<dyn crate::format::KVCacheFormat>)
+                    .collect(),
+            );
             adapter.set_kv_byte_handles(
                 quant_window_handles
                     .iter()

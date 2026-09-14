@@ -46,6 +46,14 @@ pub enum KeepError {
     /// A `(layer, head)` retains nothing. Every query row would then be blind and the score would
     /// have no cells to average, so this is rejected rather than scored as zero.
     Empty { layer: usize, kv_head: usize },
+    /// A `(layer, head)` retains a position below the head's first resident one — a hole of a
+    /// ragged cache. Its bytes are not that head's token, so the candidate cannot be scored.
+    Hole {
+        layer: usize,
+        kv_head: usize,
+        pos: u32,
+        start: usize,
+    },
 }
 
 impl fmt::Display for KeepError {
@@ -78,6 +86,16 @@ impl fmt::Display for KeepError {
                     "keep-set at (layer {layer}, kv_head {kv_head}) retains nothing"
                 )
             }
+            Self::Hole {
+                layer,
+                kv_head,
+                pos,
+                start,
+            } => write!(
+                f,
+                "keep-set at (layer {layer}, kv_head {kv_head}) retains position {pos}, but that \
+                 head is resident from {start} — the slots before it are holes"
+            ),
         }
     }
 }
@@ -106,6 +124,48 @@ impl KeepSets {
             s.off.push(s.idx.len() as u32);
         }
         s
+    }
+
+    /// Retain exactly what is resident: `[start(layer, kv_head), current_pos)` per head — the
+    /// identity candidate of a ragged cache (`KVCache::head_start`). With every start `0` this is
+    /// [`identity`](Self::identity).
+    pub fn resident(
+        n_layers: usize,
+        n_kv_heads: usize,
+        current_pos: usize,
+        start: impl Fn(usize, usize) -> usize,
+    ) -> Self {
+        let mut s = Self::with_capacity(n_layers, n_kv_heads, n_layers * n_kv_heads * current_pos);
+        for l in 0..n_layers {
+            for h in 0..n_kv_heads {
+                let from = start(l, h).min(current_pos) as u32;
+                s.idx.extend(from..current_pos as u32);
+                s.off.push(s.idx.len() as u32);
+            }
+        }
+        s
+    }
+
+    /// Every list of `self` starts at or after the corresponding list of `base` — no candidate
+    /// reaches into a hole `base` (the resident set) does not hold. Both must be complete and of
+    /// the same shape.
+    pub fn validate_within(&self, base: &KeepSets) -> Result<(), KeepError> {
+        for layer in 0..self.n_layers {
+            for kv_head in 0..self.n_kv_heads {
+                let start = base.head(layer, kv_head).first().copied().unwrap_or(0) as usize;
+                if let Some(&pos) = self.head(layer, kv_head).first()
+                    && (pos as usize) < start
+                {
+                    return Err(KeepError::Hole {
+                        layer,
+                        kv_head,
+                        pos,
+                        start,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One ascending list shared by every layer and head — the sliding / streaming shape.
@@ -197,9 +257,9 @@ impl KeepSets {
 
     /// `true` when some head of some layer retains a different number of positions than another.
     ///
-    /// Scoring does not care; committing does. The container gives every KV head of a layer the
-    /// same length, so a ragged winner is measurable but not applicable, and the caller should be
-    /// told at selection time rather than by a failed mutation later.
+    /// Scoring does not care. Committing such a winner right-aligns the heads and leaves the cache
+    /// ragged (`KVCache::head_start`), which a HeadMajor f32/f16 cache holds and the other stores
+    /// reject at the handle — so the flag tells the caller what kind of commit it is looking at.
     pub fn is_ragged(&self) -> bool {
         (0..self.n_layers).any(|l| {
             let first = self.head(l, 0).len();

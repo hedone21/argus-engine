@@ -50,6 +50,7 @@ impl StreamingLlm {
             return None; // within budget — no-op
         }
         Some(KeepTopK {
+            start: 0,
             current,
             prefix: self.sink_size,
             recent: effective_window,

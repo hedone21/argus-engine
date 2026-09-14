@@ -244,6 +244,23 @@ mod tests {
             ok.require_h2o_budgets().is_ok(),
             "explicit budgets accepted"
         );
+        // The target-derived split is a budget too.
+        let from_target = Args::try_parse_from([
+            "test",
+            "--aperturb-select",
+            "h2o",
+            "eviction",
+            "plugin",
+            "--name",
+            "none",
+            "--set",
+            "budget=target",
+        ])
+        .unwrap();
+        assert!(
+            from_target.require_h2o_budgets().is_ok(),
+            "budget=target accepted"
+        );
         // Non-h2o policy → no-op regardless.
         let sliding =
             Args::try_parse_from(["test", "eviction", "plugin", "--name", "sliding"]).unwrap();
@@ -1499,14 +1516,23 @@ impl Args {
         // ranked, and possibly chosen, on budgets nobody set.
         let h2o_in_play = self.eviction_policy() == "h2o"
             || self.aperturb_select.iter().any(|n| n.trim() == "h2o");
-        if h2o_in_play && (self.h2o_hh_size().is_none() || self.h2o_recent_size().is_none()) {
+        let sized = self.h2o_budget_from_target()
+            || (self.h2o_hh_size().is_some() && self.h2o_recent_size().is_some());
+        if h2o_in_play && !sized {
             anyhow::bail!(
                 "'h2o' requires explicit budgets: pass \
                  `--set hh_size=<N> --set recent_size=<M>` (faithful H2O keeps hh_size heavy hitters \
-                 + recent_size recent tokens; there is no default)."
+                 + recent_size recent tokens; there is no default), or `--set budget=target` to \
+                 split the engine's target length in equal heavy/recent halves."
             );
         }
         Ok(())
+    }
+
+    /// `--set budget=target`: H2O sized from the engine's target length rather than absolutely.
+    pub fn h2o_budget_from_target(&self) -> bool {
+        self.plugin_set("budget")
+            .is_some_and(|v| v.trim() == "target")
     }
 
     /// heavy-hitter verbose debug output — moved to env var `LLMRS_H2O_DEBUG`

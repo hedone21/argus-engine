@@ -1,0 +1,20 @@
+[package]
+name = "snapkv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# SnapKV (Li et al., 2024 — https://arxiv.org/abs/2404.14469) technique crate — a UNIFORM per-layer
+# KV budget over the SnapKV per-head attention selection, applied at prefill end. Stage-axis extension
+# depending only on `argus-extension-api` + `linkme` (no engine/other-axis reference = proof of
+# additive extension cost). The selection is the extension API's `snapkv_per_head_keep` (shared with
+# `pyramidkv`, which kvpress derives from SnapKV by overriding only the budget); this crate contributes
+# the budget, matched against NVIDIA kvpress `SnapKVPress`: `n_kept = int(k_len * (1 - cr))`
+# (Python `int` — truncation, not the `round` of PyramidKV's SnapKV fallback). Force-linked via one
+# `use snapkv as _;` (the pyramidkv precedent); private knobs (compression_ratio/window_size/
+# kernel_size) ride the StageArgs blob.
+[dependencies]
+argus-extension-api = { path = "../../argus-extension-api" }
+linkme = "0.3"

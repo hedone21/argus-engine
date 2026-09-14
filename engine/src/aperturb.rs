@@ -270,10 +270,28 @@ impl OutputBasis {
 pub trait LayerSource {
     /// Post-RoPE query rows of the trailing `R` positions, `[n_heads_q][rows][head_dim]`.
     fn query_rows(&self, layer: usize) -> &[f32];
+    /// First resident position of `(layer, kv_head)` — `0` unless the cache is ragged
+    /// (`KVCache::head_start`). The reference the candidates are measured against retains
+    /// `[start, current_pos)` per head, and a candidate reaching below it is rejected.
+    fn head_start(&self, layer: usize, kv_head: usize) -> usize {
+        let _ = (layer, kv_head);
+        0
+    }
     /// Keys, `[n_kv_heads][current_pos][head_dim]`, dequantized to f32.
     fn keys(&self, layer: usize) -> &[f32];
     /// Values, same shape.
     fn values(&self, layer: usize) -> &[f32];
+    /// This layer's logit block, `[n_heads_q][rows][current_pos]`, when something upstream already
+    /// computed it — A1 (ticket 010): the observation-window kernel's pass A produces exactly this
+    /// quantity on the device and then overwrites it, so a source that exported it first saves
+    /// [`decide`] a whole second `Q Kᵀ` over the resident cache.
+    ///
+    /// Defaulted to `None` so a source that has nothing to offer stays a source. That silence is
+    /// also why [`PhaseTimes::logits_n`] exists: this seam cannot report a fallback by failing.
+    fn logits(&self, layer: usize) -> Option<&[f32]> {
+        let _ = layer;
+        None
+    }
 }
 
 /// A candidate and the score it earned.
@@ -283,32 +301,54 @@ pub struct Scored {
     pub scores: ReadoutSet,
     /// Query rows that saw a retained key in every layer and head, as a bitmask.
     pub visible_rows: u32,
-    /// `true` when the candidate's per-head lengths differ within a layer. Such a candidate can be
-    /// *measured* but not applied: the cache gives every KV head of a layer one length.
+    /// `true` when the candidate's per-head lengths differ within a layer. Applying it leaves the
+    /// cache ragged (heads right-aligned on the longest, `KVCache::head_start`), which only a
+    /// HeadMajor f32/f16 cache can hold.
     pub ragged: bool,
     /// The per-cell grid, kept when [`Config::keep_cells`] asks for it — the tightest thing a parity
     /// comparison can look at.
     pub cells: Option<CellGrid>,
 }
 
-/// Wall-clock split of one decision.
+/// Wall-clock split of one decision, plus the call counts a wall clock cannot stand in for.
 ///
-/// The closed-form cost model charges a decision one attention pass and one projection per
-/// `(candidate, layer)`. These buckets are what it takes to check that against a clock: `logits_s`
-/// and `attend_s` are the two halves of the attention term — split because only the second is paid
-/// per candidate — and `keypos_s` is the per-candidate bookkeeping the model does not charge at all.
+/// Three of the five buckets are paid ONCE PER LAYER and two once per `(candidate, layer)`; that
+/// split is the whole point of measuring them separately, because it is what decides whether a
+/// bigger pool costs anything. Since the readout was fused
+/// ([`kernel::project_values_into`](kernel::project_values_into)) the projection moved from the
+/// per-candidate side to the per-layer side, and what remains per candidate is a contraction
+/// against `r` components rather than `head_dim`.
+///
+/// These are also what the production `[aperturb-select]` line reports, so read the coverage note
+/// on each field before attributing a stall to one of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PhaseTimes {
-    /// Shared `Q K^T` over the whole resident cache. Once per layer, **not** once per candidate.
+    /// Shared `Q K^T` over the whole resident cache. **Once per layer.**
     pub logits_s: f64,
+    /// `V` through the output projection. **Once per layer** — it is candidate-independent, which
+    /// is exactly what lets `attend_s` contract against `r` instead of `head_dim`. (Before the
+    /// fusion this bucket held the per-candidate `R × d` projection instead, so a stall recorded
+    /// against an older build is not comparable here.)
+    pub project_s: f64,
     /// Per-head admitted-prefix bookkeeping, once per `(candidate, layer)` plus the baseline.
     pub keypos_s: f64,
-    /// Softmax over the admitted columns and the `V` contraction. Baseline and every candidate.
+    /// Softmax over the admitted columns and the contraction against the projected values, which
+    /// together produce the readout vector. Baseline and every candidate.
     pub attend_s: f64,
-    /// The rank-`r` projection, same coverage as `attend_s`.
-    pub project_s: f64,
     /// Per-cell relative change, plus the closing RMS aggregate.
     pub readout_s: f64,
+    /// How many times [`kernel::attend_project_into`] actually ran — incremented AT the two call
+    /// sites, never derived from the pool size, so that a fold which quietly stops folding shows
+    /// up here instead of being papered over by the arithmetic that was supposed to predict it.
+    pub attend_n: usize,
+    /// DEPENDENT candidates whose keep-set was byte-identical to an earlier one and which
+    /// therefore took its readout instead of being scored again. A group of three contributes
+    /// two, not one: it counts the scorings skipped, not the groups found.
+    pub folded: usize,
+    /// How many times [`kernel::logits_into`] actually ran. `logits_s` cannot answer the same
+    /// question — a build that merely stopped timing the call and a build where the call no
+    /// longer happens both report a small number of seconds, and only the count tells them apart.
+    pub logits_n: usize,
 }
 
 impl PhaseTimes {
@@ -432,27 +472,65 @@ pub fn decide(
     let r = basis.rank();
     let n_c = pool.len();
 
+    // The reference is what is resident now — on a ragged cache that is less than `[0, current_pos)`
+    // per head, and no candidate may reach below it.
+    let identity = KeepSets::resident(g.n_layers, g.n_kv_heads, g.current_pos, |l, h| {
+        src.head_start(l, h)
+    });
     for (_, keep) in pool {
         keep.validate(g.current_pos)?;
+        keep.validate_within(&identity)?;
     }
-    let identity = KeepSets::identity(g.n_layers, g.n_kv_heads, g.current_pos);
 
     let mut grids: Vec<CellGrid> = (0..n_c)
         .map(|_| CellGrid::new(g.n_layers, g.rows))
         .collect();
     let mut visible = vec![u32::MAX; n_c];
 
+    // Two candidates that retain the same columns cannot deviate differently: the readout is a
+    // function of the keep-set alone, so the second scoring reproduces the first bit for bit.
+    // `rep[c]` names the earliest candidate holding `c`'s keep-set — `c` itself when it is the
+    // first — and only representatives enter the per-layer loop below.
+    //
+    // The pool keeps its order and its length. That is not cosmetic: the tie-break at the end of
+    // this function is the pool order, so a fold that reordered or dropped an entry could move the
+    // winner. Every dependent still gets its own `Scored` entry, built from the representative's
+    // grid.
+    let rep: Vec<usize> = (0..n_c)
+        .map(|c| (0..c).find(|&p| pool[p].1 == pool[c].1).unwrap_or(c))
+        .collect();
+
     let mut z = vec![0.0f32; g.logit_len()];
-    let mut x = vec![0.0f32; g.x_len()];
+    // The values seen through the output projection — see [`kernel::project_values_into`]. Built
+    // once per layer and shared by the baseline and every candidate, which is what makes a
+    // candidate cost `r` per retained column instead of `head_dim`.
+    let mut vb = vec![0.0f32; g.n_heads_q * g.current_pos * r];
     let mut w_base = vec![0.0f32; g.rows * r];
     let mut w_cand = vec![0.0f32; g.rows * r];
 
-    let mut times = PhaseTimes::default();
+    let mut times = PhaseTimes {
+        folded: rep.iter().enumerate().filter(|&(c, &p)| p != c).count(),
+        ..PhaseTimes::default()
+    };
     for l in 0..g.n_layers {
         let (q, k, v) = (src.query_rows(l), src.keys(l), src.values(l));
         let t = Instant::now();
-        kernel::logits_into(q, k, &mut z, g)?;
+        // A1 (ticket 010): the observation-window pass already computed this block on the device
+        // and the source kept it, so borrow it instead of recomputing it. The two are not
+        // bit-identical — the kernel reads F16 keys directly where this reads a dequantized f32
+        // mirror — which is the trade the ticket's on-device winner-parity gate exists to watch.
+        let zl: &[f32] = match src.logits(l) {
+            Some(exported) if exported.len() == z.len() => exported,
+            _ => {
+                kernel::logits_into(q, k, &mut z, g)?;
+                times.logits_n += 1;
+                &z
+            }
+        };
         times.logits_s += t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        kernel::project_values_into(v, basis.layer(l), &mut vb, g, r)?;
+        times.project_s += t.elapsed().as_secs_f64();
 
         // The reference: the same operator over the untouched cache, so common-mode rounding
         // cancels and an identity candidate lands on exactly zero.
@@ -460,26 +538,36 @@ pub fn decide(
         let kp_base = KeyPos::for_layer(&identity, l, g.current_pos, g.rows);
         times.keypos_s += t.elapsed().as_secs_f64();
         let t = Instant::now();
-        kernel::attend_into(&z, &identity, l, &kp_base, v, &mut x, g)?;
+        kernel::attend_project_into(zl, &identity, l, &kp_base, &vb, &mut w_base, g)?;
         times.attend_s += t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        kernel::project_into(&x, basis.layer(l), &mut w_base, g.rows, d, r);
-        times.project_s += t.elapsed().as_secs_f64();
+        times.attend_n += 1;
 
         for (c, (_, keep)) in pool.iter().enumerate() {
+            if rep[c] != c {
+                continue;
+            }
             let t = Instant::now();
             let kp = KeyPos::for_layer(keep, l, g.current_pos, g.rows);
             times.keypos_s += t.elapsed().as_secs_f64();
             visible[c] &= kp.visible_rows();
             let t = Instant::now();
-            kernel::attend_into(&z, keep, l, &kp, v, &mut x, g)?;
+            kernel::attend_project_into(zl, keep, l, &kp, &vb, &mut w_cand, g)?;
             times.attend_s += t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            kernel::project_into(&x, basis.layer(l), &mut w_cand, g.rows, d, r);
-            times.project_s += t.elapsed().as_secs_f64();
+            times.attend_n += 1;
             let t = Instant::now();
             grids[c].fill_layer(l, &w_base, &w_cand, r)?;
             times.readout_s += t.elapsed().as_secs_f64();
+        }
+    }
+
+    // Hand each dependent the representative's finished readout. Copying here rather than at
+    // aggregation time leaves the scoring loop and the tie-break below untouched, which is what
+    // keeps the whole `arms` line — scores included — bit-identical to an unfolded run.
+    for c in 0..n_c {
+        let p = rep[c];
+        if p != c {
+            visible[c] = visible[p];
+            grids[c] = grids[p].clone();
         }
     }
 

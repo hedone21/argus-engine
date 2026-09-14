@@ -59,6 +59,12 @@ pub struct DecodeResult {
     /// otherwise it over-reports KV footprint after an eviction-decrease.
     pub final_cache_pos: usize,
     pub stopped_by: StopReason,
+    /// Wall-clock of each completed decode step, milliseconds, in order — the per-token TBT the
+    /// bench's `--tbt-log` writes (one entry per token in `tokens_generated`).
+    pub step_ms: Vec<f32>,
+    /// Layer-0 KV occupancy after each completed step (`kv_pos_handle`, else the cumulative
+    /// position) — the KV trajectory a compression leaves in the same log.
+    pub step_cache_pos: Vec<u32>,
 }
 
 /// Typestate marker — Forward not yet supplied. `.build()` is unavailable.
@@ -342,8 +348,11 @@ impl DecodeLoop {
         // v1 run_until_stop 의 기본 stopped_by(StopConditionMet)와 수렴: stop stage 미발화 +
         // budget 무한이면 무한 루프이므로 실 종결은 항상 Stop/StopFlag 가 설정한다.
         let mut stopped_by = StopReason::BudgetExhausted;
+        let mut step_ms: Vec<f32> = Vec::with_capacity(budget.min(4096));
+        let mut step_cache_pos: Vec<u32> = Vec::with_capacity(budget.min(4096));
 
         for _ in 0..budget {
+            let t_step = std::time::Instant::now();
             if stop.load(Ordering::Acquire) {
                 stopped_by = StopReason::StopFlag;
                 break;
@@ -487,6 +496,12 @@ impl DecodeLoop {
 
             // DecodeEnd Stop 이 아니면 token push (run/run_until_stop 공통).
             generated.push(sampled);
+            step_ms.push(t_step.elapsed().as_secs_f64() as f32 * 1000.0);
+            step_cache_pos.push(
+                self.kv_pos_handle
+                    .as_ref()
+                    .map_or(self.pos, |h| h.current_pos()) as u32,
+            );
         }
 
         // final_pos = 진짜 누적 위치(self.pos). 메모리 telemetry 용 점유는 cache 에서 직접 읽는다
@@ -500,6 +515,8 @@ impl DecodeLoop {
             final_pos: self.pos,
             final_cache_pos,
             stopped_by,
+            step_ms,
+            step_cache_pos,
         })
     }
 

@@ -97,6 +97,12 @@ pub fn build_chat_session(init: SessionInitCtx, args: &Args) -> Result<ChatSessi
         if let Some(h) = kv_handle {
             adapter.set_kv_handle(h);
         }
+        adapter.set_kv_token_handles(
+            kv_handles
+                .iter()
+                .map(|h| h.clone() as Arc<dyn crate::format::KVCacheFormat>)
+                .collect(),
+        );
         adapter.set_kv_byte_handles(
             kv_handles
                 .iter()

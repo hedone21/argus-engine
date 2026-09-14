@@ -115,6 +115,68 @@ fn log_prefill_dk128_once() {
     });
 }
 
+/// The window kernel's row-block width — how many query rows share one sweep of K.
+///
+/// Higher cuts K traffic proportionally and raises register pressure; on Adreno the ceiling is the
+/// spill threshold. Compiled into the program as `-DWATT_B`, so changing it rebuilds the program.
+fn window_attn_row_block() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("ARGUS_WINDOW_ROW_BLK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|b| b.is_power_of_two() && (1..=64).contains(b))
+            // 8 is where an Adreno 830 lands. Measured 2026-09-03, 28 layers / 4096 resident
+            // tokens, against the default work-group width: 2 → 0.225 s, 4 → 0.169 s, 8 → 0.128 s,
+            // 16 → CL_OUT_OF_RESOURCES at enqueue (the register spill CLAUDE.md warns about).
+            .unwrap_or(8)
+    })
+}
+
+/// Work-group width for the window kernel. A power of two (the SLM reduction is a tree).
+fn window_attn_local_size() -> usize {
+    static L: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("ARGUS_WINDOW_LS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|l| l.is_power_of_two() && (16..=1024).contains(l))
+            // 256, not the 64 every other SLM site in this file uses: only `n_heads_q` groups
+            // are launched (12 on Qwen2.5-1.5B), so the group has to be wide or the GPU idles.
+            // Adreno 830, 4096 resident tokens: 64 → 0.283 s, 128 → 0.159 s, 256 → 0.128 s.
+            // 512 measured no better, and 1024 is CL_INVALID_WORK_GROUP_SIZE.
+            .unwrap_or(256)
+    })
+}
+
+/// The geometry one decision's observation-window pass runs at.
+///
+/// Mirrors [`crate::aperturb::Geom`] minus the fields the kernel does not read; kept separate so
+/// the backend does not depend on the metric's types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowAttnGeom {
+    pub n_heads_q: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    /// Resident tokens at the decision point — the output's column count.
+    pub current_pos: usize,
+    /// Query rows the ring holds.
+    pub rows: usize,
+    /// Physical tokens per head in the K buffer (the HeadMajor head stride).
+    pub capacity: usize,
+    /// Trailing query rows whose raw logits come back alongside the pooled scores — the metric's
+    /// own rows, which are the window's tail. `0` asks for no export at all.
+    ///
+    /// A parameter rather than a constant: production passes `HostLayers::rows`, which a short
+    /// query capture clamps below `APERTURB_ROWS`, and the selfcheck sweeps it.
+    pub export_rows: usize,
+}
+
+/// What one whole-model window pass hands back: the pooled `[n_layers][n_heads_q][current_pos]`
+/// scores, and A1's exported metric logits — `Some` only when a readback actually filled a block,
+/// and a shared handle on the backend's own reused host buffer rather than a fresh copy.
+pub type WindowAttnPass = (Vec<f32>, Option<Arc<Vec<f32>>>);
+
 /// Helper function to get the OpenCL memory handle from a tensor buffer.
 /// Works with both UnifiedBuffer and legacy OpenCLBuffer.
 pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
@@ -310,6 +372,10 @@ struct KernelCache {
     /// F32 → F16 activation transpose with N-padding to multiple of 8,
     /// used exclusively by the Adreno Q4_0 GEMM fast path.
     kernel_transpose_32_16: Option<CoreKernel>,
+    /// Decision-time observation-window attention — the GPU twin of
+    /// `kv::aperturb_select::window_attention`. `None` leaves that pass on the CPU.
+    /// Source: `engine/kernels/attention_scores.cl`.
+    kernel_window_attn_sum_half: Option<CoreKernel>,
 }
 
 // SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
@@ -444,6 +510,47 @@ pub struct OpenCLBackend {
     #[allow(clippy::type_complexity)]
     gemm_act_trans_buf:
         UnsafeCell<Option<(ocl::core::Mem, ocl::core::Mem, ocl::core::Mem, usize, usize)>>,
+
+    // Persistent device scratch for `window_attention_sum`: the packed query
+    // window uploaded once per decision, the per-layer output, the per-row
+    // logit scratch and the ragged head starts. Stored as `(q, acc, zrow,
+    // kv_start, q_elems, acc_elems, zrow_elems, start_elems)` and grown on
+    // demand — the decision runs ~18 times per 4k-token run, so the point is to
+    // stop re-creating four `cl_mem` objects each time rather than to save bytes.
+    // All four are sized by `capacity`, so a longer cache does not grow them.
+    #[allow(clippy::type_complexity)]
+    window_attn_bufs: UnsafeCell<
+        Option<(
+            ocl::core::Mem,
+            ocl::core::Mem,
+            ocl::core::Mem,
+            ocl::core::Mem,
+            usize,
+            usize,
+            usize,
+            usize,
+        )>,
+    >,
+
+    // The exported metric logits, in a slot of their own as `(zout, zout_elems)`.
+    // Separate from the four above because ZOUT is the one buffer sized by
+    // `current_pos` rather than `capacity` (an extra `export_rows` factor would
+    // pin 176 MB at capacity 8192), so it is the one that grows mid-run — and
+    // sharing their grow flag would drag all four into every such reallocation,
+    // which is exactly what the `capacity` sizing exists to prevent.
+    window_attn_zout: UnsafeCell<Option<(ocl::core::Mem, usize)>>,
+
+    // The HOST landing zone for that scratch's exported metric logits, kept here for the same
+    // reason the device buffers are: the block is 21.5 KB per resident token on Qwen2.5-1.5B
+    // (28 layers x 12 heads x 16 rows x 4 B), so a fresh `vec![0.0; n]` per decision is 88 MB of
+    // allocate-touch-free at `current_pos` 4096 and 176 MB at 8192. Commit `dcb2dee` measured that
+    // host allocation — not the transfer, which is a UMA copy — as what the mirror costs.
+    //
+    // An `Arc` rather than a bare `Vec` so the buffer can outlive the call that fills it without
+    // being copied: `window_attention_sum` hands the reader a second handle and keeps this one, so
+    // the next decision reuses the same allocation once the reader has dropped its handle (and
+    // starts a fresh buffer, rather than corrupting a live one, when it has not).
+    window_attn_host_z: UnsafeCell<Option<Arc<Vec<f32>>>>,
 
     // Per-layer cache key for the transposed activation above: `(a_buf_ptr,
     // m, k)`. When a matmul reuses the same activation pointer and shape
@@ -1230,12 +1337,17 @@ impl OpenCLBackend {
             }
         };
 
-        // Score-only attention kernel (Q*K^T + softmax, no V multiply)
+        // Score-only attention kernel (Q*K^T + softmax, no V multiply) and the decision-time
+        // observation-window kernel. `WATT_B` is the window kernel's row-block width: how many
+        // query rows share one sweep of K. It sets that kernel's register pressure, so it is
+        // tunable per device (`ARGUS_WINDOW_ROW_BLK`) and pinned by measurement, not by theory.
         let attn_scores_src = include_str!("../../kernels/attention_scores.cl");
+        let watt_b = window_attn_row_block();
+        let attn_scores_opts = format!("{cl_opts} -DWATT_B={watt_b}");
         let attention_scores_program = Program::builder()
             .devices(device)
             .src(attn_scores_src)
-            .cmplr_opt(&cl_opts)
+            .cmplr_opt(&attn_scores_opts)
             .build(&context)
             .ok();
         if attention_scores_program.is_some() {
@@ -1457,6 +1569,9 @@ impl OpenCLBackend {
             kernel_transpose_32_16: transpose_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_transpose_32_16").ok()),
+            kernel_window_attn_sum_half: attention_scores_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_window_attn_sum_half").ok()),
             // GEMV noshuffle kernel is built per-dimension (lazy), so None initially
         };
 
@@ -1535,6 +1650,9 @@ impl OpenCLBackend {
             gemv_noshuffle_cache: UnsafeCell::new(HashMap::new()),
             noshuffle_soa_registry: UnsafeCell::new(HashMap::new()),
             gemm_act_trans_buf: UnsafeCell::new(None),
+            window_attn_bufs: UnsafeCell::new(None),
+            window_attn_zout: UnsafeCell::new(None),
+            window_attn_host_z: UnsafeCell::new(None),
             gemm_act_trans_key: UnsafeCell::new(None),
             profile_events_enabled,
             profile_events: UnsafeCell::new(Vec::new()),
@@ -3281,8 +3399,14 @@ impl OpenCLBackend {
         kv_capacity: usize,
         batch_size: usize,
         is_head_major: bool,
+        // Ragged cache: device `i32` per KV head (first resident slot); `None` = uniform. Only the
+        // `flash_attn_f32_f16` programs take it (arg 40); the F32-KV programs decline a ragged ask.
+        kv_start: Option<&ocl::core::Mem>,
     ) -> Result<bool> {
         let kv_dtype = k_cache.dtype();
+        if kv_start.is_some() && kv_dtype != DType::F16 {
+            return Ok(false);
+        }
         let kernels = unsafe { &*self.kernels.get() };
         let kernel = match kv_dtype {
             DType::F32 => match head_dim {
@@ -3414,6 +3538,14 @@ impl OpenCLBackend {
             // sinks = NULL (args 38-39)
             ocl::core::set_kernel_arg(kernel, 38, ocl::core::ArgVal::mem_null())?;
             ocl::core::set_kernel_arg(kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
+            // Ragged-cache head starts (arg 40, f32_f16 programs only)
+            if kv_dtype == DType::F16 {
+                let val = match kv_start {
+                    Some(m) => ocl::core::ArgVal::mem(m),
+                    None => ocl::core::ArgVal::mem_null(),
+                };
+                ocl::core::set_kernel_arg(kernel, 40, val)?;
+            }
 
             // Work size: [ceil(n_q/block_m) * lanes_per_wg, n_heads_q * batch_size, 1]
             // BLOCK_M = Q-rows per WG (matches the -DBLOCK_M compile-time macro).
@@ -3466,6 +3598,312 @@ impl OpenCLBackend {
     /// are not met and the caller should fall back to the legacy attention kernel.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    /// Upload a ragged cache's per-KV-head first resident slots as a device `i32` buffer for the
+    /// attention kernels (`kv_start` argument). A small per-call allocation on the non-plan paths;
+    /// the fused plan binds the cache's own persistent mirror instead (`KVCache::head_start_device`).
+    pub(crate) fn upload_kv_start(&self, starts: &[usize]) -> Result<Tensor> {
+        let mut bytes = Vec::with_capacity(starts.len() * 4);
+        for &s in starts {
+            bytes.extend_from_slice(&(s as i32).to_ne_bytes());
+        }
+        let host_buf = Arc::new(crate::memory::host::shared::SharedBuffer::new(
+            bytes.len(),
+            DType::U8,
+        ));
+        let mut host = Tensor::new(
+            crate::shape::Shape::new(vec![bytes.len()]),
+            host_buf,
+            self.cpu_companion.clone(),
+        );
+        host.as_mut_slice::<u8>().copy_from_slice(&bytes);
+        self.copy_from(&host)
+    }
+
+    /// The observation-window attention for one decision, over every layer, on the device.
+    ///
+    /// The GPU twin of [`crate::kv::aperturb_select::window_attention`]: for each layer it
+    /// SUM-pools a causal, ragged-lower-bounded softmax over the ring's `rows` query rows and
+    /// returns `[n_layers][n_heads_q][current_pos]` — the prefill capture's own format, laid out
+    /// exactly as the CPU path's `heads.concat()` per layer.
+    ///
+    /// `k_mems` is one live K cache per layer, in layer order, HeadMajor F16 with the *same*
+    /// `capacity`; `head_starts` is `[n_layers][n_kv_heads]`; `qwin` is one layer's query window
+    /// per entry, `[n_heads_q][rows][head_dim]` f32 each. The caller has already checked dtype
+    /// and layout — this refuses only what it cannot express.
+    ///
+    /// One upload, `n_layers` enqueues on the in-order queue, one readback. `Ok(None)` means the
+    /// kernel is not available (program failed to compile) and the caller must run the CPU path.
+    ///
+    /// The second half of the pair is the exported raw logits of the window's trailing
+    /// `g.export_rows` rows, `[n_layers][n_heads_q][export_rows][current_pos]` — pass A's own z,
+    /// which is bit-for-bit the quantity `aperturb::decide` would otherwise recompute on the CPU.
+    ///
+    /// It is `Some` **only when a readback actually put a block in it**: `None` says the export
+    /// did not happen (`g.export_rows == 0`), and is the one signal a caller has that is not a
+    /// restatement of "the device path ran" — see [`WindowAttnGeom::export_rows`]. The handle is
+    /// shared because the buffer behind it is this backend's, reused decision after decision
+    /// rather than reallocated (`window_attn_host_z`).
+    pub fn window_attention_sum(
+        &self,
+        k_mems: &[&ocl::core::Mem],
+        head_starts: &[Vec<usize>],
+        qwin: &[&[f32]],
+        g: WindowAttnGeom,
+    ) -> Result<Option<WindowAttnPass>> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let Some(kernel) = kernels.kernel_window_attn_sum_half.as_ref() else {
+            return Ok(None);
+        };
+        let n_layers = k_mems.len();
+        anyhow::ensure!(
+            n_layers > 0 && head_starts.len() == n_layers,
+            "window_attention_sum: {n_layers} K buffers but {} head-start rows",
+            head_starts.len()
+        );
+        let q_layer = g.n_heads_q * g.rows * g.head_dim;
+        let q_elems = n_layers * q_layer;
+        anyhow::ensure!(
+            qwin.len() == n_layers && qwin.iter().all(|w| w.len() == q_layer),
+            "window_attention_sum: expected {n_layers} query windows of {q_layer} elements"
+        );
+        anyhow::ensure!(
+            g.head_dim.is_multiple_of(4),
+            "window_attention_sum: head_dim {} is not a multiple of 4",
+            g.head_dim
+        );
+        anyhow::ensure!(
+            g.export_rows <= g.rows,
+            "window_attention_sum: cannot export {} trailing rows of a {}-row window",
+            g.export_rows,
+            g.rows
+        );
+        let acc_elems = n_layers * g.n_heads_q * g.current_pos;
+        let zout_elems = acc_elems * g.export_rows;
+        let row_blk = window_attn_row_block();
+        let start_elems = n_layers * g.n_kv_heads;
+        // Size the two `current_pos`-shaped buffers by `capacity` — the physical KV width, and an
+        // upper bound on `current_pos` — while the *offsets* below stay packed by `current_pos`.
+        // Otherwise every decision at a longer cache reallocates four `cl_mem`, and on Adreno that
+        // is ~400 us of driver bookkeeping each plus the fragmentation of freeing 11 MB repeatedly.
+        let acc_cap = n_layers * g.n_heads_q * g.capacity;
+        let zrow_cap = g.n_heads_q * row_blk * g.capacity;
+        // ZOUT is the one slot NOT sized by `capacity`. It carries an extra `export_rows` factor,
+        // so the same rule would pin 176 MB on the device for a 28-layer model at capacity 8192 —
+        // 16x the whole rest of this scratch, resident for the run, in the regime the 8K cell is
+        // already throttled in. `current_pos` it is, then, plus the ratchet below.
+
+        let mk = |n: usize| -> Result<ocl::core::Mem> {
+            Ok(unsafe {
+                ocl::core::create_buffer::<_, f32>(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_WRITE,
+                    n.max(1),
+                    None,
+                )?
+            })
+        };
+        // Persistent, grown on demand: 18 decisions per run, four `cl_mem` each. Every bound here
+        // is `capacity`-shaped, so in a run these are created once and never again.
+        let slot = unsafe { &mut *self.window_attn_bufs.get() };
+        let need = match slot {
+            Some((_, _, _, _, qc, ac, zc, sc)) => {
+                *qc < q_elems || *ac < acc_cap || *zc < zrow_cap || *sc < start_elems
+            }
+            None => true,
+        };
+        if need {
+            *slot = Some((
+                mk(q_elems)?,
+                mk(acc_cap)?,
+                mk(zrow_cap)?,
+                mk(start_elems)?,
+                q_elems,
+                acc_cap,
+                zrow_cap,
+                start_elems,
+            ));
+        }
+        // ZOUT grows on a flag of its own. It is the `current_pos`-sized buffer, so it does grow
+        // mid-run — every decision that reaches a new maximum resident length — and folding that
+        // into the flag above would re-create the four `capacity`-sized buffers alongside it,
+        // ~400 us of Adreno driver bookkeeping for buffers whose contents and size are unchanged.
+        // The high-water ratchet is what keeps the growth one-way: `current_pos` falls at a
+        // compaction, and without it the buffer would be freed and re-created on the way back up.
+        let zslot = unsafe { &mut *self.window_attn_zout.get() };
+        let (zout_cap, zout_need) = match zslot {
+            Some((_, zoc)) => (zout_elems.max(*zoc), *zoc < zout_elems),
+            None => (zout_elems, true),
+        };
+        if zout_need {
+            *zslot = Some((mk(zout_cap)?, zout_cap));
+        }
+        let (q_buf, acc_buf, zrow_buf, start_buf, ..) =
+            slot.as_ref().expect("window scratch just allocated");
+        let (zout_buf, _) = zslot.as_ref().expect("window z scratch just allocated");
+
+        // One upload per layer for the decision's query window (no host concat), one for the
+        // ragged bounds. `offset` counts elements, not bytes.
+        for (l, w) in qwin.iter().enumerate() {
+            unsafe {
+                ocl::core::enqueue_write_buffer(
+                    &self.queue,
+                    q_buf,
+                    true,
+                    l * q_layer,
+                    w,
+                    None::<ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        }
+        let mut starts_i32 = Vec::with_capacity(start_elems);
+        for row in head_starts {
+            for h in 0..g.n_kv_heads {
+                starts_i32.push(row.get(h).copied().unwrap_or(0) as i32);
+            }
+        }
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &self.queue,
+                start_buf,
+                true,
+                0,
+                &starts_i32,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+
+        // The tree reduction needs a power of two, and the device caps the group per kernel
+        // (register pressure): asking for more is CL_INVALID_WORK_GROUP_SIZE at enqueue.
+        let mut local_size = window_attn_local_size();
+        if let Ok(ocl::core::KernelWorkGroupInfoResult::WorkGroupSize(max)) =
+            ocl::core::get_kernel_work_group_info(
+                kernel,
+                self.device,
+                ocl::core::KernelWorkGroupInfo::WorkGroupSize,
+            )
+            && max >= 16
+        {
+            while local_size > max {
+                local_size /= 2;
+            }
+        }
+        let local_mem = local_size * std::mem::size_of::<f32>();
+        let qblk_mem = row_blk * g.head_dim * std::mem::size_of::<f32>();
+        let denom = (g.head_dim as f32).sqrt();
+        let gws: [usize; 3] = [g.n_heads_q * local_size, 1, 1];
+        let lws: [usize; 3] = [local_size, 1, 1];
+        // One dispatch per layer, sharing `zrow_buf`. That sharing is what makes the scratch a
+        // fixed size instead of `n_layers` times it, and it is safe only because the queue is
+        // in-order (`LLMRS_OPENCL_OOO_QUEUE` unset — see `OpenCLBackend::new`). The blocking
+        // readback below is likewise what orders the last kernel before the host reads `acc_buf`.
+        for (l, k_mem) in k_mems.iter().enumerate() {
+            let q_off = (l * q_layer) as i32;
+            let acc_off = (l * g.n_heads_q * g.current_pos) as i32;
+            let start_off = (l * g.n_kv_heads) as i32;
+            unsafe {
+                ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
+                ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(k_mem))?;
+                // Bound per layer: a layer that is not ragged still reads zeros here.
+                ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(start_buf))?;
+                ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(acc_buf))?;
+                ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(zrow_buf))?;
+                ocl::core::set_kernel_arg(
+                    kernel,
+                    5,
+                    ocl::core::ArgVal::scalar(&(g.head_dim as i32)),
+                )?;
+                ocl::core::set_kernel_arg(
+                    kernel,
+                    6,
+                    ocl::core::ArgVal::scalar(&(g.n_heads_q as i32)),
+                )?;
+                ocl::core::set_kernel_arg(
+                    kernel,
+                    7,
+                    ocl::core::ArgVal::scalar(&(g.n_kv_heads as i32)),
+                )?;
+                ocl::core::set_kernel_arg(
+                    kernel,
+                    8,
+                    ocl::core::ArgVal::scalar(&(g.current_pos as i32)),
+                )?;
+                ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&(g.rows as i32)))?;
+                ocl::core::set_kernel_arg(
+                    kernel,
+                    10,
+                    ocl::core::ArgVal::scalar(&(g.capacity as i32)),
+                )?;
+                ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&q_off))?;
+                ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&acc_off))?;
+                ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&start_off))?;
+                ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&denom))?;
+                ocl::core::set_kernel_arg(kernel, 15, ocl::core::ArgVal::local::<f32>(&local_mem))?;
+                ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::local::<f32>(&qblk_mem))?;
+                // 17/18, after the two `__local` slots rather than before them: 15 and 16 are
+                // where the kernel declares `scratch` and `qblk`, and an unset argument at either
+                // index is CL_INVALID_KERNEL_ARGS at enqueue.
+                ocl::core::set_kernel_arg(kernel, 17, ocl::core::ArgVal::mem(zout_buf))?;
+                ocl::core::set_kernel_arg(
+                    kernel,
+                    18,
+                    ocl::core::ArgVal::scalar(&(g.export_rows as i32)),
+                )?;
+                self.enqueue_kernel_labeled(kernel, "window_attn", 1, &gws, Some(lws))?;
+            }
+        }
+        let mut out = vec![0.0f32; acc_elems];
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                &self.queue,
+                acc_buf,
+                true,
+                0,
+                &mut out,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        // The kernel zero-fills every exported column it does not compute, so a hole here reads
+        // 0.0 the way ACC's does rather than the previous decision's leftovers.
+        //
+        // Into the persistent host buffer, never a fresh `vec![0.0; zout_elems]`: that allocation
+        // is the 88 MB (at `current_pos` 4096) this decision would otherwise pay to zero and then
+        // immediately overwrite. `resize` grows it on demand and only truncates on the way down,
+        // so a cache that shrank past a compaction and grew back does not reallocate either.
+        let z_out = if zout_elems > 0 {
+            let host = unsafe { &mut *self.window_attn_host_z.get() };
+            let mut buf = host.take().unwrap_or_default();
+            if Arc::get_mut(&mut buf).is_none() {
+                // A previous decision's reader still holds this block. Leave it intact and start
+                // a new buffer rather than writing under it.
+                buf = Arc::new(Vec::new());
+            }
+            {
+                let v = Arc::get_mut(&mut buf).expect("sole owner of the export buffer");
+                v.resize(zout_elems, 0.0);
+                unsafe {
+                    ocl::core::enqueue_read_buffer(
+                        &self.queue,
+                        zout_buf,
+                        true,
+                        0,
+                        v.as_mut_slice(),
+                        None::<ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )?;
+                }
+            }
+            *host = Some(Arc::clone(&buf));
+            Some(buf)
+        } else {
+            None
+        };
+        Ok(Some((out, z_out)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn flash_attention_decode_gpu(
         &self,
         q: &Tensor,
@@ -3482,6 +3920,8 @@ impl OpenCLBackend {
         // `GpuScoreAccumulator` layout in `gpu_score.rs`). `None` forces the
         // dummy buffer + `write_scores=0` fast path.
         score_buf: Option<(&ocl::core::Mem, i32, i32)>,
+        // Ragged cache: device `i32` per KV head (first resident slot); `None` = uniform.
+        kv_start: Option<&ocl::core::Mem>,
     ) -> Result<bool> {
         // Only F16 KV on HeadMajor GPU buffer is supported.
         if k_cache.dtype() != DType::F16 {
@@ -3611,6 +4051,12 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 41, ocl::core::ArgVal::scalar(&s_layer_offset))?;
             ocl::core::set_kernel_arg(kernel, 42, ocl::core::ArgVal::scalar(&s_stride))?;
             ocl::core::set_kernel_arg(kernel, 43, ocl::core::ArgVal::scalar(&write_scores))?;
+            // Ragged-cache head starts (arg 44)
+            let kv_start_val = match kv_start {
+                Some(m) => ocl::core::ArgVal::mem(m),
+                None => ocl::core::ArgVal::mem_null(),
+            };
+            ocl::core::set_kernel_arg(kernel, 44, kv_start_val)?;
 
             // Q1_WG_SIZE = 64 (compile-time constant in the kernel)
             const Q1_WG_SIZE: usize = 64;
@@ -4659,6 +5105,44 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
+    fn read_buffer_range(&self, t: &Tensor, dst: &mut [u8], src_offset: usize) -> Result<()> {
+        let end = src_offset
+            .checked_add(dst.len())
+            .ok_or_else(|| anyhow::anyhow!("read_buffer_range: offset+len overflow"))?;
+        if end > t.size() {
+            anyhow::bail!(
+                "read_buffer_range: out of bounds ({} + {} > {})",
+                src_offset,
+                dst.len(),
+                t.size()
+            );
+        }
+        if let Ok(buf) = get_cl_mem(t.buffer().as_ref()) {
+            // Partial blocking read starting at `src_offset` bytes into the buffer.
+            unsafe {
+                ocl::core::enqueue_read_buffer(
+                    &self.queue,
+                    buf,
+                    true,
+                    src_offset,
+                    dst,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        } else {
+            // Mapped / host-ptr buffer: direct offset memcpy (mirrors `write_buffer_range`).
+            let src_ptr = t.buffer().as_ptr();
+            if src_ptr.is_null() {
+                anyhow::bail!("read_buffer_range: null pointer in source tensor");
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_ptr.add(src_offset), dst.as_mut_ptr(), dst.len());
+            }
+        }
+        Ok(())
+    }
+
     fn enqueue_read_buffer_async(
         &self,
         t: &Tensor,
@@ -5336,7 +5820,17 @@ impl Backend for OpenCLBackend {
         kv_capacity: usize,
         batch_size: usize,
         is_head_major: bool,
+        kv_start: Option<&[usize]>,
     ) -> Result<bool> {
+        let ragged = kv_start.filter(|s| s.iter().any(|&x| x > 0));
+        let start_dev = match ragged {
+            Some(s) => Some(self.upload_kv_start(s)?),
+            None => None,
+        };
+        let start_mem = match start_dev.as_ref() {
+            Some(t) => Some(get_cl_mem(t.buffer().as_ref())?),
+            None => None,
+        };
         self.flash_attention_prefill_gpu(
             q,
             k_cache,
@@ -5350,6 +5844,7 @@ impl Backend for OpenCLBackend {
             kv_capacity,
             batch_size,
             is_head_major,
+            start_mem,
         )
     }
 
@@ -6040,6 +6535,73 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
+    /// Ragged-cache decode: the Q1 flash kernel with its per-head `kv_start` argument. The score
+    /// columns are absolute slots (the GPU accumulator's layout), the kernel zeroes the hole
+    /// columns itself, and `kv_base` is already folded into `kv_start` by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_gen_ragged(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        kv_start: &[usize],
+        kv_start_dev: Option<&Tensor>,
+        kv_base: usize,
+        cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
+    ) -> Result<()> {
+        let gpu_acc_score_triple: Option<(ocl::core::Mem, i32, i32)> = {
+            let gpu_acc = unsafe { &*self.gpu_score_acc.get() };
+            gpu_acc.as_ref().and_then(|acc| {
+                acc.is_active().then(|| {
+                    let offset = acc.layer_offset_elems(acc.current_layer_idx()) as i32;
+                    let stride = acc.score_stride() as i32;
+                    (acc.score_buf_mem().clone(), offset, stride)
+                })
+            })
+        };
+        if gpu_acc_score_triple.is_none() && scores_out.is_some() {
+            anyhow::bail!(
+                "ragged-cache decode on OpenCL writes scores only into the GPU score accumulator; \
+                 a host score readback has no ragged kernel"
+            );
+        }
+        let flash_score_arg = gpu_acc_score_triple
+            .as_ref()
+            .map(|(buf, off, stride)| (buf, *off, *stride));
+        // The cache's own mirror holds the raw starts; a sliding window folds its floor into
+        // `kv_start`, which then needs a per-call upload.
+        let uploaded = match kv_start_dev {
+            Some(_) if kv_base == 0 => None,
+            _ => Some(self.upload_kv_start(kv_start)?),
+        };
+        let start_tensor = uploaded.as_ref().or(kv_start_dev).expect("one of the two");
+        let start_mem = get_cl_mem(start_tensor.buffer().as_ref())?;
+        if self.flash_attention_decode_gpu(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            num_heads_q,
+            num_heads_kv,
+            head_dim,
+            cache_seq_len,
+            flash_score_arg,
+            Some(start_mem),
+        )? {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "ragged-cache decode on OpenCL needs the f16 HeadMajor flash kernel (head_dim 64/128); \
+             this layer has KV dtype {:?}, head_dim {head_dim}",
+            k_cache.dtype()
+        )
+    }
+
     fn attention_gen(
         &self,
         q: &Tensor,
@@ -6100,6 +6662,7 @@ impl Backend for OpenCLBackend {
                 head_dim,
                 cache_seq_len,
                 flash_score_arg,
+                None,
             )?
         {
             // Flash attention succeeded. For GPU acc path, scores are written
@@ -6217,6 +6780,9 @@ impl Backend for OpenCLBackend {
                 15,
                 ocl::core::ArgVal::local::<f32>(&local_mem_size),
             )?;
+            // Ragged-cache head starts (arg 16): the legacy path is reached only by a uniform ask
+            // (`attention_gen_ragged` routes a ragged cache to the flash kernel).
+            ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::mem_null())?;
 
             let global_work_size: [usize; 3] = [num_heads_q * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];

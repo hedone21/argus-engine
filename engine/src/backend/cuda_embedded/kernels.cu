@@ -383,10 +383,13 @@ extern "C" __global__ void attention_gen_f32_naive(
     int n_heads_q, int kv_heads, int head_dim,
     int capacity, int cache_seq_len,
     float * __restrict__ scores_out,
-    int score_stride)
+    int score_stride,
+    // Ragged KV cache: per-KV-head first resident slot (NULL = every head from slot 0).
+    const int * __restrict__ kv_start)
 {
     int h = blockIdx.x;
     int kv_h = h / (n_heads_q / kv_heads);
+    int k_lo = (kv_start != nullptr) ? min(kv_start[kv_h], cache_seq_len) : 0;
     int tid = threadIdx.x;
     float scale = rsqrtf((float)head_dim);
 
@@ -399,7 +402,7 @@ extern "C" __global__ void attention_gen_f32_naive(
     float * scores = shmem;
 
     // Phase 1: QK^T scores (each thread handles multiple positions via stride)
-    for (int t = tid; t < cache_seq_len; t += blockDim.x) {
+    for (int t = k_lo + tid; t < cache_seq_len; t += blockDim.x) {
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             dot += q_vec[d] * k_base[t * head_dim + d];
@@ -411,13 +414,13 @@ extern "C" __global__ void attention_gen_f32_naive(
     // Phase 2: Softmax over scores
     // 2a: find max
     float max_val = -INFINITY;
-    for (int t = tid; t < cache_seq_len; t += blockDim.x)
+    for (int t = k_lo + tid; t < cache_seq_len; t += blockDim.x)
         max_val = fmaxf(max_val, scores[t]);
     max_val = block_reduce_max(max_val);
 
     // 2b: exp + sum
     float sum_exp = 0.0f;
-    for (int t = tid; t < cache_seq_len; t += blockDim.x) {
+    for (int t = k_lo + tid; t < cache_seq_len; t += blockDim.x) {
         float e = expf(scores[t] - max_val);
         scores[t] = e;
         sum_exp += e;
@@ -425,8 +428,8 @@ extern "C" __global__ void attention_gen_f32_naive(
     sum_exp = block_reduce_sum(sum_exp);
 
     // 2c: normalize
-    float inv_sum = 1.0f / sum_exp;
-    for (int t = tid; t < cache_seq_len; t += blockDim.x)
+    float inv_sum = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+    for (int t = k_lo + tid; t < cache_seq_len; t += blockDim.x)
         scores[t] *= inv_sum;
     __syncthreads();
 
@@ -435,7 +438,8 @@ extern "C" __global__ void attention_gen_f32_naive(
     // has no divergence cost. When disabled, the loop body is never entered.
     if (scores_out != nullptr) {
         float * scores_row = scores_out + (size_t)h * (size_t)score_stride;
-        for (int t = tid; t < cache_seq_len; t += blockDim.x) {
+        for (int t = tid; t < k_lo; t += blockDim.x) scores_row[t] = 0.0f;  // hole columns
+        for (int t = k_lo + tid; t < cache_seq_len; t += blockDim.x) {
             scores_row[t] = scores[t];
         }
     }
@@ -444,7 +448,7 @@ extern "C" __global__ void attention_gen_f32_naive(
     float * out_vec = out + h * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int t = 0; t < cache_seq_len; t++) {
+        for (int t = k_lo; t < cache_seq_len; t++) {
             acc += scores[t] * v_base[t * head_dim + d];
         }
         out_vec[d] = acc;
@@ -464,10 +468,13 @@ extern "C" __global__ void attention_gen_f16kv_naive(
     int n_heads_q, int kv_heads, int head_dim,
     int capacity, int cache_seq_len,
     float * __restrict__ scores_out,
-    int score_stride)
+    int score_stride,
+    // Ragged KV cache: per-KV-head first resident slot (NULL = every head from slot 0).
+    const int * __restrict__ kv_start)
 {
     int h = blockIdx.x;
     int kv_h = h / (n_heads_q / kv_heads);
+    int k_lo = (kv_start != nullptr) ? min(kv_start[kv_h], cache_seq_len) : 0;
     int tid = threadIdx.x;
     float scale = rsqrtf((float)head_dim);
 
@@ -479,7 +486,7 @@ extern "C" __global__ void attention_gen_f16kv_naive(
     float * scores = shmem;
 
     // Phase 1: QK^T (F16 K dequantized on-the-fly)
-    for (int t = tid; t < cache_seq_len; t += blockDim.x) {
+    for (int t = k_lo + tid; t < cache_seq_len; t += blockDim.x) {
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             dot += q_vec[d] * __half2float(k_base[t * head_dim + d]);
@@ -490,20 +497,20 @@ extern "C" __global__ void attention_gen_f16kv_naive(
 
     // Phase 2: Softmax
     float max_val = -INFINITY;
-    for (int t = tid; t < cache_seq_len; t += blockDim.x)
+    for (int t = k_lo + tid; t < cache_seq_len; t += blockDim.x)
         max_val = fmaxf(max_val, scores[t]);
     max_val = block_reduce_max(max_val);
 
     float sum_exp = 0.0f;
-    for (int t = tid; t < cache_seq_len; t += blockDim.x) {
+    for (int t = k_lo + tid; t < cache_seq_len; t += blockDim.x) {
         float e = expf(scores[t] - max_val);
         scores[t] = e;
         sum_exp += e;
     }
     sum_exp = block_reduce_sum(sum_exp);
 
-    float inv_sum = 1.0f / sum_exp;
-    for (int t = tid; t < cache_seq_len; t += blockDim.x)
+    float inv_sum = (sum_exp > 0.0f) ? 1.0f / sum_exp : 0.0f;
+    for (int t = k_lo + tid; t < cache_seq_len; t += blockDim.x)
         scores[t] *= inv_sum;
     __syncthreads();
 
@@ -511,7 +518,8 @@ extern "C" __global__ void attention_gen_f16kv_naive(
     // NULL check across the block; disabled path has no hot-loop overhead.
     if (scores_out != nullptr) {
         float * scores_row = scores_out + (size_t)h * (size_t)score_stride;
-        for (int t = tid; t < cache_seq_len; t += blockDim.x) {
+        for (int t = tid; t < k_lo; t += blockDim.x) scores_row[t] = 0.0f;  // hole columns
+        for (int t = k_lo + tid; t < cache_seq_len; t += blockDim.x) {
             scores_row[t] = scores[t];
         }
     }
@@ -520,7 +528,7 @@ extern "C" __global__ void attention_gen_f16kv_naive(
     float * out_vec = out + h * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int t = 0; t < cache_seq_len; t++) {
+        for (int t = k_lo; t < cache_seq_len; t++) {
             acc += scores[t] * __half2float(v_base[t * head_dim + d]);
         }
         out_vec[d] = acc;
@@ -552,7 +560,8 @@ extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
     float* __restrict__ out, \
     int n_heads_q, int n_heads_kv, \
     int seq_len, int cache_seq_len, int kv_capacity, \
-    int batch_size) \
+    int batch_size, \
+    const int* __restrict__ kv_lo_buf) /* ragged KV cache: per-KV-head first resident slot, or NULL */ \
 { \
     int tile_row = blockIdx.x;  /* which BLOCK_M tile of queries */ \
     int head_batch = blockIdx.y; /* h_q + batch * n_heads_q */ \
@@ -562,6 +571,7 @@ extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
     int h_q = head_batch % n_heads_q; \
     int gqa_ratio = n_heads_q / n_heads_kv; \
     int h_kv = h_q / gqa_ratio; \
+    int k_lo = (kv_lo_buf != nullptr) ? min(kv_lo_buf[h_kv], cache_seq_len) : 0; \
     \
     int my_query_row = tile_row * BM + tid; \
     int valid = (my_query_row < seq_len); \
@@ -593,7 +603,7 @@ extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
     __shared__ float v_tile[BN * HD]; \
     \
     /* Iterate over KV in tiles of BN */ \
-    for (int kv_start = 0; kv_start < cache_seq_len; kv_start += BN) { \
+    for (int kv_start = (k_lo / BN) * BN; kv_start < cache_seq_len; kv_start += BN) { \
         int kv_end = min(kv_start + BN, cache_seq_len); \
         int tile_len = kv_end - kv_start; \
         \
@@ -603,8 +613,8 @@ extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
             int pos_local = i / (HD); \
             int dim = i % (HD); \
             int pos_global = kv_start + pos_local; \
-            k_tile[pos_local * (HD) + dim] = k_base[pos_global * (HD) + dim]; \
-            v_tile[pos_local * (HD) + dim] = v_base[pos_global * (HD) + dim]; \
+            k_tile[pos_local * (HD) + dim] = (pos_global >= k_lo) ? k_base[pos_global * (HD) + dim] : 0.0f; \
+            v_tile[pos_local * (HD) + dim] = (pos_global >= k_lo) ? v_base[pos_global * (HD) + dim] : 0.0f; \
         } \
         __syncthreads(); \
         \
@@ -615,14 +625,14 @@ extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
         for (; p + 1 < tile_len; p += 2) { \
             int kp0 = kv_start + p; \
             int kp1 = kv_start + p + 1; \
-            float s0 = (kp0 <= causal_limit) ? 0.0f : -INFINITY; \
-            float s1 = (kp1 <= causal_limit) ? 0.0f : -INFINITY; \
-            if (kp0 <= causal_limit) { \
+            float s0 = (kp0 <= causal_limit && kp0 >= k_lo) ? 0.0f : -INFINITY; \
+            float s1 = (kp1 <= causal_limit && kp1 >= k_lo) ? 0.0f : -INFINITY; \
+            if (kp0 <= causal_limit && kp0 >= k_lo) { \
                 float dot = 0.0f; \
                 for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[p * (HD) + d]; \
                 s0 = dot * scale; \
             } \
-            if (kp1 <= causal_limit) { \
+            if (kp1 <= causal_limit && kp1 >= k_lo) { \
                 float dot = 0.0f; \
                 for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[(p+1) * (HD) + d]; \
                 s1 = dot * scale; \
@@ -645,7 +655,7 @@ extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
         if (p < tile_len) { \
             int kp = kv_start + p; \
             float s = -INFINITY; \
-            if (kp <= causal_limit) { \
+            if (kp <= causal_limit && kp >= k_lo) { \
                 float dot = 0.0f; \
                 for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[p * (HD) + d]; \
                 s = dot * scale; \
@@ -684,7 +694,8 @@ extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
     float* __restrict__ out, \
     int n_heads_q, int n_heads_kv, \
     int seq_len, int cache_seq_len, int kv_capacity, \
-    int batch_size) \
+    int batch_size, \
+    const int* __restrict__ kv_lo_buf) /* ragged KV cache: per-KV-head first resident slot, or NULL */ \
 { \
     int tile_row = blockIdx.x; \
     int head_batch = blockIdx.y; \
@@ -694,6 +705,7 @@ extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
     int h_q = head_batch % n_heads_q; \
     int gqa_ratio = n_heads_q / n_heads_kv; \
     int h_kv = h_q / gqa_ratio; \
+    int k_lo = (kv_lo_buf != nullptr) ? min(kv_lo_buf[h_kv], cache_seq_len) : 0; \
     \
     int my_query_row = tile_row * BM + tid; \
     int valid = (my_query_row < seq_len); \
@@ -723,7 +735,7 @@ extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
     __shared__ float k_tile[BN * HD]; \
     __shared__ float v_tile[BN * HD]; \
     \
-    for (int kv_start = 0; kv_start < cache_seq_len; kv_start += BN) { \
+    for (int kv_start = (k_lo / BN) * BN; kv_start < cache_seq_len; kv_start += BN) { \
         int kv_end = min(kv_start + BN, cache_seq_len); \
         int tile_len = kv_end - kv_start; \
         \
@@ -732,8 +744,8 @@ extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
             int pos_local = i / (HD); \
             int dim = i % (HD); \
             int pos_global = kv_start + pos_local; \
-            k_tile[pos_local * (HD) + dim] = __half2float(k_base[pos_global * (HD) + dim]); \
-            v_tile[pos_local * (HD) + dim] = __half2float(v_base[pos_global * (HD) + dim]); \
+            k_tile[pos_local * (HD) + dim] = (pos_global >= k_lo) ? __half2float(k_base[pos_global * (HD) + dim]) : 0.0f; \
+            v_tile[pos_local * (HD) + dim] = (pos_global >= k_lo) ? __half2float(v_base[pos_global * (HD) + dim]) : 0.0f; \
         } \
         __syncthreads(); \
         \
@@ -743,14 +755,14 @@ extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
         for (; p + 1 < tile_len; p += 2) { \
             int kp0 = kv_start + p; \
             int kp1 = kv_start + p + 1; \
-            float s0 = (kp0 <= causal_limit) ? 0.0f : -INFINITY; \
-            float s1 = (kp1 <= causal_limit) ? 0.0f : -INFINITY; \
-            if (kp0 <= causal_limit) { \
+            float s0 = (kp0 <= causal_limit && kp0 >= k_lo) ? 0.0f : -INFINITY; \
+            float s1 = (kp1 <= causal_limit && kp1 >= k_lo) ? 0.0f : -INFINITY; \
+            if (kp0 <= causal_limit && kp0 >= k_lo) { \
                 float dot = 0.0f; \
                 for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[p * (HD) + d]; \
                 s0 = dot * scale; \
             } \
-            if (kp1 <= causal_limit) { \
+            if (kp1 <= causal_limit && kp1 >= k_lo) { \
                 float dot = 0.0f; \
                 for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[(p+1) * (HD) + d]; \
                 s1 = dot * scale; \
@@ -772,7 +784,7 @@ extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
         if (p < tile_len) { \
             int kp = kv_start + p; \
             float s = -INFINITY; \
-            if (kp <= causal_limit) { \
+            if (kp <= causal_limit && kp >= k_lo) { \
                 float dot = 0.0f; \
                 for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[p * (HD) + d]; \
                 s = dot * scale; \

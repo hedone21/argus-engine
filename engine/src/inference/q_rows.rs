@@ -195,6 +195,24 @@ impl QRowCapture {
         self.drift = gap;
     }
 
+    /// The cache was just renumbered down to `resident` slots — by whoever did it, at the moment
+    /// it was done. The ring's clock is its own newest stamp (`p + 1` of the last row captured),
+    /// so the gap is read from the two clocks at the same instant, before the decode loop's
+    /// shrink detector gets a step in which to notice. A chooser that applies one budget and is
+    /// asked for the next one before the loop has stepped — a Manager ramp runs on its own
+    /// tick, and a decision itself takes a second on a phone — would otherwise refuse every
+    /// budget in the burst as stale (measured on an S25, 2026-09-02: three of six declined).
+    pub fn renumbered_to(&mut self, resident: usize) {
+        let clock = self
+            .slot_pos
+            .iter()
+            .copied()
+            .filter(|&p| p != usize::MAX)
+            .max()
+            .map_or(0, |p| p + 1);
+        self.drift = clock.saturating_sub(resident);
+    }
+
     /// Whether the ring holds the whole window [`Self::snapshot`] would read — the cheap predicate
     /// a caller checks before deciding it has something to measure.
     pub fn covers(&self, n_resident: usize) -> bool {
