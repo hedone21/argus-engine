@@ -215,6 +215,22 @@ struct PendingCompress {
 /// cache-manager path and is not wired into the pool path at all.
 const MIN_EVICT_FRACTION: f32 = 0.20;
 
+/// The fewest tokens a compression targets. A budget is a fraction of the logical context, and
+/// early in a long decode from a short prompt a 10 % budget names a few dozen tokens; ticket 018
+/// floors the target at 128 instead. The Manager cannot apply this floor itself — its heartbeat
+/// carries the resident token count, not the logical length. A context no longer than this is
+/// therefore never compressed.
+const KV_COMPRESS_MIN_TOKENS: usize = 128;
+
+/// The resident length a budget names: `budget` of the logical context, but never under
+/// [`KV_COMPRESS_MIN_TOKENS`] (or the whole context, when that is shorter), and never under one
+/// token. `submit_compress` takes its target from here and nowhere else.
+fn compress_target_len(logical_len: usize, budget: f32) -> usize {
+    ((logical_len as f32 * budget) as usize)
+        .max(KV_COMPRESS_MIN_TOKENS.min(logical_len))
+        .max(1)
+}
+
 /// The gate's floor in tokens: the reduction a directive has to reach before an eviction is
 /// submitted for it, as a truncated share of the resident length.
 ///
@@ -407,7 +423,9 @@ impl CommandDispatcher {
         // resident when the directive landed.
         let achieved = after as f32 / p.logical_len as f32;
         // One token of slack: a target that lands on a fraction cannot be hit exactly, and
-        // `target_len` is `(logical_len * budget) as usize` floored then `.max(1)`.
+        // `target_len` is `(logical_len * budget) as usize` floored then `.max(1)`. When
+        // `KV_COMPRESS_MIN_TOKENS` raised the target above that, a compaction that landed on it
+        // still reads `Partial` here (ticket 018 left the answer as it was; the Manager only logs it).
         let slack = 1.0 / p.logical_len as f32;
         if achieved <= p.budget + slack {
             return Some(CommandResult::Ok);
@@ -603,7 +621,7 @@ impl CommandDispatcher {
         // against this one it restates, which is what makes the command idempotent.
         let resident =
             crate::kv::layer_mean_resident(self.kv_handles.iter().map(|h| h.resident_tokens()));
-        let target_len = ((self.logical_len as f32 * budget) as usize).max(1);
+        let target_len = compress_target_len(self.logical_len, budget);
         if target_len >= resident {
             // The cache already fits. Nothing to remove, so nothing to score — and scoring is
             // the expensive half: it recomputes the trailing query rows against every
@@ -740,8 +758,8 @@ mod tests {
 
     const KV_HEADS: usize = 1;
     const HEAD_DIM: usize = 32;
-    const MAX_SEQ: usize = 128;
-    const N_TOKENS: usize = 120;
+    const MAX_SEQ: usize = 1280;
+    const N_TOKENS: usize = 1200;
 
     fn make_handle(n_tokens: usize) -> Arc<StandardFormat> {
         let total = MAX_SEQ * KV_HEADS * HEAD_DIM;
@@ -945,16 +963,16 @@ mod tests {
     /// 한 셀에 그런 지시를 111건 냈다.
     ///
     /// mutation-proof: `submit_compress` 의 분모를 `logical_len` → `resident` 로 되돌리면
-    /// 0.6 이 `0.6*60 = 36 < 60` 이라 새 stage 를 submit 해 아래 단정이 깨진다.
+    /// 0.6 이 `0.6*600 = 360 < 600` 이라 새 stage 를 submit 해 아래 단정이 깨진다.
     #[test]
     fn the_budget_is_a_fraction_of_the_uncompressed_context() {
         let (mut d, registry, h) = make_dispatcher();
         assert!(is_accepted(&results_of(&mut d, vec![compress(0.5)])[0]));
-        assert_eq!(registry.len(), 1, "0.5 → 60 토큰 목표, submit 된다");
+        assert_eq!(registry.len(), 1, "0.5 → 600 토큰 목표, submit 된다");
         // 이 유닛 테스트는 KvMutate 를 안 돌리므로 stage 가 했을 압축을 손으로 반영한다.
-        h.with_cache_mut(|c| c.set_current_pos(60));
+        h.with_cache_mut(|c| c.set_current_pos(600));
 
-        // 0.6 은 **느슨해진** 예산이다. 압축 전 120 기준이면 목표 72 ≥ 남은 60 이라
+        // 0.6 은 **느슨해진** 예산이다. 압축 전 1200 기준이면 목표 720 ≥ 남은 600 이라
         // 지울 것이 없다 — 채점도 하지 않는다.
         let r = results_of(&mut d, vec![compress(0.6)]);
         assert!(matches!(r[..], [CommandResult::Ok]), "{r:?}");
@@ -964,7 +982,7 @@ mod tests {
             "이미 예산 안이면 stage 를 안 만든다 (채점이 비싼 쪽이다)"
         );
 
-        // 반면 진짜로 조이는 예산은 그대로 통과한다 — 0.25*120 = 30 < 60.
+        // 반면 진짜로 조이는 예산은 그대로 통과한다 — 0.25*1200 = 300 < 600.
         assert!(is_accepted(&results_of(&mut d, vec![compress(0.25)])[0]));
         assert_eq!(registry.len(), 2, "조이는 예산은 여전히 submit 된다");
     }
@@ -972,8 +990,8 @@ mod tests {
     /// 분모는 디코드가 붙인 만큼 **자라고**, 압축이 재번호해도 **줄지 않는다**.
     ///
     /// mutation-proof: `observe_context` 에서 `saturating_sub` 대신 `pos` 를 그대로 대입하면
-    /// 압축 뒤 분모가 30 으로 떨어지고 디코드 90 을 더해 210 이 아니라 **120** 이 된다. 그러면
-    /// 아래 `compress(0.6)` 이 목표 `0.6*120 = 72 < 120` 이라 submit 되고, 이 테스트에서는
+    /// 압축 뒤 분모가 300 으로 떨어지고 디코드 900 을 더해 2100 이 아니라 **1200** 이 된다. 그러면
+    /// 아래 `compress(0.6)` 이 목표 `0.6*1200 = 720 < 1200` 이라 submit 되고, 이 테스트에서는
     /// stage 를 아무도 돌리지 않으므로 답이 `Ok` 가 아니라 `Partial` 로 뒤집혀 그 블록의
     /// 단정이 깨진다(실측: 뮤테이션 뒤 `compress(0.6)` 의 `matches!(… Ok)` 에서 패닉).
     /// ⇒ 뮤테이션을 잡는 것은 `compress(0.6)` 블록이고, **마지막 예산 줄은 아예 도달하지도
@@ -982,30 +1000,30 @@ mod tests {
     #[test]
     fn the_denominator_grows_with_decode_and_survives_compaction() {
         let (mut d, registry, h) = make_dispatcher();
-        results_of(&mut d, vec![compress(0.25)]); // 0.25*120 = 30
+        results_of(&mut d, vec![compress(0.25)]); // 0.25*1200 = 300
         assert_eq!(registry.len(), 1);
-        h.with_cache_mut(|c| c.set_current_pos(30)); // stage 가 압축했다
+        h.with_cache_mut(|c| c.set_current_pos(300)); // stage 가 압축했다
         d.finalize_results(); // 실제 루프처럼 압축 직후 표집한다 (decode_loop:362)
-        h.with_cache_mut(|c| c.advance_pos(90)); // 디코드가 90 토큰 더 붙였다 → 남은 120
+        h.with_cache_mut(|c| c.advance_pos(900)); // 디코드가 900 토큰 더 붙였다 → 남은 1200
 
-        // 문맥은 120 + 90 = 210 토큰을 만들었다. 압축이 그 사실을 지우지 않는다.
+        // 문맥은 1200 + 900 = 2100 토큰을 만들었다. 압축이 그 사실을 지우지 않는다.
         let r = results_of(&mut d, vec![compress(0.6)]);
         assert!(matches!(r[..], [CommandResult::Ok]), "{r:?}");
         assert_eq!(
             registry.len(),
             1,
-            "0.6*210 = 126 ≥ 남은 120 — 지울 것이 없다"
+            "0.6*2100 = 1260 ≥ 남은 1200 — 지울 것이 없다"
         );
 
         // 0.4 (구 0.5): 조이는 예산이라는 점은 같고, 티켓 008 의 감축률 하한
-        // (`MIN_EVICT_FRACTION` = 0.20) 위에 있다. 0.5 는 목표 105/상주 120 = 감축률 12.5 % 라
+        // (`MIN_EVICT_FRACTION` = 0.20) 위에 있다. 0.5 는 목표 1050/상주 1200 = 감축률 12.5 % 라
         // 새 게이트에 걸려 스킵된다 — 이 테스트가 세우는 것은 **분모**(210)이지 하한이 아니므로
         // 예산만 옮긴다. 하한 자체는 T1·T2 가 세운다.
         assert!(is_accepted(&results_of(&mut d, vec![compress(0.4)])[0]));
         assert_eq!(
             registry.len(),
             2,
-            "0.4*210 = 84 < 120 이고 감축률 30 % ≥ 20 % — 조인다"
+            "0.4*2100 = 840 < 1200 이고 감축률 30 % ≥ 20 % — 조인다"
         );
     }
 
@@ -1018,14 +1036,74 @@ mod tests {
         assert_eq!(registry.len(), 1);
         h.with_cache_mut(|c| c.set_current_pos(0)); // 새 시퀀스
         d.dispatch(vec![]); // 표집
-        h.with_cache_mut(|c| c.advance_pos(40)); // 새 프리필 40 토큰
+        h.with_cache_mut(|c| c.advance_pos(400)); // 새 프리필 400 토큰
 
+        // 새 문맥 기준 0.25*400 = 100 은 `KV_COMPRESS_MIN_TOKENS` 에 걸려 128 이 되고, 여전히
+        // 400 보다 작아 조인다. 분모를 안 비웠다면 1200+400 = 1600 기준 목표 400 ≥ 400 이라
+        // submit 되지 않는다.
         assert!(is_accepted(&results_of(&mut d, vec![compress(0.25)])[0]));
         assert_eq!(
             registry.len(),
             2,
-            "0.25*40 = 10 < 40 — 새 문맥 기준으로 조인다"
+            "목표 max(0.25*400, 128) = 128 < 400 — 새 문맥 기준으로 조인다"
         );
+    }
+
+    /// **ticket 018.** A compression never targets fewer than [`KV_COMPRESS_MIN_TOKENS`] tokens,
+    /// or the whole context when that is shorter.
+    ///
+    /// The values pin the arithmetic; the dispatcher half pins that `submit_compress` takes its
+    /// target from it. Mutation-proof: dropping the `.max(KV_COMPRESS_MIN_TOKENS.min(..))` fails
+    /// the values, and a `submit_compress` that computes `logical_len * budget` on its own again
+    /// submits a stage for both dispatchers below (targets 50 < 128 and 10 < 100).
+    #[test]
+    fn kv_compress_never_targets_below_min_tokens() {
+        assert_eq!(compress_target_len(500, 0.10), 128, "50 is under the floor");
+        assert_eq!(
+            compress_target_len(100, 0.10),
+            100,
+            "a shorter context is kept whole"
+        );
+        assert_eq!(
+            compress_target_len(4000, 0.10),
+            400,
+            "400 is over the floor"
+        );
+        assert_eq!(
+            compress_target_len(0, 0.10),
+            1,
+            "never zero (`observe_context`)"
+        );
+
+        let registry = Arc::new(PipelineRegistry::new());
+        let h = make_handle(500);
+        let mut d = CommandDispatcher::new(
+            Arc::clone(&registry),
+            vec![h.clone()],
+            Some(make_cm()),
+            Arc::new(Mutex::new(None)),
+        );
+        assert!(is_accepted(&results_of(&mut d, vec![compress(0.10)])[0]));
+        assert_eq!(registry.len(), 1, "500 → 128 is a real reduction");
+        h.with_cache_mut(|c| c.set_current_pos(128)); // the stage landed on its target
+        let r = results_of(&mut d, vec![compress(0.10)]);
+        assert!(matches!(r[..], [CommandResult::Ok]), "{r:?}");
+        assert_eq!(
+            registry.len(),
+            1,
+            "128 resident already meets the floored target"
+        );
+
+        let registry = Arc::new(PipelineRegistry::new());
+        let mut d = CommandDispatcher::new(
+            Arc::clone(&registry),
+            vec![make_handle(100)],
+            Some(make_cm()),
+            Arc::new(Mutex::new(None)),
+        );
+        let r = results_of(&mut d, vec![compress(0.10)]);
+        assert!(matches!(r[..], [CommandResult::Ok]), "{r:?}");
+        assert_eq!(registry.len(), 0, "a 100-token context is never compressed");
     }
 
     /// `RestoreDefaults` 는 재무장한다 — 그 뒤 같은 budget 도 다시 submit 된다.
@@ -1183,8 +1261,8 @@ mod tests {
     /// **T1 (ticket 008).** A directive whose requested reduction is under
     /// [`MIN_EVICT_FRACTION`] never reaches a stage.
     ///
-    /// `logical_len` and `resident` are both 120 here, so `budget=0.85` resolves to
-    /// `target_len = 102` and asks for `1 - 102/120 = 15.0 %` — the camera 1K cell's first
+    /// `logical_len` and `resident` are both 1200 here, so `budget=0.85` resolves to
+    /// `target_len = 1020` and asks for `1 - 1020/1200 = 15.0 %` — the camera 1K cell's first
     /// directive, the one measured skip target of the three cells (it cost 0.221 s of stage time
     /// to remove 77 of 512 tokens). The answer is `Partial`, not `Ok`: unlike the
     /// `target_len >= resident` branch above it, the state the directive names does NOT hold.
@@ -1227,8 +1305,8 @@ mod tests {
 
     /// **T2 (ticket 008).** A directive just above the floor still submits.
     ///
-    /// `budget=0.73` against `logical_len = resident = 120` resolves to `target_len = 87`, an ask
-    /// of `1 - 87/120 = 27.5 %`. That is the camera 8K cell's tightest real directive (#12 asked
+    /// `budget=0.73` against `logical_len = resident = 1200` resolves to `target_len = 876`, an ask
+    /// of `1 - 876/1200 = 27.0 %`. That is the camera 8K cell's tightest real directive (#12 asked
     /// 27.2 %) and the reason [`MIN_EVICT_FRACTION`] cannot be raised: a floor above it would skip
     /// all twelve of that cell's decisions.
     ///
@@ -1241,7 +1319,7 @@ mod tests {
         assert_eq!(
             registry.len(),
             1,
-            "a 27.5 % ask clears the 20 % floor — the stage must be submitted"
+            "a 27.0 % ask clears the 20 % floor — the stage must be submitted"
         );
         assert!(is_accepted(&r[0]), "{r:?}");
         assert_eq!(d.last_evict_ratio, Some(0.73));
@@ -1321,16 +1399,16 @@ mod tests {
 
         // ⓑ The ratio has to be taken in f64, and only the rendered line can say so.
         //
-        // T1's own directive is the case: `target_len` 102 against 120 resident tokens, the 15.0 %
-        // ask the reason string quotes. In f64 `1 - 102/120` lands a hair above 0.15 and truncates
+        // T1's own directive is the case: `target_len` 1020 against 1200 resident tokens, the 15.0 %
+        // ask the reason string quotes. In f64 `1 - 1020/1200` lands a hair above 0.15 and truncates
         // to 0.150; narrowed to f32 it lands at 0.14999998 and truncates to 0.149, so the line
         // would call a 15.0 % directive 0.149 -- the same disagreement between the two renderings
         // that task 8" exists to remove. None of the four boundary residents below notices: at
         // every one of them the third decimal reads 0.198/0.199 in either width.
-        let t1_line = skip_log_line(102, 120);
+        let t1_line = skip_log_line(1020, 1200);
         assert!(
             t1_line.contains("frac=0.150"),
-            "the reduction fraction must be taken in f64: 1 - 102/120 is 0.15 and prints \
+            "the reduction fraction must be taken in f64: 1 - 1020/1200 is 0.15 and prints \
              frac=0.150, where f32's 0.14999998 truncates to frac=0.149. Line: {t1_line:?}"
         );
 
@@ -1506,29 +1584,29 @@ mod tests {
         //
         // So take the two tokens either side of the boundary through `submit_compress` itself and
         // read the outcome off the registry, the way T1 and T2 do. `make_dispatcher` gives one
-        // 120-token layer, so `logical_len = resident = 120` and the floor is 24 tokens: an ask of
-        // exactly 24 has REACHED the floor and must submit, an ask of 23 has not and must skip.
+        // 1200-token layer, so `logical_len = resident = 1200` and the floor is 240 tokens: an ask
+        // of exactly 240 has REACHED the floor and must submit, an ask of 239 has not and must skip.
         assert_eq!(
-            evict_floor_tokens(120),
-            24,
-            "the harness's boundary: 120 * 0.20 = 24 tokens"
+            evict_floor_tokens(N_TOKENS),
+            240,
+            "the harness's boundary: 1200 * 0.20 = 240 tokens"
         );
 
-        // `budget = 0.805` → `target_len = (120 * 0.805) as usize = 96`, an ask of exactly 24.
+        // `budget = 0.80` → `target_len = (1200 * 0.80) as usize = 960`, an ask of exactly 240.
         let (mut d, registry, _h) = make_dispatcher();
-        let r = results_of(&mut d, vec![compress(0.805)]);
+        let r = results_of(&mut d, vec![compress(0.80)]);
         assert_eq!(
             registry.len(),
             1,
             "an ask of exactly {} tokens has reached the floor and must submit: {r:?}",
-            evict_floor_tokens(120)
+            evict_floor_tokens(N_TOKENS)
         );
         assert!(is_accepted(&r[0]), "{r:?}");
 
-        // `budget = 0.81` → `target_len = (120 * 0.81) as usize = 97`, an ask of 23: one token
+        // `budget = 0.801` → `target_len = (1200 * 0.801) as usize = 961`, an ask of 239: one token
         // short of the floor.
         let (mut d, registry, _h) = make_dispatcher();
-        let r = results_of(&mut d, vec![compress(0.81)]);
+        let r = results_of(&mut d, vec![compress(0.801)]);
         assert_eq!(
             registry.len(),
             0,
@@ -1549,21 +1627,21 @@ mod tests {
     /// This transposes camera 8K decision #12, where a winner that budgets per layer (pyramidkv
     /// clamps layer 0 at `q - window`) left layer 0 at 1061 while the 28-layer mean landed exactly
     /// on its 816-token budget — and the engine answered the Manager `Partial` for a compression
-    /// that had hit its target. Scaled to this harness (`MAX_SEQ = 128`):
+    /// that had hit its target. Scaled to this harness (`MAX_SEQ = 1280`):
     ///
     /// | | layer 0 | layer 1 | mean (round up) |
     /// |---|---|---|---|
-    /// | at submit | 120 | 80 (`head_start` 40) | **100** |
-    /// | after | 60 | 40 (`head_start` 80) | **50** |
+    /// | at submit | 1200 | 800 (`head_start` 400) | **1000** |
+    /// | after | 600 | 400 (`head_start` 800) | **500** |
     ///
-    /// With `logical_len = 120` and `budget = 0.45`, `50/120 = 0.417 <= 0.45 + 1/120` is `Ok`
-    /// while layer 0's `60/120 = 0.500` is not.
+    /// With `logical_len = 1200` and `budget = 0.45`, `500/1200 = 0.417 <= 0.45 + 1/1200` is `Ok`
+    /// while layer 0's `600/1200 = 0.500` is not.
     ///
     /// The second half pins the OTHER operand. Nothing runs `KvMutate` in these tests, so a
     /// submission left alone finds the cache exactly as it was, and `compress_outcome` must say
     /// "removed nothing" — which it can only do if `after` and `PendingCompress::tokens_before`
     /// are the same unit. An implementation that averages `after` but leaves the submit-time
-    /// `resident` on layer 0 compares 100 against 120, misses that branch, and fails here.
+    /// `resident` on layer 0 compares 1000 against 1200, misses that branch, and fails here.
     ///
     /// The third half (T3′, 6차 수리) covers the one `achieved` neither of the first two reaches:
     /// the skip gate's, computed before any stage exists and never passing through
@@ -1573,9 +1651,9 @@ mod tests {
     #[test]
     fn the_outcome_reads_back_across_layers_not_from_layer_zero() {
         fn two_layer_dispatcher() -> (CommandDispatcher, Arc<StandardFormat>, Arc<StandardFormat>) {
-            let l0 = make_handle(N_TOKENS); // 120 resident
+            let l0 = make_handle(N_TOKENS); // 1200 resident
             let l1 = make_handle(N_TOKENS);
-            l1.with_cache_mut(|c| c.set_head_starts(&[40])); // 80 resident
+            l1.with_cache_mut(|c| c.set_head_starts(&[400])); // 800 resident
             let d = CommandDispatcher::new(
                 Arc::new(PipelineRegistry::new()),
                 vec![l0.clone(), l1.clone()],
@@ -1587,22 +1665,22 @@ mod tests {
 
         // ── half 1: `achieved` is the layer mean ──────────────────────────────────────────
         let (mut d, l0, l1) = two_layer_dispatcher();
-        assert_eq!(l0.resident_tokens(), 120);
-        assert_eq!(l1.resident_tokens(), 80);
+        assert_eq!(l0.resident_tokens(), 1200);
+        assert_eq!(l1.resident_tokens(), 800);
         d.dispatch(vec![compress(0.45)]);
         assert_eq!(
             d.pending_compress.as_ref().map(|p| p.tokens_before),
-            Some(100),
-            "the submit-time length is the layer mean, not layer 0's 120"
+            Some(1000),
+            "the submit-time length is the layer mean, not layer 0's 1200"
         );
         // Stand in for the compaction the `KvMutate` phase would have applied.
-        l0.with_cache_mut(|c| c.set_current_pos(60));
-        l1.with_cache_mut(|c| c.set_head_starts(&[80]));
-        assert_eq!(l1.resident_tokens(), 40);
+        l0.with_cache_mut(|c| c.set_current_pos(600));
+        l1.with_cache_mut(|c| c.set_head_starts(&[800]));
+        assert_eq!(l1.resident_tokens(), 400);
         let r = d.finalize_results();
         assert!(
             matches!(r[..], [CommandResult::Ok]),
-            "mean 50/120 is inside budget 0.45; layer 0's 60/120 is not: {r:?}"
+            "mean 500/1200 is inside budget 0.45; layer 0's 600/1200 is not: {r:?}"
         );
 
         // ── half 2: `tokens_before` is the same unit as `after` ───────────────────────────
@@ -1613,7 +1691,7 @@ mod tests {
             panic!("an unapplied compression reports Partial: {r:?}");
         };
         assert!(
-            (achieved - 100.0 / 120.0).abs() < 1e-6,
+            (achieved - 1000.0 / 1200.0).abs() < 1e-6,
             "achieved is the layer mean over logical_len: {achieved}"
         );
         assert!(
@@ -1631,25 +1709,25 @@ mod tests {
         // numerator to `self.kv_handles[0].resident_tokens()` left all eight of this ticket's
         // acceptance criteria green (adversarial pass, 2026-09-10): nothing read it.
         //
-        // `budget = 0.75` against `logical_len = 120` gives `target_len = 90`. The layer mean is
-        // 100, so the ask is 10 tokens against a 20-token floor — skipped — while layer 0 alone
-        // would read 120 resident and answer a fraction of 1.0 for a cache that is 100 tokens deep
-        // on average.
+        // `budget = 0.75` against `logical_len = 1200` gives `target_len = 900`. The layer mean is
+        // 1000, so the ask is 100 tokens against a 200-token floor — skipped — while layer 0 alone
+        // would read 1200 resident and answer a fraction of 1.0 for a cache that is 1000 tokens
+        // deep on average.
         let (mut d, l0, l1) = two_layer_dispatcher();
-        assert_eq!(l0.resident_tokens(), 120);
-        assert_eq!(l1.resident_tokens(), 80);
+        assert_eq!(l0.resident_tokens(), 1200);
+        assert_eq!(l1.resident_tokens(), 800);
         let r = results_of(&mut d, vec![compress(0.75)]);
         let [CommandResult::Partial { achieved, reason }] = &r[..] else {
             panic!("a sub-floor directive is answered Partial by the gate: {r:?}");
         };
         assert_eq!(
             *achieved,
-            100.0f32 / 120.0f32,
+            1000.0f32 / 1200.0f32,
             "the skipped directive's `achieved` is the layer mean over logical_len"
         );
         assert_ne!(
             *achieved,
-            120.0f32 / 120.0f32,
+            1200.0f32 / 1200.0f32,
             "…not layer 0's resident length over logical_len"
         );
 
@@ -1658,10 +1736,10 @@ mod tests {
         // The sentence the Manager receives names the same denominator the gate compared
         // against: the resident layer mean. Swapping it for `self.logical_len` is invisible
         // everywhere else in this ticket — T1 and T6ⓓ both run `make_dispatcher`, one layer at
-        // 120 tokens, where `resident == logical_len` and the two denominators render the same
+        // 1200 tokens, where `resident == logical_len` and the two denominators render the same
         // percentage. They part only once the cache has actually been compressed below the
         // logical length, which is every real directive after the first eviction: here
-        // `1 - 90/100` against `1 - 90/120 = 25.0 %`.
+        // `1 - 900/1000` against `1 - 900/1200 = 25.0 %`.
         //
         // The `logical_len` form is not merely a different number, it is self-contradicting: it
         // would tell the Manager the ask was "25.0% of the resident length, below the 20.0%
@@ -1672,7 +1750,7 @@ mod tests {
         // local to this test).
         //
         // The share prints 9.9 %, not 10.0 %: since 7차 수리 정정 the percentage goes through
-        // [`skip_frac_display`], and `1 - 90/100` lands a hair BELOW 0.1 in f64
+        // [`skip_frac_display`], and `1 - 900/1000` lands a hair BELOW 0.1 in f64
         // (0.09999999999999998), which truncation takes to 0.099 — the same 0.099 the skip line
         // beside it prints for this directive. Truncation can only ever understate the ask, so
         // the reason stays strictly under the floor it quotes, which is the invariant; the price
@@ -1683,8 +1761,8 @@ mod tests {
             reason,
             "eviction declined: the requested reduction was 9.9% of the resident length, \
              below the 20.0% floor",
-            "the declined share is target_len against the resident layer mean (1 - 90/100), \
-             not against logical_len (1 - 90/120 would print 25.0%, above the floor it claims \
+            "the declined share is target_len against the resident layer mean (1 - 900/1000), \
+             not against logical_len (1 - 900/1200 would print 25.0%, above the floor it claims \
              to be under), and it is truncated the way the line beside it is"
         );
     }
