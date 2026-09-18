@@ -343,6 +343,12 @@ struct KernelCache {
     /// Decode-specialized flash attention, head_dim=128 variant
     /// (Q=F32, KV=F16, compiled with -DDK=128 -DDV=128).
     kernel_flash_attn_f32_f16_q1_dk128: Option<CoreKernel>,
+    /// Split-KV decode pair (ticket 019), compiled from the same DK=64 program.
+    kernel_flash_attn_q1_split_dk64: Option<CoreKernel>,
+    kernel_flash_attn_q1_merge_dk64: Option<CoreKernel>,
+    /// Split-KV decode pair (ticket 019), compiled from the same DK=128 program.
+    kernel_flash_attn_q1_split_dk128: Option<CoreKernel>,
+    kernel_flash_attn_q1_merge_dk128: Option<CoreKernel>,
     /// GPU-native opaque q2_0 -> F16 dequant (W-CODEC slice 3). `None` when the strict-math
     /// program failed to compile → `supports_opaque_q2_dequant()` reports false → host floor.
     kernel_dequant_opaque_q2_to_f16: Option<CoreKernel>,
@@ -475,6 +481,11 @@ pub struct OpenCLBackend {
     // Pre-allocated 1-element dummy buffer for attention_gen when scores_out is None.
     // Avoids per-call GPU buffer allocation (16 layers x every token).
     dummy_score_buf: ocl::core::Mem,
+
+    // Split-KV decode partials for the runtime path (ticket 019):
+    // `(part_ml, part_o, ml_len, o_len)` in f32 elements, grown on demand.
+    // The plan path keeps its own per-layer pair in `retained_bufs`.
+    q1_split_scratch: UnsafeCell<Option<(ocl::core::Mem, ocl::core::Mem, usize, usize)>>,
 
     // GPU-side attention score accumulator (optional).
     // When active, attention_gen writes to a persistent GPU buffer and
@@ -1538,6 +1549,18 @@ impl OpenCLBackend {
             kernel_flash_attn_f32_f16_q1_dk128: flash_attn_f32_f16_program_dk128
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1").ok()),
+            kernel_flash_attn_q1_split_dk64: flash_attn_f32_f16_program_dk64
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1_split").ok()),
+            kernel_flash_attn_q1_merge_dk64: flash_attn_f32_f16_program_dk64
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_q1_merge").ok()),
+            kernel_flash_attn_q1_split_dk128: flash_attn_f32_f16_program_dk128
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1_split").ok()),
+            kernel_flash_attn_q1_merge_dk128: flash_attn_f32_f16_program_dk128
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_q1_merge").ok()),
             kernel_dequant_opaque_q2_to_f16: dequant_opaque_q2_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_dequant_opaque_q2_to_f16").ok()),
@@ -1644,6 +1667,7 @@ impl OpenCLBackend {
             kernels: UnsafeCell::new(kernel_cache),
             use_zero_copy,
             dummy_score_buf,
+            q1_split_scratch: UnsafeCell::new(None),
             gpu_score_acc: UnsafeCell::new(None),
             cl_opts: cl_opts.clone(),
             max_mem_alloc_size,
@@ -3921,6 +3945,169 @@ impl OpenCLBackend {
         // dummy buffer + `write_scores=0` fast path.
         score_buf: Option<(&ocl::core::Mem, i32, i32)>,
         // Ragged cache: device `i32` per KV head (first resident slot); `None` = uniform.
+        kv_start: Option<&ocl::core::Mem>,
+    ) -> Result<bool> {
+        // Ticket 019: the lanes-across-row kernel by default; `LLMRS_Q1_KERNEL=q1`
+        // selects the original single-work-group q1 kernel (the A/B control).
+        // Both take the same inputs and produce the same O / score-buffer contents.
+        if plan::q1_use_split_pair() {
+            let n_splits = plan::q1_splits();
+            self.flash_attention_decode_split_gpu(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                cache_seq_len,
+                score_buf,
+                kv_start,
+                n_splits,
+            )
+        } else {
+            self.flash_attention_decode_q1_gpu(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                cache_seq_len,
+                score_buf,
+                kv_start,
+            )
+        }
+    }
+
+    /// Split-KV decode flash attention (ticket 019): `flash_attn_f32_f16_q1_split`
+    /// over `[64, n_heads_q, n_splits]` followed by `flash_attn_q1_merge`.
+    /// Same contract as [`Self::flash_attention_decode_q1_gpu`]; `n_splits`
+    /// must be in `1..=plan::Q1_SPLITS_MAX`. Returns `Ok(false)` when the
+    /// KV layout or head_dim is unsupported, exactly like the q1 path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attention_decode_split_gpu(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        score_buf: Option<(&ocl::core::Mem, i32, i32)>,
+        kv_start: Option<&ocl::core::Mem>,
+        n_splits: usize,
+    ) -> Result<bool> {
+        if !(1..=plan::Q1_SPLITS_MAX).contains(&n_splits) {
+            anyhow::bail!(
+                "flash_attention_decode_split_gpu: n_splits {n_splits} outside 1..={}",
+                plan::Q1_SPLITS_MAX
+            );
+        }
+        if k_cache.dtype() != DType::F16 {
+            return Ok(false);
+        }
+        let k_shape = k_cache.shape().dims();
+        let is_head_major =
+            k_shape.len() >= 3 && k_shape[1] == n_heads_kv && k_shape[1] != k_shape[2];
+        if !is_head_major {
+            return Ok(false);
+        }
+        let kv_capacity = k_shape[2];
+
+        let kernels = unsafe { &*self.kernels.get() };
+        let (main, merge) = match head_dim {
+            64 => (
+                &kernels.kernel_flash_attn_q1_split_dk64,
+                &kernels.kernel_flash_attn_q1_merge_dk64,
+            ),
+            128 => (
+                &kernels.kernel_flash_attn_q1_split_dk128,
+                &kernels.kernel_flash_attn_q1_merge_dk128,
+            ),
+            _ => return Ok(false),
+        };
+        let (main, merge) = match (main, merge) {
+            (Some(m), Some(g)) => (m, g),
+            _ => return Ok(false),
+        };
+
+        // Grow-on-demand partials: (part_ml, part_o) sized for this call.
+        let (ml_len, o_len) = plan::q1_split_scratch_len(n_heads_q, n_splits, head_dim);
+        let scratch = unsafe { &mut *self.q1_split_scratch.get() };
+        let needs_alloc = match scratch {
+            Some((_, _, have_ml, have_o)) => *have_ml < ml_len || *have_o < o_len,
+            None => true,
+        };
+        if needs_alloc {
+            let alloc = |len: usize| unsafe {
+                ocl::core::create_buffer::<_, f32>(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_WRITE,
+                    len,
+                    None,
+                )
+            };
+            let ml = alloc(ml_len)
+                .map_err(|e| anyhow!("create part_ml scratch for split flash: {e}"))?;
+            let o =
+                alloc(o_len).map_err(|e| anyhow!("create part_o scratch for split flash: {e}"))?;
+            *scratch = Some((ml, o, ml_len, o_len));
+        }
+        let (part_ml, part_o, _, _) = scratch.as_ref().expect("scratch just ensured");
+
+        let (s_buf, s_layer_offset, s_stride, write_scores) = match score_buf {
+            Some((buf, off, stride)) => (buf, off, stride, 1i32),
+            None => (&self.dummy_score_buf, 0i32, 0i32, 0i32),
+        };
+        let args = plan::FlashQ1SplitArgs {
+            q: get_cl_mem(q.buffer().as_ref())?,
+            k: get_cl_mem(k_cache.buffer().as_ref())?,
+            v: get_cl_mem(v_cache.buffer().as_ref())?,
+            o: get_cl_mem(out.buffer().as_ref())?,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            kv_capacity,
+            n_kv: cache_seq_len as i32,
+            score: (s_buf, s_layer_offset, s_stride, write_scores),
+            kv_start,
+            part_ml,
+            part_o,
+            n_splits,
+        };
+        unsafe {
+            plan::bind_flash_q1_split_main_args(main, &args)?;
+            plan::bind_flash_q1_merge_args(merge, &args)?;
+        }
+        let (main_gws, main_lws, merge_gws, merge_lws) =
+            plan::q1_split_work_sizes(n_heads_q, head_dim, n_splits);
+        self.enqueue_kernel_labeled(main, "attention", 3, &main_gws, Some(main_lws))?;
+        if n_splits > 1 {
+            self.enqueue_kernel_labeled(merge, "attention", 2, &merge_gws, Some(merge_lws))?;
+        }
+        Ok(true)
+    }
+
+    /// The original single-work-group decode kernel (`flash_attn_f32_f16_q1`,
+    /// one 64-lane work-group per query head). Kept byte-for-byte as the
+    /// ticket 019 control arm; `flash_attention_decode_gpu` routes here when
+    /// `LLMRS_Q1_SPLITS=1`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attention_decode_q1_gpu(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        score_buf: Option<(&ocl::core::Mem, i32, i32)>,
         kv_start: Option<&ocl::core::Mem>,
     ) -> Result<bool> {
         // Only F16 KV on HeadMajor GPU buffer is supported.

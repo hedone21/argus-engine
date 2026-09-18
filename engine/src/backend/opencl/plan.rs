@@ -163,7 +163,52 @@ pub enum AttentionVariant {
     /// softmax, no score output. Selected at plan-build time when
     /// head_dim==64, F16 KV, HeadMajor, and no scores are needed.
     StandardFlash(KernelStep),
+    /// Lanes-across-row decode flash attention (ticket 019): `main` is
+    /// `flash_attn_f32_f16_q1_split` over `[64, n_heads_q, n_splits]`, `merge`
+    /// is `flash_attn_q1_merge` over `[head_dim, n_heads_q]` (dispatched only
+    /// when `n_splits > 1`; a single split finalises inside `main`). Same
+    /// inputs and outputs (O, scores, ragged `kv_start`) as `StandardFlash`.
+    SplitFlash { main: KernelStep, merge: KernelStep },
 }
+
+/// Number of KV splits for the lanes-across-row decode kernel (ticket 019).
+/// `LLMRS_Q1_SPLITS` overrides the default so one binary can sweep it in an
+/// order-interleaved on-device batch.
+pub fn q1_splits() -> usize {
+    static SPLITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SPLITS.get_or_init(|| {
+        std::env::var("LLMRS_Q1_SPLITS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(Q1_SPLITS_DEFAULT)
+            .min(Q1_SPLITS_MAX)
+    })
+}
+
+/// Default split count. S25 sweep 2026-09-18 (ticket 019, N = 128 / 2048 /
+/// 4096 / 7168): 2 was best or tied at every length (55.4 / 60.5 / 66.2 /
+/// 71.6-76.3 ms vs 55.5 / 66.0 / 78.5 / 101.9 ms for 1); 4 and 8 were level
+/// with 2, 16 slightly worse.
+pub const Q1_SPLITS_DEFAULT: usize = 2;
+
+/// Which decode kernel the plan and runtime paths use. Default: the
+/// lanes-across-row kernel (`flash_attn_f32_f16_q1_split`). `LLMRS_Q1_KERNEL=q1`
+/// forces the original `flash_attn_f32_f16_q1` — the control arm of every
+/// ticket 019 A/B.
+pub fn q1_use_split_pair() -> bool {
+    static KERNEL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    !matches!(
+        KERNEL
+            .get_or_init(|| std::env::var("LLMRS_Q1_KERNEL").ok())
+            .as_deref(),
+        Some("q1")
+    )
+}
+
+/// Upper bound on `LLMRS_Q1_SPLITS`: the merge kernel loops over the splits
+/// and the scratch buffers scale with it.
+pub const Q1_SPLITS_MAX: usize = 128;
 
 /// Execution plan for a single transformer layer.
 pub struct LayerKernelPlan {
@@ -1406,6 +1451,83 @@ impl FullKernelPlan {
                         );
                     }
                 }
+                AttentionVariant::SplitFlash { main, merge } => {
+                    bind_kv_start(&main.kernel, Q1_SPLIT_MAIN_KV_START_ARG);
+                    bind_kv_start(&merge.kernel, Q1_MERGE_KV_START_ARG);
+                    if debug_sync {
+                        eprintln!(
+                            "[Plan] L{} split flash attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
+                            i, attn_seq_len, main.global_work_size, main.local_work_size
+                        );
+                    }
+                    // The pair is one attention op for `LLMRS_TRACE_Q1` / `LLMRS_Q1_REPEAT`
+                    // (same env knobs as the `StandardFlash` arm) so the two kernels'
+                    // numbers are directly comparable.
+                    let dispatch_pair = || {
+                        Self::dispatch_step(
+                            backend,
+                            main,
+                            start_pos_i32,
+                            attn_seq_len,
+                            write_pos,
+                            kv_cap,
+                            rp,
+                            q2t,
+                            rt,
+                        );
+                        // A single split finalises inside the main kernel (`final_out`).
+                        if main.global_work_size[2] <= 1 {
+                            return;
+                        }
+                        Self::dispatch_step(
+                            backend,
+                            merge,
+                            start_pos_i32,
+                            attn_seq_len,
+                            write_pos,
+                            kv_cap,
+                            rp,
+                            q2t,
+                            rt,
+                        );
+                    };
+                    let trace_q1 = std::env::var_os("LLMRS_TRACE_Q1").is_some();
+                    if trace_q1 {
+                        ocl::core::finish(queue).ok();
+                    }
+                    let q1_start = std::time::Instant::now();
+                    dispatch_pair();
+                    if trace_q1 {
+                        ocl::core::finish(queue).ok();
+                        let us = q1_start.elapsed().as_nanos() as u64 / 1000;
+                        eprintln!(
+                            "[Q1_TRACE] layer={} n_kv={} us={} splits={}",
+                            i, attn_seq_len, us, main.global_work_size[2]
+                        );
+                    }
+                    let q1_repeat: u32 = std::env::var("LLMRS_Q1_REPEAT")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1);
+                    for rep in 1..q1_repeat {
+                        ocl::core::finish(queue).ok();
+                        let rep_start = std::time::Instant::now();
+                        dispatch_pair();
+                        ocl::core::finish(queue).ok();
+                        let rep_us = rep_start.elapsed().as_nanos() as u64 / 1000;
+                        eprintln!(
+                            "[Q1_REPEAT] layer={} n_kv={} rep={} us={}",
+                            i, attn_seq_len, rep, rep_us
+                        );
+                    }
+                    if debug_sync {
+                        ocl::core::finish(queue).ok();
+                        eprintln!(
+                            "[Plan] L{} split flash attention OK (attn_seq_len={})",
+                            i, attn_seq_len
+                        );
+                    }
+                }
             }
 
             // Steps 9-10: post-attention pre-FFN (Wo matmul, add_rms_norm).
@@ -2204,6 +2326,313 @@ fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVaria
     }))
 }
 
+/// Everything the split-KV decode kernel pair (ticket 019) needs bound.
+/// Shared by the plan builder and the runtime path
+/// (`OpenCLBackend::flash_attention_decode_split_gpu`) so the two cannot
+/// drift apart on argument order.
+pub(crate) struct FlashQ1SplitArgs<'a> {
+    pub q: &'a Mem,
+    pub k: &'a Mem,
+    pub v: &'a Mem,
+    pub o: &'a Mem,
+    pub n_heads_q: usize,
+    pub n_heads_kv: usize,
+    pub head_dim: usize,
+    pub kv_capacity: usize,
+    /// Initial `n_kv`; the plan patches it per step through `DynamicArg::CacheSeqLen`.
+    pub n_kv: i32,
+    /// `(buffer, layer_offset, stride, write_scores)`; the buffer must be valid
+    /// even when `write_scores == 0` (bind a 1-element dummy).
+    pub score: (&'a Mem, i32, i32, i32),
+    pub kv_start: Option<&'a Mem>,
+    pub part_ml: &'a Mem,
+    pub part_o: &'a Mem,
+    pub n_splits: usize,
+}
+
+/// Arg index of `n_kv` in `flash_attn_f32_f16_q1_split` (same slot as q1).
+pub(crate) const Q1_SPLIT_MAIN_NKV_ARG: u32 = 10;
+/// Arg index of `kv_start` in `flash_attn_f32_f16_q1_split` (same slot as q1).
+pub(crate) const Q1_SPLIT_MAIN_KV_START_ARG: u32 = 44;
+/// Arg index of `n_kv` in `flash_attn_q1_merge`.
+pub(crate) const Q1_MERGE_NKV_ARG: u32 = 2;
+/// Arg index of `kv_start` in `flash_attn_q1_merge`.
+pub(crate) const Q1_MERGE_KV_START_ARG: u32 = 13;
+
+/// Scratch sizes (in f32 elements) for the split pair: `(part_ml, part_o)`.
+pub(crate) fn q1_split_scratch_len(
+    n_heads_q: usize,
+    n_splits: usize,
+    head_dim: usize,
+) -> (usize, usize) {
+    (n_heads_q * n_splits * 2, n_heads_q * n_splits * head_dim)
+}
+
+/// Bind all 48 arguments of `flash_attn_f32_f16_q1_split`.
+///
+/// # Safety
+/// `kernel` must have been created from `flash_attn_f32_f16_q1_split` and the
+/// buffers must outlive every enqueue of it.
+pub(crate) unsafe fn bind_flash_q1_split_main_args(
+    kernel: &CoreKernel,
+    a: &FlashQ1SplitArgs<'_>,
+) -> Result<()> {
+    use ocl::core::{ArgVal, set_kernel_arg};
+    let head_dim = a.head_dim;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    // Q strides (F32 [batch=1, seq=1, n_heads_q, head_dim]), bytes
+    let q_nb1 = (a.n_heads_q * head_dim * 4) as u64;
+    let q_nb2 = (head_dim * 4) as u64;
+    let q_nb3 = q_nb1;
+    // KV strides (F16 HeadMajor [1, n_heads_kv, capacity, head_dim]), bytes
+    let k_nb1 = (head_dim as u64) * 2;
+    let k_nb2 = (a.kv_capacity * head_dim) as u64 * 2;
+    let k_nb3 = (a.n_heads_kv as u64) * k_nb2;
+    // O strides (F32 [batch=1, seq=1, n_heads_q, head_dim]), bytes
+    let o_nb1 = (head_dim * 4) as u64;
+    let o_nb2 = (a.n_heads_q * head_dim * 4) as u64;
+    let o_nb3 = o_nb2;
+
+    let n_q = 1i32;
+    let is_causal = 0i32;
+    let n_head = a.n_heads_q as i32;
+    let n_head_kv = a.n_heads_kv as i32;
+    let zero_f32 = 0.0f32;
+    let zero_u64 = 0u64;
+    let zero_i32 = 0i32;
+    let (s_buf, s_layer_offset, s_stride, write_scores) = a.score;
+
+    unsafe {
+        set_kernel_arg(kernel, 0, ArgVal::mem(a.q))?;
+        set_kernel_arg(kernel, 1, ArgVal::scalar(&zero_u64))?;
+        set_kernel_arg(kernel, 2, ArgVal::mem(a.k))?;
+        set_kernel_arg(kernel, 3, ArgVal::scalar(&zero_u64))?;
+        set_kernel_arg(kernel, 4, ArgVal::mem(a.v))?;
+        set_kernel_arg(kernel, 5, ArgVal::scalar(&zero_u64))?;
+        set_kernel_arg(kernel, 6, ArgVal::mem(a.o))?;
+        set_kernel_arg(kernel, 7, ArgVal::scalar(&zero_u64))?;
+        set_kernel_arg(kernel, 8, ArgVal::scalar(&scale))?;
+        set_kernel_arg(kernel, 9, ArgVal::scalar(&n_q))?;
+        set_kernel_arg(kernel, Q1_SPLIT_MAIN_NKV_ARG, ArgVal::scalar(&a.n_kv))?;
+        set_kernel_arg(kernel, 11, ArgVal::scalar(&is_causal))?;
+        set_kernel_arg(kernel, 12, ArgVal::scalar(&n_head))?;
+        set_kernel_arg(kernel, 13, ArgVal::scalar(&q_nb1))?;
+        set_kernel_arg(kernel, 14, ArgVal::scalar(&q_nb2))?;
+        set_kernel_arg(kernel, 15, ArgVal::scalar(&q_nb3))?;
+        set_kernel_arg(kernel, 16, ArgVal::scalar(&k_nb1))?;
+        set_kernel_arg(kernel, 17, ArgVal::scalar(&k_nb2))?;
+        set_kernel_arg(kernel, 18, ArgVal::scalar(&k_nb3))?;
+        set_kernel_arg(kernel, 19, ArgVal::scalar(&k_nb1))?;
+        set_kernel_arg(kernel, 20, ArgVal::scalar(&k_nb2))?;
+        set_kernel_arg(kernel, 21, ArgVal::scalar(&k_nb3))?;
+        set_kernel_arg(kernel, 22, ArgVal::scalar(&o_nb1))?;
+        set_kernel_arg(kernel, 23, ArgVal::scalar(&o_nb2))?;
+        set_kernel_arg(kernel, 24, ArgVal::scalar(&o_nb3))?;
+        // ALiBi / softcap unused (args 25-29)
+        set_kernel_arg(kernel, 25, ArgVal::scalar(&zero_f32))?;
+        set_kernel_arg(kernel, 26, ArgVal::scalar(&zero_f32))?;
+        set_kernel_arg(kernel, 27, ArgVal::scalar(&zero_f32))?;
+        set_kernel_arg(kernel, 28, ArgVal::scalar(&zero_i32))?;
+        set_kernel_arg(kernel, 29, ArgVal::scalar(&zero_f32))?;
+        set_kernel_arg(kernel, 30, ArgVal::scalar(&n_head_kv))?;
+        // mask = NULL (args 31-37)
+        set_kernel_arg(kernel, 31, ArgVal::mem_null())?;
+        set_kernel_arg(kernel, 32, ArgVal::scalar(&zero_u64))?;
+        set_kernel_arg(kernel, 33, ArgVal::scalar(&zero_u64))?;
+        set_kernel_arg(kernel, 34, ArgVal::scalar(&zero_u64))?;
+        set_kernel_arg(kernel, 35, ArgVal::scalar(&zero_u64))?;
+        set_kernel_arg(kernel, 36, ArgVal::scalar(&zero_i32))?;
+        set_kernel_arg(kernel, 37, ArgVal::scalar(&zero_i32))?;
+        // sinks = NULL (args 38-39)
+        set_kernel_arg(kernel, 38, ArgVal::mem_null())?;
+        set_kernel_arg(kernel, 39, ArgVal::scalar(&zero_u64))?;
+        // scores (args 40-43)
+        set_kernel_arg(kernel, 40, ArgVal::mem(s_buf))?;
+        set_kernel_arg(kernel, 41, ArgVal::scalar(&s_layer_offset))?;
+        set_kernel_arg(kernel, 42, ArgVal::scalar(&s_stride))?;
+        set_kernel_arg(kernel, 43, ArgVal::scalar(&write_scores))?;
+        // ragged head starts (arg 44)
+        let kv_start_val = match a.kv_start {
+            Some(m) => ArgVal::mem(m),
+            None => ArgVal::mem_null(),
+        };
+        set_kernel_arg(kernel, Q1_SPLIT_MAIN_KV_START_ARG, kv_start_val)?;
+        // split partials (args 45-46) and the single-split finalize flag (arg 47)
+        set_kernel_arg(kernel, 45, ArgVal::mem(a.part_ml))?;
+        set_kernel_arg(kernel, 46, ArgVal::mem(a.part_o))?;
+        let final_out: i32 = (a.n_splits == 1) as i32;
+        set_kernel_arg(kernel, 47, ArgVal::scalar(&final_out))?;
+    }
+    Ok(())
+}
+
+/// Bind all 17 arguments of `flash_attn_q1_merge`.
+///
+/// # Safety
+/// `kernel` must have been created from `flash_attn_q1_merge` and the buffers
+/// must outlive every enqueue of it.
+pub(crate) unsafe fn bind_flash_q1_merge_args(
+    kernel: &CoreKernel,
+    a: &FlashQ1SplitArgs<'_>,
+) -> Result<()> {
+    use ocl::core::{ArgVal, set_kernel_arg};
+    let o_nb1 = (a.head_dim * 4) as u64;
+    let o_nb3 = (a.n_heads_q * a.head_dim * 4) as u64;
+    let n_head = a.n_heads_q as i32;
+    let n_head_kv = a.n_heads_kv as i32;
+    let n_splits = a.n_splits as i32;
+    let zero_u64 = 0u64;
+    let (s_buf, s_layer_offset, s_stride, write_scores) = a.score;
+    unsafe {
+        set_kernel_arg(kernel, 0, ArgVal::mem(a.o))?;
+        set_kernel_arg(kernel, 1, ArgVal::scalar(&zero_u64))?;
+        set_kernel_arg(kernel, Q1_MERGE_NKV_ARG, ArgVal::scalar(&a.n_kv))?;
+        set_kernel_arg(kernel, 3, ArgVal::scalar(&n_head))?;
+        set_kernel_arg(kernel, 4, ArgVal::scalar(&n_head_kv))?;
+        set_kernel_arg(kernel, 5, ArgVal::scalar(&o_nb1))?;
+        set_kernel_arg(kernel, 6, ArgVal::scalar(&o_nb3))?;
+        // sinks = NULL (args 7-8)
+        set_kernel_arg(kernel, 7, ArgVal::mem_null())?;
+        set_kernel_arg(kernel, 8, ArgVal::scalar(&zero_u64))?;
+        set_kernel_arg(kernel, 9, ArgVal::mem(s_buf))?;
+        set_kernel_arg(kernel, 10, ArgVal::scalar(&s_layer_offset))?;
+        set_kernel_arg(kernel, 11, ArgVal::scalar(&s_stride))?;
+        set_kernel_arg(kernel, 12, ArgVal::scalar(&write_scores))?;
+        let kv_start_val = match a.kv_start {
+            Some(m) => ArgVal::mem(m),
+            None => ArgVal::mem_null(),
+        };
+        set_kernel_arg(kernel, Q1_MERGE_KV_START_ARG, kv_start_val)?;
+        set_kernel_arg(kernel, 14, ArgVal::mem(a.part_ml))?;
+        set_kernel_arg(kernel, 15, ArgVal::mem(a.part_o))?;
+        set_kernel_arg(kernel, 16, ArgVal::scalar(&n_splits))?;
+    }
+    Ok(())
+}
+
+/// Work sizes for the split pair: `(main gws, main lws, merge gws, merge lws)`.
+pub(crate) fn q1_split_work_sizes(
+    n_heads_q: usize,
+    head_dim: usize,
+    n_splits: usize,
+) -> ([usize; 3], [usize; 3], [usize; 3], [usize; 3]) {
+    const Q1_WG_SIZE: usize = 64;
+    (
+        [Q1_WG_SIZE, n_heads_q, n_splits],
+        [Q1_WG_SIZE, 1, 1],
+        [head_dim, n_heads_q, 1],
+        [head_dim, 1, 1],
+    )
+}
+
+/// Build the pre-bound lanes-across-row decode attention pair (ticket 019).
+///
+/// Mirrors [`build_flash_attention_step`]: same program selection, same
+/// score binding, `n_kv` patched per step, `kv_start` rebound per layer step
+/// by the executor. The partial buffers are private to this layer.
+fn build_split_flash_attention_steps(
+    config: &LayerPlanConfig,
+    n_splits: usize,
+) -> Result<AttentionVariant> {
+    let program = match config.head_dim {
+        64 => config.flash_attn_f32_f16_program_dk64,
+        128 => config.flash_attn_f32_f16_program_dk128,
+        _ => None,
+    }
+    .expect("caller must verify flash program is Some for this head_dim");
+
+    let main_kernel = ocl::core::create_kernel(program, "flash_attn_f32_f16_q1_split")
+        .context("create flash_attn_f32_f16_q1_split for plan")?;
+    let merge_kernel = ocl::core::create_kernel(program, "flash_attn_q1_merge")
+        .context("create flash_attn_q1_merge for plan")?;
+
+    let (ml_len, o_len) = q1_split_scratch_len(config.n_heads_q, n_splits, config.head_dim);
+    let alloc = |len: usize, what: &str| -> Result<Mem> {
+        unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                config.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                len,
+                None,
+            )
+        }
+        .with_context(|| format!("create {what} scratch for split flash plan"))
+    };
+    let part_ml = alloc(ml_len, "part_ml")?;
+    let part_o = alloc(o_len, "part_o")?;
+
+    let mut retained_bufs = vec![part_ml.clone(), part_o.clone()];
+    let (score_mem, score_stride_val, score_layer_offset_val, write_scores) =
+        match config.gpu_score_buf {
+            Some(buf) => (
+                buf.clone(),
+                config.gpu_score_stride,
+                config.gpu_score_layer_offset,
+                1i32,
+            ),
+            None => {
+                let dummy = alloc(1, "dummy score")?;
+                retained_bufs.push(dummy.clone());
+                (dummy, 0i32, 0i32, 0i32)
+            }
+        };
+
+    let args = FlashQ1SplitArgs {
+        q: config.q_buf,
+        k: config.k_cache_buf,
+        v: config.v_cache_buf,
+        o: config.out_attn_buf,
+        n_heads_q: config.n_heads_q,
+        n_heads_kv: config.n_kv_heads,
+        head_dim: config.head_dim,
+        kv_capacity: config.kv_capacity,
+        n_kv: 0,
+        score: (
+            &score_mem,
+            score_layer_offset_val,
+            score_stride_val,
+            write_scores,
+        ),
+        kv_start: None,
+        part_ml: &part_ml,
+        part_o: &part_o,
+        n_splits,
+    };
+    unsafe {
+        bind_flash_q1_split_main_args(&main_kernel, &args)?;
+        bind_flash_q1_merge_args(&merge_kernel, &args)?;
+    }
+
+    let (main_gws, main_lws, merge_gws, merge_lws) =
+        q1_split_work_sizes(config.n_heads_q, config.head_dim, n_splits);
+    Ok(AttentionVariant::SplitFlash {
+        main: KernelStep {
+            kernel: main_kernel,
+            ndim: 3,
+            global_work_size: main_gws,
+            local_work_size: Some(main_lws),
+            dynamic_args: vec![DynamicArg::CacheSeqLen {
+                arg_idx: Q1_SPLIT_MAIN_NKV_ARG,
+            }],
+            op_tag: OpTag::Attention,
+            retained_bufs,
+            noshuffle_act_rebuild: None,
+        },
+        merge: KernelStep {
+            kernel: merge_kernel,
+            ndim: 2,
+            global_work_size: merge_gws,
+            local_work_size: Some(merge_lws),
+            dynamic_args: vec![DynamicArg::CacheSeqLen {
+                arg_idx: Q1_MERGE_NKV_ARG,
+            }],
+            op_tag: OpTag::Attention,
+            retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
+        },
+    })
+}
+
 /// Build a pre-bound `kernel_add_row_bias` step that adds the given bias
 /// buffer to the given `x` buffer in-place. Used after QKV matmul steps
 /// for models with `has_qkv_bias=true` (Qwen2 etc.).
@@ -2622,7 +3051,11 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     let use_flash = is_head_major && flash_program_available && !scores_need_legacy_readback;
 
     let attention = if use_flash {
-        build_flash_attention_step(config)?
+        if q1_use_split_pair() {
+            build_split_flash_attention_steps(config, q1_splits())?
+        } else {
+            build_flash_attention_step(config)?
+        }
     } else {
         let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_attn_gen_half")
             .context("create kernel_attn_gen_half")?;

@@ -1125,3 +1125,374 @@ __kernel void flash_attn_f32_f16_q1_partial(
         atomic_xchg(&ready_flags[head_idx], 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Split-KV decode (ticket 019) — lanes-across-row layout, two kernels.
+//
+// Why (argus-paper verdict 2026-09-18 + on-device sweeps the same day): the q1
+// kernel above gives every lane its own cache row and reads it 8 bytes at a
+// time, so one wave-wide load touches 64 different 256-byte lines; with the
+// 32 loads per row that is 64x more line requests than the data needs, and
+// the per-lane state (q + o = 64 float4) leaves at most ~2 waves resident per
+// shader core. Splitting the KV axis across more work-groups on that layout
+// only queued the work-groups (S=2..64 all slower). The cost is the access
+// pattern, not the work-group count.
+//
+// Layout here: LANES_PER_ROW (4) consecutive lanes share one cache row and
+// each reads a contiguous DK/4 slice of it, so a wave-wide load consumes
+// 16 whole lines. Per-lane state is q_slice + o_slice (2*DK_VEC/4 float4).
+// The 4 partial dot products are exchanged through a double-buffered SLM
+// array: one barrier per 16-row iteration. m/l of a row group are kept
+// identically on its 4 lanes (same arithmetic, same values).
+//
+//   flash_attn_f32_f16_q1_split : gws [Q1_WG_SIZE, n_head, n_splits], lws [Q1_WG_SIZE,1,1]
+//       args 0..44 are the q1 layout; 45 = part_ml, 46 = part_o, 47 = final_out.
+//       Chunk of split s: [k_lo + s*chunk, min(k_lo + (s+1)*chunk, n_kv)) with
+//       chunk = round_up(ceil((n_kv - k_lo) / n_splits), 16).
+//       final_out == 0: writes part_ml[(hb*n_splits + s)*2 + {0,1}] = (m, l) and
+//         part_o[(hb*n_splits + s)*DV + d] = sum_t exp(s_t - m) * V[t][d]; an empty
+//         chunk writes l = 0 and zeros. With write_scores the RAW scaled logit
+//         goes to S[row + t]; split 0 zeroes the hole columns [0, k_lo).
+//       final_out != 0 (n_splits == 1): writes O = o / l straight into o_void
+//         and normalises the score row itself — no merge dispatch.
+//   flash_attn_q1_merge         : gws [DV, n_head], lws [DV,1,1]  (n_splits > 1 only)
+//       M = max over valid splits (and the sink); L = sum exp(m_s - M) * l_s (+ exp(sink - M));
+//       o[d] = sum exp(m_s - M) * part_o[s][d] / L; scores S[row+t] = exp(S[row+t] - M) / L.
+//       A split is valid iff l_s > 0 (no ±INFINITY tests: -cl-finite-math-only).
+// ---------------------------------------------------------------------------
+#define Q1S_LANES_PER_ROW 4
+#define Q1S_ROWS_PER_ITER (Q1_WG_SIZE / Q1S_LANES_PER_ROW)   // 16
+#define Q1S_DK_SLICE (DK_VEC / Q1S_LANES_PER_ROW)             // float4s per lane (8 @DK=128)
+#define Q1S_DV_SLICE (DV_VEC / Q1S_LANES_PER_ROW)             // float4s per lane (8 @DV=128)
+#define Q1S_DV_SLICE_FLOATS (DV / Q1S_LANES_PER_ROW)          // floats per lane (32 @DV=128)
+
+__kernel void flash_attn_f32_f16_q1_split(
+    const global void * q_void, ulong q_offset,
+    const global void * k_void, ulong k_offset,
+    const global void * v_void, ulong v_offset,
+    global void * o_void, ulong o_offset,
+    const float scale,
+    const int n_q,
+    const int n_kv,
+    const int is_causal,
+    const int n_head,
+    const ulong q_nb1, const ulong q_nb2, const ulong q_nb3,
+    const ulong k_nb1, const ulong k_nb2, const ulong k_nb3,
+    const ulong v_nb1, const ulong v_nb2, const ulong v_nb3,
+    const ulong o_nb1, const ulong o_nb2, const ulong o_nb3,
+    const float max_bias,
+    const float m0,
+    const float m1,
+    const int n_head_log2,
+    const float logit_softcap,
+    const int n_head_kv,
+    const global void* mask_void,
+    const ulong mask_offset,
+    const ulong mask_nb1,
+    const ulong mask_nb2,
+    const ulong mask_nb3,
+    const int mask_ne2,
+    const int mask_ne3,
+    const global void* sinks_void,             // folded only when final_out != 0
+    const ulong sinks_offset,
+    global float * S,
+    const int score_layer_offset,
+    const int score_stride,
+    const int write_scores,
+    const global int * kv_start,
+    global float * part_ml,
+    global float * part_o,
+    const int final_out
+) {
+    const int tid = get_local_id(0);
+    const int grp = tid / Q1S_LANES_PER_ROW;      // row group 0..15
+    const int sub = tid % Q1S_LANES_PER_ROW;      // slice 0..3
+    const int head_batch_idx = get_global_id(1);
+    const int split = get_group_id(2);
+    const int n_splits = get_num_groups(2);
+
+    const int batch_idx = head_batch_idx / n_head;
+    const int head_idx = head_batch_idx % n_head;
+
+    const int gqa_ratio = n_head / n_head_kv;
+    const int head_kv_idx = head_idx / gqa_ratio;
+    const int k_lo = (kv_start != NULL) ? min(kv_start[head_kv_idx], n_kv) : 0;
+
+    const int total = n_kv - k_lo;
+    int chunk = 0;
+    if (total > 0) {
+        chunk = (total + n_splits - 1) / n_splits;
+        chunk = (chunk + Q1S_ROWS_PER_ITER - 1) & ~(Q1S_ROWS_PER_ITER - 1);
+    }
+    const int kv_begin = k_lo + split * chunk;
+    const int kv_end = min(kv_begin + chunk, n_kv);
+    const int part_idx = head_batch_idx * n_splits + split;
+
+    const int score_row_base = score_layer_offset + head_idx * score_stride;
+    if (write_scores && split == 0) {
+        for (int t = tid; t < k_lo; t += Q1_WG_SIZE) {
+            S[score_row_base + t] = 0.0f;
+        }
+    }
+
+    global char* o_base = (global char*)o_void + o_offset;
+    global float * o_row = (global float *)(o_base + batch_idx * o_nb3 + head_idx * o_nb1);
+
+    // Empty chunk. `l == 0` is the "no rows" marker the merge kernel tests.
+    // Uniform branch; no barrier has been passed yet.
+    if (kv_begin >= kv_end) {
+        if (final_out) {
+            for (int d = tid; d < DV; d += Q1_WG_SIZE) o_row[d] = 0.0f;
+        } else {
+            if (tid == 0) {
+                part_ml[part_idx * 2 + 0] = 0.0f;
+                part_ml[part_idx * 2 + 1] = 0.0f;
+            }
+            global float * po_empty = part_o + (ulong)part_idx * DV;
+            for (int d = tid; d < DV; d += Q1_WG_SIZE) po_empty[d] = 0.0f;
+        }
+        return;
+    }
+
+    const global char* q_base = (const global char*)q_void + q_offset;
+    const global char* k_base = (const global char*)k_void + k_offset;
+    const global char* v_base = (const global char*)v_void + v_offset;
+
+    const global char* mask_base = NULL;
+    if (mask_void != NULL) {
+        const int mask_head_idx = head_idx % mask_ne2;
+        const int mask_batch_idx = batch_idx % mask_ne3;
+        mask_base = (const global char*)mask_void + mask_offset + mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
+    }
+
+    // This lane's DK slice of q.
+    ACC_TYPE4 q_slice[Q1S_DK_SLICE];
+    {
+        const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
+        const global Q_DATA_TYPE4* q_ptr = (const global Q_DATA_TYPE4*)(q_base + q_row_offset) + sub * Q1S_DK_SLICE;
+        #pragma unroll
+        for (int i = 0; i < Q1S_DK_SLICE; ++i) q_slice[i] = CONVERT_Q_ACC4(q_ptr[i]);
+    }
+
+    float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
+
+    ACC_TYPE m_i = -INFINITY;
+    ACC_TYPE l_i = 0.0f;
+    ACC_TYPE4 o_slice[Q1S_DV_SLICE];
+    #pragma unroll
+    for (int i = 0; i < Q1S_DV_SLICE; ++i) o_slice[i] = (ACC_TYPE4)(0.0f);
+
+    __local ACC_TYPE xch[2][Q1_WG_SIZE];   // 4-lane partial-dot exchange, double buffered
+    int buf = 0;
+    // Uniform trip count: every lane hits every barrier; inactive tail rows contribute 0.
+    for (int base = kv_begin; base < kv_end; base += Q1S_ROWS_PER_ITER) {
+        const int k_idx = base + grp;
+        const int active = (k_idx < kv_end);
+        ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
+        if (active) {
+            const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
+            const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset) + sub * Q1S_DK_SLICE;
+            #pragma unroll
+            for (int k = 0; k < Q1S_DK_SLICE; k++) {
+                dot_acc = mad(q_slice[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
+            }
+        }
+        xch[buf][tid] = dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const int xb = grp * Q1S_LANES_PER_ROW;
+        ACC_TYPE score = (xch[buf][xb] + xch[buf][xb + 1] + xch[buf][xb + 2] + xch[buf][xb + 3]) * scale;
+        buf ^= 1;
+        if (active) {
+            if (mask_base != NULL) {
+                const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
+                score += slope * (ACC_TYPE)mask_ptr[k_idx];
+            }
+            if (logit_softcap > 0.0f) {
+                score = logit_softcap * tanh(score / logit_softcap);
+            }
+            if (write_scores && sub == 0) {
+                S[score_row_base + k_idx] = (float)score;
+            }
+            // Online softmax with a lazy rescale (identical on the 4 lanes of a group).
+            if (score > m_i) {
+                const ACC_TYPE f = exp(m_i - score);   // exp(-inf) = 0 on the first row
+                l_i *= f;
+                #pragma unroll
+                for (int i = 0; i < Q1S_DV_SLICE; i++) o_slice[i] *= f;
+                m_i = score;
+            }
+            const ACC_TYPE p = exp(score - m_i);
+            l_i += p;
+            const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
+            const global KV_DATA_TYPE4* v_ptr = (const global KV_DATA_TYPE4*)(v_base + v_row_offset) + sub * Q1S_DV_SLICE;
+            #pragma unroll
+            for (int i = 0; i < Q1S_DV_SLICE; i++) {
+                o_slice[i] = mad(p, CONVERT_KV_ACC4(v_ptr[i]), o_slice[i]);
+            }
+        }
+    }
+
+    // --- Reduce the 16 row groups ---------------------------------------------
+    __local ACC_TYPE local_m[Q1S_ROWS_PER_ITER];
+    __local ACC_TYPE local_l[Q1S_ROWS_PER_ITER];
+    __local float o_t[Q1S_ROWS_PER_ITER][DV];   // 8 KB @DV=128
+    if (sub == 0) {
+        local_m[grp] = m_i;
+        local_l[grp] = l_i;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    // Every lane derives M and L itself from the 16 (m, l) pairs: no tree, no extra barrier.
+    // Groups that saw no row have l == 0 and are skipped (no exp(-inf) evaluated).
+    ACC_TYPE m_wg = 0.0f;
+    int any_valid = 0;
+    #pragma unroll
+    for (int g = 0; g < Q1S_ROWS_PER_ITER; ++g) {
+        if (local_l[g] > 0.0f) {
+            m_wg = any_valid ? max(m_wg, local_m[g]) : local_m[g];
+            any_valid = 1;
+        }
+    }
+    ACC_TYPE l_wg = 0.0f;
+    #pragma unroll
+    for (int g = 0; g < Q1S_ROWS_PER_ITER; ++g) {
+        if (local_l[g] > 0.0f) l_wg += exp(local_m[g] - m_wg) * local_l[g];
+    }
+    {
+        const ACC_TYPE f = (l_i > 0.0f) ? exp(m_i - m_wg) : 0.0f;
+        #pragma unroll
+        for (int i = 0; i < Q1S_DV_SLICE; ++i) {
+            const ACC_TYPE4 v = o_slice[i] * f;
+            const int c = sub * Q1S_DV_SLICE_FLOATS + i * 4;
+            o_t[grp][c + 0] = v.s0;
+            o_t[grp][c + 1] = v.s1;
+            o_t[grp][c + 2] = v.s2;
+            o_t[grp][c + 3] = v.s3;
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (final_out) {
+        // n_splits == 1: finish here (the q1 contract: o = acc / l, zeros when l == 0).
+        ACC_TYPE m_final = m_wg;
+        ACC_TYPE l_final = l_wg;
+        if (sinks_void != NULL) {
+            const global ACC_TYPE* sinks_ptr = (const global ACC_TYPE*)((const global char*)sinks_void + sinks_offset);
+            const ACC_TYPE m_sink = sinks_ptr[head_idx];
+            m_final = any_valid ? max(m_wg, m_sink) : m_sink;
+            const ACC_TYPE rs = any_valid ? exp(m_wg - m_final) : 0.0f;
+            l_final = l_wg * rs + exp(m_sink - m_final);
+            // Rescale the tile contribution below through `rs`.
+            for (int d = tid; d < DV; d += Q1_WG_SIZE) {
+                ACC_TYPE acc = 0.0f;
+                #pragma unroll
+                for (int g = 0; g < Q1S_ROWS_PER_ITER; ++g) acc += o_t[g][d];
+                o_row[d] = (l_final > 0.0f) ? (float)(acc * rs / l_final) : 0.0f;
+            }
+        } else {
+            for (int d = tid; d < DV; d += Q1_WG_SIZE) {
+                ACC_TYPE acc = 0.0f;
+                #pragma unroll
+                for (int g = 0; g < Q1S_ROWS_PER_ITER; ++g) acc += o_t[g][d];
+                o_row[d] = (l_final > 0.0f) ? (float)(acc / l_final) : 0.0f;
+            }
+        }
+        if (write_scores && l_final > 0.0f) {
+            const ACC_TYPE inv_l = 1.0f / l_final;
+            for (int t = kv_begin + tid; t < kv_end; t += Q1_WG_SIZE) {
+                S[score_row_base + t] = (float)(exp((ACC_TYPE)S[score_row_base + t] - m_final) * inv_l);
+            }
+        }
+        return;
+    }
+
+    global float * po = part_o + (ulong)part_idx * DV;
+    for (int d = tid; d < DV; d += Q1_WG_SIZE) {
+        ACC_TYPE acc = 0.0f;
+        #pragma unroll
+        for (int g = 0; g < Q1S_ROWS_PER_ITER; ++g) acc += o_t[g][d];
+        po[d] = (float)acc;
+    }
+    if (tid == 0) {
+        part_ml[part_idx * 2 + 0] = (float)m_wg;
+        part_ml[part_idx * 2 + 1] = (float)l_wg;
+    }
+}
+
+__kernel void flash_attn_q1_merge(
+    global void * o_void, ulong o_offset,      // 0, 1
+    const int n_kv,                            // 2 (patched per decode step)
+    const int n_head,                          // 3
+    const int n_head_kv,                       // 4
+    const ulong o_nb1,                         // 5  head stride (bytes)
+    const ulong o_nb3,                         // 6  batch stride (bytes)
+    const global void* sinks_void,             // 7
+    const ulong sinks_offset,                  // 8
+    global float * S,                          // 9
+    const int score_layer_offset,              // 10
+    const int score_stride,                    // 11
+    const int write_scores,                    // 12
+    const global int * kv_start,               // 13
+    const global float * part_ml,              // 14
+    const global float * part_o,               // 15
+    const int n_splits                         // 16
+) {
+    const int tid = get_local_id(0);           // 0..DV-1: one output component
+    const int head_batch_idx = get_global_id(1);
+    const int batch_idx = head_batch_idx / n_head;
+    const int head_idx = head_batch_idx % n_head;
+    const int gqa_ratio = n_head / n_head_kv;
+    const int head_kv_idx = head_idx / gqa_ratio;
+    const int k_lo = (kv_start != NULL) ? min(kv_start[head_kv_idx], n_kv) : 0;
+    const int base = head_batch_idx * n_splits;
+
+    ACC_TYPE m_sink = 0.0f;
+    if (sinks_void != NULL) {
+        const global ACC_TYPE* sinks_ptr = (const global ACC_TYPE*)((const global char*)sinks_void + sinks_offset);
+        m_sink = sinks_ptr[head_idx];
+    }
+
+    // A split is valid iff l_s > 0 (empty chunks write l = 0). No ±INFINITY
+    // comparisons: -cl-finite-math-only may fold them.
+    const int has_sink = (sinks_void != NULL);
+    ACC_TYPE M = 0.0f;
+    int any_valid = 0;
+    for (int s = 0; s < n_splits; ++s) {
+        const ACC_TYPE l_s = part_ml[(base + s) * 2 + 1];
+        if (l_s > 0.0f) {
+            const ACC_TYPE m_s = part_ml[(base + s) * 2 + 0];
+            M = any_valid ? max(M, m_s) : m_s;
+            any_valid = 1;
+        }
+    }
+    if (has_sink) {
+        M = any_valid ? max(M, m_sink) : m_sink;
+        any_valid = 1;
+    }
+
+    ACC_TYPE L = 0.0f;
+    ACC_TYPE acc = 0.0f;
+    if (any_valid) {
+        for (int s = 0; s < n_splits; ++s) {
+            const ACC_TYPE l_s = part_ml[(base + s) * 2 + 1];
+            if (!(l_s > 0.0f)) continue;
+            const ACC_TYPE w = exp(part_ml[(base + s) * 2 + 0] - M);
+            L += w * l_s;
+            acc += w * part_o[(ulong)(base + s) * DV + tid];
+        }
+        if (has_sink) {
+            L += exp(m_sink - M);
+        }
+    }
+
+    global char* o_base = (global char*)o_void + o_offset;
+    global float * o_row = (global float *)(o_base + batch_idx * o_nb3 + head_idx * o_nb1);
+    o_row[tid] = (L > 0.0f) ? (float)(acc / L) : 0.0f;
+
+    if (write_scores && L > 0.0f) {
+        const int score_row_base = score_layer_offset + head_idx * score_stride;
+        const ACC_TYPE inv_l = 1.0f / L;
+        for (int t = k_lo + tid; t < n_kv; t += DV) {
+            S[score_row_base + t] = (float)(exp((ACC_TYPE)S[score_row_base + t] - M) * inv_l);
+        }
+    }
+}
