@@ -36,6 +36,20 @@ project is pre-1.0; minor releases may include breaking changes.
 
 ### Changed
 
+- **OpenCL decode attention reads each KV row with four lanes** (`flash_attn_f32_f16_q1_split` +
+  `flash_attn_q1_merge`, F16 HeadMajor KV, head_dim 64/128; plan and runtime paths). The previous
+  decode kernel (`flash_attn_f32_f16_q1`) gave every lane its own cache row and read it 8 bytes at a
+  time, so one wave-wide load touched 64 different 256-byte lines, and its per-lane state (q + o =
+  64 float4) left few waves resident per shader core. The new kernel has four consecutive lanes share
+  a row and read contiguous DK/4 slices, keeps only a q/o slice per lane, exchanges the four partial
+  dot products through a double-buffered local array (one barrier per 16 rows), runs a single-pass
+  online softmax, and splits the KV axis into 2 chunks merged by a small second kernel. Same O,
+  post-softmax score buffer and ragged `kv_start` contract (host parity test: 480 combinations vs an
+  F32 reference and vs the old kernel, 1e-4). On Galaxy S25 (Adreno 830, Qwen2.5-1.5B F16, same
+  binary, order-interleaved A/B) decode TBT is 0.96x / 0.81x / 0.58x of the old kernel at 128 / 2048 /
+  7168 cached tokens, with byte-identical greedy output. `LLMRS_Q1_KERNEL=q1` selects the old kernel
+  (unchanged) and `LLMRS_Q1_SPLITS=<n>` overrides the split count; both exist for A/B runs.
+
 - Unified the GPU score-accumulator arming into one helper, `score_fed::arm_gpu_score_acc`,
   replacing four hand-rolled `init_gpu_score_acc` + `set_active` blocks (`eval`, `bench` ×2, `chat`)
   that had drifted in their failure-logging. It sits next to its `sync_gpu_scores_to_cpu` /
