@@ -939,10 +939,11 @@ pub struct FullKernelPlan {
     pub lm_head: Option<KernelStep>,
     /// KV cache capacity at plan creation time (for invalidation check)
     pub kv_capacity: usize,
-    /// True when the legacy attention step was bound to the backend's GPU
-    /// score accumulator at build time. `execute()` uses this flag to drive
-    /// `GpuScoreAccumulator::reduce_layer` per layer and `end_step` after
-    /// the final layer, mirroring the non-plan path in `transformer.rs`.
+    /// True when the attention step was bound to the backend's GPU score
+    /// accumulator at build time. `execute()` uses this flag to run `end_step`
+    /// after the final layer, mirroring the non-plan path in `transformer.rs`;
+    /// the caller compares it with the accumulator's live state and rebuilds
+    /// the plan on a mismatch.
     pub writes_gpu_scores: bool,
     /// ENG-ALG-219: `TransformerModel::ratio_generation` value captured at
     /// `build_plan` time (Acquire load). `execute()` compares the live counter
@@ -955,6 +956,28 @@ pub struct FullKernelPlan {
     /// lifetime — cheap clone, ensures the atomic is not dropped while this
     /// plan is cached.
     pub ratio_generation_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// `Some` when the output-perturbation query-row ring is armed: `execute()` copies each
+    /// layer's rotated query row into the ring right after the RoPE steps. Set by the caller
+    /// after `build_full_plan` ([`FullKernelPlan::set_q_row_copy`]); `None` costs one branch
+    /// per layer.
+    pub q_row_copy: Option<QRowPlanCopy>,
+}
+
+/// Per-layer device copy of the step's rotated query row into the output-perturbation ring
+/// (`crate::inference::q_rows`). The plan twin of `QRowCapture::capture` for one decode row:
+/// layer `l` at absolute position `p` lands in ring row `l * rows + p % rows`.
+pub struct QRowPlanCopy {
+    /// The decode workspace's query buffer (`ws.q`), rotated in place by the layer's RoPE step.
+    pub src: Mem,
+    /// `[n_layers][rows][q_dim]` f32 ring.
+    pub ring: Mem,
+    pub n_layers: usize,
+    pub rows: usize,
+    /// `q_dim * size_of::<f32>()`.
+    pub row_bytes: usize,
+    /// Set when a copy failed to enqueue. The caller then leaves the ring's position stamps
+    /// alone, so the next read of the ring is refused instead of served with a stale row.
+    pub failed: std::sync::atomic::AtomicBool,
 }
 
 /// Error indicating the plan's pre-bound arguments are stale.
@@ -1011,6 +1034,23 @@ pub fn check_global_generation(
 }
 
 impl FullKernelPlan {
+    /// Arm the per-layer query-row copy (see [`QRowPlanCopy`]).
+    pub fn set_q_row_copy(&mut self, copy: QRowPlanCopy) {
+        self.q_row_copy = Some(copy);
+    }
+
+    /// Whether this plan copies query rows into the ring.
+    pub fn captures_q_rows(&self) -> bool {
+        self.q_row_copy.is_some()
+    }
+
+    /// False once any query-row copy failed to enqueue.
+    pub fn q_row_copy_ok(&self) -> bool {
+        self.q_row_copy
+            .as_ref()
+            .is_none_or(|c| !c.failed.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// Dispatch a single kernel step, updating its dynamic args.
     ///
     /// When `backend.profile_events_enabled` is true, the dispatch goes
@@ -1315,6 +1355,29 @@ impl FullKernelPlan {
                     );
                 }
             }
+            // Query-row capture (output-perturbation metric): the RoPE steps above left this
+            // layer's rotated query row in `ws.q`; copy it out before the next layer overwrites it.
+            if let Some(c) = self.q_row_copy.as_ref()
+                && i < c.n_layers
+            {
+                let dst_off = (i * c.rows + start_pos % c.rows) * c.row_bytes;
+                if let Err(e) = unsafe {
+                    ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
+                        queue,
+                        &c.src,
+                        &c.ring,
+                        0,
+                        dst_off,
+                        c.row_bytes,
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )
+                } {
+                    log::error!("Plan q-row copy failed: layer={i} pos={start_pos}: {e}");
+                    c.failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+
             // Step 7: KV update
             match &layer_plan.kv_update {
                 KvUpdateVariant::Standard(step) => {
@@ -4156,5 +4219,6 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
         writes_gpu_scores: config.needs_attention_scores && config.gpu_score_buf.is_some(),
         ratio_generation_at_build,
         ratio_generation_counter,
+        q_row_copy: None,
     })
 }
