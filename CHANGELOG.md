@@ -36,6 +36,31 @@ project is pre-1.0; minor releases may include breaking changes.
 
 ### Changed
 
+- **OpenCL decode keeps the pre-bound kernel plan when the GPU score accumulator or the
+  query-row ring is armed** (`--aperturb-select`, score-based eviction on a GPU backend). Both used
+  to force every decode step through the `forward_into` layer loop: per-step kernel-argument
+  rebinding, two flushes per layer, one `clEnqueueCopyBuffer` per layer for the query-row capture,
+  and a CPU score accumulator doing per-token work whose result the device-authoritative pull
+  (`SignalRuntime::ensure_coherent`) overwrites anyway. The plan already writes scores into the
+  GPU accumulator and binds the ragged `kv_start`; it now also copies each layer's rotated query
+  row into the ring right after the RoPE steps (`QRowPlanCopy`), and the forward stamps the ring
+  position after a successful step (a failed copy leaves the stamp stale, so the next ring read is
+  refused). A plan whose armed state no longer matches is rebuilt. A CPU-only score path, a read
+  stage, head masking, DuoAttention and a layer-boundary hook still take the layer loop. With
+  `--no-gpu-plan` the four-decision `sched010` fixture is byte-identical to the previous build
+  (choices, candidate scores, text); on the plan path the first three decisions make the same
+  choice with scores equal to 3-4 significant digits and the text matches for ~870 tokens (the
+  plan and layer-loop kernels differ in rounding). On Galaxy S25 (Adreno 830, Qwen2.5-1.5B F16)
+  under 4K60 camera recording at the 160 MHz GPU cap, the armed arm's decode TBT gap over the
+  unarmed plan arm goes from +8.1 ms to +0.4 ms at cache 128-512 and from +8.4 ms to +4.2 ms at
+  cache 1024-1280 (baseline 275-286 ms; order-interleaved, two cells per arm). The remainder
+  scales with the cache: the score writes and the two per-token score-reduce kernels. The layer
+  loop also runs a different F16 GEMV kernel than the plan (`1row` vs the 4-wave kernel): `1row`
+  is ~1.9 ms/token faster at the 1200 MHz cap and neutral-to-slower at 525 / 160 MHz, so at an
+  unthrottled clock the armed arm is now ~1.4 ms slower than before (53.6-54.5 → 55.5 ms; it
+  equals the unarmed arm) and faster once the GPU throttles (525 MHz: 76.0 → 71.2 ms). The plan's
+  kernel choice is unchanged.
+
 - **OpenCL decode attention reads each KV row with four lanes** (`flash_attn_f32_f16_q1_split` +
   `flash_attn_q1_merge`, F16 HeadMajor KV, head_dim 64/128; plan and runtime paths). The previous
   decode kernel (`flash_attn_f32_f16_q1`) gave every lane its own cache row and read it 8 bytes at a

@@ -391,6 +391,35 @@ impl ModelForward {
             handles,
             &self.backend,
         );
+        // Query-row ring armed → the plan copies each layer's rotated query row itself.
+        let plan = plan.and_then(|mut plan| {
+            let guard = self.q_rows.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(cap) = guard.as_ref() else {
+                return Some(plan);
+            };
+            let src = crate::backend::opencl::get_cl_mem(self.decode_workspace.q.buffer().as_ref());
+            let ring = crate::backend::opencl::get_cl_mem(cap.ring().buffer().as_ref());
+            let q_floats = self.decode_workspace.q.size() / 4;
+            match (src, ring) {
+                (Ok(src), Ok(ring)) if q_floats == cap.q_dim() => {
+                    plan.set_q_row_copy(crate::backend::opencl::plan::QRowPlanCopy {
+                        src: src.clone(),
+                        ring: ring.clone(),
+                        n_layers: cap.n_layers(),
+                        rows: cap.rows(),
+                        row_bytes: cap.q_dim() * 4,
+                        failed: std::sync::atomic::AtomicBool::new(false),
+                    });
+                    Some(plan)
+                }
+                _ => {
+                    if trace {
+                        eprintln!("[fwd-trace] q-row ring not plan-copyable → dyn path");
+                    }
+                    None
+                }
+            }
+        });
         if plan.is_none() {
             // build_plan이 None 반환 → 본 모델/상태에서 plan path 미지원.
             // 매 step 시도를 막기 위해 sticky lock-out.
@@ -701,10 +730,10 @@ impl Forward for ModelForward {
         // forward_into(layer loop) 폴백만이 hook 을 정확히 호출한다.
         let hook = self.current_hook();
 
-        // §5.9.1 Track A: score accumulator 활성 여부 1회 read. active 면 plan path(execute_plan)를
-        // 우회한다 — plan path 는 CPU score_accumulator 슬롯을 지원하지 않는다(GPU gpu_score_acc
-        // 는 plan path 지원하나 CPU-side AttentionScoreAccumulator 는 forward_into layer loop 에서만
-        // 누적). accumulator 가 active 면 단일 lock 스코프에서 begin_step() 호출 + guard 해제 후
+        // §5.9.1 Track A: score accumulator 활성 여부 1회 read. active 이고 **GPU 누적기가 없으면**
+        // plan path(execute_plan)를 우회한다 — CPU-side AttentionScoreAccumulator 는 forward_into
+        // layer loop 에서만 누적한다(GPU gpu_score_acc 는 plan path 가 지원 — 아래 `gpu_scores_armed`).
+        // layer loop 로 가면 단일 lock 스코프에서 begin_step() 호출 + guard 해제 후
         // forward args 에 `Some(&mut acc)` 주입(end_step 은 forward_into 내부 자동 — 재호출 금지).
         // opencl plan-bypass 게이트 전용(cuda 는 plan path 없음 → 아래 fallback 에서 직접 재평가하므로 미사용).
         #[cfg_attr(not(feature = "opencl"), allow(unused_variables))]
@@ -727,9 +756,10 @@ impl Forward for ModelForward {
         // plan path → bypass the plan when armed (same reason as head-masking).
         #[cfg_attr(not(feature = "opencl"), allow(unused_variables))]
         let duo_heads_active = self.duo_heads.is_some();
-        // The query-row capture lives in the `forward_into` layer loop; the fused plan path
-        // bypasses that loop entirely and overwrites `ws.q` layer to layer, so a plan step would
-        // capture nothing at all. Bypass it when armed — the same reason as head-masking.
+        // The query-row capture lives in the `forward_into` layer loop, and the fused plan path
+        // bypasses that loop and overwrites `ws.q` layer to layer. A plan built while the ring is
+        // armed therefore carries its own per-layer device copy (`QRowPlanCopy`, set in
+        // `try_build_plan`); this flag only tells the gate below which kind of plan it needs.
         #[cfg_attr(not(feature = "opencl"), allow(unused_variables))]
         let q_rows_active = self
             .q_rows
@@ -737,16 +767,36 @@ impl Forward for ModelForward {
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
 
+        // An armed GPU score accumulator is device-authoritative: the plan's attention step writes
+        // the scores, `FullKernelPlan::execute` folds them at `end_step`, and every reader pulls
+        // them through `SignalRuntime::ensure_coherent` — the CPU accumulator's per-step calls add
+        // nothing to that, so the score signal alone no longer forces the layer loop. A CPU-only
+        // score path (no GPU accumulator) still does.
+        #[cfg(feature = "opencl")]
+        let gpu_scores_armed = self
+            .backend
+            .gpu_score_acc()
+            .is_some_and(|acc| acc.is_active());
+        #[cfg(feature = "opencl")]
+        let score_needs_layer_loop = score_active && !gpu_scores_armed;
+
         // (3p) ④-a plan path: fmt 핸들 기반 lazy build + execute_plan.
-        // hook 설치 중 또는 score accumulator active 또는 read stage active 이면 우회.
+        // hook 설치 중 또는 CPU-only score accumulator active 또는 read stage active 이면 우회.
+        // The query-row capture rides the plan as a per-layer device copy (`QRowPlanCopy`).
         #[cfg(feature = "opencl")]
         if hook.is_none()
-            && !score_active
+            && !score_needs_layer_loop
             && !read_stage_active
             && !head_mask_active
             && !duo_heads_active
-            && !q_rows_active
         {
+            // A plan built before the score accumulator or the query-row ring was armed (or
+            // after one was disarmed) has the wrong steps bound — rebuild it.
+            if self.gpu_plan.as_ref().is_some_and(|p| {
+                p.writes_gpu_scores != gpu_scores_armed || p.captures_q_rows() != q_rows_active
+            }) {
+                self.gpu_plan = None;
+            }
             if self.gpu_plan.is_none() && !self.sticky_disabled {
                 self.gpu_plan = self.try_build_plan();
             }
@@ -771,6 +821,20 @@ impl Forward for ModelForward {
             };
             match plan_result {
                 Ok(true) => {
+                    // The plan copied this step's query rows on the device; stamp the ring so
+                    // the decision-point read finds them. A failed copy leaves the stamp stale
+                    // and that read is refused.
+                    if let Some(plan) = plan_opt.as_ref()
+                        && plan.captures_q_rows()
+                        && plan.q_row_copy_ok()
+                        && let Some(cap) = self
+                            .q_rows
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_mut()
+                    {
+                        cap.note_decode_step(ctx.pos);
+                    }
                     self.gpu_plan = plan_opt;
                     return self.read_logits(&self.logits_decode);
                 }

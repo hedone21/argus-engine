@@ -145,12 +145,27 @@ impl QRowCapture {
             done += run;
         }
         if layer == 0 {
-            for j in 0..take {
-                let p = first_pos + j;
-                self.slot_pos[p % self.rows] = p;
-            }
+            self.stamp(first_pos, take);
         }
         Ok(())
+    }
+
+    /// Record that slots `first_pos..first_pos + count` now hold those positions.
+    fn stamp(&mut self, first_pos: usize, count: usize) {
+        for p in first_pos..first_pos + count {
+            self.slot_pos[p % self.rows] = p;
+        }
+    }
+
+    /// The ring tensor `[n_layers][rows][q_dim]`, for a caller that does the device copy itself.
+    pub fn ring(&self) -> &Tensor {
+        &self.ring
+    }
+
+    /// A decode step at `pos` was captured for every layer by someone else — the OpenCL plan
+    /// path copies the rows inside its own dispatch loop (`QRowPlanCopy`) and reports here.
+    pub fn note_decode_step(&mut self, pos: usize) {
+        self.stamp(pos, 1);
     }
 
     /// The `min(rows, n_resident)` most recently captured positions, as `(first_pos, count)`, or
@@ -344,6 +359,43 @@ mod tests {
             }
         }
         assert_eq!(snap.first_pos + snap.rows, n);
+    }
+
+    /// The OpenCL plan path copies a decode step's rows itself (same slot rule: layer `l`,
+    /// position `p` → ring row `l * rows + p % rows`) and only reports the position. The ring
+    /// must then serve those rows exactly as if `capture` had written them.
+    #[test]
+    fn a_decode_step_copied_by_the_plan_is_served_like_a_captured_one() {
+        let (n_layers, rows, q_dim) = (2usize, 4usize, 3usize);
+        let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+        let mut c = cap(n_layers, rows, q_dim);
+        let row = |p: usize, l: usize| -> Vec<f32> {
+            (0..q_dim)
+                .map(|e| (p * 100 + l) as f32 + e as f32 / 1000.0)
+                .collect()
+        };
+        // Prefill of 6 through `capture`, then 3 decode steps written the way the plan does.
+        for l in 0..n_layers {
+            let buf = mem.alloc(6 * q_dim * 4, DType::F32).unwrap();
+            let mut t = Tensor::new(Shape::new(vec![1, 6, q_dim]), buf, backend.clone());
+            for p in 0..6 {
+                t.as_mut_slice::<f32>()[p * q_dim..(p + 1) * q_dim].copy_from_slice(&row(p, l));
+            }
+            c.capture(l, &t, backend.as_ref(), 0, 6, q_dim).unwrap();
+        }
+        for p in 6..9 {
+            for l in 0..n_layers {
+                let mut ring = c.ring().clone();
+                let at = (l * rows + p % rows) * q_dim;
+                ring.as_mut_slice::<f32>()[at..at + q_dim].copy_from_slice(&row(p, l));
+            }
+            // Not reported yet → the newest position is not served.
+            assert!(!c.covers(p + 1));
+            c.note_decode_step(p);
+            assert!(c.covers(p + 1));
+        }
+        check(&c.snapshot(9).expect("snapshot"), 9, q_dim);
     }
 
     #[test]
