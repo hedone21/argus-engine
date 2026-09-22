@@ -688,6 +688,25 @@ pub struct Args {
     #[arg(long, default_value_t = 0.0)]
     pub tensor_partition: f32,
 
+    /// argus-bench tensor partition: let the adaptive controller move each layer's CPU–GPU split
+    /// (attention and FFN separately) from `--tensor-partition` (ticket 021). Off = static split.
+    #[arg(long, default_value_t = false)]
+    pub tp_adaptive: bool,
+
+    /// argus-bench tensor partition: skip the per-segment done-flag kernels (static split only) —
+    /// the control arm that prices the controller's measurement.
+    #[arg(long, default_value_t = false)]
+    pub tp_no_flags: bool,
+
+    /// argus-bench tensor partition: Descent step size of the adaptive controller.
+    #[arg(long, default_value_t = crate::layers::tp_controller::DEFAULT_ETA)]
+    pub tp_eta: f32,
+
+    /// argus-bench tensor partition: a segment slower than this × its best time for 3 tokens is
+    /// contended (Doppeladler's 1.2× rule).
+    #[arg(long, default_value_t = crate::layers::tp_controller::DEFAULT_CONTENTION_RATIO)]
+    pub tp_contention_ratio: f32,
+
     /// Chunked prefill: split long prompts into chunks to limit peak memory.
     /// 0 = auto (default): GPU backend derives a safe size from max_single_alloc()
     ///     to avoid CL_INVALID_BUFFER_SIZE; CPU backend processes entire prompt as one batch.

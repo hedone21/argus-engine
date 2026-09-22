@@ -31,18 +31,12 @@ pub struct LayerWorkspace {
     /// Avoids GPU memory allocation per token per layer.
     pub k_cast: Option<Tensor>,
     pub v_cast: Option<Tensor>,
-    /// Pre-allocated scratch buffers for CPU-GPU tensor partition (decode only).
+    /// Tensor-partition workspace (ticket 021, decode only), installed by `enable_partition`.
     /// None when tensor partition is disabled.
     ///
-    /// Wrapped in `Arc<UnsafeCell<..>>` so the OpenCL plan path
-    /// (`build_partitioned_layer_plan`) can share ownership with the
-    /// forward_gen partition path — both mutate the workspace through the
-    /// same allocation. Safety: single-threaded dispatch (same model as
-    /// `KernelStep`). The Arc clone that the plan retains bumps the refcount
-    /// so the workspace outlives the plan even if `LayerWorkspace` is
-    /// reallocated mid-flight (e.g. on UMA switch). See
-    /// `backend/opencl/plan.rs::PartitionPlanContext` for the dispatch-side
-    /// invariant enforcement.
+    /// Wrapped in `Arc<UnsafeCell<..>>` so the OpenCL plan's partition steps
+    /// (`backend/opencl/tp_plan.rs`) share it and keep it alive across plan
+    /// rebuilds. Safety: single-threaded dispatch (same model as `KernelStep`).
     pub partition_ws: Option<Arc<PartitionWsCell>>,
     /// Fused-merge carry slots: when `LLMRS_PARTITION_FUSED_MERGE=1`, the
     /// previous layer's partition FFN end leaves its `down_partial_gpu` and
@@ -78,14 +72,7 @@ impl LayerWorkspace {
         if let Some(ref pw_cell) = self.partition_ws {
             // SAFETY: single-threaded dispatch (see field doc).
             let pw: &PartitionWorkspace = unsafe { &*pw_cell.get() };
-            bufs.push(pw.gate_gpu.buffer().clone());
-            bufs.push(pw.gate_cpu.buffer().clone());
-            bufs.push(pw.up_gpu.buffer().clone());
-            bufs.push(pw.up_cpu.buffer().clone());
-            bufs.push(pw.residual_cpu.buffer().clone());
-            bufs.push(pw.down_partial_gpu.buffer().clone());
-            bufs.push(pw.down_partial_cpu.buffer().clone());
-            bufs.push(pw.cpu_merge_staging.buffer().clone());
+            bufs.extend(pw.buffers());
         }
         bufs
     }
@@ -110,39 +97,10 @@ impl LayerWorkspace {
             score_offset: self.score_offset,
             k_cast: self.k_cast.map(&retag),
             v_cast: self.v_cast.map(&retag),
-            partition_ws: self.partition_ws.map(|pw_cell| {
-                // `retag_backend` is only called on UMA GPU↔CPU switch, which
-                // invalidates any active plan beforehand — so the Arc should
-                // be unique here. Fall back to deep-cloning if unexpectedly
-                // shared.
-                let cell = Arc::try_unwrap(pw_cell).unwrap_or_else(|shared| {
-                    // SAFETY: single-threaded dispatch invariant.
-                    let pw: &PartitionWorkspace = unsafe { &*shared.get() };
-                    PartitionWsCell::new(PartitionWorkspace {
-                        gate_gpu: pw.gate_gpu.clone(),
-                        gate_cpu: pw.gate_cpu.clone(),
-                        up_gpu: pw.up_gpu.clone(),
-                        up_cpu: pw.up_cpu.clone(),
-                        residual_cpu: pw.residual_cpu.clone(),
-                        down_partial_gpu: pw.down_partial_gpu.clone(),
-                        down_partial_cpu: pw.down_partial_cpu.clone(),
-                        cpu_merge_staging: pw.cpu_merge_staging.clone(),
-                        ready_flag: pw.ready_flag.clone(),
-                    })
-                });
-                let pw = cell.0.into_inner();
-                Arc::new(PartitionWsCell::new(PartitionWorkspace {
-                    gate_gpu: retag(pw.gate_gpu),
-                    gate_cpu: retag(pw.gate_cpu),
-                    up_gpu: retag(pw.up_gpu),
-                    up_cpu: retag(pw.up_cpu),
-                    residual_cpu: retag(pw.residual_cpu),
-                    down_partial_gpu: retag(pw.down_partial_gpu),
-                    down_partial_cpu: retag(pw.down_partial_cpu),
-                    cpu_merge_staging: retag(pw.cpu_merge_staging),
-                    ready_flag: retag(pw.ready_flag),
-                }))
-            }),
+            // The partition workspace keeps its tags: its CPU scratch is host memory either way,
+            // and its GPU-visible buffers are host-mapped ALLOC_HOST_PTR memory the plan reaches
+            // by cl_mem, not through the tensor's backend.
+            partition_ws: self.partition_ws,
             partition_prev_gpu_partial: self.partition_prev_gpu_partial.map(&retag),
             partition_prev_cpu_staging: self.partition_prev_cpu_staging.map(&retag),
         }
@@ -173,10 +131,34 @@ impl LayerWorkspace {
             score_offset: 0,
             k_cast: None, // Lazily initialized on first use with correct dtype
             v_cast: None,
-            partition_ws: None, // Set externally when tensor partition is enabled
+            partition_ws: None, // Set by `enable_partition` when tensor partition is on
             partition_prev_gpu_partial: None,
             partition_prev_cpu_staging: None,
         })
+    }
+
+    /// Install the tensor-partition workspace (ticket 021) and keep `residual` host-mapped: the
+    /// CPU share reads each segment's normed input straight from it.
+    pub fn enable_partition(
+        &mut self,
+        geom: crate::partition_workspace::PartitionWsGeom,
+        memory: &dyn Memory,
+        cpu_backend: Arc<dyn Backend>,
+    ) -> Result<()> {
+        self.residual.buffer().map_for_cpu()?;
+        anyhow::ensure!(
+            !self.residual.buffer().as_ptr().is_null(),
+            "tensor partition needs a host-mappable residual buffer (zero-copy UMA device)"
+        );
+        let gpu_backend = self.residual.backend().clone();
+        let ws = PartitionWorkspace::new(
+            geom,
+            &|bytes, dtype| memory.alloc(bytes, dtype),
+            gpu_backend,
+            cpu_backend,
+        )?;
+        self.partition_ws = Some(Arc::new(PartitionWsCell::new(ws)));
+        Ok(())
     }
 
     /// Clear fused-merge carry slots. Called at the start of every

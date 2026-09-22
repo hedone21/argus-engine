@@ -224,8 +224,10 @@ fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
             "argus-eval: --profile / --profile-events oversimplify eval measurement (sync overhead); not supported"
         );
     }
-    if args.tensor_partition > 0.0 {
-        bail!("argus-eval: --tensor-partition is a decode-only measurement mode, not eval");
+    if args.tensor_partition > 0.0 || args.tp_adaptive || args.tp_no_flags {
+        bail!(
+            "argus-eval: --tensor-partition / --tp-* is a decode-only measurement mode, not eval"
+        );
     }
     // W-ALLOC: eval honors a per-layer KV format POLICY (N-way mixed precision) on the Standard KV
     // path (`build_eval_*_ctx` → `alloc_eval_kv_caches`), matching argus-cli / argus-bench. The

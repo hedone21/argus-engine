@@ -33,6 +33,9 @@ struct SharedState {
     batch_mode: AtomicBool,
     /// Number of worker threads (excludes main thread).
     n_workers: usize,
+    /// Workers that take part in a dispatch (`<= n_workers`); the rest stay parked. Changed only
+    /// between dispatches, by the dispatching thread (`set_active_workers`).
+    active_workers: AtomicUsize,
     /// Work function pointer (stored as usize for atomicity).
     work_fn: AtomicUsize,
     /// Work context pointer (stored as usize for atomicity).
@@ -57,6 +60,7 @@ impl SpinPool {
             shutdown: AtomicBool::new(false),
             batch_mode: AtomicBool::new(false),
             n_workers,
+            active_workers: AtomicUsize::new(n_workers),
             work_fn: AtomicUsize::new(0),
             work_ctx: AtomicUsize::new(0),
         });
@@ -64,20 +68,23 @@ impl SpinPool {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut join_handles = Vec::with_capacity(n_workers);
 
-        for _ in 0..n_workers {
+        for idx in 0..n_workers {
             let s = shared.clone();
             let tx = tx.clone();
             join_handles.push(std::thread::spawn(move || {
                 // Send our Thread handle back for unpark, then drop sender
                 // so rx.into_iter() terminates after all handles are collected.
-                tx.send(std::thread::current()).unwrap();
+                tx.send((idx, std::thread::current())).unwrap();
                 drop(tx);
-                Self::worker_loop(&s);
+                Self::worker_loop(&s, idx);
             }));
         }
         drop(tx);
 
-        let worker_threads: Vec<_> = rx.into_iter().collect();
+        // Index order, so `worker_threads[..active]` are the workers that take part.
+        let mut worker_threads: Vec<_> = rx.into_iter().collect();
+        worker_threads.sort_by_key(|(idx, _)| *idx);
+        let worker_threads = worker_threads.into_iter().map(|(_, t)| t).collect();
 
         SpinPool {
             shared,
@@ -86,7 +93,7 @@ impl SpinPool {
         }
     }
 
-    fn worker_loop(shared: &SharedState) {
+    fn worker_loop(shared: &SharedState, idx: usize) {
         let mut last_gen = 0u64;
 
         loop {
@@ -101,10 +108,16 @@ impl SpinPool {
                 let g = shared.generation.0.load(Ordering::Acquire);
                 if g != last_gen {
                     last_gen = g;
-                    break;
+                    // An inactive worker sits this dispatch out (not counted in `done_count`).
+                    if idx < shared.active_workers.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    spins = 500;
+                    continue;
                 }
                 spins += 1;
-                if spins < 500 || shared.batch_mode.load(Ordering::Relaxed) {
+                let active = idx < shared.active_workers.load(Ordering::Relaxed);
+                if spins < 500 || (active && shared.batch_mode.load(Ordering::Relaxed)) {
                     // In batch mode: pure spin (keep workers hot between dispatches)
                     // Normal mode: brief spin then park
                     std::hint::spin_loop();
@@ -171,11 +184,12 @@ impl SpinPool {
         self.shared.next_chunk.0.store(0, Ordering::Relaxed);
         self.shared.done_count.0.store(0, Ordering::Relaxed);
         self.shared.generation.0.fetch_add(1, Ordering::Release);
-        for wt in &self.worker_threads {
+        let active = self.shared.active_workers.load(Ordering::Relaxed);
+        for wt in &self.worker_threads[..active] {
             wt.unpark();
         }
         Self::steal_work(&self.shared);
-        while self.shared.done_count.0.load(Ordering::Acquire) < self.shared.n_workers {
+        while self.shared.done_count.0.load(Ordering::Acquire) < active {
             std::hint::spin_loop();
         }
 
@@ -190,10 +204,24 @@ impl SpinPool {
             self.shared.generation.0.fetch_add(1, Ordering::Release);
             // Workers are still spinning — they'll catch the generation change
             Self::steal_work(&self.shared);
-            while self.shared.done_count.0.load(Ordering::Acquire) < self.shared.n_workers {
+            while self.shared.done_count.0.load(Ordering::Acquire) < active {
                 std::hint::spin_loop();
             }
         }
+    }
+
+    /// Number of background workers.
+    pub fn n_workers(&self) -> usize {
+        self.shared.n_workers
+    }
+
+    /// Limit dispatches to the first `n` workers (clamped to the pool size); the others stay
+    /// parked. Must be called from the dispatching thread, between dispatches. Tensor-partition
+    /// contention rule (ticket 021 §D4).
+    pub fn set_active_workers(&self, n: usize) {
+        self.shared
+            .active_workers
+            .store(n.min(self.shared.n_workers), Ordering::Relaxed);
     }
 
     /// Dispatch `n_chunks` work items. Blocks until all are processed.
@@ -218,16 +246,17 @@ impl SpinPool {
         // Publish work (Release ensures setup is visible to workers)
         self.shared.generation.0.fetch_add(1, Ordering::Release);
 
-        // Wake all parked workers
-        for wt in &self.worker_threads {
+        // Wake the active workers
+        let active = self.shared.active_workers.load(Ordering::Relaxed);
+        for wt in &self.worker_threads[..active] {
             wt.unpark();
         }
 
         // Main thread also steals work
         Self::steal_work(&self.shared);
 
-        // Wait for all workers to finish
-        while self.shared.done_count.0.load(Ordering::Acquire) < self.shared.n_workers {
+        // Wait for the active workers to finish
+        while self.shared.done_count.0.load(Ordering::Acquire) < active {
             std::hint::spin_loop();
         }
     }
@@ -282,6 +311,31 @@ mod tests {
     }
 
     #[test]
+    fn test_active_workers_subset() {
+        let pool = SpinPool::new(4);
+        let counter = AtomicU64::new(0);
+
+        unsafe fn add_work(ctx: *const u8, _chunk_id: usize) {
+            // SAFETY: ctx is a valid pointer to AtomicU64 for the duration of dispatch.
+            let c = unsafe { &*(ctx as *const AtomicU64) };
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+
+        for active in [2, 0, 4, 1] {
+            pool.set_active_workers(active);
+            counter.store(0, Ordering::Relaxed);
+            unsafe {
+                pool.dispatch(100, add_work, &counter as *const _ as *const u8);
+                pool.dispatch_batch(&[
+                    (add_work, &counter as *const _ as *const u8, 10),
+                    (add_work, &counter as *const _ as *const u8, 10),
+                ]);
+            }
+            assert_eq!(counter.load(Ordering::Relaxed), 120, "active={active}");
+        }
+    }
+
+    #[test]
     fn test_work_stealing() {
         let pool = SpinPool::new(4);
         let results: Vec<AtomicU64> = (0..1000).map(|_| AtomicU64::new(0)).collect();
@@ -319,6 +373,7 @@ mod tests {
             shutdown: AtomicBool::new(false),
             batch_mode: AtomicBool::new(false),
             n_workers: 0,
+            active_workers: AtomicUsize::new(0),
             work_fn: AtomicUsize::new(0),
             work_ctx: AtomicUsize::new(0),
         };

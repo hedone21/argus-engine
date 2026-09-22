@@ -15,7 +15,7 @@ use arc_swap::ArcSwap;
 use crate::buffer::DType;
 use crate::format::weight_format::{LayerDispatch, WeightFormat};
 use crate::hardware::Hardware;
-use crate::layers::tensor_partition::{PartitionContext, split_weight, split_weight_col};
+use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::TransformerLayer;
 
 use super::secondary_mmap::SecondaryMmap;
@@ -234,21 +234,17 @@ impl WeightFormat for LayerSlot {
                     .as_ref()
                     .map(|c| c.ratio_generation.clone());
 
-                // Strategy B: whole-FFN slice. gate/up split_row is on the
-                // ffn_hidden (out_dim) axis. down split_col is on the ffn_hidden
-                // (in_dim) axis — same logical dimension, so we reuse gate's
-                // split_row.
-                let gate = split_weight(&old.w_gate, gpu_ratio, &cpu_backend)?;
-                let up = split_weight(&old.w_up, gpu_ratio, &cpu_backend)?;
-                debug_assert_eq!(
-                    gate.split_row, up.split_row,
-                    "gate/up split_row must match (same ffn_hidden, same gpu_ratio)",
-                );
-                let down = split_weight_col(&old.w_down, gate.split_row, &cpu_backend)?;
+                // FFN split: gate/up rows and down columns `[0, ffn_split)` stay on the GPU.
+                // Only the split point is computed — the weights are read in place (ticket 021).
+                let ffn_hidden = old.w_gate.shape().dims()[0];
+                let ffn_split = crate::layers::tp_controller::quantize_ffn(gpu_ratio, ffn_hidden)
+                    .ok_or_else(|| {
+                    anyhow::anyhow!("cannot split ffn_hidden={ffn_hidden} at gpu_ratio={gpu_ratio}")
+                })?;
 
                 // Bump the shared counter if this is a re-split; allocate a
                 // fresh counter at 0 otherwise. Release ordering pairs with the
-                // Acquire load in `PartitionStep::run`.
+                // Acquire load in the partition steps' generation check (`tp_plan`).
                 let gen_arc = match prev_gen {
                     Some(g) => {
                         g.fetch_add(1, Ordering::Release);
@@ -261,9 +257,7 @@ impl WeightFormat for LayerSlot {
                 new.partition_ctx = Some(PartitionContext {
                     gpu_ratio,
                     cpu_backend,
-                    gate,
-                    up,
-                    down,
+                    ffn_split,
                     ratio_generation: gen_arc,
                 });
                 self.store_weights_same_dtype(Arc::new(new));
@@ -326,9 +320,8 @@ mod tests {
     }
 
     fn ffn_layer(be: &Arc<dyn Backend>) -> LayerWeights {
-        // FFN weights are 2D and large enough to satisfy split_weight's
-        // out_dim >= 256 / 128-alignment requirements. Attention weights are
-        // never partitioned, so a small placeholder shape is fine.
+        // FFN weights are 2D with ffn_hidden >= 256 (two 128-row quanta).
+        // The attention placeholders are never read by apply_dispatch.
         let small = f32_weight(be, 1, 1);
         TransformerLayer {
             wq: small.clone(),

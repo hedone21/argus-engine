@@ -95,8 +95,8 @@ fn reject_unsupported_for_chat(args: &Args) -> anyhow::Result<()> {
     if args.profile || args.profile_events {
         bail!("argus-chat: --profile / --profile-events not supported");
     }
-    if args.tensor_partition > 0.0 {
-        bail!("argus-chat: --tensor-partition not supported");
+    if args.tensor_partition > 0.0 || args.tp_adaptive || args.tp_no_flags {
+        bail!("argus-chat: --tensor-partition / --tp-* not supported");
     }
     if args.skip_ratio.unwrap_or(0.0) > 0.0 {
         bail!("argus-chat: --skip-ratio not supported");

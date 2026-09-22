@@ -391,6 +391,8 @@ pub fn build_bench_loop(
     // metric scores on and routes compressions through the selector instead of the CLI-configured
     // policy; `None` leaves the forward byte-identical and the method-drop path untouched.
     aperturb_pool: Option<AperturbPool>,
+    // Tensor-partition `--tp-*` options (ticket 021); inert unless the model was partitioned.
+    tp_options: crate::partition_workspace::TpOptions,
 ) -> Result<DecodeLoop> {
     let vocab_size = model.config.vocab_size;
     // Captured before `model` is moved into `mf` — the PFA handle row count for the prefill keep-set.
@@ -434,6 +436,7 @@ pub fn build_bench_loop(
         Arc::clone(&hook_cell),
         Arc::clone(&score_cell),
     )?;
+    mf.set_tp_options(tp_options);
     // Faithful-H2O (c): arm a full-prompt-window (`usize::MAX` clamps to seq_len) PFA producer + the
     // prefill seed. The dummy cell is never consumed in the bench loop (no PrefillKeepSetStage); the
     // PFA buffer is used only to fold prefill column-sums into `score_cell` at the final chunk.

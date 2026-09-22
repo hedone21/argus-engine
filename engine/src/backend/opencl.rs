@@ -21,6 +21,7 @@ pub mod host_ptr_pool;
 pub mod host_ptr_pool_buffer;
 pub mod memory;
 pub mod plan;
+pub mod tp_plan;
 
 /// `cl_khr_priority_hints` property name (`CL_QUEUE_PRIORITY_KHR`).
 const CL_QUEUE_PRIORITY_KHR: u64 = 0x1096;

@@ -1030,6 +1030,13 @@ kernel void kernel_add_assign_simple(
     }
 }
 
+// Tensor-partition done-flag (ticket 021): publishes 1 to a host-visible ALLOC_HOST_PTR flag once
+// every earlier command of the in-order queue has finished. Timing signal only — the host reads no
+// data behind it. gws = lws = [1, 1, 1].
+kernel void kernel_signal_flag(global volatile int * flag) {
+    atomic_xchg(flag, 1);
+}
+
 // Tensor-partition fused merge + residual: x += gpu_partial + cpu_partial.
 // Replaces 3 sequential kernels (copy_slice + add_assign_staging + post_ffn add_assign)
 // with a single dispatch on partition layers. `gpu_partial` = down_partial_gpu

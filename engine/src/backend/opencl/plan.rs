@@ -13,12 +13,10 @@ use ocl::core::Mem;
 use std::sync::Arc;
 
 use crate::backend::Backend;
-use crate::layers::tensor_partition::{
-    PartitionContext, PartitionPath, partition_plan_debug_enabled, partition_plan_enabled,
-    partition_trace_enabled, record_partition_timing,
-};
+use crate::layers::tensor_partition::PartitionContext;
 use crate::partition_workspace::PartitionWsCell;
-use crate::tensor::Tensor;
+
+pub use super::tp_plan::{AttnPartitionStep, FfnPartitionStep, TpHostWeights};
 
 thread_local! {
     /// LLMRS_OP_TRACE: per-token wall-clock accumulator (label -> microseconds).
@@ -212,6 +210,27 @@ pub const Q1_SPLITS_MAX: usize = 128;
 
 /// Execution plan for a single transformer layer.
 pub struct LayerKernelPlan {
+    /// Steps 1-10: attention block, GPU-only or split with the CPU (ticket 021).
+    pub attn: AttnVariant,
+    /// Step 11-14: FFN — GPU-only (gate/up/silu/down) or split with the CPU.
+    pub ffn: FfnVariant,
+    /// Step 15+: typically `add_assign(x += down)`. Empty for a partitioned layer, whose FFN
+    /// step lands `x` itself.
+    pub steps_post_ffn: Vec<KernelStep>,
+    /// Whether to call clFlush after this layer's steps
+    pub flush_after: bool,
+}
+
+/// Attention-block execution strategy for a layer.
+#[allow(clippy::large_enum_variant)]
+pub enum AttnVariant {
+    GpuOnly(GpuAttnSteps),
+    /// Q heads / Wo columns split between GPU and CPU (`tp_plan`).
+    Partitioned(Box<AttnPartitionStep>),
+}
+
+/// GPU-only attention block: steps 1-10.
+pub struct GpuAttnSteps {
     /// Steps 1-6: RMSNorm, QKV matmul, RoPE Q, RoPE K
     pub steps_pre_kv: Vec<KernelStep>,
     /// Step 7: KV update (Standard scatter)
@@ -221,23 +240,13 @@ pub struct LayerKernelPlan {
     /// Steps 9-10: Wo matmul, add+RMSNorm. FFN input (`residual`) is produced
     /// by the last step here.
     pub steps_post_attn_pre_ffn: Vec<KernelStep>,
-    /// Step 11-14: FFN — GPU-only (gate/up/silu/down) or cooperative partition
-    /// (GPU-slice chain + CPU slice + merge).
-    pub ffn: FfnVariant,
-    /// Step 15+: typically `add_assign(x += down)`. Skipped by the caller when
-    /// a partition layer defers the residual add into the next layer's fused
-    /// norm+merge.
-    pub steps_post_ffn: Vec<KernelStep>,
-    /// Whether to call clFlush after this layer's steps
-    pub flush_after: bool,
 }
 
 /// FFN execution strategy for a layer.
 ///
 /// `GpuOnly` is the historical plan path (4 KernelSteps dispatched inline).
-/// `Partitioned` wraps the cooperative GPU+CPU FFN slice (see
-/// `arch/plan_partition_integration.md`, §A.3.1). `Box`-ing the variant keeps
-/// the enum compact even though `PartitionStep` carries CPU-side buffers.
+/// `Partitioned` splits gate/up rows and down columns between GPU and CPU
+/// (`tp_plan`, ticket 021).
 #[allow(clippy::large_enum_variant)]
 pub enum FfnVariant {
     /// Dense GPU FFN: gate + up + silu/gelu + down. `gate` and `up` are
@@ -249,658 +258,46 @@ pub enum FfnVariant {
         silu_mul: KernelStep,
         down: KernelStep,
     },
-    /// Cooperative partition path: GPU runs its split-row FFN chain, CPU runs
-    /// the complementary slice, and the merge lands the sum back in
-    /// `ws.down`. Boxed so a GpuOnly layer stays small.
-    Partitioned(Box<PartitionStep>),
+    Partitioned(Box<FfnPartitionStep>),
 }
 
-// ---------------------------------------------------------------------------
-// Partition step — cooperative GPU+CPU FFN dispatch inside a plan.
-// ---------------------------------------------------------------------------
-
-/// Single PartitionStep: wraps the 4 GPU FFN KernelSteps (gate, up, silu/gelu
-/// * up, down) plus the CPU-side FFN slice invocation plus the merge substeps.
-///
-/// Safety model matches `KernelStep` (single-threaded dispatch — see the
-/// `unsafe impl Send/Sync` blocks below for the invariant).
-pub struct PartitionStep {
-    /// GPU slice gate matmul: `residual @ part.gate.gpu_slice^T -> gate_gpu`.
-    pub gpu_gate: KernelStep,
-    /// GPU slice up matmul: `residual @ part.up.gpu_slice^T -> up_gpu`.
-    pub gpu_up: KernelStep,
-    /// GPU SiLU/GELU × up in place on `gate_gpu`.
-    pub gpu_act_mul: KernelStep,
-    /// GPU slice down matmul: `gate_gpu @ part.down.gpu_slice^T -> down_partial_gpu`.
-    pub gpu_down: KernelStep,
-    /// CPU-side context (backends + workspace + geometry).
-    pub cpu_ctx: Arc<PartitionPlanContext>,
-    /// Merge variant decided at build time (env-gated).
-    pub merge: PartitionMerge,
-    /// Whether this is the last transformer layer (fused_norm_merge can't
-    /// defer past the final layer because there's no next norm to fold into).
-    pub is_last_layer: bool,
-    /// Build-time policy snapshot — env flag readback captured once at
-    /// `build_partition_plan` time. Runtime `execute()` reads this field
-    /// instead of re-querying `layers::tensor_partition::*_enabled()`,
-    /// keeping the runtime path free of L1→L3 imports (§13.8-J).
-    pub policy: PartitionPolicySnapshot,
-}
-
-/// Build-time snapshot of `layers/tensor_partition` env flag policy.
-///
-/// Captured once by `build_partition_plan` and injected into `PartitionStep`,
-/// so the runtime dispatch path never imports `layers/tensor_partition::*`.
-/// All fields are env-gated booleans that are stable across the decode session.
-#[derive(Clone, Copy, Default)]
-pub struct PartitionPolicySnapshot {
-    pub poll_flag: bool,
-}
-
-// SAFETY: Same model as `KernelStep`. `PartitionStep` owns `CoreKernel` / `Mem`
-// handles and an `Arc<PartitionWsCell>`; all are accessed
-// only from the plan's single-threaded dispatch loop (`FullKernelPlan::execute`),
-// and `PartitionStep::run` asserts the TLS thread id matches the build thread.
-unsafe impl Send for PartitionStep {}
-unsafe impl Sync for PartitionStep {}
-
-/// Merge strategy — how the GPU partial and the CPU partial combine into
-/// `ws.down`.
-#[allow(clippy::large_enum_variant)]
+/// How a partitioned FFN lands its two partial sums.
 pub enum PartitionMerge {
-    /// Fused merge: `x += down_partial_gpu + cpu_merge_staging` in a single
-    /// kernel. Replaces `Inline`'s 3 sub-steps (copy_slice, add_assign,
-    /// post_ffn add_assign) with one dispatch per partition layer.
-    /// Skips `steps_post_ffn` — the fused kernel already writes the residual.
-    ///
-    /// Default for all partition layers on the plan path. ~0.15 ms/layer
-    /// saved vs `Inline` on Adreno 830 (measured 2026-04-22): 3 dispatches
-    /// × driver submission latency dropped to 1. Does NOT touch `ws.down`,
-    /// so downstream consumers that read `ws.down` (debug hooks) will see
-    /// stale data when partition is active — not currently a concern.
+    /// `x += down_gpu + cpu_staging` in one kernel
+    /// (`kernel_partition_fused_merge_residual_f4`).
     Fused { fused_step: KernelStep },
-    /// Immediate merge into `ws.down` followed by the standalone post_ffn
-    /// `add_assign(x, ws.down)`. Requires 3 sub-steps:
-    /// 1. copy `down_partial_gpu[0..hidden] -> ws.down[0..hidden]`
-    /// 2. write CPU partial → `cpu_merge_staging` GPU buffer
-    ///    (backend `write_buffer`, not a KernelStep — handled directly in `run`)
-    /// 3. `add_assign(ws.down, cpu_merge_staging)`
-    ///
-    /// Used as fallback when `LLMRS_PARTITION_FUSED_RESIDUAL=0` is set.
-    Inline {
-        copy_gpu_to_down: KernelStep,
-        add_assign: KernelStep,
-    },
-    /// Defer the final merge (copy + add_assign) to the next layer's
-    /// `fused_norm_merge` kernel. Only the CPU upload runs now, landing the
-    /// CPU partial in `cpu_merge_staging`. The next layer picks it up via the
-    /// `partition_prev_*` carry slots (see `LayerWorkspace`).
-    ///
-    /// NOTE: plan path has no fused_norm_merge kernel wiring, so this
-    /// variant produces incorrect output today. Retained for future Phase 2-B
-    /// work; do not enable via `LLMRS_PARTITION_FUSED_MERGE=1` on plan path.
-    Deferred,
 }
 
-/// CPU/workspace context used by a `PartitionStep`.
-///
-/// All Arc-held resources must outlive the plan (INV-082).
-pub struct PartitionPlanContext {
-    /// CPU-capable backend (NEON on Android/Apple, scalar fallback on host
-    /// CPUs without NEON). Used for gate/up/silu/down CPU-slice matmul.
-    pub cpu_backend: Arc<dyn Backend>,
-    /// CPU slice of gate weight. Shape `[ffn_hidden - split_row, dim]`.
-    pub gate_cpu: Tensor,
-    /// CPU slice of up weight. Shape `[ffn_hidden - split_row, dim]`.
-    pub up_cpu: Tensor,
-    /// CPU slice of down weight. Shape `[dim, ffn_hidden - split_row]`.
-    pub down_cpu: Tensor,
-    /// Shared partition workspace — gate_cpu/up_cpu/down_partial_cpu (NEON
-    /// working tensors), residual_cpu (CPU mirror of ws.residual),
-    /// cpu_merge_staging (GPU upload target). `UnsafeCell` since the plan
-    /// only ever mutates it from the single dispatch thread.
-    pub workspace: Arc<PartitionWsCell>,
-    /// Kernel args in the 4 GPU sub-steps are pre-bound to these cl_mem
-    /// handles; storing them here lets `run()` sanity-check stale buffers
-    /// (plan invalidation on UMA remapping). Currently informational only.
-    #[allow(dead_code)]
-    pub residual_buf_handle: Mem,
-    /// Permanent-mapped host pointer for `residual_buf_handle`. Non-null
-    /// only when the residual cl_mem is an ALLOC_HOST_PTR UnifiedBuffer
-    /// with `.map()` held for the plan's lifetime — which the poll-flag
-    /// path auto-enables. When available, `PartitionStep::run` reads
-    /// residual directly via this pointer instead of issuing a blocking
-    /// `enqueue_read_buffer`.
-    pub residual_host_ptr: *const u8,
-    /// Whether the model uses `gelu(tanh)` instead of SiLU (arch-dependent).
-    /// The GPU kernel binding picks `kernel_silu_mul_simple` vs
-    /// `kernel_gelu_tanh_mul_simple`; this flag mirrors the decision so CPU
-    /// FFN on the same layer stays in sync.
-    pub use_gelu_tanh: bool,
-    /// Mirror of `LayerPlanConfig::rms_norm_eps` — unused today (the pre-FFN
-    /// norm is a separate KernelStep), kept for Phase 2-B fused_norm_merge.
-    #[allow(dead_code)]
-    pub rms_norm_eps: f32,
-    /// Whether the pre-FFN norm uses Gemma3's `add_unit=1` variant.
-    /// Currently the plan path rejects Gemma3 outright, but this is kept
-    /// so a future fused_norm_merge can route both paths.
-    #[allow(dead_code)]
-    pub rms_norm_add_unit: bool,
-    /// Debugging: which layer this step belongs to.
-    pub layer_idx: usize,
-    // Note: residual transport path is determined dynamically per-call inside
-    // `PartitionStep::run` (poll-flag + non-null `residual_host_ptr` → Zcopy
-    // fast memcpy, else SyncRead via `enqueue_read_buffer`). Earlier code
-    // hardcoded `SyncRead` here, which made the trace counter mislabel every
-    // dispatch even when the fast path was active. Removed 2026-05-04.
-    /// INV-120 generation captured at build time. `PartitionStep::run` loads
-    /// `PartitionContext.ratio_generation` with `Acquire` and compares; a
-    /// miss returns `PlanInvalidated` to the executor.
-    pub ratio_generation_at_build: u64,
-    /// Shared generation counter. Held as an Arc clone of
-    /// `PartitionContext.ratio_generation` — cheap clone, keeps the atomic
-    /// alive even if the caller drops the PartitionContext while this plan
-    /// is still cached (shouldn't happen in generate.rs today but defensive).
-    pub ratio_generation_counter: Arc<std::sync::atomic::AtomicU64>,
-    /// TLS thread id captured at plan build. `run()` asserts the dispatch
-    /// thread matches — enforces the single-threaded safety model.
-    pub build_thread_id: std::thread::ThreadId,
+/// Dispatch shape of the F16 GEMV kernels (`kernel_mul_mat_f16_f32[_l4|_ld]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemvKind {
+    /// 4-wave K-split, N_DST=2: local [64,4,1].
+    Wave4,
+    /// 4-wave K-split, N_DST=4 (large N): local [64,4,1].
+    L4,
+    /// Subgroup-less fallback, N_DST=4: local [64,1,1].
+    Nosub,
 }
 
-// SAFETY: Mirrors `KernelStep` — all interior references are accessed only
-// from the dispatch thread (debug-asserted in `PartitionStep::run`). The
-// `UnsafeCell<PartitionPlanWorkspace>` is never aliased outside the plan.
-unsafe impl Send for PartitionPlanContext {}
-unsafe impl Sync for PartitionPlanContext {}
-
-/// Plan-side partition workspace — a direct reuse of the layer's
-/// `PartitionWorkspace` buffers. We re-declare as a type alias to the real
-/// `PartitionWorkspace` so callers can share allocations with `forward_gen`
-/// (both paths read/write the same `gate_cpu`, `down_partial_gpu`, etc).
-pub type PartitionPlanWorkspace = crate::partition_workspace::PartitionWorkspace;
-
-impl PartitionStep {
-    /// INV-120 generation check — separated so tests can exercise staleness
-    /// detection without a live OpenCL backend.
-    ///
-    /// Compares `cpu_ctx.ratio_generation_at_build` against the current value
-    /// of `cpu_ctx.ratio_generation_counter`. Returns `Err(PlanInvalidated)`
-    /// when the counter has advanced past the captured generation.
-    pub fn check_generation(&self) -> std::result::Result<(), PlanInvalidated> {
-        use std::sync::atomic::Ordering;
-        let live_gen = self
-            .cpu_ctx
-            .ratio_generation_counter
-            .load(Ordering::Acquire);
-        if live_gen != self.cpu_ctx.ratio_generation_at_build {
-            return Err(PlanInvalidated);
+impl GemvKind {
+    /// Kernel `make_f16_matmul_step` picks for an `n`-row GEMV.
+    pub fn select(n: usize, l4_available: bool, is_nosub: bool) -> Self {
+        if is_nosub {
+            GemvKind::Nosub
+        } else if l4_available && n > LARGE_N_THRESHOLD {
+            GemvKind::L4
+        } else {
+            GemvKind::Wave4
         }
-        Ok(())
     }
 
-    /// Execute this partition layer step.
-    ///
-    /// Sequence (mirrors `forward_gen` partition SyncRead path, see
-    /// `arch/plan_partition_integration.md` §A.4.3):
-    ///   1. INV-120 generation check (stale ratio → `PlanInvalidated`).
-    ///   2. `backend.synchronize()` — ARM UMA cache barrier; ensures the
-    ///      preceding `add_rms_norm_oop` result in `ws.residual` is visible
-    ///      to the CPU read.
-    ///   3. `backend.read_buffer(ws.residual → pw.residual_cpu)` — load the
-    ///      FFN input into CPU-accessible memory for NEON.
-    ///   4. Enqueue the 4 GPU FFN sub-steps + `flush()`.
-    ///   5. CPU FFN chain (gate → up → silu/gelu_mul → down) against the
-    ///      partition slice, using `cpu_ctx.cpu_backend`.
-    ///   6. Merge — `Inline` runs copy_gpu_to_down + write_buffer(CPU→GPU
-    ///      staging) + add_assign. `Deferred` uploads the CPU partial and
-    ///      returns (next layer will absorb).
-    ///
-    /// Returns `Err(PlanInvalidated)` if the captured ratio generation no
-    /// longer matches the live `PartitionContext`.
-    pub fn run(
-        &self,
-        backend: &crate::backend::opencl::OpenCLBackend,
-        layer_idx: usize,
-    ) -> std::result::Result<(), PlanInvalidated> {
-        use std::sync::atomic::Ordering;
-        debug_assert_eq!(
-            std::thread::current().id(),
-            self.cpu_ctx.build_thread_id,
-            "PartitionStep::run must run on the plan build thread"
-        );
-
-        // 1. INV-120 generation check.
-        if let Err(e) = self.check_generation() {
-            let live_gen = self
-                .cpu_ctx
-                .ratio_generation_counter
-                .load(Ordering::Acquire);
-            log::warn!(
-                "PartitionStep stale: layer={} build_gen={} live_gen={} → PlanInvalidated",
-                layer_idx,
-                self.cpu_ctx.ratio_generation_at_build,
-                live_gen,
-            );
-            return Err(e);
+    /// `(global, local)` work size for `n` output rows, decode (m = 1).
+    pub fn work_size(self, n: usize) -> ([usize; 3], [usize; 3]) {
+        match self {
+            GemvKind::Nosub => ([n.div_ceil(4) * 64, 1, 1], [64, 1, 1]),
+            GemvKind::L4 => ([n.div_ceil(4) * 64, 4, 1], [64, 4, 1]),
+            GemvKind::Wave4 => ([n.div_ceil(2) * 64, 4, 1], [64, 4, 1]),
         }
-
-        let debug = partition_plan_debug_enabled();
-        let trace = partition_trace_enabled();
-        let t0 = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // 2. Sync + read residual into CPU workspace.
-        //    Default path: `ocl::core::finish` drains the in-order queue
-        //    (add_rms_norm_oop + prior ops) and issues the ARM UMA cache
-        //    flush needed before the host read.
-        //    Poll-flag path (LLMRS_PARTITION_POLL_FLAG=1): the sigflag
-        //    kernel variant wrote `ready_flag=1` after the residual store
-        //    with an atomic_xchg release edge. CPU spin-polls the host
-        //    pointer instead of blocking on `clFinish` — skipping the
-        //    ~0.29 ms Adreno driver round-trip. The blocking
-        //    `enqueue_read_buffer` that follows still serves as an
-        //    in-order sync point (fast because add_rms_norm_oop is already
-        //    done) and performs the residual DMA read.
-        let queue = backend.queue.as_core();
-        let poll_flag = self.policy.poll_flag;
-        // Actual residual transport path used this dispatch — drives the trace
-        // counter at the end. Zcopy when the poll-flag fast memcpy from the
-        // permanent-mapped `residual_host_ptr` runs; SyncRead otherwise.
-        let actual_path = if poll_flag && !self.cpu_ctx.residual_host_ptr.is_null() {
-            PartitionPath::Zcopy
-        } else {
-            PartitionPath::SyncRead
-        };
-        // SAFETY: `workspace` is owned by this plan and only accessed here.
-        let pw: &mut PartitionPlanWorkspace = unsafe { &mut *self.cpu_ctx.workspace.get() };
-        if poll_flag {
-            let flag_ptr = pw.ready_flag.buffer().as_mut_ptr() as *mut i32;
-            if flag_ptr.is_null() {
-                log::error!(
-                    "PartitionStep poll flag host ptr is null: layer={} (ALLOC_HOST_PTR map failed?)",
-                    layer_idx,
-                );
-                return Err(PlanInvalidated);
-            }
-            // Flush host's pending enqueues so the sigflag kernel is
-            // submitted to the GPU. Without this, the CPU would spin on a
-            // flag that the driver hasn't even handed to hardware yet.
-            if let Err(e) = ocl::core::flush(queue) {
-                log::error!(
-                    "PartitionStep flush pre-poll failed: layer={} err={}",
-                    layer_idx,
-                    e
-                );
-                return Err(PlanInvalidated);
-            }
-            // Spin until the GPU signals completion. Cap iterations to
-            // bail out if the kernel crashed or the flag path is broken,
-            // so the engine degrades to `PlanInvalidated` rather than
-            // hanging forever.
-            const MAX_SPINS: u64 = 50_000_000; // ~seconds on a 3 GHz core
-            let mut spins = 0u64;
-            loop {
-                let v = unsafe { std::ptr::read_volatile(flag_ptr) };
-                if v != 0 {
-                    break;
-                }
-                std::hint::spin_loop();
-                spins += 1;
-                if spins == MAX_SPINS {
-                    log::error!("PartitionStep poll-flag timeout: layer={}", layer_idx,);
-                    return Err(PlanInvalidated);
-                }
-            }
-            // Acquire fence: pair with the GPU's atomic_xchg release so
-            // subsequent residual reads observe the sigflag kernel's
-            // stores.
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            // Reset the flag for the next layer's sigflag kernel.
-            unsafe {
-                std::ptr::write_volatile(flag_ptr, 0);
-            }
-        } else if let Err(e) = ocl::core::finish(queue) {
-            log::error!(
-                "PartitionStep synchronize failed: layer={} err={}",
-                layer_idx,
-                e
-            );
-            return Err(PlanInvalidated);
-        }
-        let t_sync_done = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // Read residual into CPU-visible buffer. The pre-bound cl_mem is the
-        // canonical source; a blocking `enqueue_read_buffer` guarantees the
-        // bytes land in `pw.residual_cpu` before the CPU FFN chain starts.
-        //
-        // Poll-flag fast path: when the residual buffer is a permanent-mapped
-        // ALLOC_HOST_PTR UnifiedBuffer and the sigflag release has already
-        // been observed, `residual_host_ptr` points into the same physical
-        // memory. memcpy straight from there — no DMA, no driver
-        // round-trip. The CPU matmul still runs against `pw.residual_cpu`
-        // for cache locality.
-        let residual_bytes = pw.residual_cpu.size();
-        let residual_slice =
-            unsafe { std::slice::from_raw_parts_mut(pw.residual_cpu.as_mut_ptr(), residual_bytes) };
-        if poll_flag && !self.cpu_ctx.residual_host_ptr.is_null() {
-            // SAFETY: `residual_host_ptr` wraps a permanent-mapped
-            // ALLOC_HOST_PTR region backing the same cl_mem the GPU wrote
-            // to. The acquire fence above pairs with the sigflag kernel's
-            // atomic_xchg release, making the residual stores visible.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.cpu_ctx.residual_host_ptr,
-                    residual_slice.as_mut_ptr(),
-                    residual_bytes,
-                );
-            }
-        } else if let Err(e) = unsafe {
-            ocl::core::enqueue_read_buffer(
-                queue,
-                &self.cpu_ctx.residual_buf_handle,
-                true, // blocking — implicit in-order barrier + cache flush
-                0,
-                residual_slice,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )
-        } {
-            log::error!(
-                "PartitionStep read residual failed: layer={} err={}",
-                layer_idx,
-                e
-            );
-            return Err(PlanInvalidated);
-        }
-        let t_read_done = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // 3. Enqueue the 4 GPU FFN sub-steps. `dispatch_step` dynamic args
-        //    are all zero for the FFN chain (no StartPos/CacheSeqLen/etc).
-        for step in [
-            &self.gpu_gate,
-            &self.gpu_up,
-            &self.gpu_act_mul,
-            &self.gpu_down,
-        ] {
-            FullKernelPlan::dispatch_step(backend, step, 0, 0, 0, 0, 0, 0, 0);
-            if debug {
-                ocl::core::finish(queue).ok();
-                eprintln!(
-                    "plan-partition: layer={} sub_step={:?}",
-                    layer_idx, step.op_tag,
-                );
-            }
-        }
-        if let Err(e) = ocl::core::flush(queue) {
-            log::error!("PartitionStep flush failed: layer={} err={}", layer_idx, e);
-            return Err(PlanInvalidated);
-        }
-
-        // 4. CPU FFN chain. Uses the `PartitionPlanContext`'s saved Tensor
-        //    slices — these are Arc-cloned from the PartitionContext at
-        //    plan build time. Live PartitionContext re-slices bump
-        //    `ratio_generation`, so the check above already rejected us if
-        //    the weights have moved.
-        let cpu = &self.cpu_ctx.cpu_backend;
-
-        // Run CPU gate/up through the backend trait — for the plan path we
-        // intentionally skip the host `fused_matmul_*` fast path; the GPU
-        // plan chain dominates wall-clock and the saved 100-300us per layer
-        // on fused_matmul would come at the cost of duplicating the
-        // `residual_cpu_ptr` routing logic here. Treat that as a future
-        // optimization gated on benchmark evidence.
-        let cpu_ok = (|| -> Result<()> {
-            // Fused gate+up matmul: single F32→F16 A conversion, single
-            // SpinPool dispatch — saves ~100-300 us/layer vs two separate
-            // `matmul_transposed` calls. Mirrors the forward_gen partition
-            // path (transformer_layer/forward_gen.rs:1367).
-            #[cfg(target_arch = "aarch64")]
-            let used_fused_gate_up = {
-                let gate_dtype = self.cpu_ctx.gate_cpu.dtype();
-                let k = self.cpu_ctx.gate_cpu.shape().dims()[1];
-                // B-5b Phase 2 Stage 2-A: route fused NEON kernels through the
-                // GPU backend's CPU companion. `cpu_companion().cpu_kernels()`
-                // is `Some` on aarch64 (NEON CpuBackend) and `None` elsewhere;
-                // this fast path is aarch64-gated so `expect` is sound.
-                let kernels = backend.cpu_companion().cpu_kernels().expect(
-                    "plan.rs: cpu_kernels required for partition fused gate+up matmul fast path",
-                );
-                if gate_dtype == crate::buffer::DType::F16 {
-                    unsafe {
-                        (kernels.fused_matmul_f16)(
-                            pw.residual_cpu.as_ptr() as *const f32,
-                            k,
-                            &[
-                                (
-                                    self.cpu_ctx.gate_cpu.as_ptr() as *const u16,
-                                    pw.gate_cpu.as_mut_ptr() as *mut f32,
-                                    self.cpu_ctx.gate_cpu.shape().dims()[0],
-                                ),
-                                (
-                                    self.cpu_ctx.up_cpu.as_ptr() as *const u16,
-                                    pw.up_cpu.as_mut_ptr() as *mut f32,
-                                    self.cpu_ctx.up_cpu.shape().dims()[0],
-                                ),
-                            ],
-                        );
-                    }
-                    true
-                } else if gate_dtype == crate::buffer::DType::Q4_0 {
-                    use crate::quant::BlockQ4_0;
-                    unsafe {
-                        (kernels.fused_matmul_q4_0)(
-                            pw.residual_cpu.as_ptr() as *const f32,
-                            k,
-                            &[
-                                (
-                                    self.cpu_ctx.gate_cpu.as_ptr() as *const BlockQ4_0,
-                                    pw.gate_cpu.as_mut_ptr() as *mut f32,
-                                    self.cpu_ctx.gate_cpu.shape().dims()[0],
-                                ),
-                                (
-                                    self.cpu_ctx.up_cpu.as_ptr() as *const BlockQ4_0,
-                                    pw.up_cpu.as_mut_ptr() as *mut f32,
-                                    self.cpu_ctx.up_cpu.shape().dims()[0],
-                                ),
-                            ],
-                        );
-                    }
-                    true
-                } else {
-                    false
-                }
-            };
-            #[cfg(not(target_arch = "aarch64"))]
-            let used_fused_gate_up = false;
-
-            if !used_fused_gate_up {
-                cpu.matmul_transposed(&pw.residual_cpu, &self.cpu_ctx.gate_cpu, &mut pw.gate_cpu)?;
-                cpu.matmul_transposed(&pw.residual_cpu, &self.cpu_ctx.up_cpu, &mut pw.up_cpu)?;
-            }
-
-            if self.cpu_ctx.use_gelu_tanh {
-                cpu.gelu_tanh_mul(&mut pw.gate_cpu, &pw.up_cpu)?;
-            } else {
-                cpu.silu_mul(&mut pw.gate_cpu, &pw.up_cpu)?;
-            }
-
-            cpu.matmul_transposed(
-                &pw.gate_cpu,
-                &self.cpu_ctx.down_cpu,
-                &mut pw.down_partial_cpu,
-            )?;
-            Ok(())
-        })();
-        if let Err(e) = cpu_ok {
-            log::error!(
-                "PartitionStep CPU FFN failed: layer={} err={}",
-                layer_idx,
-                e
-            );
-            return Err(PlanInvalidated);
-        }
-        let t_cpu_done = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // 5. GPU wait — historically a `finish()` drain before delivering the
-        //    CPU partial to `cpu_merge_staging`. Default is now SKIP: the
-        //    in-order queue serializes `gpu_down → copy_slice → add_assign`
-        //    for us, and the CPU→staging path is covered by a Release fence
-        //    below (ALLOC_HOST_PTR on Adreno UMA). Re-validated bit-exact on
-        //    2026-04-22: Qwen 2.5 1.5B F16 (200 tokens, r∈{0.5..0.9}),
-        //    Llama 3.2 3B Q4_0 (r=0.97). The prior Qwen F16 garbage regression
-        //    (2026-04-21 opt-in downgrade) no longer reproduces — the
-        //    intervening landings (POLL_FLAG sigflag release edge, permanent-
-        //    mapped cpu_merge_staging, fused_matmul) appear to have closed
-        //    the hazard window. Set `LLMRS_PARTITION_WAIT_GPU=1` to re-enable
-        //    the drain if correctness regresses on new hardware.
-        let wait_gpu = std::env::var_os("LLMRS_PARTITION_WAIT_GPU").is_some();
-        if wait_gpu && let Err(e) = ocl::core::finish(queue) {
-            log::error!(
-                "PartitionStep GPU wait failed: layer={} err={}",
-                layer_idx,
-                e
-            );
-            return Err(PlanInvalidated);
-        }
-        let t_gpu_done = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // 6. Merge.
-        let staging_mem: &Mem =
-            match crate::backend::opencl::get_cl_mem(pw.cpu_merge_staging.buffer().as_ref()) {
-                Ok(m) => m,
-                Err(e) => {
-                    log::error!(
-                        "PartitionStep staging cl_mem lookup failed: layer={} err={}",
-                        layer_idx,
-                        e
-                    );
-                    return Err(PlanInvalidated);
-                }
-            };
-        let staging_bytes = pw.cpu_merge_staging.size();
-        let cpu_partial_slice = unsafe {
-            std::slice::from_raw_parts(pw.down_partial_cpu.as_ptr(), pw.down_partial_cpu.size())
-        };
-        debug_assert!(
-            staging_bytes >= cpu_partial_slice.len(),
-            "cpu_merge_staging must be >= down_partial_cpu size",
-        );
-
-        // Phase 1a: when `cpu_merge_staging` is permanent-mapped (via
-        // LLMRS_PARTITION_ZCOPY_MERGE, default on), memcpy from the CPU
-        // partial into its host pointer instead of enqueueing a blocking
-        // `enqueue_write_buffer`. Same cl_mem is visible to the GPU kernel
-        // via ALLOC_HOST_PTR; Adreno UMA allows concurrent CPU-write +
-        // kernel-read. Fallback to the legacy upload path when mapping is
-        // unavailable (e.g. discrete OpenCL device, env opt-out).
-        let staging_host_ptr = pw.cpu_merge_staging.buffer().as_mut_ptr();
-        let upload_cpu_partial =
-            |fallback_label: &str| -> std::result::Result<(), PlanInvalidated> {
-                if !staging_host_ptr.is_null() {
-                    // SAFETY: `staging_host_ptr` is from ALLOC_HOST_PTR-backed
-                    // buffer, mapped for the workspace lifetime. Non-overlapping
-                    // with `down_partial_cpu` (separate allocations).
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            cpu_partial_slice.as_ptr(),
-                            staging_host_ptr,
-                            cpu_partial_slice.len(),
-                        );
-                    }
-                    // Release fence: ensure CPU stores to the zero-copy staging
-                    // buffer commit before the in-order queue starts executing
-                    // `add_assign` (which reads the same ALLOC_HOST_PTR region
-                    // via GPU). On ARM Adreno UMA this is the minimum barrier
-                    // required when the gpu_wait drain is skipped.
-                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                    return Ok(());
-                }
-                if let Err(e) = unsafe {
-                    ocl::core::enqueue_write_buffer(
-                        queue,
-                        staging_mem,
-                        true,
-                        0,
-                        cpu_partial_slice,
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>,
-                    )
-                } {
-                    log::error!(
-                        "PartitionStep CPU partial upload failed ({}): layer={} err={}",
-                        fallback_label,
-                        layer_idx,
-                        e
-                    );
-                    return Err(PlanInvalidated);
-                }
-                Ok(())
-            };
-
-        match &self.merge {
-            PartitionMerge::Fused { fused_step } => {
-                // Deliver CPU partial to staging, then single fused kernel:
-                //   x += down_partial_gpu + cpu_merge_staging
-                // Replaces 3 sequential dispatches (copy_slice, add_assign
-                // staging, post_ffn add_assign) with one. The plan executor
-                // recognises the Fused variant and skips steps_post_ffn for
-                // this layer.
-                upload_cpu_partial("fused")?;
-                FullKernelPlan::dispatch_step(backend, fused_step, 0, 0, 0, 0, 0, 0, 0);
-            }
-            PartitionMerge::Inline {
-                copy_gpu_to_down,
-                add_assign,
-            } => {
-                // (a) copy_slice(down_partial_gpu → ws.down). Pre-bound.
-                FullKernelPlan::dispatch_step(backend, copy_gpu_to_down, 0, 0, 0, 0, 0, 0, 0);
-                // (b) deliver CPU partial to `cpu_merge_staging` (memcpy on
-                //     UMA with permanent-mapped staging, else blocking DMA).
-                upload_cpu_partial("inline")?;
-                // (c) add_assign(ws.down, cpu_merge_staging).
-                FullKernelPlan::dispatch_step(backend, add_assign, 0, 0, 0, 0, 0, 0, 0);
-            }
-            PartitionMerge::Deferred => {
-                // Deliver CPU partial only; the next layer's fused kernel
-                // will perform copy+add. (Phase 2-B placeholder.)
-                upload_cpu_partial("deferred")?;
-            }
-        }
-
-        // 7. Trace accounting. Mirrors forward_gen segment breakdown:
-        //    sync_drain / dma_read / cpu_matmul / gpu_wait / merge.
-        if let (Some(t0), Some(t_sync), Some(t_read), Some(t_cpu), Some(t_gpu)) =
-            (t0, t_sync_done, t_read_done, t_cpu_done, t_gpu_done)
-        {
-            let t_merge = std::time::Instant::now();
-            let sync_ns = t_sync.duration_since(t0).as_nanos() as u64;
-            let dma_ns = t_read.duration_since(t_sync).as_nanos() as u64;
-            let cpu_ns = t_cpu.duration_since(t_read).as_nanos() as u64;
-            let gpu_wait_ns = t_gpu.duration_since(t_cpu).as_nanos() as u64;
-            let merge_ns = t_merge.duration_since(t_gpu).as_nanos() as u64;
-            record_partition_timing(sync_ns, dma_ns, cpu_ns, gpu_wait_ns, merge_ns, actual_path);
-        }
-
-        Ok(())
     }
 }
 
@@ -961,6 +358,9 @@ pub struct FullKernelPlan {
     /// after `build_full_plan` ([`FullKernelPlan::set_q_row_copy`]); `None` costs one branch
     /// per layer.
     pub q_row_copy: Option<QRowPlanCopy>,
+    /// `Some` when the layers are CPU–GPU partitioned (ticket 021): the shared partition
+    /// workspace, whose controller closes each token after the last layer.
+    pub tp: Option<Arc<PartitionWsCell>>,
 }
 
 /// Per-layer device copy of the step's rotated query row into the output-perturbation ring
@@ -993,7 +393,7 @@ impl std::fmt::Display for PlanInvalidated {
 impl std::error::Error for PlanInvalidated {}
 
 /// INV-120 generation check as a free function — usable from tests without
-/// constructing a full `PartitionStep`.
+/// constructing a partition step.
 ///
 /// Returns `Err(PlanInvalidated)` when `counter.load(Acquire) != at_build`.
 pub fn check_partition_generation(
@@ -1063,6 +463,36 @@ impl FullKernelPlan {
     pub(crate) fn dispatch_step(
         backend: &crate::backend::opencl::OpenCLBackend,
         step: &KernelStep,
+        start_pos: i32,
+        cache_seq_len: i32,
+        write_pos: i32,
+        kv_capacity: i32,
+        res_pos: i32,
+        q2_tokens: i32,
+        res_tokens: i32,
+    ) {
+        Self::dispatch_step_gws(
+            backend,
+            step,
+            &step.global_work_size,
+            start_pos,
+            cache_seq_len,
+            write_pos,
+            kv_capacity,
+            res_pos,
+            q2_tokens,
+            res_tokens,
+        );
+    }
+
+    /// [`Self::dispatch_step`] with a per-dispatch global work size (the partitioned steps size
+    /// their kernels to the current split).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_step_gws(
+        backend: &crate::backend::opencl::OpenCLBackend,
+        step: &KernelStep,
+        global_work_size: &[usize; 3],
         start_pos: i32,
         cache_seq_len: i32,
         write_pos: i32,
@@ -1228,13 +658,13 @@ impl FullKernelPlan {
                 &step.kernel,
                 step.op_tag.profile_label(),
                 step.ndim,
-                &step.global_work_size,
+                global_work_size,
                 step.local_work_size,
             ) {
                 log::error!(
                     "Plan enqueue_kernel_labeled failed: op={:?} gws={:?}: {}",
                     step.op_tag,
-                    step.global_work_size,
+                    global_work_size,
                     e
                 );
             }
@@ -1245,7 +675,7 @@ impl FullKernelPlan {
                     &step.kernel,
                     step.ndim,
                     None,
-                    &step.global_work_size,
+                    global_work_size,
                     step.local_work_size,
                     None::<&ocl::core::Event>,
                     None::<&mut ocl::core::Event>,
@@ -1253,7 +683,7 @@ impl FullKernelPlan {
                     log::error!(
                         "Plan enqueue_kernel failed: op={:?} gws={:?}: {}",
                         step.op_tag,
-                        step.global_work_size,
+                        global_work_size,
                         e
                     );
                 }
@@ -1334,53 +764,22 @@ impl FullKernelPlan {
                 trace_n_kv = attn_seq_len;
             }
 
-            // Steps 1-6: pre-KV steps
-            for (si, step) in layer_plan.steps_pre_kv.iter().enumerate() {
-                Self::dispatch_step(
-                    backend,
-                    step,
-                    start_pos_i32,
-                    cache_seq_len,
-                    write_pos,
-                    kv_cap,
-                    rp,
-                    q2t,
-                    rt,
-                );
-                if debug_sync {
-                    ocl::core::finish(queue).ok();
-                    eprintln!(
-                        "[Plan] L{} pre_kv[{}] {:?} OK (pos={}, cap={})",
-                        i, si, step.op_tag, start_pos, kv_cap
-                    );
+            let a = match &layer_plan.attn {
+                AttnVariant::Partitioned(step) => {
+                    step.run(
+                        backend,
+                        start_pos,
+                        g.current_pos,
+                        kv_cap,
+                        g.head_start.is_some(),
+                    )?;
+                    None
                 }
-            }
-            // Query-row capture (output-perturbation metric): the RoPE steps above left this
-            // layer's rotated query row in `ws.q`; copy it out before the next layer overwrites it.
-            if let Some(c) = self.q_row_copy.as_ref()
-                && i < c.n_layers
-            {
-                let dst_off = (i * c.rows + start_pos % c.rows) * c.row_bytes;
-                if let Err(e) = unsafe {
-                    ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
-                        queue,
-                        &c.src,
-                        &c.ring,
-                        0,
-                        dst_off,
-                        c.row_bytes,
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>,
-                    )
-                } {
-                    log::error!("Plan q-row copy failed: layer={i} pos={start_pos}: {e}");
-                    c.failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-
-            // Step 7: KV update
-            match &layer_plan.kv_update {
-                KvUpdateVariant::Standard(step) => {
+                AttnVariant::GpuOnly(a) => Some(a),
+            };
+            if let Some(a) = a {
+                // Steps 1-6: pre-KV steps
+                for (si, step) in a.steps_pre_kv.iter().enumerate() {
                     Self::dispatch_step(
                         backend,
                         step,
@@ -1395,99 +794,80 @@ impl FullKernelPlan {
                     if debug_sync {
                         ocl::core::finish(queue).ok();
                         eprintln!(
-                            "[Plan] L{} kv_scatter OK (write_pos={}, cap={})",
-                            i, write_pos, kv_cap
+                            "[Plan] L{} pre_kv[{}] {:?} OK (pos={}, cap={})",
+                            i, si, step.op_tag, start_pos, kv_cap
                         );
                     }
                 }
-            }
+                // Query-row capture (output-perturbation metric): the RoPE steps above left this
+                // layer's rotated query row in `ws.q`; copy it out before the next layer overwrites it.
+                if let Some(c) = self.q_row_copy.as_ref()
+                    && i < c.n_layers
+                {
+                    let dst_off = (i * c.rows + start_pos % c.rows) * c.row_bytes;
+                    if let Err(e) = unsafe {
+                        ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
+                            queue,
+                            &c.src,
+                            &c.ring,
+                            0,
+                            dst_off,
+                            c.row_bytes,
+                            None::<&ocl::core::Event>,
+                            None::<&mut ocl::core::Event>,
+                        )
+                    } {
+                        log::error!("Plan q-row copy failed: layer={i} pos={start_pos}: {e}");
+                        c.failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
 
-            // Step 8: Attention — uses attn_seq_len (includes just-scattered token)
-            // A ragged cache hands the kernel its per-head first resident slots (NULL = uniform).
-            let bind_kv_start = |kernel: &ocl::core::Kernel, arg_idx: u32| {
-                let val = match g.head_start.as_ref() {
-                    Some(m) => ocl::core::ArgVal::mem(m),
-                    None => ocl::core::ArgVal::mem_null(),
+                // Step 7: KV update
+                match &a.kv_update {
+                    KvUpdateVariant::Standard(step) => {
+                        Self::dispatch_step(
+                            backend,
+                            step,
+                            start_pos_i32,
+                            cache_seq_len,
+                            write_pos,
+                            kv_cap,
+                            rp,
+                            q2t,
+                            rt,
+                        );
+                        if debug_sync {
+                            ocl::core::finish(queue).ok();
+                            eprintln!(
+                                "[Plan] L{} kv_scatter OK (write_pos={}, cap={})",
+                                i, write_pos, kv_cap
+                            );
+                        }
+                    }
+                }
+
+                // Step 8: Attention — uses attn_seq_len (includes just-scattered token)
+                // A ragged cache hands the kernel its per-head first resident slots (NULL = uniform).
+                let bind_kv_start = |kernel: &ocl::core::Kernel, arg_idx: u32| {
+                    let val = match g.head_start.as_ref() {
+                        Some(m) => ocl::core::ArgVal::mem(m),
+                        None => ocl::core::ArgVal::mem_null(),
+                    };
+                    if let Err(e) = unsafe { ocl::core::set_kernel_arg(kernel, arg_idx, val) } {
+                        log::error!(
+                            "Plan set kv_start arg failed: layer={i} arg_idx={arg_idx}: {e}"
+                        );
+                    }
                 };
-                if let Err(e) = unsafe { ocl::core::set_kernel_arg(kernel, arg_idx, val) } {
-                    log::error!("Plan set kv_start arg failed: layer={i} arg_idx={arg_idx}: {e}");
-                }
-            };
-            match &layer_plan.attention {
-                AttentionVariant::Standard(step) => {
-                    bind_kv_start(&step.kernel, 16);
-                    if debug_sync {
-                        eprintln!(
-                            "[Plan] L{} attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
-                            i, attn_seq_len, step.global_work_size, step.local_work_size
-                        );
-                    }
-                    Self::dispatch_step(
-                        backend,
-                        step,
-                        start_pos_i32,
-                        attn_seq_len,
-                        write_pos,
-                        kv_cap,
-                        rp,
-                        q2t,
-                        rt,
-                    );
-                    // GPU score accumulator: per-layer scores now live in the
-                    // layer's own slice of `score_buf` (offset pre-baked at
-                    // plan-build time, see `LayerPlanConfig::gpu_score_layer_offset`).
-                    // A single fused reduce kernel folds all layers into
-                    // cumulative importance at `end_step()` after the final
-                    // layer — no per-layer dispatch needed here.
-                    if debug_sync {
-                        eprintln!("[Plan] L{} attention enqueued, calling finish...", i);
-                        ocl::core::finish(queue).ok();
-                        eprintln!("[Plan] L{} attention OK (attn_seq_len={})", i, attn_seq_len);
-                    }
-                }
-                AttentionVariant::StandardFlash(step) => {
-                    bind_kv_start(&step.kernel, 44);
-                    if debug_sync {
-                        eprintln!(
-                            "[Plan] L{} flash attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
-                            i, attn_seq_len, step.global_work_size, step.local_work_size
-                        );
-                    }
-                    let trace_q1 = std::env::var_os("LLMRS_TRACE_Q1").is_some();
-                    if trace_q1 {
-                        ocl::core::finish(queue).ok();
-                    }
-                    let q1_start = std::time::Instant::now();
-                    Self::dispatch_step(
-                        backend,
-                        step,
-                        start_pos_i32,
-                        attn_seq_len,
-                        write_pos,
-                        kv_cap,
-                        rp,
-                        q2t,
-                        rt,
-                    );
-                    if trace_q1 {
-                        ocl::core::finish(queue).ok();
-                        let us = q1_start.elapsed().as_nanos() as u64 / 1000;
-                        eprintln!("[Q1_TRACE] layer={} n_kv={} us={}", i, attn_seq_len, us);
-                    }
-                    // LLMRS_Q1_REPEAT=N: re-dispatch the Q1 kernel (N-1) additional
-                    // times against the same KV state, measuring each repetition in
-                    // isolation. The first (production) iteration follows matmul_qkv
-                    // /rope/kv_update and reads KV "cold" from the just-written slot;
-                    // subsequent reps read it "warm". Comparing rep=0 vs rep>=1
-                    // slope against n_kv separates kernel-intrinsic cost from
-                    // context-dependent cache/coherency effects.
-                    let q1_repeat: u32 = std::env::var("LLMRS_Q1_REPEAT")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(1);
-                    for rep in 1..q1_repeat {
-                        ocl::core::finish(queue).ok();
-                        let rep_start = std::time::Instant::now();
+                match &a.attention {
+                    AttentionVariant::Standard(step) => {
+                        bind_kv_start(&step.kernel, 16);
+                        if debug_sync {
+                            eprintln!(
+                                "[Plan] L{} attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
+                                i, attn_seq_len, step.global_work_size, step.local_work_size
+                            );
+                        }
                         Self::dispatch_step(
                             backend,
                             step,
@@ -1499,52 +879,34 @@ impl FullKernelPlan {
                             q2t,
                             rt,
                         );
-                        ocl::core::finish(queue).ok();
-                        let rep_us = rep_start.elapsed().as_nanos() as u64 / 1000;
-                        eprintln!(
-                            "[Q1_REPEAT] layer={} n_kv={} rep={} us={}",
-                            i, attn_seq_len, rep, rep_us
-                        );
-                    }
-                    if debug_sync {
-                        ocl::core::finish(queue).ok();
-                        eprintln!(
-                            "[Plan] L{} flash attention OK (attn_seq_len={})",
-                            i, attn_seq_len
-                        );
-                    }
-                }
-                AttentionVariant::SplitFlash { main, merge } => {
-                    bind_kv_start(&main.kernel, Q1_SPLIT_MAIN_KV_START_ARG);
-                    bind_kv_start(&merge.kernel, Q1_MERGE_KV_START_ARG);
-                    if debug_sync {
-                        eprintln!(
-                            "[Plan] L{} split flash attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
-                            i, attn_seq_len, main.global_work_size, main.local_work_size
-                        );
-                    }
-                    // The pair is one attention op for `LLMRS_TRACE_Q1` / `LLMRS_Q1_REPEAT`
-                    // (same env knobs as the `StandardFlash` arm) so the two kernels'
-                    // numbers are directly comparable.
-                    let dispatch_pair = || {
-                        Self::dispatch_step(
-                            backend,
-                            main,
-                            start_pos_i32,
-                            attn_seq_len,
-                            write_pos,
-                            kv_cap,
-                            rp,
-                            q2t,
-                            rt,
-                        );
-                        // A single split finalises inside the main kernel (`final_out`).
-                        if main.global_work_size[2] <= 1 {
-                            return;
+                        // GPU score accumulator: per-layer scores now live in the
+                        // layer's own slice of `score_buf` (offset pre-baked at
+                        // plan-build time, see `LayerPlanConfig::gpu_score_layer_offset`).
+                        // A single fused reduce kernel folds all layers into
+                        // cumulative importance at `end_step()` after the final
+                        // layer — no per-layer dispatch needed here.
+                        if debug_sync {
+                            eprintln!("[Plan] L{} attention enqueued, calling finish...", i);
+                            ocl::core::finish(queue).ok();
+                            eprintln!("[Plan] L{} attention OK (attn_seq_len={})", i, attn_seq_len);
                         }
+                    }
+                    AttentionVariant::StandardFlash(step) => {
+                        bind_kv_start(&step.kernel, 44);
+                        if debug_sync {
+                            eprintln!(
+                                "[Plan] L{} flash attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
+                                i, attn_seq_len, step.global_work_size, step.local_work_size
+                            );
+                        }
+                        let trace_q1 = std::env::var_os("LLMRS_TRACE_Q1").is_some();
+                        if trace_q1 {
+                            ocl::core::finish(queue).ok();
+                        }
+                        let q1_start = std::time::Instant::now();
                         Self::dispatch_step(
                             backend,
-                            merge,
+                            step,
                             start_pos_i32,
                             attn_seq_len,
                             write_pos,
@@ -1553,65 +915,150 @@ impl FullKernelPlan {
                             q2t,
                             rt,
                         );
-                    };
-                    let trace_q1 = std::env::var_os("LLMRS_TRACE_Q1").is_some();
-                    if trace_q1 {
-                        ocl::core::finish(queue).ok();
+                        if trace_q1 {
+                            ocl::core::finish(queue).ok();
+                            let us = q1_start.elapsed().as_nanos() as u64 / 1000;
+                            eprintln!("[Q1_TRACE] layer={} n_kv={} us={}", i, attn_seq_len, us);
+                        }
+                        // LLMRS_Q1_REPEAT=N: re-dispatch the Q1 kernel (N-1) additional
+                        // times against the same KV state, measuring each repetition in
+                        // isolation. The first (production) iteration follows matmul_qkv
+                        // /rope/kv_update and reads KV "cold" from the just-written slot;
+                        // subsequent reps read it "warm". Comparing rep=0 vs rep>=1
+                        // slope against n_kv separates kernel-intrinsic cost from
+                        // context-dependent cache/coherency effects.
+                        let q1_repeat: u32 = std::env::var("LLMRS_Q1_REPEAT")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(1);
+                        for rep in 1..q1_repeat {
+                            ocl::core::finish(queue).ok();
+                            let rep_start = std::time::Instant::now();
+                            Self::dispatch_step(
+                                backend,
+                                step,
+                                start_pos_i32,
+                                attn_seq_len,
+                                write_pos,
+                                kv_cap,
+                                rp,
+                                q2t,
+                                rt,
+                            );
+                            ocl::core::finish(queue).ok();
+                            let rep_us = rep_start.elapsed().as_nanos() as u64 / 1000;
+                            eprintln!(
+                                "[Q1_REPEAT] layer={} n_kv={} rep={} us={}",
+                                i, attn_seq_len, rep, rep_us
+                            );
+                        }
+                        if debug_sync {
+                            ocl::core::finish(queue).ok();
+                            eprintln!(
+                                "[Plan] L{} flash attention OK (attn_seq_len={})",
+                                i, attn_seq_len
+                            );
+                        }
                     }
-                    let q1_start = std::time::Instant::now();
-                    dispatch_pair();
-                    if trace_q1 {
-                        ocl::core::finish(queue).ok();
-                        let us = q1_start.elapsed().as_nanos() as u64 / 1000;
-                        eprintln!(
-                            "[Q1_TRACE] layer={} n_kv={} us={} splits={}",
-                            i, attn_seq_len, us, main.global_work_size[2]
-                        );
-                    }
-                    let q1_repeat: u32 = std::env::var("LLMRS_Q1_REPEAT")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(1);
-                    for rep in 1..q1_repeat {
-                        ocl::core::finish(queue).ok();
-                        let rep_start = std::time::Instant::now();
+                    AttentionVariant::SplitFlash { main, merge } => {
+                        bind_kv_start(&main.kernel, Q1_SPLIT_MAIN_KV_START_ARG);
+                        bind_kv_start(&merge.kernel, Q1_MERGE_KV_START_ARG);
+                        if debug_sync {
+                            eprintln!(
+                                "[Plan] L{} split flash attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
+                                i, attn_seq_len, main.global_work_size, main.local_work_size
+                            );
+                        }
+                        // The pair is one attention op for `LLMRS_TRACE_Q1` / `LLMRS_Q1_REPEAT`
+                        // (same env knobs as the `StandardFlash` arm) so the two kernels'
+                        // numbers are directly comparable.
+                        let dispatch_pair = || {
+                            Self::dispatch_step(
+                                backend,
+                                main,
+                                start_pos_i32,
+                                attn_seq_len,
+                                write_pos,
+                                kv_cap,
+                                rp,
+                                q2t,
+                                rt,
+                            );
+                            // A single split finalises inside the main kernel (`final_out`).
+                            if main.global_work_size[2] <= 1 {
+                                return;
+                            }
+                            Self::dispatch_step(
+                                backend,
+                                merge,
+                                start_pos_i32,
+                                attn_seq_len,
+                                write_pos,
+                                kv_cap,
+                                rp,
+                                q2t,
+                                rt,
+                            );
+                        };
+                        let trace_q1 = std::env::var_os("LLMRS_TRACE_Q1").is_some();
+                        if trace_q1 {
+                            ocl::core::finish(queue).ok();
+                        }
+                        let q1_start = std::time::Instant::now();
                         dispatch_pair();
-                        ocl::core::finish(queue).ok();
-                        let rep_us = rep_start.elapsed().as_nanos() as u64 / 1000;
-                        eprintln!(
-                            "[Q1_REPEAT] layer={} n_kv={} rep={} us={}",
-                            i, attn_seq_len, rep, rep_us
-                        );
+                        if trace_q1 {
+                            ocl::core::finish(queue).ok();
+                            let us = q1_start.elapsed().as_nanos() as u64 / 1000;
+                            eprintln!(
+                                "[Q1_TRACE] layer={} n_kv={} us={} splits={}",
+                                i, attn_seq_len, us, main.global_work_size[2]
+                            );
+                        }
+                        let q1_repeat: u32 = std::env::var("LLMRS_Q1_REPEAT")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(1);
+                        for rep in 1..q1_repeat {
+                            ocl::core::finish(queue).ok();
+                            let rep_start = std::time::Instant::now();
+                            dispatch_pair();
+                            ocl::core::finish(queue).ok();
+                            let rep_us = rep_start.elapsed().as_nanos() as u64 / 1000;
+                            eprintln!(
+                                "[Q1_REPEAT] layer={} n_kv={} rep={} us={}",
+                                i, attn_seq_len, rep, rep_us
+                            );
+                        }
+                        if debug_sync {
+                            ocl::core::finish(queue).ok();
+                            eprintln!(
+                                "[Plan] L{} split flash attention OK (attn_seq_len={})",
+                                i, attn_seq_len
+                            );
+                        }
                     }
+                }
+
+                // Steps 9-10: post-attention pre-FFN (Wo matmul, add_rms_norm).
+                for (si, step) in a.steps_post_attn_pre_ffn.iter().enumerate() {
+                    Self::dispatch_step(
+                        backend,
+                        step,
+                        start_pos_i32,
+                        cache_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt,
+                    );
                     if debug_sync {
                         ocl::core::finish(queue).ok();
                         eprintln!(
-                            "[Plan] L{} split flash attention OK (attn_seq_len={})",
-                            i, attn_seq_len
+                            "[Plan] L{} post_attn_pre_ffn[{}] {:?} OK",
+                            i, si, step.op_tag
                         );
                     }
-                }
-            }
-
-            // Steps 9-10: post-attention pre-FFN (Wo matmul, add_rms_norm).
-            for (si, step) in layer_plan.steps_post_attn_pre_ffn.iter().enumerate() {
-                Self::dispatch_step(
-                    backend,
-                    step,
-                    start_pos_i32,
-                    cache_seq_len,
-                    write_pos,
-                    kv_cap,
-                    rp,
-                    q2t,
-                    rt,
-                );
-                if debug_sync {
-                    ocl::core::finish(queue).ok();
-                    eprintln!(
-                        "[Plan] L{} post_attn_pre_ffn[{}] {:?} OK",
-                        i, si, step.op_tag
-                    );
                 }
             }
 
@@ -1643,25 +1090,17 @@ impl FullKernelPlan {
                     false
                 }
                 FfnVariant::Partitioned(step) => {
-                    step.run(backend, i)?;
+                    step.run(backend)?;
                     if debug_sync {
                         ocl::core::finish(queue).ok();
                         eprintln!("[Plan] L{} partition FFN OK", i);
                     }
-                    // `Fused` merge already performs `x += gpu_partial + cpu_partial`
-                    // inside PartitionStep::run, so the standalone post_ffn
-                    // add_assign step becomes redundant. `Deferred` is still
-                    // broken on plan path (see PartitionMerge::Deferred doc).
-                    match step.merge {
-                        PartitionMerge::Fused { .. } => true,
-                        PartitionMerge::Deferred => !step.is_last_layer,
-                        PartitionMerge::Inline { .. } => false,
-                    }
+                    // The fused merge already landed `x += down_gpu + cpu_partial`.
+                    true
                 }
             };
 
-            // Step 15: add_assign (x += down). Partition `Deferred` layers
-            // fold this into the next layer's fused norm kernel.
+            // Step 15: add_assign (x += down).
             if !skip_post_ffn {
                 for (si, step) in layer_plan.steps_post_ffn.iter().enumerate() {
                     Self::dispatch_step(
@@ -1750,6 +1189,12 @@ impl FullKernelPlan {
         // per-token overhead from the dispatcher wrapping.
         if let Some(ref lm_head) = self.lm_head {
             Self::dispatch_step(backend, lm_head, 0, 0, 0, 0, 0, 0, 0);
+        }
+        if let Some(tp) = self.tp.as_ref() {
+            if let Err(e) = ocl::core::flush(queue) {
+                log::error!("Plan flush failed: {}", e);
+            }
+            super::tp_plan::end_token(tp)?;
         }
 
         if op_trace {
@@ -1878,24 +1323,8 @@ pub struct LayerPlanConfig<'a> {
     pub w_gate_noshuffle: Option<NoshufflePlanEntry<'a>>,
     pub w_up_noshuffle: Option<NoshufflePlanEntry<'a>>,
     pub w_down_noshuffle: Option<NoshufflePlanEntry<'a>>,
-    /// Partition slice SOA entries. Populated when `partition_ctx` is active
-    /// and the slice cl_mems have been registered via
-    /// `prepare_noshuffle_buffers`. `build_partitioned_layer_plan` consults
-    /// these before falling back to the AOS GEMV kernel.
-    pub partition_gate_noshuffle: Option<NoshufflePlanEntry<'a>>,
-    pub partition_up_noshuffle: Option<NoshufflePlanEntry<'a>>,
-    pub partition_down_noshuffle: Option<NoshufflePlanEntry<'a>>,
-    /// Partition ready-flag buffer. When `Some`, `build_layer_plan` selects
-    /// the `_sigflag` variant for step 10 (`add_rms_norm_oop`) and binds
-    /// this cl_mem as the flag output. `PartitionStep::run` then
-    /// spin-polls the host-mapped side instead of calling `clFinish` —
-    /// only valid with `partition_poll_flag_enabled()`.
-    pub partition_ready_flag_buf: Option<&'a Mem>,
-    /// Permanent-mapped host pointer for `residual_buf`. When non-null,
-    /// the partition plan path can read residual directly via this
-    /// pointer (skipping the blocking `enqueue_read_buffer`). Only used
-    /// by `build_partitioned_layer_plan` to stash into
-    /// `PartitionPlanContext.residual_host_ptr`.
+    /// Permanent-mapped host pointer for `residual_buf` (null when unmapped). The partitioned
+    /// layers' CPU share reads each segment's normed input through it (ticket 021).
     pub residual_host_ptr: *const u8,
 }
 
@@ -1929,7 +1358,7 @@ const LARGE_N_THRESHOLD: usize = 4096;
 /// - Nosub fallback: local=[64,1,1], N_DST=4 → 4 rows/WG,
 ///   global=[ceil(n/4)*64, 1, 1].
 #[allow(clippy::too_many_arguments)]
-fn make_f16_matmul_step(
+pub(crate) fn make_f16_matmul_step(
     program: &ocl::Program,
     src_buf: &Mem,
     weight_buf: &Mem,
@@ -1944,7 +1373,8 @@ fn make_f16_matmul_step(
     // - 4-wave path is active (nosub fallback has incompatible dispatch)
     // - l4_program compiled successfully
     // - n exceeds the threshold where halving WG count pays off
-    let use_l4 = !is_nosub && l4_program.is_some() && n > LARGE_N_THRESHOLD;
+    let kind = GemvKind::select(n, l4_program.is_some(), is_nosub);
+    let use_l4 = kind == GemvKind::L4;
     let kernel = if use_l4 {
         ocl::core::create_kernel(l4_program.unwrap(), "kernel_mul_mat_f16_f32_l4")
             .context("create kernel_mul_mat_f16_f32_l4")?
@@ -1981,23 +1411,9 @@ fn make_f16_matmul_step(
         ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
     }
 
-    let (global_work_size, local_work_size) = if is_nosub {
-        // Nosub: single-subgroup WG, 4 rows/WG.
-        const NOSUB_N_DST: usize = 4;
-        let n_groups = n.div_ceil(NOSUB_N_DST);
-        ([n_groups * 64, 1, 1], [64usize, 1, 1])
-    } else if use_l4 {
-        // 4-wave L4: 4 waves × 64 lanes cooperate per row-group, N_DST=4.
-        const L4_N_DST: usize = 4;
-        let n_groups = n.div_ceil(L4_N_DST);
-        // m=1 for decode → dim1 = m*4 = 4
-        ([n_groups * 64, 4, 1], [64usize, 4, 1])
-    } else {
-        // 4-wave: 4 waves × 64 lanes cooperate per row-group, N_DST=2.
-        const WAVE4_N_DST: usize = 2;
-        let n_groups = n.div_ceil(WAVE4_N_DST);
-        ([n_groups * 64, 4, 1], [64usize, 4, 1])
-    };
+    // Nosub: single-subgroup WG, 4 rows/WG. L4: 4 waves × 64 lanes, N_DST=4.
+    // Wave4: 4 waves × 64 lanes, N_DST=2.
+    let (global_work_size, local_work_size) = kind.work_size(n);
 
     Ok(KernelStep {
         kernel,
@@ -3247,15 +2663,8 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     }
 
     // 10. add_rms_norm_oop (x += attn_out, then norm -> residual)
-    //     Optional: when `partition_ready_flag_buf` is set, use the
-    //     `_sigflag` variant that writes a host-visible flag after the
-    //     residual store (release semantics). `PartitionStep::run` then
-    //     spin-polls the flag instead of blocking on `clFinish(queue)`.
     {
-        let use_sigflag = config.partition_ready_flag_buf.is_some() && dim.is_multiple_of(4);
-        let kernel_name = if use_sigflag {
-            "kernel_add_rms_norm_oop_f4_sigflag"
-        } else if dim.is_multiple_of(4) {
+        let kernel_name = if dim.is_multiple_of(4) {
             "kernel_add_rms_norm_oop_f4"
         } else {
             "kernel_add_rms_norm_oop"
@@ -3271,22 +2680,11 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&config.rms_norm_eps))?;
             // add_unit = 0 (non-Gemma3)
             ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::scalar(&0i32))?;
-            if use_sigflag {
-                // SAFETY: existence checked above.
-                let flag_buf = config.partition_ready_flag_buf.unwrap();
-                ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::mem(flag_buf))?;
-                ocl::core::set_kernel_arg(
-                    &kernel,
-                    8,
-                    ocl::core::ArgVal::local::<f32>(&local_mem_bytes),
-                )?;
-            } else {
-                ocl::core::set_kernel_arg(
-                    &kernel,
-                    7,
-                    ocl::core::ArgVal::local::<f32>(&local_mem_bytes),
-                )?;
-            }
+            ocl::core::set_kernel_arg(
+                &kernel,
+                7,
+                ocl::core::ArgVal::local::<f32>(&local_mem_bytes),
+            )?;
         }
         steps_post_attn_pre_ffn.push(KernelStep {
             kernel,
@@ -3427,9 +2825,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 15: post-FFN (residual add). Partition layers with `Deferred`
-    // merge skip this step on non-last layers — the plan executor owns that
-    // logic, so we always emit it here and let the caller suppress.
+    // Step 15: post-FFN (residual add).
     // -----------------------------------------------------------------------
     let mut steps_post_ffn = Vec::with_capacity(1);
     {
@@ -3455,353 +2851,16 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     }
 
     Ok(LayerKernelPlan {
-        steps_pre_kv,
-        kv_update,
-        attention,
-        steps_post_attn_pre_ffn,
+        attn: AttnVariant::GpuOnly(GpuAttnSteps {
+            steps_pre_kv,
+            kv_update,
+            attention,
+            steps_post_attn_pre_ffn,
+        }),
         ffn,
         steps_post_ffn,
         flush_after: false,
     })
-}
-
-/// Build a layer plan with a cooperative FFN partition (see arch A.3/A.7.1).
-///
-/// `config` is the same LayerPlanConfig used by `build_layer_plan` — shared
-/// QKV/attention/Wo bindings. The FFN section is replaced with a
-/// `FfnVariant::Partitioned` that wraps GPU slice dispatches + a
-/// `PartitionPlanContext` carrying CPU-side handles.
-///
-/// Returns `Err` when the plan path is disabled (`LLMRS_PARTITION_PLAN=0`).
-/// The caller falls back to `forward_gen` in that case.
-#[allow(clippy::too_many_arguments)]
-// LAYER-EXEMPT: dispatch_orchestrator
-pub fn build_partitioned_layer_plan(
-    config: &LayerPlanConfig,
-    partition_ctx: &PartitionContext,
-    workspace: &Arc<PartitionWsCell>,
-    cpu_backend: &Arc<dyn Backend>,
-    use_gelu_tanh: bool,
-    layer_idx: usize,
-    is_last_layer: bool,
-) -> Result<LayerKernelPlan> {
-    use std::sync::atomic::Ordering;
-
-    if !partition_plan_enabled() {
-        anyhow::bail!("LLMRS_PARTITION_PLAN=0 — partition plan path disabled");
-    }
-
-    let dim = config.dim;
-    let split_row = partition_ctx.gate.split_row; // GPU rows (gate/up out_dim slice)
-    let cpu_rows = config.ffn_hidden - split_row;
-    anyhow::ensure!(
-        split_row > 0 && cpu_rows > 0,
-        "partition split_row must be in (0, ffn_hidden), got split_row={} ffn_hidden={}",
-        split_row,
-        config.ffn_hidden,
-    );
-    anyhow::ensure!(
-        split_row.is_multiple_of(4),
-        "partition split_row must be a multiple of 4 for silu_mul f4 kernel, got {}",
-        split_row,
-    );
-
-    // SAFETY: `workspace` is only accessed from the dispatch thread.
-    let pw_ref: &PartitionPlanWorkspace = unsafe { &*workspace.get() };
-
-    // ── Steps 1-10 (pre-FFN) are reused from the non-partition path ──
-    let mut base_plan = build_layer_plan(config)?;
-
-    // cl_mem handles for the partition-side bindings.
-    let gate_gpu_mem = crate::backend::opencl::get_cl_mem(pw_ref.gate_gpu.buffer().as_ref())
-        .context("partition gate_gpu cl_mem")?;
-    let up_gpu_mem = crate::backend::opencl::get_cl_mem(pw_ref.up_gpu.buffer().as_ref())
-        .context("partition up_gpu cl_mem")?;
-    let down_partial_gpu_mem =
-        crate::backend::opencl::get_cl_mem(pw_ref.down_partial_gpu.buffer().as_ref())
-            .context("partition down_partial_gpu cl_mem")?;
-    let cpu_merge_staging_mem =
-        crate::backend::opencl::get_cl_mem(pw_ref.cpu_merge_staging.buffer().as_ref())
-            .context("partition cpu_merge_staging cl_mem")?;
-
-    // Partition weight slice cl_mem handles. `gpu_slice()` (slices[0]) tensors
-    // are produced by `split_weight` / `split_weight_col` via
-    // `backend.copy_from`, so they are regular (non-noshuffle) GPU buffers.
-    let gate_slice_mem =
-        crate::backend::opencl::get_cl_mem(partition_ctx.gate.gpu_slice().buffer().as_ref())
-            .context("partition gate slice cl_mem")?;
-    let up_slice_mem =
-        crate::backend::opencl::get_cl_mem(partition_ctx.up.gpu_slice().buffer().as_ref())
-            .context("partition up slice cl_mem")?;
-    let down_slice_mem =
-        crate::backend::opencl::get_cl_mem(partition_ctx.down.gpu_slice().buffer().as_ref())
-            .context("partition down slice cl_mem")?;
-
-    // Dtype dispatch: partition weights inherit the base model dtype. When
-    // Q4_0 partition slices have been registered in the backend's noshuffle
-    // SOA registry (via `prepare_noshuffle_buffers`), prefer the
-    // Adreno-optimized `kernel_gemv_noshuffle_q4_0` path; otherwise fall back
-    // to the AOS `kernel_mul_mat_q4_0_f32`. The F16 path forwards the L4
-    // program so large slices select the N_DST=4 kernel.
-    let gate_dtype = partition_ctx.gate.gpu_slice().dtype();
-    let use_q4_0 = gate_dtype == crate::buffer::DType::Q4_0;
-
-    let build_matmul = |src: &Mem,
-                        weight: &Mem,
-                        dst: &Mem,
-                        n: usize,
-                        k: usize,
-                        tag: OpTag,
-                        ns: Option<&NoshufflePlanEntry>|
-     -> Result<KernelStep> {
-        if use_q4_0 {
-            if let (Some(entry), Some(progs)) = (ns, config.noshuffle_programs)
-                && let Some(prog) = progs.get(&entry.ne01)
-            {
-                return make_q4_0_noshuffle_matmul_step(
-                    prog,
-                    config.context.as_core(),
-                    entry.q_img,
-                    entry.d_buf,
-                    src,
-                    dst,
-                    entry.ne00,
-                    entry.ne01,
-                    tag,
-                );
-            }
-            make_q4_0_aos_matmul_step(config.q4_0_program, weight, src, dst, k, n, tag)
-        } else {
-            make_f16_matmul_step(
-                config.f16_program,
-                src,
-                weight,
-                dst,
-                n,
-                k,
-                tag,
-                config.f16_l4_program,
-                config.is_nosub,
-            )
-        }
-    };
-
-    // GPU FFN slice: gate/up on residual → gate_gpu / up_gpu (split_row cols)
-    let gpu_gate = build_matmul(
-        config.residual_buf,
-        gate_slice_mem,
-        gate_gpu_mem,
-        split_row,
-        dim,
-        OpTag::MatmulGateUp,
-        config.partition_gate_noshuffle.as_ref(),
-    )?;
-    let gpu_up = build_matmul(
-        config.residual_buf,
-        up_slice_mem,
-        up_gpu_mem,
-        split_row,
-        dim,
-        OpTag::MatmulGateUp,
-        config.partition_up_noshuffle.as_ref(),
-    )?;
-
-    // SiLU/GELU × up into gate_gpu (in place). split_row must be multiple of 4.
-    let gpu_act_mul = {
-        let kernel_name = if use_gelu_tanh {
-            "kernel_gelu_tanh_mul_simple"
-        } else {
-            "kernel_silu_mul_simple"
-        };
-        let kernel = ocl::core::create_kernel(config.simple_ops_program, kernel_name)
-            .with_context(|| format!("create {}", kernel_name))?;
-        let size4 = (split_row / 4) as i32;
-        unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(gate_gpu_mem))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(up_gpu_mem))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&size4))?;
-        }
-        KernelStep {
-            kernel,
-            ndim: 1,
-            global_work_size: [split_row / 4, 1, 1],
-            local_work_size: None,
-            dynamic_args: vec![],
-            op_tag: OpTag::SiluMul,
-            retained_bufs: vec![],
-            noshuffle_act_rebuild: None,
-        }
-    };
-
-    // down: gate_gpu [1, 1, split_row] @ down.gpu_slice [dim, split_row]^T
-    //       → down_partial_gpu [1, 1, dim]
-    let gpu_down = build_matmul(
-        gate_gpu_mem,
-        down_slice_mem,
-        down_partial_gpu_mem,
-        dim,
-        split_row,
-        OpTag::MatmulDown,
-        config.partition_down_noshuffle.as_ref(),
-    )?;
-
-    // ── Merge sub-steps ──
-    // Plan path has no `fused_norm_merge` kernel wiring yet (see
-    // `PartitionMerge::Deferred` comment above). Honouring
-    // `LLMRS_PARTITION_FUSED_MERGE=1` here silently drops the merge altogether
-    // — fast but produces garbage logits. Hard-force deferred off for the plan
-    // path; `forward_gen` still consumes the env flag and uses the real fused
-    // kernel. Flip this back to `partition_fused_merge_enabled() && !is_last_layer`
-    // only after wiring `fused_norm_merge` into the plan executor (Phase 2-B).
-    let merge_mode_deferred = false;
-
-    // (a) copy_slice(down_partial_gpu → ws.down), first `dim` floats.
-    let copy_gpu_to_down = {
-        let kernel =
-            ocl::core::create_kernel(config.simple_ops_program, "kernel_copy_slice_simple")
-                .context("create kernel_copy_slice_simple for partition merge")?;
-        let size = dim as i32;
-        let src_offset = 0i32;
-        let dst_offset = 0i32;
-        unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(down_partial_gpu_mem))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(config.down_buf))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&src_offset))?;
-            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&dst_offset))?;
-            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&size))?;
-        }
-        KernelStep {
-            kernel,
-            ndim: 1,
-            global_work_size: [dim, 1, 1],
-            local_work_size: None,
-            dynamic_args: vec![],
-            op_tag: OpTag::AddAssign, // reuse the post-FFN tag for tracing
-            retained_bufs: vec![],
-            noshuffle_act_rebuild: None,
-        }
-    };
-
-    // (c) add_assign(ws.down, cpu_merge_staging) — requires dim % 4 == 0.
-    anyhow::ensure!(
-        dim.is_multiple_of(4),
-        "partition requires dim to be a multiple of 4 for add_assign_simple, got dim={}",
-        dim
-    );
-    let add_assign_staging = {
-        let kernel =
-            ocl::core::create_kernel(config.simple_ops_program, "kernel_add_assign_simple")
-                .context("create kernel_add_assign_simple for partition merge")?;
-        let size4 = (dim / 4) as i32;
-        unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.down_buf))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(cpu_merge_staging_mem))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&size4))?;
-        }
-        KernelStep {
-            kernel,
-            ndim: 1,
-            global_work_size: [dim / 4, 1, 1],
-            local_work_size: None,
-            dynamic_args: vec![],
-            op_tag: OpTag::AddAssign,
-            retained_bufs: vec![],
-            noshuffle_act_rebuild: None,
-        }
-    };
-
-    // (d) Fused merge: `x += down_partial_gpu + cpu_merge_staging` in one
-    //     kernel, subsuming (a), (c), and the separate steps_post_ffn
-    //     add_assign. Default path; opt-out via LLMRS_PARTITION_FUSED_RESIDUAL=0.
-    let fused_residual_enabled = std::env::var("LLMRS_PARTITION_FUSED_RESIDUAL")
-        .map(|v| v != "0")
-        .unwrap_or(true);
-    let fused_merge_residual = {
-        let kernel = ocl::core::create_kernel(
-            config.simple_ops_program,
-            "kernel_partition_fused_merge_residual_f4",
-        )
-        .context("create kernel_partition_fused_merge_residual_f4 for partition merge")?;
-        let size4 = (dim / 4) as i32;
-        unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.x_buf))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(down_partial_gpu_mem))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(cpu_merge_staging_mem))?;
-            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&size4))?;
-        }
-        KernelStep {
-            kernel,
-            ndim: 1,
-            global_work_size: [dim / 4, 1, 1],
-            local_work_size: None,
-            dynamic_args: vec![],
-            op_tag: OpTag::AddAssign,
-            retained_bufs: vec![],
-            noshuffle_act_rebuild: None,
-        }
-    };
-
-    let merge = if merge_mode_deferred {
-        PartitionMerge::Deferred
-    } else if fused_residual_enabled {
-        PartitionMerge::Fused {
-            fused_step: fused_merge_residual,
-        }
-    } else {
-        PartitionMerge::Inline {
-            copy_gpu_to_down,
-            add_assign: add_assign_staging,
-        }
-    };
-
-    // Capture the generation counter. Plan becomes stale if the live counter
-    // diverges (see INV-120).
-    let gen_arc = partition_ctx.ratio_generation.clone();
-    let ratio_generation_at_build = gen_arc.load(Ordering::Acquire);
-
-    // Clone Tensor slices so the PartitionPlanContext owns references that
-    // live for the plan's lifetime (INV-082). `Tensor::clone` is a shallow
-    // Arc clone on the underlying Buffer.
-    let cpu_ctx = Arc::new(PartitionPlanContext {
-        cpu_backend: cpu_backend.clone(),
-        gate_cpu: partition_ctx.gate.cpu_slice().clone(),
-        up_cpu: partition_ctx.up.cpu_slice().clone(),
-        down_cpu: partition_ctx.down.cpu_slice().clone(),
-        workspace: workspace.clone(),
-        residual_buf_handle: config.residual_buf.clone(),
-        residual_host_ptr: config.residual_host_ptr,
-        use_gelu_tanh,
-        rms_norm_eps: config.rms_norm_eps,
-        rms_norm_add_unit: false,
-        layer_idx,
-        ratio_generation_at_build,
-        ratio_generation_counter: gen_arc,
-        build_thread_id: std::thread::current().id(),
-    });
-
-    // §13.8-J: build-time policy snapshot. Reads `layers/tensor_partition`
-    // env flag state once and freezes it into `PartitionStep::policy`, so the
-    // runtime `execute()` path is free of L1→L3 calls.
-    let partition_policy_snapshot = PartitionPolicySnapshot {
-        poll_flag: crate::layers::tensor_partition::partition_poll_flag_enabled(),
-    };
-
-    let partition_step = PartitionStep {
-        gpu_gate,
-        gpu_up,
-        gpu_act_mul,
-        gpu_down,
-        cpu_ctx,
-        merge,
-        is_last_layer,
-        policy: partition_policy_snapshot,
-    };
-
-    // Replace FFN with the partition variant; the GpuOnly gate/up/silu/down
-    // kernels produced by `build_layer_plan` are discarded (they bound the
-    // wrong weights for the partition path).
-    base_plan.ffn = FfnVariant::Partitioned(Box::new(partition_step));
-    Ok(base_plan)
 }
 
 // ---------------------------------------------------------------------------
@@ -3881,22 +2940,8 @@ pub struct FullPlanConfig<'a> {
     pub noshuffle_programs: Option<std::collections::HashMap<usize, ocl::Program>>,
     /// Per-layer noshuffle SOA entries for lm_head. `None` for F16 or CPU lm_head.
     pub lm_head_noshuffle: Option<NoshufflePlanEntry<'a>>,
-    /// Optional per-layer tensor-partition context. When
-    /// `partition_layers[i].is_some()`, the FFN segment of that layer is
-    /// built via `build_partitioned_layer_plan` instead of the default
-    /// `build_layer_plan`. Length must equal `layer_bufs.len()` when present.
-    pub partition_layers: Option<Vec<Option<&'a PartitionContext>>>,
-    /// Per-layer shared workspace for the partition FFN (only consulted for
-    /// layers with a non-None `partition_layers[i]`). Plan execution mutates
-    /// the workspace through `Arc<UnsafeCell<..>>` from the dispatch thread.
-    pub partition_workspace: Option<Arc<PartitionWsCell>>,
-    /// CPU-capable backend for NEON FFN slice dispatch. Required when
-    /// `partition_layers` contains any `Some(..)` entry.
-    pub partition_cpu_backend: Option<Arc<dyn Backend>>,
-    /// Whether the model uses `gelu(tanh)` instead of SiLU in the FFN. Mirror
-    /// of the layer config seen by `forward_gen`. Default `false` when
-    /// `partition_layers` is not set.
-    pub partition_use_gelu_tanh: bool,
+    /// Tensor partition (ticket 021): `Some` = every layer is split between GPU and CPU.
+    pub tp: Option<TpPlanConfig<'a>>,
     /// dtype of the lm_head weight tensor. Determines which GPU matmul
     /// variant the plan binds (noshuffle GEMV for Q4_0, F16 GEMV for F16).
     /// When the lm_head is stored as F32 (e.g. Llama 3.2 GGUF where
@@ -3940,14 +2985,16 @@ pub struct LayerBufs<'a> {
     pub w_gate_noshuffle: Option<NoshufflePlanEntry<'a>>,
     pub w_up_noshuffle: Option<NoshufflePlanEntry<'a>>,
     pub w_down_noshuffle: Option<NoshufflePlanEntry<'a>>,
-    /// Q4_0 noshuffle SOA entries for partition-path slice weights. Populated
-    /// by `transformer::build_plan` when the layer has a `PartitionContext`
-    /// and `prepare_noshuffle_buffers` has registered the slices. Used by
-    /// `build_partitioned_layer_plan` to route the GPU FFN slice through
-    /// `kernel_gemv_noshuffle_q4_0` instead of the slower AOS GEMV.
-    pub partition_gate_noshuffle: Option<NoshufflePlanEntry<'a>>,
-    pub partition_up_noshuffle: Option<NoshufflePlanEntry<'a>>,
-    pub partition_down_noshuffle: Option<NoshufflePlanEntry<'a>>,
+}
+
+/// What `build_full_plan` needs for a CPU–GPU partitioned model (ticket 021).
+pub struct TpPlanConfig<'a> {
+    /// One per layer (every layer is partitioned).
+    pub ctxs: Vec<&'a PartitionContext>,
+    /// Host views of each layer's weights for the CPU share.
+    pub host: Vec<Arc<TpHostWeights>>,
+    pub workspace: Arc<PartitionWsCell>,
+    pub kernels: Option<&'static crate::cpu_kernels::CpuKernelSet>,
 }
 
 /// Per-layer KV cache buffer references.
@@ -3963,28 +3010,26 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
     let n_k = config.n_kv_heads * config.head_dim;
     let n_v = n_k;
 
-    // Extract the partition ready-flag cl_mem once per plan build so every
-    // layer with a `PartitionContext` can point its `add_rms_norm_oop`
-    // step at the shared flag buffer. Only active when the opt-in poll
-    // mode is enabled (otherwise the sigflag kernel variant is skipped
-    // and the classic `clFinish` drain in `PartitionStep::run` is used).
-    let partition_ready_flag_mem: Option<&Mem> =
-        if crate::layers::tensor_partition::partition_poll_flag_enabled()
-            && config
-                .partition_layers
-                .as_ref()
-                .is_some_and(|v| v.iter().any(|p| p.is_some()))
-        {
-            config.partition_workspace.as_ref().and_then(|ws| {
-                // SAFETY: `workspace` is only mutated from the dispatch
-                // thread; here we only read the tensor's buffer handle to
-                // extract its cl_mem for pre-binding.
-                let pw = unsafe { &*ws.get() };
-                crate::backend::opencl::get_cl_mem(pw.ready_flag.buffer().as_ref()).ok()
-            })
-        } else {
-            None
-        };
+    let n_layers = config.layer_bufs.len();
+    if let Some(tp) = config.tp.as_ref() {
+        anyhow::ensure!(
+            tp.ctxs.len() == n_layers && tp.host.len() == n_layers,
+            "tensor partition must cover every layer"
+        );
+        super::tp_plan::prepare_runtime(
+            &tp.workspace,
+            &super::tp_plan::TpRuntimeGeom {
+                n_layers,
+                n_heads_q: config.n_heads_q,
+                n_kv_heads: config.n_kv_heads,
+                head_dim: config.head_dim,
+                ffn_hidden: config.ffn_hidden,
+                kv_capacity: config.kv_capacity,
+            },
+            tp.ctxs[0].gpu_ratio,
+            &tp.ctxs[0].cpu_backend,
+        )?;
+    }
 
     let mut layers = Vec::with_capacity(config.layer_bufs.len());
     for (i, (lb, kb)) in config
@@ -4058,54 +3103,24 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             w_gate_noshuffle: lb.w_gate_noshuffle,
             w_up_noshuffle: lb.w_up_noshuffle,
             w_down_noshuffle: lb.w_down_noshuffle,
-            partition_gate_noshuffle: lb.partition_gate_noshuffle,
-            partition_up_noshuffle: lb.partition_up_noshuffle,
-            partition_down_noshuffle: lb.partition_down_noshuffle,
-            partition_ready_flag_buf: if config
-                .partition_layers
-                .as_ref()
-                .and_then(|v| v.get(i))
-                .copied()
-                .flatten()
-                .is_some()
-            {
-                partition_ready_flag_mem
-            } else {
-                None
-            },
             residual_host_ptr: config.residual_host_ptr,
         };
-        // Route through the partition builder when this layer has a
-        // `PartitionContext` attached AND the plan-path feature is enabled.
-        let partition_ctx = config
-            .partition_layers
-            .as_ref()
-            .and_then(|v| v.get(i))
-            .copied()
-            .flatten();
-        let layer_plan =
-            if let Some(p_ctx) = partition_ctx {
-                let workspace = config.partition_workspace.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("partition workspace missing for layer {}", i)
-                })?;
-                let cpu_backend = config.partition_cpu_backend.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("partition cpu backend missing for layer {}", i)
-                })?;
-                let is_last = i + 1 == config.layer_bufs.len();
-                build_partitioned_layer_plan(
-                    &layer_config,
-                    p_ctx,
-                    workspace,
-                    cpu_backend,
-                    config.partition_use_gelu_tanh,
-                    i,
-                    is_last,
-                )
-                .with_context(|| format!("build partitioned plan for layer {}", i))?
-            } else {
-                build_layer_plan(&layer_config)
-                    .with_context(|| format!("build plan for layer {}", i))?
-            };
+        let layer_plan = if let Some(tp) = config.tp.as_ref() {
+            super::tp_plan::build_tp_layer(
+                &layer_config,
+                super::tp_plan::TpLayerInputs {
+                    ctx: tp.ctxs[i],
+                    host: tp.host[i].clone(),
+                    ws: &tp.workspace,
+                    layer: i,
+                    kernels: tp.kernels,
+                },
+            )
+            .with_context(|| format!("build partitioned plan for layer {}", i))?
+        } else {
+            build_layer_plan(&layer_config)
+                .with_context(|| format!("build plan for layer {}", i))?
+        };
         layers.push(layer_plan);
     }
 
@@ -4220,5 +3235,6 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
         ratio_generation_at_build,
         ratio_generation_counter,
         q_row_copy: None,
+        tp: config.tp.as_ref().map(|tp| tp.workspace.clone()),
     })
 }

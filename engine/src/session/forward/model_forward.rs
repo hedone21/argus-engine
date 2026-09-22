@@ -173,6 +173,9 @@ pub struct ModelForward {
     sticky_disabled: bool,
     #[cfg(feature = "opencl")]
     plan_enabled: bool,
+    /// The `[tp] plan-path partition active` line was printed.
+    #[cfg(feature = "opencl")]
+    tp_announced: bool,
 }
 
 impl ModelForward {
@@ -200,11 +203,31 @@ impl ModelForward {
         let hidden_size = model.config.hidden_size;
         let vocab_size = model.config.vocab_size;
 
-        let decode_workspace = LayerWorkspace::new(
+        let mut decode_workspace = LayerWorkspace::new(
             workspace_config_for(&model, max_seq_len),
             memory.as_ref(),
             backend.clone(),
         )?;
+        // Tensor partition (ticket 021): `prepare_tensor_partition` installed a context on every
+        // layer; the plan's CPU share needs its workspace.
+        if model
+            .layers
+            .first()
+            .is_some_and(|l| l.load_weights().partition_ctx.is_some())
+        {
+            let c = &model.config;
+            decode_workspace.enable_partition(
+                crate::partition_workspace::PartitionWsGeom {
+                    n_layers: c.num_hidden_layers,
+                    dim: c.hidden_size,
+                    q_dim: c.num_attention_heads * c.head_dim,
+                    kv_dim: c.num_key_value_heads * c.head_dim,
+                    ffn_hidden: c.intermediate_size,
+                },
+                memory.as_ref(),
+                cpu_backend.clone(),
+            )?;
+        }
 
         let decode_input_buf = memory.alloc(4, DType::U8)?;
         let decode_input = Tensor::new(Shape::new(vec![1, 1]), decode_input_buf, backend.clone());
@@ -252,6 +275,8 @@ impl ModelForward {
             sticky_disabled: false,
             #[cfg(feature = "opencl")]
             plan_enabled,
+            #[cfg(feature = "opencl")]
+            tp_announced: false,
         };
         // β-3 commit A: construction 시점 wrap — EvictionStage register 시점에
         // fmt handle 을 보유(INV-STAGE-LAYER-HANDLE). prefill/step 의 ensure_fmt_wrapped
@@ -283,6 +308,21 @@ impl ModelForward {
             acc.set_active(true);
             self.query_stats_accumulator = Some(acc);
         }
+    }
+
+    /// Tensor-partition session options (argus-bench `--tp-*`). No-op when the model is not
+    /// partitioned.
+    pub fn set_tp_options(&mut self, opts: crate::partition_workspace::TpOptions) {
+        if let Some(pw) = self.decode_workspace.partition_ws.as_ref() {
+            // SAFETY: no plan exists yet; single-threaded setup.
+            unsafe { (*pw.get()).tp.opts = opts };
+        }
+    }
+
+    /// Whether the decode runs the CPU–GPU tensor partition (ticket 021).
+    #[cfg(feature = "opencl")]
+    fn tp_active(&self) -> bool {
+        self.decode_workspace.partition_ws.is_some()
     }
 
     /// Install a resolved head-mask set (argus-cli `--mask-heads` / `--mask-heads-random` free-gen
@@ -429,6 +469,31 @@ impl ModelForward {
             self.sticky_disabled = true;
         } else if trace {
             eprintln!("[fwd-trace] build_plan SUCCESS");
+        }
+        // Behavioral evidence that the partition runs on the plan path (ticket 021 §D6), once.
+        if let Some(p) = plan.as_ref()
+            && p.tp.is_some()
+            && !std::mem::replace(&mut self.tp_announced, true)
+        {
+            let r0 = self.model.layers[0]
+                .load_weights()
+                .partition_ctx
+                .as_ref()
+                .map_or(1.0, |c| c.gpu_ratio);
+            // SAFETY: plan built on this (dispatch) thread; nothing executes it concurrently.
+            let adaptive = self
+                .decode_workspace
+                .partition_ws
+                .as_ref()
+                .is_some_and(|pw| unsafe {
+                    (*pw.get()).tp.ctl.as_ref().is_some_and(|c| c.adaptive)
+                });
+            eprintln!(
+                "[tp] plan-path partition active layers={} r0={} adaptive={}",
+                p.layers.len(),
+                r0,
+                adaptive as u8
+            );
         }
         plan
     }
@@ -845,6 +910,14 @@ impl Forward for ModelForward {
             }
         }
 
+        // A partitioned model never falls back: the dyn path runs it GPU-only, which would be a
+        // silent copy of the unpartitioned arm (ticket 021 §D6).
+        #[cfg(feature = "opencl")]
+        if self.tp_active() {
+            eprintln!("[tp] FATAL plan path unavailable");
+            std::process::exit(3);
+        }
+
         // 폴백: forward_into(trait object) — plan 미빌드(host CPU)·invalidation 경로.
         let dyn_fmts: Vec<Arc<dyn KVCacheFormat>> = self
             .fmt_caches
@@ -932,6 +1005,12 @@ impl Forward for ModelForward {
     }
 
     fn finalize(&mut self) -> Result<()> {
+        if let Some(pw) = self.decode_workspace.partition_ws.as_ref() {
+            // SAFETY: decode finished; no plan is executing.
+            if let Some(ctl) = unsafe { (*pw.get()).tp.ctl.as_ref() } {
+                eprintln!("{}", ctl.summary_line());
+            }
+        }
         Ok(())
     }
 

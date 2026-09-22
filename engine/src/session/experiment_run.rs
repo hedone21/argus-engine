@@ -238,6 +238,7 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
         score_cell,
         faithful_h2o(&args),
         aperturb_selector,
+        tp_options(&args),
     )?;
 
     run_decode_loop_experiment(
@@ -262,6 +263,10 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
 /// occupancy after each decode step — so a compression
 /// shows up as a drop in this column). `forward_ms` equals `tbt_ms` and `pacing_ms` is 0: this
 /// loop has no pacing and does not split the step further.
+///
+/// A tensor-partition run (ticket 021) adds `tp_r_attn` / `tp_r_ffn` (mean GPU share over layers),
+/// `tp_lookup` (segments in Lookup) and `tp_contention` (events so far) to each decode row; other
+/// runs write none of them.
 fn write_tbt_log(
     path: &str,
     prefill_ms: f64,
@@ -275,23 +280,44 @@ fn write_tbt_log(
         "{{\"token_idx\":0,\"tbt_ms\":{:.2},\"forward_ms\":{:.2},\"cache_pos\":{},\"pacing_ms\":0.00}}",
         prefill_ms, prefill_ms, prompt_len
     )?;
+    let tp = crate::layers::tp_controller::telemetry_take();
     for (i, (ms, pos)) in result
         .step_ms
         .iter()
         .zip(result.step_cache_pos.iter())
         .enumerate()
     {
+        let tp_fields = tp.get(i).map_or_else(String::new, |t| {
+            format!(
+                ",\"tp_r_attn\":{:.4},\"tp_r_ffn\":{:.4},\"tp_lookup\":{},\"tp_contention\":{}",
+                t.r_attn, t.r_ffn, t.lookup, t.contention
+            )
+        });
         writeln!(
             f,
-            "{{\"token_idx\":{},\"tbt_ms\":{:.2},\"forward_ms\":{:.2},\"cache_pos\":{},\"pacing_ms\":0.00}}",
+            "{{\"token_idx\":{},\"tbt_ms\":{:.2},\"forward_ms\":{:.2},\"cache_pos\":{},\"pacing_ms\":0.00{}}}",
             i + 1,
             ms,
             ms,
-            pos
+            pos,
+            tp_fields
         )?;
     }
     f.flush()?;
     Ok(())
+}
+
+/// Tensor-partition session options from the `--tp-*` flags (ticket 021).
+fn tp_options(args: &Args) -> crate::partition_workspace::TpOptions {
+    crate::partition_workspace::TpOptions {
+        adaptive: args.tp_adaptive,
+        flags: !args.tp_no_flags,
+        cfg: crate::layers::tp_controller::TpConfig {
+            eta: args.tp_eta,
+            contention_ratio: args.tp_contention_ratio,
+            probe: true,
+        },
+    }
 }
 
 fn wants_scores(args: &Args) -> bool {
@@ -626,6 +652,7 @@ pub fn run_experiment_schedule_path(
         score_cell,
         faithful_h2o(&args),
         aperturb_selector,
+        tp_options(&args),
     )?;
 
     let t_prefill = std::time::Instant::now();
