@@ -95,6 +95,27 @@ pub struct TpRuntime {
     pub ctl: Option<TpController>,
     pub pending: Vec<PendingObs>,
     pub kv: Vec<HostKv>,
+    /// Host-KV catch-up counts (ticket 023 T6): layers copied from slot 0 / from their tail.
+    pub catch_up: CatchUpCount,
+    /// Per layer: the CPU heads' score rows (`n_heads_q` rows of the attention length) and
+    /// rotated query row, staged for a non-blocking device write. One buffer per layer because
+    /// the next layer's CPU share runs before the write has read its source.
+    pub score_stage: Vec<Vec<f32>>,
+    pub q_stage: Vec<Vec<f32>>,
+}
+
+/// Host-KV catch-up counter. A full copy from slot 0 happens after prefill and after every
+/// compaction; one on any other token means the host cache lost track of the GPU cache.
+#[derive(Default)]
+pub struct CatchUpCount {
+    pub full: u64,
+    pub tail: u64,
+    /// Layers fully re-copied in the token being run.
+    pub full_this_token: usize,
+    /// RoPE position of the token being run.
+    pub pos: usize,
+    /// Decode steps closed so far (the index of the token being run).
+    pub step: u64,
 }
 
 /// Host-mapped (`CL_MEM_ALLOC_HOST_PTR`) buffer that stays mapped for its lifetime, so the CPU
@@ -207,6 +228,9 @@ impl PartitionWorkspace {
                 ctl: None,
                 pending: Vec::new(),
                 kv: Vec::new(),
+                catch_up: CatchUpCount::default(),
+                score_stage: Vec::new(),
+                q_stage: Vec::new(),
             },
         })
     }

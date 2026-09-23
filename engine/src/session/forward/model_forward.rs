@@ -1007,8 +1007,13 @@ impl Forward for ModelForward {
     fn finalize(&mut self) -> Result<()> {
         if let Some(pw) = self.decode_workspace.partition_ws.as_ref() {
             // SAFETY: decode finished; no plan is executing.
-            if let Some(ctl) = unsafe { (*pw.get()).tp.ctl.as_ref() } {
+            let rt = unsafe { &(*pw.get()).tp };
+            if let Some(ctl) = rt.ctl.as_ref() {
                 eprintln!("{}", ctl.summary_line());
+                eprintln!(
+                    "[tp] catch-up full={} tail={}",
+                    rt.catch_up.full, rt.catch_up.tail
+                );
             }
         }
         Ok(())
