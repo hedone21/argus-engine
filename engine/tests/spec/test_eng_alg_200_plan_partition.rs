@@ -16,7 +16,7 @@
 //! ## 검증 항목 (호스트 실행 가능)
 //!
 //! - [x] FfnVariant enum에 GpuOnly + Partitioned variant가 존재 (컴파일 검증)
-//! - [x] PartitionMerge enum에 Inline + Deferred variant가 존재 (컴파일 검증)
+//! - [x] PartitionMerge enum에 Fused variant만 존재 (컴파일 검증, ticket 021)
 //! - [x] partition_plan_enabled() 기본값 = true (env var 미설정 시)
 //! - [x] partition_fused_merge_enabled() 기본값 = false (env var 미설정 시)
 //!
@@ -55,11 +55,10 @@ mod eng_alg_200_host {
             }
         }
 
+        // Ticket 021: the never-executed Inline / Deferred merges were removed.
         fn _assert_merge_variant_exhaustive(merge: &PartitionMerge) {
             match merge {
                 PartitionMerge::Fused { .. } => {}
-                PartitionMerge::Inline { .. } => {}
-                PartitionMerge::Deferred => {}
             }
         }
 

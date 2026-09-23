@@ -34,6 +34,11 @@ pub struct CpuKernelSet {
     /// `(weight_base: *const u16, out_ptr: *mut f32, n_rows: usize)`.
     pub fused_matmul_f16: unsafe fn(*const f32, usize, &[(*const u16, *mut f32, usize)]),
 
+    /// `fused_matmul_f16` with a per-weight row stride:
+    /// `(weight_base, ld, out_ptr, n_rows)` — row `j` starts at `weight_base + j * ld`. Serves the
+    /// tensor-partition row/column slices without copying the weight (ticket 021).
+    pub fused_matmul_f16_ld: unsafe fn(*const f32, usize, &[(*const u16, usize, *mut f32, usize)]),
+
     /// Fused multi-matmul for Q4_0 decode (M=1): single Q8_0 quantization plus
     /// a single Rayon dispatch. `matmuls`: up to 3
     /// `(weight_base: *const BlockQ4_0, out_ptr: *mut f32, n_rows: usize)`.
@@ -46,6 +51,7 @@ pub struct CpuKernelSet {
 #[cfg(target_arch = "aarch64")]
 pub static CPU_KERNEL_SET: CpuKernelSet = CpuKernelSet {
     fused_matmul_f16: crate::backend::cpu::neon::fused_matmul_f16,
+    fused_matmul_f16_ld: crate::backend::cpu::neon::fused_matmul_f16_ld,
     fused_matmul_q4_0: crate::backend::cpu::neon::fused_matmul_q4_0,
 };
 

@@ -1236,31 +1236,6 @@ impl TransformerModel {
                     layer_mutated = true;
                 }
             }
-            // Partition slices: when `--tensor-partition <r>` is active the
-            // plan-path FFN dispatches onto `partition_ctx.{gate,up,down}.
-            // gpu_slice()` (slices[0]). Without SOA these fall back to the AOS
-            // GEMV kernel which is measurably slower than noshuffle on Adreno
-            // 830 (see build_partitioned_layer_plan). Register the sub-buffer
-            // cl_mems here so the plan builder can look them up via the same
-            // key scheme used for full weights.
-            //
-            // Partition slices live on `ClSubBuffer` whose cl_mem references
-            // a parent full-weight allocation — we cannot drop the parent
-            // without invalidating the sub-buffers, so keep `allow_swap=false`
-            // here and rely on the plan path's key matching the sub-buffer
-            // cl_mem address rather than the placeholder.
-            if let Some(ref mut ctx) = layer.partition_ctx {
-                for weight in [
-                    ctx.gate.gpu_slice_mut(),
-                    ctx.up.gpu_slice_mut(),
-                    ctx.down.gpu_slice_mut(),
-                ] {
-                    if process_weight(weight, false)? {
-                        count += 1;
-                        layer_mutated = true;
-                    }
-                }
-            }
             // Phase 4-4.8: RCU publish step. Without this the swapped tensors
             // live only on the local `layer` clone and slot readers continue
             // to see the pre-swap AOS buffers, so `lookup_noshuffle_soa` keys
@@ -2082,15 +2057,6 @@ impl TransformerModel {
                 Some(bias) => (Some(cl!(bias.bq)), Some(cl!(bias.bk)), Some(cl!(bias.bv))),
                 None => (None, None, None),
             };
-            let (partition_gate_ns, partition_up_ns, partition_down_ns) =
-                match layer.partition_ctx.as_ref() {
-                    Some(ctx) => (
-                        ns_entry(ctx.gate.gpu_slice()),
-                        ns_entry(ctx.up.gpu_slice()),
-                        ns_entry(ctx.down.gpu_slice()),
-                    ),
-                    None => (None, None, None),
-                };
             layer_bufs.push(LayerBufs {
                 wq: cl!(layer.wq),
                 wk: cl!(layer.wk),
@@ -2111,9 +2077,6 @@ impl TransformerModel {
                 w_gate_noshuffle: ns_entry(&layer.w_gate),
                 w_up_noshuffle: ns_entry(&layer.w_up),
                 w_down_noshuffle: ns_entry(&layer.w_down),
-                partition_gate_noshuffle: partition_gate_ns,
-                partition_up_noshuffle: partition_up_ns,
-                partition_down_noshuffle: partition_down_ns,
             });
             kv_bufs_vec.push(KvBufs {
                 k_cache: cl!(kv_caches[i].k_buffer),
@@ -2127,9 +2090,7 @@ impl TransformerModel {
         // ne01 set; only the Q4_0 layers do, which is exactly what the
         // noshuffle programs need to cover.
         let noshuffle_programs = if any_q4_0 {
-            // Collect unique ne01 values from all noshuffle entries — including
-            // partition slice entries whose `ne01` (split_row or hidden_size)
-            // typically differs from the full weight's ne01.
+            // Collect unique ne01 values from all noshuffle entries.
             let mut ne01_set: Vec<usize> = layer_bufs
                 .iter()
                 .flat_map(|lb| {
@@ -2141,9 +2102,6 @@ impl TransformerModel {
                         lb.w_gate_noshuffle.as_ref(),
                         lb.w_up_noshuffle.as_ref(),
                         lb.w_down_noshuffle.as_ref(),
-                        lb.partition_gate_noshuffle.as_ref(),
-                        lb.partition_up_noshuffle.as_ref(),
-                        lb.partition_down_noshuffle.as_ref(),
                     ]
                     .into_iter()
                     .flatten()
@@ -2256,27 +2214,40 @@ impl TransformerModel {
             is_nosub: ocl_backend.is_nosub(),
             noshuffle_programs,
             lm_head_noshuffle,
-            partition_layers: {
-                // Route each layer's optional PartitionContext into the plan
-                // builder. When any layer has a partition_ctx, the FFN
-                // segment uses `build_partitioned_layer_plan`; otherwise the
-                // legacy GPU-only FFN is used per layer. See arch A.6.1.
-                let mut any = false;
-                let v: Vec<Option<&PartitionContext>> = layer_snaps
+            // Tensor partition (ticket 021): all layers or none. The CPU share reads the same
+            // host-mapped weights the GPU kernels read, so the snapshots are handed over whole.
+            tp: {
+                let ctxs: Vec<&PartitionContext> = layer_snaps
                     .iter()
-                    .map(|l| {
-                        let opt = l.partition_ctx.as_ref();
-                        any |= opt.is_some();
-                        opt
-                    })
+                    .filter_map(|l| l.partition_ctx.as_ref())
                     .collect();
-                if any { Some(v) } else { None }
+                match (ctxs.len(), ws.partition_ws.clone()) {
+                    (0, _) => None,
+                    (n, Some(workspace)) if n == layer_snaps.len() => Some(TpPlanConfig {
+                        host: layer_snaps
+                            .iter()
+                            .map(|l| {
+                                Arc::new(TpHostWeights {
+                                    wq: l.wq.clone(),
+                                    wk: l.wk.clone(),
+                                    wv: l.wv.clone(),
+                                    wo: l.wo.clone(),
+                                    w_gate: l.w_gate.clone(),
+                                    w_up: l.w_up.clone(),
+                                    w_down: l.w_down.clone(),
+                                    bq: l.qkv_bias.as_ref().map(|b| b.bq.clone()),
+                                    bk: l.qkv_bias.as_ref().map(|b| b.bk.clone()),
+                                    bv: l.qkv_bias.as_ref().map(|b| b.bv.clone()),
+                                })
+                            })
+                            .collect(),
+                        ctxs,
+                        workspace,
+                        kernels: backend.cpu_companion().cpu_kernels(),
+                    }),
+                    _ => trace_none!("tensor partition: mixed layers or no partition workspace"),
+                }
             },
-            partition_workspace: ws.partition_ws.clone(),
-            partition_cpu_backend: layer_snaps
-                .iter()
-                .find_map(|l| l.partition_ctx.as_ref().map(|c| c.cpu_backend.clone())),
-            partition_use_gelu_tanh: self.config.arch == crate::model_config::ModelArch::Gemma3,
             lm_head_dtype: self.lm_head.dtype(),
             // ENG-ALG-219: pass the global ratio_generation counter so the
             // plan can detect weight swaps at execute() entry (INV-129).

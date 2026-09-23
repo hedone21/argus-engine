@@ -92,8 +92,8 @@ fn reject_unsupported_modes_v0(args: &Args) -> anyhow::Result<()> {
     if args.profile || args.profile_events {
         bail!("argus-cli v0: --profile / --profile-events not yet supported (planned for v1)");
     }
-    if args.tensor_partition > 0.0 {
-        bail!("argus-cli v0: --tensor-partition not yet supported (planned for v1)");
+    if args.tensor_partition > 0.0 || args.tp_adaptive || args.tp_no_flags {
+        bail!("argus-cli v0: --tensor-partition / --tp-* not yet supported (planned for v1)");
     }
     // is_standard_happy_path 가 막던 나머지 가드를 명시 reject 로 이전 (eviction 만 해제).
     if args.skip_ratio.unwrap_or(0.0) > 0.0 {

@@ -3519,9 +3519,52 @@ struct FusedGemvCtx {
     n_matmuls: usize,
     // Per-matmul params (up to 3 for QKV)
     b_bases: [*const u16; 3],
+    // Row stride of each weight in elements (`k` for a whole matrix, the full width for a column slice)
+    lds: [usize; 3],
     out_ptrs: [*mut f32; 3],
     ns: [usize; 3],
     chunk_offsets: [usize; 3], // cumulative chunk offset per matmul
+    // F32 activation + F32 accumulation (`a_ptr`) instead of the F16 fast path (`a_f16_ptr`)
+    f32_acc: bool,
+}
+
+/// Dot products of four F16 weight rows with one F32 activation, F32 accumulation (the GPU
+/// `kernel_mul_mat_f16_f32` numerics). Rows may repeat (the caller's 1-row tail).
+///
+/// # Safety
+/// `a` has `k` floats; each `b[r]` has `k` halves.
+#[target_feature(enable = "neon")]
+unsafe fn dot_f16w_f32a_4rows(k: usize, a: *const f32, b: [*const u16; 4], out: &mut [f32; 4]) {
+    unsafe {
+        let mut acc = [vdupq_n_f32(0.0); 8];
+        let mut i = 0;
+        while i + 8 <= k {
+            let a0 = vld1q_f32(a.add(i));
+            let a1 = vld1q_f32(a.add(i + 4));
+            for r in 0..4 {
+                let w: uint16x8_t = vld1q_u16(b[r].add(i));
+                let lo: float32x4_t;
+                let hi: float32x4_t;
+                std::arch::asm!(
+                    "fcvtl {lo:v}.4s, {w:v}.4h",
+                    "fcvtl2 {hi:v}.4s, {w:v}.8h",
+                    w = in(vreg) w,
+                    lo = out(vreg) lo,
+                    hi = out(vreg) hi,
+                );
+                acc[2 * r] = vfmaq_f32(acc[2 * r], lo, a0);
+                acc[2 * r + 1] = vfmaq_f32(acc[2 * r + 1], hi, a1);
+            }
+            i += 8;
+        }
+        for r in 0..4 {
+            let mut sum = vaddvq_f32(vaddq_f32(acc[2 * r], acc[2 * r + 1]));
+            for t in i..k {
+                sum += half::f16::from_bits(*b[r].add(t)).to_f32() * *a.add(t);
+            }
+            out[r] = sum;
+        }
+    }
 }
 
 /// Work function for fused multi-matmul: chunk_id spans across all matmuls.
@@ -3543,6 +3586,7 @@ unsafe fn fused_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
         };
 
         let b_base = ctx.b_bases[mat_idx];
+        let ld = ctx.lds[mat_idx];
         let out_ptr = ctx.out_ptrs[mat_idx];
         let n = ctx.ns[mat_idx];
 
@@ -3550,12 +3594,34 @@ unsafe fn fused_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
         let j_end = (j_start + ctx.rows_per_chunk).min(n);
 
         let mut j = j_start;
+        if ctx.f32_acc {
+            while j + NR <= j_end {
+                let b_ptrs = [
+                    b_base.add(j * ld),
+                    b_base.add((j + 1) * ld),
+                    b_base.add((j + 2) * ld),
+                    b_base.add((j + 3) * ld),
+                ];
+                let mut results = [0.0f32; NR];
+                dot_f16w_f32a_4rows(ctx.k, ctx.a_ptr, b_ptrs, &mut results);
+                std::ptr::copy_nonoverlapping(results.as_ptr(), out_ptr.add(j), NR);
+                j += NR;
+            }
+            while j < j_end {
+                let mut results = [0.0f32; NR];
+                let b = b_base.add(j * ld);
+                dot_f16w_f32a_4rows(ctx.k, ctx.a_ptr, [b; 4], &mut results);
+                *out_ptr.add(j) = results[0];
+                j += 1;
+            }
+            return;
+        }
         while j + NR <= j_end {
             let b_ptrs = [
-                b_base.add(j * ctx.k),
-                b_base.add((j + 1) * ctx.k),
-                b_base.add((j + 2) * ctx.k),
-                b_base.add((j + 3) * ctx.k),
+                b_base.add(j * ld),
+                b_base.add((j + 1) * ld),
+                b_base.add((j + 2) * ld),
+                b_base.add((j + 3) * ld),
             ];
             let mut results = [0.0f32; NR];
             CpuBackendNeon::vec_dot_f16_native_gemv_4rows(
@@ -3571,7 +3637,7 @@ unsafe fn fused_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
             *out_ptr.add(j) = CpuBackendNeon::vec_dot_f16_native_gemv_1row(
                 ctx.k,
                 ctx.a_f16_ptr,
-                b_base.add(j * ctx.k),
+                b_base.add(j * ld),
             );
             j += 1;
         }
@@ -3589,29 +3655,75 @@ pub unsafe fn fused_matmul_f16(
     k: usize,
     matmuls: &[(*const u16, *mut f32, usize)], // (weight_base, out_ptr, n_rows)
 ) {
+    let mut strided = [(
+        std::ptr::null::<u16>(),
+        0usize,
+        std::ptr::null_mut::<f32>(),
+        0usize,
+    ); 3];
+    for (dst, &(b, o, n)) in strided.iter_mut().zip(matmuls) {
+        *dst = (b, k, o, n);
+    }
+    unsafe { fused_matmul_f16_strided(a_data, k, &strided[..matmuls.len().min(3)], false) }
+}
+
+/// Row-strided F16 GEMVs with the GPU kernel's numerics — F32 activation, F32 accumulation —
+/// sharing one activation: `(weight_base, ld, out_ptr, n_rows)` where row `j` of the weight
+/// starts at `weight_base + j * ld` and `k` elements of it are used. A column slice
+/// `W[:, k_lo..k_hi]` of a `[n, ld]` matrix is `weight_base = W + k_lo`, `k = k_hi - k_lo`.
+///
+/// Serves the tensor-partition CPU share (ticket 021), whose partial sums are added to the GPU
+/// kernel's: the F16-accumulating fast path of [`fused_matmul_f16`] drifts the greedy decode
+/// within a few dozen tokens on the FFN down projection (K up to 8960).
+///
+/// # Safety
+/// As [`fused_matmul_f16`]; each row `j < n_rows` must have `k` readable halves at
+/// `weight_base + j * ld`.
+pub unsafe fn fused_matmul_f16_ld(
+    a_data: *const f32,
+    k: usize,
+    matmuls: &[(*const u16, usize, *mut f32, usize)], // (weight_base, ld, out_ptr, n_rows)
+) {
+    unsafe { fused_matmul_f16_strided(a_data, k, matmuls, true) }
+}
+
+/// One-dispatch body of [`fused_matmul_f16`] / [`fused_matmul_f16_ld`].
+unsafe fn fused_matmul_f16_strided(
+    a_data: *const f32,
+    k: usize,
+    matmuls: &[(*const u16, usize, *mut f32, usize)],
+    f32_acc: bool,
+) {
     unsafe {
         use crate::thread_pool;
         const NR: usize = 4;
 
         let pool = thread_pool::get_pool();
         let n_threads = rayon::current_num_threads();
-        let total_rows: usize = matmuls.iter().map(|m| m.2).sum();
+        let total_rows: usize = matmuls.iter().map(|m| m.3).sum();
         let target_chunks = n_threads * 8;
         let rows_per_chunk = total_rows.div_ceil(target_chunks).div_ceil(NR) * NR;
         let rows_per_chunk = rows_per_chunk.max(NR);
 
         // Pre-convert A from F32 to F16 for the F16 matmul kernels
-        let mut a_f16_buf: Vec<u16> = vec![0u16; k];
-        CpuBackendNeon::f32_to_f16_neon(a_data, a_f16_buf.as_mut_ptr(), k);
+        let a_f16_buf: Vec<u16> = if f32_acc {
+            Vec::new()
+        } else {
+            let mut buf = vec![0u16; k];
+            CpuBackendNeon::f32_to_f16_neon(a_data, buf.as_mut_ptr(), k);
+            buf
+        };
 
         let mut b_bases = [std::ptr::null::<u16>(); 3];
+        let mut lds = [0usize; 3];
         let mut out_ptrs = [std::ptr::null_mut::<f32>(); 3];
         let mut ns = [0usize; 3];
         let mut chunk_offsets = [0usize; 3];
         let mut total_chunks = 0;
 
-        for (i, &(b, o, n)) in matmuls.iter().enumerate().take(3) {
+        for (i, &(b, ld, o, n)) in matmuls.iter().enumerate().take(3) {
             b_bases[i] = b;
+            lds[i] = ld;
             out_ptrs[i] = o;
             ns[i] = n;
             chunk_offsets[i] = total_chunks;
@@ -3633,9 +3745,11 @@ pub unsafe fn fused_matmul_f16(
             rows_per_chunk,
             n_matmuls: matmuls.len(),
             b_bases,
+            lds,
             out_ptrs,
             ns,
             chunk_offsets,
+            f32_acc,
         };
 
         pool.dispatch(

@@ -129,5 +129,13 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
         bail!("argus-bench AB-0: --profile / --profile-events not yet supported");
     }
     // AB-4: --tensor-partition 해제 — PartitionStage + build_bench_loop 배선 완료.
+    // ticket 021: the `--tp-*` knobs only mean something on an actual split.
+    let split = args.tensor_partition > 0.0 && args.tensor_partition < 1.0;
+    if (args.tp_adaptive || args.tp_no_flags) && !split {
+        bail!("argus-bench: --tp-adaptive / --tp-no-flags need --tensor-partition in (0, 1)");
+    }
+    if args.tp_adaptive && args.tp_no_flags {
+        bail!("argus-bench: --tp-adaptive measures through the done-flags; drop --tp-no-flags");
+    }
     Ok(())
 }
