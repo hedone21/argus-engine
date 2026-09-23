@@ -15,9 +15,15 @@ pub type WorkFn = unsafe fn(*const u8, usize);
 #[repr(C, align(64))]
 struct CacheAligned<T>(T);
 
+/// Low bits of `SharedState::generation` that hold the dispatch's active-worker count.
+const ACTIVE_BITS: u32 = 16;
+const ACTIVE_MASK: u64 = (1 << ACTIVE_BITS) - 1;
+
 #[repr(C)]
 struct SharedState {
-    /// Incremented each dispatch — workers check this after unpark.
+    /// Bumped each dispatch — workers check this after unpark. The low `ACTIVE_BITS` carry the
+    /// dispatch's active-worker count, so a worker decides whether it takes part from the one
+    /// value it read (a separate read of `active_workers` could already see the next dispatch's).
     generation: CacheAligned<AtomicU64>,
     /// Workers fetch_add to grab the next chunk (work-stealing).
     next_chunk: CacheAligned<AtomicUsize>,
@@ -52,6 +58,7 @@ impl SpinPool {
     /// Create a pool with `n_workers` background threads.
     /// The main thread also participates during dispatch (total = n_workers + 1).
     pub fn new(n_workers: usize) -> Self {
+        assert!(n_workers as u64 <= ACTIVE_MASK, "{n_workers} workers");
         let shared = Arc::new(SharedState {
             generation: CacheAligned(AtomicU64::new(0)),
             next_chunk: CacheAligned(AtomicUsize::new(0)),
@@ -109,7 +116,7 @@ impl SpinPool {
                 if g != last_gen {
                     last_gen = g;
                     // An inactive worker sits this dispatch out (not counted in `done_count`).
-                    if idx < shared.active_workers.load(Ordering::Relaxed) {
+                    if idx < (g & ACTIVE_MASK) as usize {
                         break;
                     }
                     spins = 500;
@@ -183,8 +190,7 @@ impl SpinPool {
         self.shared.total_chunks.store(nc, Ordering::Relaxed);
         self.shared.next_chunk.0.store(0, Ordering::Relaxed);
         self.shared.done_count.0.store(0, Ordering::Relaxed);
-        self.shared.generation.0.fetch_add(1, Ordering::Release);
-        let active = self.shared.active_workers.load(Ordering::Relaxed);
+        let active = self.publish();
         for wt in &self.worker_threads[..active] {
             wt.unpark();
         }
@@ -193,21 +199,36 @@ impl SpinPool {
             std::hint::spin_loop();
         }
 
-        // Subsequent items: workers are spinning (within spin window),
-        // just update work params and bump generation — no unpark needed.
+        // Subsequent items: workers are usually still inside their spin window, but one that
+        // ran out of it has parked and would never see the next generation — so unpark the
+        // active workers again (a no-op for a thread that is not parked).
         for &(wf, ctx, nc) in &items[1..] {
             self.shared.work_fn.store(wf as usize, Ordering::Relaxed);
             self.shared.work_ctx.store(ctx as usize, Ordering::Relaxed);
             self.shared.total_chunks.store(nc, Ordering::Relaxed);
             self.shared.next_chunk.0.store(0, Ordering::Relaxed);
             self.shared.done_count.0.store(0, Ordering::Relaxed);
-            self.shared.generation.0.fetch_add(1, Ordering::Release);
-            // Workers are still spinning — they'll catch the generation change
+            self.publish();
+            for wt in &self.worker_threads[..active] {
+                wt.unpark();
+            }
             Self::steal_work(&self.shared);
             while self.shared.done_count.0.load(Ordering::Acquire) < active {
                 std::hint::spin_loop();
             }
         }
+    }
+
+    /// Publish the work set up so far as a new generation stamped with the current active-worker
+    /// count, and return that count. Only the dispatching thread writes `generation`.
+    fn publish(&self) -> usize {
+        let active = self.shared.active_workers.load(Ordering::Relaxed);
+        let seq = (self.shared.generation.0.load(Ordering::Relaxed) >> ACTIVE_BITS) + 1;
+        self.shared
+            .generation
+            .0
+            .store((seq << ACTIVE_BITS) | active as u64, Ordering::Release);
+        active
     }
 
     /// Number of background workers.
@@ -244,10 +265,9 @@ impl SpinPool {
         self.shared.done_count.0.store(0, Ordering::Relaxed);
 
         // Publish work (Release ensures setup is visible to workers)
-        self.shared.generation.0.fetch_add(1, Ordering::Release);
+        let active = self.publish();
 
         // Wake the active workers
-        let active = self.shared.active_workers.load(Ordering::Relaxed);
         for wt in &self.worker_threads[..active] {
             wt.unpark();
         }
@@ -265,7 +285,10 @@ impl SpinPool {
 impl Drop for SpinPool {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
-        self.shared.generation.0.fetch_add(1, Ordering::Release);
+        self.shared
+            .generation
+            .0
+            .fetch_add(1 << ACTIVE_BITS, Ordering::Release);
         for wt in &self.worker_threads {
             wt.unpark();
         }
