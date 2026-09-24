@@ -693,6 +693,13 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub tp_adaptive: bool,
 
+    /// Tensor partition: prepare the split but start with it off, so only the manager's
+    /// `gpu.offload` command turns it on (ticket 024). Needs `--tensor-partition` in (0, 1),
+    /// `--tp-adaptive`, and a command source (argus-bench: resilience on; argus-eval:
+    /// `--experiment-schedule`).
+    #[arg(long, default_value_t = false)]
+    pub tp_start_off: bool,
+
     /// argus-bench tensor partition: skip the per-segment done-flag kernels (static split only) —
     /// the control arm that prices the controller's measurement.
     #[arg(long, default_value_t = false)]

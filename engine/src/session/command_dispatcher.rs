@@ -174,6 +174,37 @@ pub struct CommandDispatcher {
     /// Index the command currently being applied will occupy in `last_results`. Scratch
     /// for `apply`, which does not otherwise know where its answer lands.
     result_idx: usize,
+    /// Turns the tensor partition on and off (`gpu.offload`). `None` = the partition was not
+    /// prepared at start, and `gpu.offload` is answered `Rejected`.
+    tp_switch: Option<TpSwitch>,
+    /// Offload state this step's commands ask for, and where the last `gpu.offload` answer
+    /// sits in `last_results`. Only the net state is applied, once, after every command of the
+    /// step (ticket 024 T3).
+    tp_target: Option<(bool, Option<usize>)>,
+}
+
+/// Turns the prepared tensor partition on or off (ticket 024).
+///
+/// `apply(on)` fans the split out over every layer (`on`) or returns every layer to the GPU
+/// (`!on`). It must leave no layer mixed: when turning on fails part way, it returns every layer
+/// to the GPU before it returns the error. The forward sees the change on its next step and does
+/// the rest (plan rebuild, controller reset, host KV release).
+pub struct TpSwitch {
+    apply: Box<dyn FnMut(bool) -> anyhow::Result<()> + Send>,
+    /// The state the engine started in — what `RestoreDefaults` returns to.
+    start_on: bool,
+    /// The state last applied.
+    on: bool,
+}
+
+impl TpSwitch {
+    pub fn new(start_on: bool, apply: Box<dyn FnMut(bool) -> anyhow::Result<()> + Send>) -> Self {
+        Self {
+            apply,
+            start_on,
+            on: start_on,
+        }
+    }
 }
 
 /// The engine's own compression chooser, and the query rows it scores candidates on.
@@ -326,7 +357,15 @@ impl CommandDispatcher {
             last_results: Vec::new(),
             pending_compress: None,
             result_idx: 0,
+            tp_switch: None,
+            tp_target: None,
         }
+    }
+
+    /// Let `gpu.offload` turn the prepared tensor partition on and off.
+    pub fn with_tp_switch(mut self, switch: TpSwitch) -> Self {
+        self.tp_switch = Some(switch);
+        self
     }
 
     /// bench GPU-score 경로: score-fed `EvictionStage`(submit_evict)가 GPU 누적 score 를 CPU 로
@@ -517,6 +556,7 @@ impl CommandDispatcher {
 
         self.last_results = Vec::with_capacity(cmds.len());
         self.pending_compress = None;
+        self.tp_target = None;
         for (i, cmd) in cmds.iter().enumerate() {
             self.result_idx = self.last_results.len();
             let r = if is_folded[i] {
@@ -526,8 +566,37 @@ impl CommandDispatcher {
             };
             self.last_results.push(r);
         }
+        self.apply_tp_target();
 
         &self.control
+    }
+
+    /// Apply the step's net offload state. `[RestoreDefaults, GpuOffload{on: true}]` arriving
+    /// while the partition is on changes nothing, so nothing is called — a restart would cost
+    /// the controller its converged split for no reason.
+    fn apply_tp_target(&mut self) {
+        let (Some((want, idx)), Some(sw)) = (self.tp_target.take(), self.tp_switch.as_mut()) else {
+            return;
+        };
+        if want == sw.on {
+            return;
+        }
+        match (sw.apply)(want) {
+            Ok(()) => sw.on = want,
+            Err(e) => {
+                // `apply` left every layer on the GPU.
+                sw.on = false;
+                eprintln!(
+                    "[tp] offload {} failed: {e:#}",
+                    if want { "on" } else { "off" }
+                );
+                if let Some(i) = idx {
+                    self.last_results[i] = CommandResult::Rejected {
+                        reason: format!("tensor partition could not be applied: {e:#}"),
+                    };
+                }
+            }
+        }
     }
 
     /// 현재 구성에서 KV 압축이 가능한 상태인지 판정한다.
@@ -562,6 +631,10 @@ impl CommandDispatcher {
                 // 재무장: 다음 KvCompress 가 새 OneShot submit 가능.
                 self.last_evict_ratio = None;
                 crate::yield_policy::restore_default_yield_every();
+                // Offload returns to the state the engine started in. Unprepared: nothing to do.
+                if let Some(sw) = self.tp_switch.as_ref() {
+                    self.tp_target = Some((sw.start_on, None));
+                }
                 CommandResult::Ok
             }
 
@@ -569,6 +642,19 @@ impl CommandDispatcher {
             // 엔진은 받은 값을 그대로 쓴다 — 범위(0..=64)는 argus-shared 역직렬화가 이미 검사했다.
             EngineCommand::GpuYield { every } => {
                 crate::yield_policy::set_yield_every(*every as usize);
+                CommandResult::Ok
+            }
+
+            // gpu.offload → the tensor partition switch (ticket 024). Recorded here and applied
+            // once after the step's last command (`apply_tp_target`).
+            EngineCommand::GpuOffload { on } => {
+                if self.tp_switch.is_none() {
+                    return CommandResult::Rejected {
+                        reason: "tensor partition was not prepared at start (--tensor-partition)"
+                            .to_string(),
+                    };
+                }
+                self.tp_target = Some((*on, Some(self.result_idx)));
                 CommandResult::Ok
             }
         }
@@ -1194,6 +1280,102 @@ mod tests {
         assert!(matches!(r[..], [CommandResult::Ok]));
         // The test process runs with no LLMRS_DECODE_YIELD_EVERY set, so the env seed is 0.
         assert_eq!(crate::yield_policy::yield_every(), 0);
+    }
+
+    /// A switch that records every `apply` call instead of touching layers.
+    fn recording_switch(start_on: bool) -> (TpSwitch, Arc<Mutex<Vec<bool>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let sw = TpSwitch::new(
+            start_on,
+            Box::new(move |on| {
+                seen.lock().unwrap().push(on);
+                Ok(())
+            }),
+        );
+        (sw, calls)
+    }
+
+    /// ticket 024: without a prepared partition `gpu.offload` is refused, and `RestoreDefaults`
+    /// still answers `Ok`.
+    #[test]
+    fn gpu_offload_rejected_without_partition() {
+        let _g = crate::yield_policy::TEST_LOCK.lock().unwrap();
+        let (mut d, _registry) = bare_dispatcher();
+        for on in [true, false] {
+            let r = results_of(&mut d, vec![EngineCommand::GpuOffload { on }]);
+            assert!(is_rejected(&r[0]), "{r:?}");
+        }
+        let r = results_of(&mut d, vec![EngineCommand::RestoreDefaults]);
+        assert!(matches!(r[..], [CommandResult::Ok]));
+    }
+
+    /// ticket 024: `RestoreDefaults` returns offload to the state the engine started in, and
+    /// does nothing when it is already there.
+    #[test]
+    fn gpu_offload_restore_returns_to_start_state() {
+        let _g = crate::yield_policy::TEST_LOCK.lock().unwrap();
+        for start_on in [false, true] {
+            let (sw, calls) = recording_switch(start_on);
+            let (d, _registry) = bare_dispatcher();
+            let mut d = d.with_tp_switch(sw);
+
+            let r = results_of(&mut d, vec![EngineCommand::RestoreDefaults]);
+            assert!(matches!(r[..], [CommandResult::Ok]));
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "already in the start state"
+            );
+
+            let r = results_of(&mut d, vec![EngineCommand::GpuOffload { on: !start_on }]);
+            assert!(matches!(r[..], [CommandResult::Ok]));
+            let r = results_of(&mut d, vec![EngineCommand::RestoreDefaults]);
+            assert!(matches!(r[..], [CommandResult::Ok]));
+            assert_eq!(*calls.lock().unwrap(), vec![!start_on, start_on]);
+        }
+    }
+
+    /// ticket 024: only a step's net state reaches the switch.
+    #[test]
+    fn gpu_offload_net_state_per_step() {
+        let _g = crate::yield_policy::TEST_LOCK.lock().unwrap();
+        let (sw, calls) = recording_switch(false);
+        let (d, _registry) = bare_dispatcher();
+        let mut d = d.with_tp_switch(sw);
+        let on = |on| EngineCommand::GpuOffload { on };
+
+        results_of(&mut d, vec![on(true)]);
+        assert_eq!(*calls.lock().unwrap(), vec![true]);
+
+        // Started off, now on: restore alone would turn it off; restore then on nets to on.
+        let r = results_of(&mut d, vec![EngineCommand::RestoreDefaults, on(true)]);
+        assert!(matches!(r[..], [CommandResult::Ok, CommandResult::Ok]));
+        assert_eq!(*calls.lock().unwrap(), vec![true], "no switch call");
+
+        results_of(&mut d, vec![on(false), on(true), on(false)]);
+        assert_eq!(*calls.lock().unwrap(), vec![true, false]);
+    }
+
+    /// ticket 024: a failed fan-out answers the step's last `gpu.offload` `Rejected`.
+    #[test]
+    fn gpu_offload_failure_is_rejected() {
+        let (d, _registry) = bare_dispatcher();
+        let mut d = d.with_tp_switch(TpSwitch::new(
+            false,
+            Box::new(|on| {
+                anyhow::ensure!(!on, "no cpu backend");
+                Ok(())
+            }),
+        ));
+        let r = results_of(
+            &mut d,
+            vec![
+                EngineCommand::GpuOffload { on: false },
+                EngineCommand::GpuOffload { on: true },
+            ],
+        );
+        assert!(matches!(r[0], CommandResult::Ok), "{r:?}");
+        assert!(is_rejected(&r[1]), "{r:?}");
     }
 
     /// `finalize_results` 는 비운다 — 다음 dispatch 가 이전 결과를 물려받지 않는다.

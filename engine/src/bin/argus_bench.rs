@@ -137,5 +137,12 @@ fn reject_unsupported_modes_ab0(args: &Args) -> anyhow::Result<()> {
     if args.tp_adaptive && args.tp_no_flags {
         bail!("argus-bench: --tp-adaptive measures through the done-flags; drop --tp-no-flags");
     }
+    // ticket 024: a partition that starts off is turned on only by a `gpu.offload` command.
+    if args.tp_start_off && !(split && args.tp_adaptive) {
+        bail!("argus-bench: --tp-start-off needs --tensor-partition in (0, 1) and --tp-adaptive");
+    }
+    if args.tp_start_off && args.no_resilience {
+        bail!("argus-bench: --tp-start-off needs the manager connection; drop --no-resilience");
+    }
     Ok(())
 }

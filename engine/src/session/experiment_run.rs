@@ -264,9 +264,10 @@ pub fn run_experiment_path(ctx: StandardHappyCtx) -> anyhow::Result<()> {
 /// shows up as a drop in this column). `forward_ms` equals `tbt_ms` and `pacing_ms` is 0: this
 /// loop has no pacing and does not split the step further.
 ///
-/// A tensor-partition run (ticket 021) adds `tp_r_attn` / `tp_r_ffn` (mean GPU share over layers),
-/// `tp_lookup` (segments in Lookup) and `tp_contention` (events so far) to each decode row; other
-/// runs write none of them.
+/// A run with the tensor partition prepared (ticket 021) adds `tp_on` to each decode row: 1 when
+/// the partition ran that token, 0 when `gpu.offload` had it off (ticket 024). A `tp_on=1` row also
+/// carries `tp_r_attn` / `tp_r_ffn` (mean GPU share over layers), `tp_lookup` (segments in Lookup)
+/// and `tp_contention` (events so far). Runs without the partition write none of them.
 fn write_tbt_log(
     path: &str,
     prefill_ms: f64,
@@ -281,18 +282,23 @@ fn write_tbt_log(
         prefill_ms, prefill_ms, prompt_len
     )?;
     let tp = crate::layers::tp_controller::telemetry_take();
+    let mut tp_rows = tp.rows.iter().peekable();
     for (i, (ms, pos)) in result
         .step_ms
         .iter()
         .zip(result.step_cache_pos.iter())
         .enumerate()
     {
-        let tp_fields = tp.get(i).map_or_else(String::new, |t| {
-            format!(
-                ",\"tp_r_attn\":{:.4},\"tp_r_ffn\":{:.4},\"tp_lookup\":{},\"tp_contention\":{}",
+        // Rows are in decode order; match by step, not by index.
+        let row = tp_rows.next_if(|(step, _)| *step == i).map(|(_, t)| t);
+        let tp_fields = match row {
+            Some(t) => format!(
+                ",\"tp_on\":1,\"tp_r_attn\":{:.4},\"tp_r_ffn\":{:.4},\"tp_lookup\":{},\"tp_contention\":{}",
                 t.r_attn, t.r_ffn, t.lookup, t.contention
-            )
-        });
+            ),
+            None if tp.prepared => ",\"tp_on\":0".to_string(),
+            None => String::new(),
+        };
         writeln!(
             f,
             "{{\"token_idx\":{},\"tbt_ms\":{:.2},\"forward_ms\":{:.2},\"cache_pos\":{},\"pacing_ms\":0.00{}}}",
@@ -317,6 +323,7 @@ fn tp_options(args: &Args) -> crate::partition_workspace::TpOptions {
             contention_ratio: args.tp_contention_ratio,
             probe: true,
         },
+        start_off: args.tp_start_off,
     }
 }
 

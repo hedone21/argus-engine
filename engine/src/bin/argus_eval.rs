@@ -225,7 +225,7 @@ fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
             "argus-eval: --profile / --profile-events oversimplify eval measurement (sync overhead); not supported"
         );
     }
-    if args.tensor_partition > 0.0 || args.tp_adaptive || args.tp_no_flags {
+    if args.tensor_partition > 0.0 || args.tp_adaptive || args.tp_no_flags || args.tp_start_off {
         if args.experiment_schedule.is_none() {
             bail!(
                 "argus-eval: --tensor-partition / --tp-* is a decode-only measurement mode, not eval \
@@ -239,6 +239,13 @@ fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
         }
         if args.tp_adaptive && args.tp_no_flags {
             bail!("argus-eval: --tp-adaptive measures through the done-flags; drop --tp-no-flags");
+        }
+        // ticket 024: a partition that starts off is turned on only by a `gpu.offload` command,
+        // and the schedule (checked above) is the only command source argus-eval has.
+        if args.tp_start_off && !(split && args.tp_adaptive) {
+            bail!(
+                "argus-eval: --tp-start-off needs --tensor-partition in (0, 1) and --tp-adaptive"
+            );
         }
     }
     // W-ALLOC: eval honors a per-layer KV format POLICY (N-way mixed precision) on the Standard KV
@@ -418,6 +425,38 @@ mod tests {
             ]
             .concat()
         ));
+    }
+
+    /// ticket 024: `--tp-start-off` needs a schedule, an actual split and the controller.
+    #[test]
+    fn argus_eval_tp_start_off_needs_schedule_and_adaptive() {
+        let passes = |extra: &[&str]| {
+            let args = make_args(extra);
+            reject_unsupported_modes_eval(&args).is_ok() && eval_supported(&args)
+        };
+        let sched = ["--experiment-schedule", "/tmp/s.json"];
+        let arm = [
+            "--tensor-partition",
+            "0.75",
+            "--tp-adaptive",
+            "--tp-start-off",
+        ];
+        assert!(passes(&[&sched[..], &arm[..]].concat()));
+        assert!(!passes(&[
+            "--eval-ll",
+            "--tensor-partition",
+            "0.75",
+            "--tp-adaptive",
+            "--tp-start-off"
+        ]));
+        assert!(!passes(
+            &[
+                &sched[..],
+                &["--tensor-partition", "0.75", "--tp-start-off"]
+            ]
+            .concat()
+        ));
+        assert!(!passes(&[&sched[..], &["--tp-start-off"]].concat()));
     }
 
     #[test]

@@ -22,7 +22,7 @@
 //! 0 에서 시작해 `directives_at(decode_step)` 를 호출했으므로 **off-by-one 없음** —
 //! schedule 파일의 `at_token` 은 decode step 인덱스(0-based)를 의미한다.
 
-use argus_shared::EngineCommand;
+use argus_shared::{CommandResult, EngineCommand};
 
 use crate::experiment::ExperimentSchedule;
 use crate::session::command_dispatcher::CommandSource;
@@ -35,6 +35,8 @@ pub struct ScheduleCommandSource {
     schedule: ExperimentSchedule,
     /// 다음 poll 에서 조회할 decode step 위치 (0-based).
     cur_token: usize,
+    /// Wire names of the commands the last `poll` returned, for the `[schedule]` result line.
+    last_names: Vec<String>,
 }
 
 impl ScheduleCommandSource {
@@ -43,6 +45,7 @@ impl ScheduleCommandSource {
         Self {
             schedule,
             cur_token: 0,
+            last_names: Vec::new(),
         }
     }
 }
@@ -64,8 +67,44 @@ impl CommandSource for ScheduleCommandSource {
             .directives_at(pos)
             .flat_map(|e| e.directive.commands.iter().cloned())
             .collect();
+        self.last_names = cmds.iter().map(wire_name).collect();
         Ok(cmds)
     }
+
+    /// A schedule has no one to answer, so the outcomes go to stderr — the only place a run
+    /// can show that the engine refused a command (ticket 024):
+    /// `[schedule] step=<n> results=[gpu.offload:Rejected, kv.compress:Ok]`.
+    fn report_results(&mut self, results: Vec<CommandResult>) {
+        if results.is_empty() {
+            return;
+        }
+        let items: Vec<String> = self
+            .last_names
+            .iter()
+            .zip(&results)
+            .map(|(name, r)| {
+                let r = match r {
+                    CommandResult::Ok => "Ok",
+                    CommandResult::Partial { .. } => "Partial",
+                    CommandResult::Rejected { .. } => "Rejected",
+                };
+                format!("{name}:{r}")
+            })
+            .collect();
+        eprintln!(
+            "[schedule] step={} results=[{}]",
+            self.cur_token - 1,
+            items.join(", ")
+        );
+    }
+}
+
+/// The command's `type` tag as the schedule file spells it.
+fn wire_name(cmd: &EngineCommand) -> String {
+    serde_json::to_value(cmd)
+        .ok()
+        .and_then(|v| v.get("type")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
 }
 
 #[cfg(test)]
@@ -91,6 +130,23 @@ mod tests {
             description: String::new(),
             directives,
         }
+    }
+
+    /// The `[schedule]` line names commands the way the schedule file spells them.
+    #[test]
+    fn wire_name_is_the_type_tag() {
+        assert_eq!(
+            wire_name(&EngineCommand::GpuOffload { on: true }),
+            "gpu.offload"
+        );
+        assert_eq!(
+            wire_name(&EngineCommand::RestoreDefaults),
+            "restore_defaults"
+        );
+        assert_eq!(
+            wire_name(&EngineCommand::KvCompress { budget: 0.5 }),
+            "kv.compress"
+        );
     }
 
     // (a) pos 도달 시 commands 반환
