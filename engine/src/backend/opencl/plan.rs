@@ -322,6 +322,9 @@ pub(crate) struct PlanGeometry {
     /// Per-KV-head first resident slot (`i32` per head) of a ragged cache
     /// (`KVCache::head_start_device`); `None` binds NULL = every head from slot 0.
     pub head_start: Option<ocl::core::Mem>,
+    /// Host copy of the same starts, for the CPU share of a partitioned layer (empty when
+    /// `head_start` is `None`).
+    pub head_starts: Vec<usize>,
 }
 
 /// Execution plan for the full model decode pass.
@@ -771,7 +774,11 @@ impl FullKernelPlan {
                         start_pos,
                         g.current_pos,
                         kv_cap,
-                        g.head_start.is_some(),
+                        &super::tp_plan::AttnRunCtx {
+                            head_start: g.head_start.as_ref(),
+                            head_starts: &g.head_starts,
+                            q_rows: self.q_row_copy.as_ref(),
+                        },
                     )?;
                     None
                 }

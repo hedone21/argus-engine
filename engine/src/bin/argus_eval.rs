@@ -181,7 +181,8 @@ fn dispatch_eval(mode: EvalMode, args: Args) -> anyhow::Result<()> {
 fn eval_supported(args: &Args) -> bool {
     !args.profile
         && !args.profile_events
-        && args.tensor_partition == 0.0
+        // A static schedule is the decode loop argus-bench runs, so it can carry the split.
+        && (args.tensor_partition == 0.0 || args.experiment_schedule.is_some())
         && !args.chat
         && args.chat_socket.is_none()
         && args.chat_tcp.is_none()
@@ -225,9 +226,20 @@ fn reject_unsupported_modes_eval(args: &Args) -> anyhow::Result<()> {
         );
     }
     if args.tensor_partition > 0.0 || args.tp_adaptive || args.tp_no_flags {
-        bail!(
-            "argus-eval: --tensor-partition / --tp-* is a decode-only measurement mode, not eval"
-        );
+        if args.experiment_schedule.is_none() {
+            bail!(
+                "argus-eval: --tensor-partition / --tp-* is a decode-only measurement mode, not eval \
+                 (only --experiment-schedule runs it)"
+            );
+        }
+        // Same combination rules as argus-bench.
+        let split = args.tensor_partition > 0.0 && args.tensor_partition < 1.0;
+        if (args.tp_adaptive || args.tp_no_flags) && !split {
+            bail!("argus-eval: --tp-adaptive / --tp-no-flags need --tensor-partition in (0, 1)");
+        }
+        if args.tp_adaptive && args.tp_no_flags {
+            bail!("argus-eval: --tp-adaptive measures through the done-flags; drop --tp-no-flags");
+        }
     }
     // W-ALLOC: eval honors a per-layer KV format POLICY (N-way mixed precision) on the Standard KV
     // path (`build_eval_*_ctx` → `alloc_eval_kv_caches`), matching argus-cli / argus-bench. The
@@ -370,6 +382,42 @@ mod tests {
     fn eval_supported_blocks_tensor_partition() {
         let args = make_args(&["--ppl", "/tmp/ref.txt", "--tensor-partition", "0.5"]);
         assert!(!eval_supported(&args));
+    }
+
+    /// ticket 023: the split runs only in schedule mode, through both guards.
+    #[test]
+    fn argus_eval_accepts_tp_only_with_schedule() {
+        let passes = |extra: &[&str]| {
+            let args = make_args(extra);
+            reject_unsupported_modes_eval(&args).is_ok() && eval_supported(&args)
+        };
+        let sched = ["--experiment-schedule", "/tmp/s.json"];
+        assert!(passes(
+            &[&sched[..], &["--tensor-partition", "0.5"]].concat()
+        ));
+        assert!(passes(
+            &[&sched[..], &["--tensor-partition", "0.75", "--tp-adaptive"]].concat()
+        ));
+        assert!(!passes(&[
+            "--ppl",
+            "/tmp/ref.txt",
+            "--tensor-partition",
+            "0.5"
+        ]));
+        assert!(!passes(&["--eval-ll", "--tensor-partition", "0.5"]));
+        assert!(!passes(&[&sched[..], &["--tp-adaptive"]].concat()));
+        assert!(!passes(
+            &[
+                &sched[..],
+                &[
+                    "--tensor-partition",
+                    "0.5",
+                    "--tp-adaptive",
+                    "--tp-no-flags"
+                ]
+            ]
+            .concat()
+        ));
     }
 
     #[test]

@@ -128,12 +128,18 @@ impl StandardFormat {
                     .ok()
                     .cloned()
             });
+        let head_starts = if head_start.is_some() {
+            g.cache.head_starts()
+        } else {
+            Vec::new()
+        };
         crate::backend::opencl::plan::PlanGeometry {
             current_pos: g.cache.current_pos(),
             capacity: g.cache.capacity(),
             res_pos: 0,
             q2_tokens: 0,
             head_start,
+            head_starts,
         }
     }
 

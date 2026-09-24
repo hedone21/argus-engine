@@ -203,6 +203,13 @@ pub fn matmul_f16_colslice(
     Ok(())
 }
 
+/// Indices the CPU attention share uses for the token at RoPE position `start_pos` that is
+/// written at cache slot `write_pos` — `(rope_pos, slot, attn_len, new_len)`. The two differ
+/// after a compaction: the RoPE clock keeps counting while the cache renumbers its slots down.
+pub fn cpu_share_indices(start_pos: usize, write_pos: usize) -> (usize, usize, usize, usize) {
+    (start_pos, write_pos, write_pos + 1, write_pos + 1)
+}
+
 /// Single-query attention for Q heads `heads` only, one KV group at a time.
 ///
 /// `q` / `out` hold all `n_heads_q` heads (`[.., n_heads_q·head_dim]` F32); only the rows of
@@ -210,6 +217,11 @@ pub fn matmul_f16_colslice(
 /// head_dim]`. The backend's `attention_gen` maps Q head `h` to KV head `h / (n_q / n_kv)`, so a
 /// range that straddles a group boundary must be called per group — each call sees one KV head
 /// and only that group's Q heads.
+///
+/// `kv_start` (one entry per KV head) marks a ragged cache: KV head `h` is resident over
+/// `[kv_start[h], cache_seq_len)` (see `Backend::attention_gen_ragged`). `scores_out` holds
+/// `n_heads_q` rows of `scores_out.len() / n_heads_q` floats; the post-softmax row of each head in
+/// `heads` is written to its columns `[0, cache_seq_len)` (hole columns 0).
 #[allow(clippy::too_many_arguments)]
 pub fn attention_head_range(
     backend: &dyn Backend,
@@ -222,11 +234,22 @@ pub fn attention_head_range(
     n_kv_heads: usize,
     head_dim: usize,
     cache_seq_len: usize,
+    kv_start: Option<&[usize]>,
+    mut scores_out: Option<&mut [f32]>,
 ) -> Result<()> {
     let dims = k_cache.shape().dims();
     ensure!(
         dims.len() == 4 && dims[1] == n_kv_heads && dims[3] == head_dim,
         "attention_head_range expects HeadMajor [1, n_kv, cap, head_dim], got {dims:?}"
+    );
+    ensure!(
+        kv_start.is_none_or(|s| s.len() == n_kv_heads),
+        "attention_head_range: kv_start needs one entry per KV head"
+    );
+    let score_stride = scores_out.as_ref().map_or(0, |s| s.len() / n_heads_q);
+    ensure!(
+        scores_out.is_none() || score_stride >= cache_seq_len,
+        "attention_head_range: score rows shorter than the cache ({score_stride} < {cache_seq_len})"
     );
     let capacity = dims[2];
     let group = n_heads_q / n_kv_heads;
@@ -270,17 +293,36 @@ pub fn attention_head_range(
             kv_dtype,
         )?;
         let v_v = view(v_cache, kv_h * head_bytes, head_bytes, kv_shape, kv_dtype)?;
-        backend.attention_gen(
-            &q_v,
-            &k_v,
-            &v_v,
-            &mut o_v,
-            nh,
-            1,
-            head_dim,
-            cache_seq_len,
-            None,
-        )?;
+        let scores = scores_out
+            .as_deref_mut()
+            .map(|s| &mut s[h * score_stride..h_end * score_stride]);
+        match kv_start {
+            Some(starts) => backend.attention_gen_ragged(
+                &q_v,
+                &k_v,
+                &v_v,
+                &mut o_v,
+                nh,
+                1,
+                head_dim,
+                &starts[kv_h..kv_h + 1],
+                None,
+                0,
+                cache_seq_len,
+                scores,
+            )?,
+            None => backend.attention_gen(
+                &q_v,
+                &k_v,
+                &v_v,
+                &mut o_v,
+                nh,
+                1,
+                head_dim,
+                cache_seq_len,
+                scores,
+            )?,
+        }
         h = h_end;
     }
     Ok(())
@@ -581,6 +623,8 @@ mod tests {
                         n_kv,
                         hd,
                         seq,
+                        None,
+                        None,
                     )
                     .unwrap();
                 }
@@ -591,6 +635,160 @@ mod tests {
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0f32, f32::max);
                 assert!(err <= 1e-5, "seq={seq} h_g={h_g}: max err {err}");
+            }
+        }
+    }
+
+    /// Ticket 023 E1: after a compaction the RoPE position runs ahead of the cache slot.
+    #[test]
+    fn tp_cpu_share_indices_after_compaction() {
+        for (start_pos, write_pos) in [(10usize, 10usize), (1500, 882), (2324, 807)] {
+            let (rope_pos, slot, attn_len, new_len) = cpu_share_indices(start_pos, write_pos);
+            assert_eq!(rope_pos, start_pos);
+            assert_eq!(slot, write_pos);
+            assert_eq!(attn_len, write_pos + 1);
+            assert_eq!(new_len, write_pos + 1);
+        }
+    }
+
+    /// Q 12 · KV 2 · hd 128 inputs over a KV capacity of 64 (> 1: x86 reads a capacity-1 view as
+    /// SeqMajor).
+    fn head_range_inputs(be: &Arc<dyn Backend>) -> (Tensor, Tensor, Tensor) {
+        let (n_q, n_kv, hd, cap) = (12usize, 2usize, 128usize, 64usize);
+        let alloc = |shape: Vec<usize>, dtype: DType| {
+            let elems: usize = shape.iter().product();
+            let buf = Galloc::new().alloc(elems * dtype.size(), dtype).unwrap();
+            Tensor::new(Shape::new(shape), buf, be.clone())
+        };
+        let mut q = alloc(vec![1, 1, n_q, hd], DType::F32);
+        q.as_mut_slice::<f32>().copy_from_slice(&noise(3, n_q * hd));
+        let mut k = alloc(vec![1, n_kv, cap, hd], DType::F16);
+        let mut v = alloc(vec![1, n_kv, cap, hd], DType::F16);
+        for (t, seed) in [(&mut k, 5u64), (&mut v, 9)] {
+            let vals = noise(seed, n_kv * cap * hd);
+            for (d, s) in t.as_mut_slice::<half::f16>().iter_mut().zip(vals) {
+                *d = half::f16::from_f32(s);
+            }
+        }
+        (q, k, v)
+    }
+
+    fn out_tensor(be: &Arc<dyn Backend>) -> Tensor {
+        let buf = Galloc::new().alloc(12 * 128 * 4, DType::F32).unwrap();
+        Tensor::new(Shape::new(vec![1, 1, 12, 128]), buf, be.clone())
+    }
+
+    fn max_err(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Ticket 023 E2: the CPU heads' probability rows equal the full attention's rows.
+    #[test]
+    fn tp_attn_head_range_scores_match_full() {
+        let be = cpu_backend();
+        let (n_q, n_kv, hd) = (12usize, 2usize, 128usize);
+        let (q, k, v) = head_range_inputs(&be);
+        for seq in [1usize, 37, 64] {
+            let mut full = out_tensor(&be);
+            let mut full_s = vec![0.0f32; n_q * seq];
+            be.attention_gen(&q, &k, &v, &mut full, n_q, n_kv, hd, seq, Some(&mut full_s))
+                .unwrap();
+            for h_g in [1usize, 5, 6, 7, 11] {
+                let mut part = out_tensor(&be);
+                let mut s = vec![f32::NAN; n_q * seq];
+                attention_head_range(
+                    be.as_ref(),
+                    &q,
+                    &k,
+                    &v,
+                    &mut part,
+                    h_g..n_q,
+                    n_q,
+                    n_kv,
+                    hd,
+                    seq,
+                    None,
+                    Some(&mut s),
+                )
+                .unwrap();
+                let rows = h_g * seq..n_q * seq;
+                let err = max_err(&full_s[rows.clone()], &s[rows]);
+                assert!(err <= 1e-5, "seq={seq} h_g={h_g}: score err {err}");
+                for h in h_g..n_q {
+                    let sum: f32 = s[h * seq..(h + 1) * seq].iter().sum();
+                    assert!((sum - 1.0).abs() <= 1e-4, "seq={seq} h={h}: row sum {sum}");
+                }
+                let err = max_err(
+                    &full.as_slice::<f32>()[h_g * hd..],
+                    &part.as_slice::<f32>()[h_g * hd..],
+                );
+                assert!(err <= 1e-5, "seq={seq} h_g={h_g}: output err {err}");
+            }
+        }
+    }
+
+    /// Ticket 023 E4: on a ragged cache the head range equals the full ragged attention.
+    /// (`attention_head_range` calls `attention_gen_ragged` itself, so this checks the per-group
+    /// slicing of Q / KV / start / score rows, not the ragged kernel.)
+    #[test]
+    fn tp_attn_head_range_ragged_matches_full() {
+        let be = cpu_backend();
+        let (n_q, n_kv, hd, seq) = (12usize, 2usize, 128usize, 64usize);
+        let (q, k, v) = head_range_inputs(&be);
+        for starts in [[0usize, 0], [0, 17], [30, 5]] {
+            let mut full = out_tensor(&be);
+            let mut full_s = vec![0.0f32; n_q * seq];
+            be.attention_gen_ragged(
+                &q,
+                &k,
+                &v,
+                &mut full,
+                n_q,
+                n_kv,
+                hd,
+                &starts,
+                None,
+                0,
+                seq,
+                Some(&mut full_s),
+            )
+            .unwrap();
+            for h_g in [1usize, 5, 6, 7, 11] {
+                let mut part = out_tensor(&be);
+                let mut s = vec![f32::NAN; n_q * seq];
+                attention_head_range(
+                    be.as_ref(),
+                    &q,
+                    &k,
+                    &v,
+                    &mut part,
+                    h_g..n_q,
+                    n_q,
+                    n_kv,
+                    hd,
+                    seq,
+                    Some(&starts),
+                    Some(&mut s),
+                )
+                .unwrap();
+                let rows = h_g * seq..n_q * seq;
+                let err = max_err(&full_s[rows.clone()], &s[rows]);
+                assert!(err <= 1e-5, "starts={starts:?} h_g={h_g}: score err {err}");
+                let err = max_err(
+                    &full.as_slice::<f32>()[h_g * hd..],
+                    &part.as_slice::<f32>()[h_g * hd..],
+                );
+                assert!(err <= 1e-5, "starts={starts:?} h_g={h_g}: output err {err}");
+                for h in h_g..n_q {
+                    let start = starts[h / (n_q / n_kv)];
+                    assert!(
+                        s[h * seq..h * seq + start].iter().all(|&x| x == 0.0),
+                        "starts={starts:?} h={h}: hole column not 0"
+                    );
+                }
             }
         }
     }

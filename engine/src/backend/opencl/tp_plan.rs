@@ -39,11 +39,13 @@ use ocl::core::{ArgVal, Kernel as CoreKernel, Mem};
 
 use super::plan::{
     AttentionVariant, FullKernelPlan, GemvKind, KernelStep, LayerKernelPlan, LayerPlanConfig,
-    OpTag, PlanInvalidated, check_partition_generation,
+    OpTag, PlanInvalidated, Q1_MERGE_KV_START_ARG, Q1_SPLIT_MAIN_KV_START_ARG, QRowPlanCopy,
+    check_partition_generation,
 };
 use crate::backend::Backend;
 use crate::layers::tensor_partition::{
-    PartitionContext, attention_head_range, gemv_f16_strided, partition_plan_enabled,
+    PartitionContext, attention_head_range, cpu_share_indices, gemv_f16_strided,
+    partition_plan_enabled,
 };
 use crate::layers::tp_controller::{Obs, SegGeom, TpController};
 use crate::partition_workspace::{HostKv, PartitionWorkspace, PartitionWsCell, PendingObs};
@@ -512,7 +514,29 @@ pub struct AttnPartitionStep {
     v_cache: Mem,
     kv_capacity: usize,
     cpu_backend: Arc<dyn Backend>,
+    /// Set when the plan writes GPU scores: the CPU heads' rows go here too (ticket 023 E2).
+    scores: Option<ScoreRows>,
 }
+
+/// This layer's slice of the GPU score buffer (`[n_heads_q][stride]` f32 at `layer_offset`).
+struct ScoreRows {
+    buf: Mem,
+    layer_offset: usize,
+    stride: usize,
+}
+
+/// Per-token inputs of [`AttnPartitionStep::run`] beyond the cache positions.
+pub struct AttnRunCtx<'a> {
+    /// Device mirror of the ragged cache's per-KV-head first slots (`None` = uniform).
+    pub head_start: Option<&'a Mem>,
+    /// Host copy of the same starts (empty when `head_start` is `None`).
+    pub head_starts: &'a [usize],
+    /// The query-row ring copy, when armed.
+    pub q_rows: Option<&'a QRowPlanCopy>,
+}
+
+static RAGGED_BOUND_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// FFN segment of one partitioned layer.
 pub struct FfnPartitionStep {
@@ -599,8 +623,23 @@ impl AttnPartitionStep {
         Ok(())
     }
 
-    /// CPU share of the attention block for heads `[h_g, n_heads_q)` at `pos`.
-    fn cpu_share(&self, h_g: usize, pos: usize) -> Result<()> {
+    /// CPU share of the attention block for heads `[h_g, n_heads_q)` for the token at RoPE
+    /// position `start_pos`, written at cache slot `write_pos`. `kv_start` marks a ragged cache;
+    /// `scores` receives the heads' post-softmax rows (`n_heads_q` rows of the attention length).
+    fn cpu_share(
+        &self,
+        h_g: usize,
+        start_pos: usize,
+        write_pos: usize,
+        kv_start: Option<&[usize]>,
+        scores: Option<&mut [f32]>,
+    ) -> Result<()> {
+        let (rope_pos, slot, attn_len, new_len) = cpu_share_indices(start_pos, write_pos);
+        ensure!(
+            slot < self.kv_capacity,
+            "host KV slot {slot} outside capacity {}",
+            self.kv_capacity
+        );
         let ws = self.c.ws();
         let hd = self.head_dim;
         let (nq, nkv, dim) = (self.n_heads_q, self.n_kv, self.dim);
@@ -638,20 +677,20 @@ impl AttnPartitionStep {
             add_bias(&mut q[q_lo..], &h.bq, q_lo);
             add_bias(k, &h.bk, 0);
             add_bias(v, &h.bv, 0);
-            rope_rows(q, h_g..nq, hd, pos, &self.freqs);
-            rope_rows(k, 0..nkv, hd, pos, &self.freqs);
+            rope_rows(q, h_g..nq, hd, rope_pos, &self.freqs);
+            rope_rows(k, 0..nkv, hd, rope_pos, &self.freqs);
 
             let kv = &mut ws.tp.kv[self.c.layer];
             let kc = kv.k.buffer().as_mut_ptr() as *mut half::f16;
             let vc = kv.v.buffer().as_mut_ptr() as *mut half::f16;
             for head in 0..nkv {
-                let base = (head * self.kv_capacity + pos) * hd;
+                let base = (head * self.kv_capacity + slot) * hd;
                 for d in 0..hd {
                     *kc.add(base + d) = half::f16::from_f32(k[head * hd + d]);
                     *vc.add(base + d) = half::f16::from_f32(v[head * hd + d]);
                 }
             }
-            kv.len = pos + 1;
+            kv.len = new_len;
         }
         let kv = &ws.tp.kv[self.c.layer];
         attention_head_range(
@@ -664,7 +703,9 @@ impl AttnPartitionStep {
             nq,
             nkv,
             hd,
-            pos + 1,
+            attn_len,
+            kv_start,
+            scores,
         )?;
         unsafe {
             gemv_f16_strided(
@@ -689,18 +730,24 @@ impl AttnPartitionStep {
         start_pos: usize,
         write_pos: usize,
         kv_cap: i32,
-        has_head_start: bool,
+        rc: &AttnRunCtx,
     ) -> std::result::Result<(), PlanInvalidated> {
         self.c.check()?;
-        if has_head_start {
-            log::error!("tensor partition does not support a ragged KV cache");
-            return Err(PlanInvalidated);
-        }
         let layer = self.c.layer;
         {
-            let kv = &mut self.c.ws().tp.kv[layer];
+            let rt = &mut self.c.ws().tp;
+            rt.catch_up.pos = start_pos;
+            let kv = &mut rt.kv[layer];
             if kv.len != write_pos {
+                let full = kv.len > write_pos || kv.len == 0;
                 self.catch_up(backend, kv, write_pos)?;
+                let n = &mut rt.catch_up;
+                if full {
+                    n.full += 1;
+                    n.full_this_token += 1;
+                } else {
+                    n.tail += 1;
+                }
             }
         }
         let h_g = SegGeom::attn(self.n_heads_q).split(self.c.applied(0));
@@ -724,8 +771,49 @@ impl AttnPartitionStep {
         }
         d(&self.rope_q, &[h_g * self.head_dim / 2, 1, 1], cs);
         d(&self.rope_k, &self.rope_k.global_work_size, cs);
+        // The GPU heads' rotated query rows: `ws.q` holds only `[0, h_g)` valid (ticket 023 E3).
+        let q_ring_off = rc
+            .q_rows
+            .filter(|c| layer < c.n_layers)
+            .map(|c| (c, (layer * c.rows + start_pos % c.rows) * c.row_bytes));
+        if let Some((c, off)) = q_ring_off
+            && let Err(e) = unsafe {
+                ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
+                    backend.queue.as_core(),
+                    &c.src,
+                    &c.ring,
+                    0,
+                    off,
+                    h_g * self.head_dim * 4,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )
+            }
+        {
+            log::error!("tensor partition: q-row copy failed: layer={layer}: {e}");
+            c.failed.store(true, Ordering::Relaxed);
+        }
         d(&self.kv_update, &self.kv_update.global_work_size, cs);
         let attn_seq = cs + 1;
+        // A ragged cache: the GPU heads read from their own first slot (ticket 023 E4).
+        if let Some(m) = rc.head_start {
+            let bind = |k: &CoreKernel, idx: u32| {
+                if let Err(e) = unsafe { ocl::core::set_kernel_arg(k, idx, ArgVal::mem(m)) } {
+                    log::error!("tensor partition: set kv_start arg {idx} failed: {e}");
+                }
+            };
+            match &self.attention {
+                AttentionVariant::StandardFlash(s) => bind(&s.kernel, 44),
+                AttentionVariant::SplitFlash { main, merge } => {
+                    bind(&main.kernel, Q1_SPLIT_MAIN_KV_START_ARG);
+                    bind(&merge.kernel, Q1_MERGE_KV_START_ARG);
+                }
+                AttentionVariant::Standard(_) => unreachable!("rejected at build"),
+            }
+            if !RAGGED_BOUND_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[tp] ragged kv_start bound");
+            }
+        }
         match &self.attention {
             AttentionVariant::StandardFlash(s) => d(s, &[s.global_work_size[0], h_g, 1], attn_seq),
             AttentionVariant::SplitFlash { main, merge } => {
@@ -751,11 +839,73 @@ impl AttnPartitionStep {
             _ => None,
         };
         let t_cpu0 = if serial { Instant::now() } else { t0 };
-        if let Err(e) = self.cpu_share(h_g, start_pos) {
+        let ragged = rc.head_starts.iter().any(|&s| s > 0);
+        let kv_start = ragged.then_some(rc.head_starts);
+        let (_, _, attn_len, _) = cpu_share_indices(start_pos, write_pos);
+        let nq = self.n_heads_q;
+        let mut score_stage = self.scores.as_ref().map(|_| {
+            let stage = &mut self.c.ws().tp.score_stage[layer];
+            stage.resize(nq * attn_len, 0.0);
+            stage
+        });
+        let res = self.cpu_share(
+            h_g,
+            start_pos,
+            write_pos,
+            kv_start,
+            score_stage.as_deref_mut().map(|v| v.as_mut_slice()),
+        );
+        if let Err(e) = res {
             log::error!("tensor partition: CPU attention failed: layer={layer} err={e:#}");
             return Err(PlanInvalidated);
         }
         let t_cpu_end = Instant::now();
+        // Hand the CPU heads' score rows and query rows to the device. Non-blocking: each layer
+        // has its own staging, and the token's blocking logits read ends before a layer's staging
+        // is written again. Enqueued before `end_step`'s reduce, which reads the score rows.
+        let queue = backend.queue.as_core();
+        if let (Some(sr), Some(stage)) = (&self.scores, score_stage) {
+            for h in h_g..nq {
+                if let Err(e) = unsafe {
+                    ocl::core::enqueue_write_buffer(
+                        queue,
+                        &sr.buf,
+                        false,
+                        sr.layer_offset + h * sr.stride,
+                        &stage[h * attn_len..(h + 1) * attn_len],
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )
+                } {
+                    log::error!("tensor partition: score row write failed: layer={layer}: {e}");
+                    return Err(PlanInvalidated);
+                }
+            }
+        }
+        if let Some((c, off)) = q_ring_off {
+            let ws = self.c.ws();
+            let q_lo = h_g * self.head_dim;
+            let q_all = nq * self.head_dim;
+            let stage = &mut ws.tp.q_stage[layer];
+            stage.resize(q_all, 0.0);
+            // SAFETY: `q_cpu` holds `n_heads_q * head_dim` floats.
+            let q = unsafe { std::slice::from_raw_parts(f32_ptr(&ws.q_cpu), q_all) };
+            stage[q_lo..].copy_from_slice(&q[q_lo..]);
+            if let Err(e) = unsafe {
+                ocl::core::enqueue_write_buffer(
+                    queue,
+                    &c.ring,
+                    false,
+                    off / 4 + q_lo,
+                    &stage[q_lo..],
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )
+            } {
+                log::error!("tensor partition: q-row write failed: layer={layer}: {e}");
+                c.failed.store(true, Ordering::Relaxed);
+            }
+        }
         {
             let ws = self.c.ws();
             deliver(&ws.wo_partial_cpu, &ws.staging_attn, self.dim);
@@ -908,6 +1058,15 @@ pub(crate) fn end_token(ws: &PartitionWsCell) -> std::result::Result<(), PlanInv
             return Err(PlanInvalidated);
         }
     }
+    let n = &mut rt.catch_up;
+    if n.full_this_token > 0 {
+        eprintln!(
+            "[tp] recopy step={} pos={} full_layers={}",
+            n.step, n.pos, n.full_this_token
+        );
+        n.full_this_token = 0;
+    }
+    n.step += 1;
     if let Some(ctl) = rt.ctl.as_mut() {
         if let Some(threads) = ctl.end_token() {
             crate::thread_pool::get_pool().set_active_workers(threads.saturating_sub(1));
@@ -1137,6 +1296,11 @@ pub fn build_tp_layer(config: &LayerPlanConfig, inp: TpLayerInputs) -> Result<La
         v_cache: config.v_cache_buf.clone(),
         kv_capacity: config.kv_capacity,
         cpu_backend: inp.ctx.cpu_backend.clone(),
+        scores: config.gpu_score_buf.map(|buf| ScoreRows {
+            buf: buf.clone(),
+            layer_offset: config.gpu_score_layer_offset as usize,
+            stride: config.gpu_score_stride as usize,
+        }),
     };
     let ffn = FfnPartitionStep {
         c: common(layer),
@@ -1196,6 +1360,10 @@ pub fn prepare_runtime(
             pw.tp.opts.adaptive && pw.tp.opts.flags,
             pw.tp.opts.cfg,
         ));
+    }
+    if pw.tp.score_stage.len() != g.n_layers {
+        pw.tp.score_stage = vec![Vec::new(); g.n_layers];
+        pw.tp.q_stage = vec![Vec::new(); g.n_layers];
     }
     let fits = pw.tp.kv.len() == g.n_layers
         && pw
