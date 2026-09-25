@@ -1066,12 +1066,17 @@ pub(crate) fn end_token(ws: &PartitionWsCell) -> std::result::Result<(), PlanInv
         );
         n.full_this_token = 0;
     }
-    n.step += 1;
+    // `n.step` is the decode step, set by the forward before the plan runs.
+    let step = n.step as usize;
     if let Some(ctl) = rt.ctl.as_mut() {
+        let converged = ctl.converged_tok.is_some();
         if let Some(threads) = ctl.end_token() {
             crate::thread_pool::get_pool().set_active_workers(threads.saturating_sub(1));
         }
-        crate::layers::tp_controller::telemetry_push(ctl.stats());
+        if let (false, Some(tok), Some(on)) = (converged, ctl.converged_tok, ctl.on_tokens) {
+            eprintln!("[tp] reconverged step={step} tokens_since_on={}", tok - on);
+        }
+        crate::layers::tp_controller::telemetry_push(step, ctl.stats());
     }
     Ok(())
 }
@@ -1360,6 +1365,11 @@ pub fn prepare_runtime(
             pw.tp.opts.adaptive && pw.tp.opts.flags,
             pw.tp.opts.cfg,
         ));
+        if std::mem::take(&mut pw.tp.on_pending)
+            && let Some(ctl) = pw.tp.ctl.as_mut()
+        {
+            ctl.on_tokens = Some(0);
+        }
     }
     if pw.tp.score_stage.len() != g.n_layers {
         pw.tp.score_stage = vec![Vec::new(); g.n_layers];

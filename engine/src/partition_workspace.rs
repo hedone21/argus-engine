@@ -51,6 +51,8 @@ pub struct TpOptions {
     /// control arm that prices the measurement.
     pub flags: bool,
     pub cfg: TpConfig,
+    /// `--tp-start-off`: prepared, but every layer starts on the GPU until `gpu.offload`.
+    pub start_off: bool,
 }
 
 impl Default for TpOptions {
@@ -59,6 +61,7 @@ impl Default for TpOptions {
             adaptive: false,
             flags: true,
             cfg: TpConfig::default(),
+            start_off: false,
         }
     }
 }
@@ -102,6 +105,72 @@ pub struct TpRuntime {
     /// the next layer's CPU share runs before the write has read its source.
     pub score_stage: Vec<Vec<f32>>,
     pub q_stage: Vec<Vec<f32>>,
+    /// `gpu.offload` turned the partition on before the controller existed: the plan build that
+    /// creates it marks it as turned on (see [`TpController::on_tokens`]).
+    pub on_pending: bool,
+}
+
+/// What turning the partition off released (ticket 024), for the `[tp] offload off` line.
+pub struct OffloadOff {
+    /// Active CPU pool workers before → after.
+    pub workers: (usize, usize),
+    /// Host KV bytes allocated.
+    pub host_kv_freed: usize,
+    /// Host KV bytes written (`2 · n_kv · len · head_dim · 2` per layer): what PSS can return.
+    pub touched: usize,
+    /// `Pss` of `/proc/self/smaps_rollup` right before and after the release, in kB.
+    pub pss_before: Option<u64>,
+    pub pss_after: Option<u64>,
+}
+
+impl TpRuntime {
+    /// `gpu.offload` turned the partition off: give the CPU pool back its workers (the contention
+    /// rule may have parked some) and free the host KV, so the partition costs no memory while it
+    /// is off. Turning it on again allocates a fresh host KV, which the next plan build fills from
+    /// slot 0.
+    pub fn release_for_off(&mut self) -> OffloadOff {
+        let pool = crate::thread_pool::get_pool();
+        let before = pool.active_workers();
+        pool.set_active_workers(pool.n_workers());
+        let workers = (before, pool.active_workers());
+        let mut host_kv_freed = 0;
+        let mut touched = 0;
+        for kv in &self.kv {
+            let d = kv.k.shape().dims();
+            host_kv_freed += kv.k.size() + kv.v.size();
+            touched += 2 * d[1] * kv.len * d[3] * 2;
+        }
+        let pss_before = pss_kb();
+        self.kv = Vec::new();
+        let pss_after = pss_kb();
+        OffloadOff {
+            workers,
+            host_kv_freed,
+            touched,
+            pss_before,
+            pss_after,
+        }
+    }
+
+    /// `gpu.offload` turned the partition on: the controller starts over
+    /// ([`TpController::reset_for_on`]).
+    pub fn reset_for_on(&mut self) {
+        match self.ctl.as_mut() {
+            Some(ctl) => ctl.reset_for_on(),
+            None => self.on_pending = true,
+        }
+    }
+}
+
+/// `Pss` of this process from `/proc/self/smaps_rollup`, in kB (`None` where it cannot be read).
+fn pss_kb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    s.lines()
+        .find_map(|l| l.strip_prefix("Pss:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Host-KV catch-up counter. A full copy from slot 0 happens after prefill and after every
@@ -114,7 +183,7 @@ pub struct CatchUpCount {
     pub full_this_token: usize,
     /// RoPE position of the token being run.
     pub pos: usize,
-    /// Decode steps closed so far (the index of the token being run).
+    /// Decode step of the token being run (set by the forward each step).
     pub step: u64,
 }
 
@@ -231,6 +300,7 @@ impl PartitionWorkspace {
                 catch_up: CatchUpCount::default(),
                 score_stage: Vec::new(),
                 q_stage: Vec::new(),
+                on_pending: false,
             },
         })
     }
@@ -256,5 +326,63 @@ impl PartitionWorkspace {
         .collect();
         v.extend(self.flags.iter().flatten().map(|t| t.buffer().clone()));
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::cpu::CpuBackend;
+    use crate::memory::galloc::Galloc;
+
+    /// Tests that change the global pool's active worker count.
+    static POOL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn host_kv(n_kv: usize, cap: usize, hd: usize, len: usize) -> HostKv {
+        let be: Arc<dyn crate::backend::Backend> = Arc::new(CpuBackend::new());
+        let t = || {
+            let buf = Galloc::new()
+                .alloc(n_kv * cap * hd * 2, DType::F16)
+                .unwrap();
+            Tensor::new(Shape::new(vec![1, n_kv, cap, hd]), buf, be.clone())
+        };
+        HostKv {
+            k: t(),
+            v: t(),
+            len,
+        }
+    }
+
+    /// ticket 024: turning the partition off restores every pool worker and frees the host KV.
+    #[test]
+    fn release_for_off_restores_workers_and_frees_host_kv() {
+        let _g = POOL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pool = crate::thread_pool::get_pool();
+        let mut rt = TpRuntime {
+            opts: TpOptions::default(),
+            ctl: None,
+            pending: Vec::new(),
+            kv: vec![host_kv(2, 64, 8, 10), host_kv(2, 64, 8, 64)],
+            catch_up: CatchUpCount::default(),
+            score_stage: Vec::new(),
+            q_stage: Vec::new(),
+            on_pending: false,
+        };
+        pool.set_active_workers(pool.n_workers().saturating_sub(1));
+        let r = rt.release_for_off();
+        assert_eq!(
+            r.workers,
+            (pool.n_workers().saturating_sub(1), pool.n_workers())
+        );
+        assert_eq!(pool.active_workers(), pool.n_workers());
+        assert_eq!(r.host_kv_freed, 2 * 2 * (2 * 64 * 8 * 2));
+        assert_eq!(r.touched, 2 * 2 * (10 + 64) * 8 * 2);
+        assert!(rt.kv.is_empty());
+
+        rt.reset_for_on();
+        assert!(
+            rt.on_pending,
+            "no controller yet: the next plan build marks it"
+        );
     }
 }

@@ -360,7 +360,8 @@ pub fn build_bench_loop(
     memory: Arc<dyn Memory>,
     cpu_backend: Arc<dyn Backend>,
     // AB-4: PartitionStage 의 companion resolve 용 hardware (init.rs:822 보유분 전달).
-    _hardware: Arc<crate::hardware::Hardware>,
+    // ticket 024: the `gpu.offload` switch resolves the CPU companion through it.
+    hardware: Arc<crate::hardware::Hardware>,
     model: TransformerModel,
     kv_caches: Vec<KVCache>,
     max_seq_len: usize,
@@ -437,6 +438,24 @@ pub fn build_bench_loop(
         Arc::clone(&score_cell),
     )?;
     mf.set_tp_options(tp_options);
+    // ticket 024: a prepared partition gets a `gpu.offload` switch over every layer slot. Its
+    // presence is what "prepared" means to the dispatcher; without it `gpu.offload` is refused.
+    let tp_switch = tp_switch_for(mf.model(), &hardware, tp_options.start_off)?;
+    if tp_switch.is_some() && tp_options.start_off {
+        // Start state, before prefill: every layer on the GPU. Not a `gpu.offload` event.
+        crate::layers::tensor_partition::apply_partition_dispatch(
+            &mf.model().layers,
+            1.0,
+            &hardware,
+        )?;
+        mf.set_tp_start_off();
+        if resilience.is_none() && schedule_source.is_none() {
+            eprintln!(
+                "[tp] warning: --tp-start-off with no command source (manager not connected) — \
+                 nothing can turn the partition on"
+            );
+        }
+    }
     // Faithful-H2O (c): arm a full-prompt-window (`usize::MAX` clamps to seq_len) PFA producer + the
     // prefill seed. The dummy cell is never consumed in the bench loop (no PrefillKeepSetStage); the
     // PFA buffer is used only to fold prefill column-sums into `score_cell` at the final chunk.
@@ -631,6 +650,10 @@ pub fn build_bench_loop(
             }
             None => dispatcher,
         })
+        .map(|d| match tp_switch {
+            Some(sw) => d.with_tp_switch(sw),
+            None => d,
+        })
     } else {
         if aperturb_pool.is_some() {
             // Nothing polls commands, so no `KvCompress` can arrive and the pool would never be
@@ -723,4 +746,38 @@ mod tests {
             "non-v3 name → v2 fallback"
         );
     }
+}
+
+/// The `gpu.offload` switch of a prepared tensor partition (ticket 024), or `None` when the model
+/// was not partitioned at start. On fans the starting split out over every layer; off returns every
+/// layer to the GPU. A failed fan-out leaves no layer split.
+fn tp_switch_for(
+    model: &Arc<TransformerModel>,
+    hardware: &Arc<crate::hardware::Hardware>,
+    start_off: bool,
+) -> Result<Option<crate::session::command_dispatcher::TpSwitch>> {
+    use crate::layers::tensor_partition::apply_partition_dispatch;
+    let Some(r0) = model
+        .layers
+        .first()
+        .and_then(|l| l.load_weights().partition_ctx.as_ref().map(|c| c.gpu_ratio))
+    else {
+        return Ok(None);
+    };
+    let slots = model.layers.clone();
+    let hw = Arc::clone(hardware);
+    Ok(Some(crate::session::command_dispatcher::TpSwitch::new(
+        !start_off,
+        Box::new(move |on| {
+            if !on {
+                return apply_partition_dispatch(&slots, 1.0, &hw).map(|_| ());
+            }
+            apply_partition_dispatch(&slots, r0, &hw)
+                .map(|_| ())
+                .inspect_err(|_| {
+                    // Never leave the layers mixed.
+                    let _ = apply_partition_dispatch(&slots, 1.0, &hw);
+                })
+        }),
+    )))
 }

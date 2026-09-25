@@ -495,20 +495,36 @@ pub struct TpTokenStats {
     pub contention: u64,
 }
 
-/// Per-token stats of the running partition arm, in decode order, for the `--tbt-log` writer
-/// (one entry per plan-executed decode token). Process-global like the partition trace
-/// counters: one decode session per process.
-static TELEMETRY: std::sync::Mutex<Vec<TpTokenStats>> = std::sync::Mutex::new(Vec::new());
+/// Per-token stats of the partition arm for the `--tbt-log` writer: whether the partition was
+/// prepared at all, and one `(decode step, stats)` row per token the partition actually ran
+/// (ticket 024 T4 — with `gpu.offload` the plan-executed tokens are no longer every token).
+/// Process-global like the partition trace counters: one decode session per process.
+#[derive(Default)]
+pub struct Telemetry {
+    pub prepared: bool,
+    pub rows: Vec<(usize, TpTokenStats)>,
+}
 
-pub fn telemetry_push(stats: TpTokenStats) {
+static TELEMETRY: std::sync::Mutex<Telemetry> = std::sync::Mutex::new(Telemetry {
+    prepared: false,
+    rows: Vec::new(),
+});
+
+/// The partition was prepared: every decode row carries `tp_on`, even if it never runs.
+pub fn telemetry_mark_prepared() {
+    TELEMETRY.lock().unwrap_or_else(|e| e.into_inner()).prepared = true;
+}
+
+pub fn telemetry_push(step: usize, stats: TpTokenStats) {
     TELEMETRY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(stats);
+        .rows
+        .push((step, stats));
 }
 
-/// Drain the recorded per-token stats (empty when partition was off).
-pub fn telemetry_take() -> Vec<TpTokenStats> {
+/// Drain the recorded per-token stats (not prepared and empty when partition was off).
+pub fn telemetry_take() -> Telemetry {
     std::mem::take(&mut *TELEMETRY.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
@@ -522,10 +538,17 @@ pub struct TpController {
     /// Total CPU threads (SpinPool workers + dispatch thread) the CPU shares may use.
     pub threads: usize,
     pub threads_initial: usize,
+    /// Starting GPU share, what `reset_for_on` puts every segment back at.
+    r0: f32,
     pub tokens: u32,
     /// Token at which the last segment converged for the first time (Startup + Descent done
-    /// everywhere). Later Lookup exits (probe hits, contention) do not move it.
+    /// everywhere) since the controller started or was last reset by `reset_for_on` — so after a
+    /// `gpu.offload` restart the end-of-run line reports the last on-period's value, still counted
+    /// in cumulative `tokens`. Later Lookup exits (probe hits, contention) do not move it.
     pub converged_tok: Option<u32>,
+    /// `tokens` when the partition was last turned on by `gpu.offload`; `None` if it never was
+    /// (it started on). Tells the `[tp] reconverged` line apart from the first convergence.
+    pub on_tokens: Option<u32>,
     /// Per `(layer, seg)`: converged at least once.
     converged_once: Vec<[bool; 2]>,
     pub forced: u64,
@@ -558,8 +581,10 @@ impl TpController {
             segs,
             threads,
             threads_initial: threads,
+            r0,
             tokens: 0,
             converged_tok: None,
+            on_tokens: None,
             converged_once: vec![[false; 2]; n_layers],
             forced: 0,
             contention: 0,
@@ -623,6 +648,22 @@ impl TpController {
         }
         self.threads = next;
         Some(next)
+    }
+
+    /// Start over after `gpu.offload` turned the partition back on (ticket 024): every segment
+    /// from `r0` in Startup, the full thread count, nothing converged. The split found before
+    /// the partition was turned off was measured under the contention of that time, which the
+    /// switch suggests has changed. The event counters (`forced`, `contention`, `probe_hits`,
+    /// `tokens`) keep counting across the restart.
+    pub fn reset_for_on(&mut self) {
+        for s in self.segs.iter_mut().flatten() {
+            *s = SegState::new(s.geom, self.r0);
+        }
+        self.converged_once.iter_mut().for_each(|c| *c = [false; 2]);
+        self.converged_tok = None;
+        self.threads = self.threads_initial;
+        self.reduce_pending = false;
+        self.on_tokens = Some(self.tokens);
     }
 
     pub fn stats(&self) -> TpTokenStats {
@@ -826,6 +867,67 @@ mod tests {
         assert_eq!(c.segs[0][1].phase, Phase::Lookup);
         assert_eq!(c.contention, 0);
         assert_eq!(c.threads, 8);
+    }
+
+    /// ticket 024: turning the partition back on restarts the controller from scratch but keeps
+    /// the event counters.
+    #[test]
+    fn reset_for_on_restores_initial_state() {
+        let cfg = TpConfig {
+            probe: false,
+            ..TpConfig::default()
+        };
+        let r0 = 0.75;
+        let mut c = TpController::new(2, N_HEADS, FFN, r0, 8, true, cfg);
+        // Lower the thread count through the contention path first.
+        for layer in 0..2 {
+            let s = &mut c.segs[layer][1];
+            s.phase = Phase::Lookup;
+            s.q_opt = s.applied();
+            s.t_best = 10.0;
+            s.t_cpu_best = 9.0;
+        }
+        for _ in 0..3 {
+            c.observe(
+                0,
+                1,
+                Obs {
+                    waited: false,
+                    t_cpu: 13.0,
+                    t_gpu: None,
+                },
+            );
+            c.end_token();
+        }
+        assert_eq!(c.threads, 6);
+        // Then converge every segment.
+        for _ in 0..50 {
+            if c.converged_tok.is_some() {
+                break;
+            }
+            for layer in 0..2 {
+                for seg in 0..2 {
+                    let obs = sim(&c.segs[layer][seg], 1.0, 2.0);
+                    c.observe(layer, seg, obs);
+                }
+            }
+            c.end_token();
+        }
+        assert!(c.converged_tok.is_some(), "setup: no convergence");
+        let counters = (c.forced, c.contention, c.probe_hits, c.tokens);
+        assert!(counters.1 > 0);
+
+        c.reset_for_on();
+
+        assert_eq!(c.threads, 8);
+        assert_eq!(c.converged_tok, None);
+        assert!(c.converged_once.iter().flatten().all(|&x| !x));
+        for s in c.segs.iter().flatten() {
+            assert_eq!(s.applied(), s.geom.quantize(r0).unwrap());
+            assert_eq!(s.phase, Phase::Startup);
+        }
+        assert_eq!((c.forced, c.contention, c.probe_hits, c.tokens), counters);
+        assert_eq!(c.on_tokens, Some(c.tokens));
     }
 
     #[test]

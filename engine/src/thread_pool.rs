@@ -236,6 +236,11 @@ impl SpinPool {
         self.shared.n_workers
     }
 
+    /// Workers a dispatch uses now (`set_active_workers`; all of them by default).
+    pub fn active_workers(&self) -> usize {
+        self.shared.active_workers.load(Ordering::Relaxed)
+    }
+
     /// Limit dispatches to the first `n` workers (clamped to the pool size); the others stay
     /// parked. Must be called from the dispatching thread, between dispatches. Tensor-partition
     /// contention rule (ticket 021 §D4).

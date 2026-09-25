@@ -176,6 +176,11 @@ pub struct ModelForward {
     /// The `[tp] plan-path partition active` line was printed.
     #[cfg(feature = "opencl")]
     tp_announced: bool,
+    /// Whether the partition runs now, as last seen on layer 0's `partition_ctx`. `gpu.offload`
+    /// flips the layers between steps; `step` compares against this every step — with or without
+    /// a plan, since a compaction in the same step drops the plan first (ticket 024).
+    #[cfg(feature = "opencl")]
+    tp_on_applied: bool,
 }
 
 impl ModelForward {
@@ -210,11 +215,12 @@ impl ModelForward {
         )?;
         // Tensor partition (ticket 021): `prepare_tensor_partition` installed a context on every
         // layer; the plan's CPU share needs its workspace.
-        if model
+        let partitioned = model
             .layers
             .first()
-            .is_some_and(|l| l.load_weights().partition_ctx.is_some())
-        {
+            .is_some_and(|l| l.load_weights().partition_ctx.is_some());
+        if partitioned {
+            crate::layers::tp_controller::telemetry_mark_prepared();
             let c = &model.config;
             decode_workspace.enable_partition(
                 crate::partition_workspace::PartitionWsGeom {
@@ -277,6 +283,8 @@ impl ModelForward {
             plan_enabled,
             #[cfg(feature = "opencl")]
             tp_announced: false,
+            #[cfg(feature = "opencl")]
+            tp_on_applied: partitioned,
         };
         // β-3 commit A: construction 시점 wrap — EvictionStage register 시점에
         // fmt handle 을 보유(INV-STAGE-LAYER-HANDLE). prefill/step 의 ensure_fmt_wrapped
@@ -319,10 +327,60 @@ impl ModelForward {
         }
     }
 
-    /// Whether the decode runs the CPU–GPU tensor partition (ticket 021).
+    /// `--tp-start-off`: the caller returned every layer to the GPU before the first step. That is
+    /// the start state, not a `gpu.offload` event, so nothing is logged or released.
+    pub fn set_tp_start_off(&mut self) {
+        #[cfg(feature = "opencl")]
+        {
+            self.tp_on_applied = false;
+        }
+    }
+
+    /// Whether the decode runs the CPU–GPU tensor partition now (ticket 021; `gpu.offload` turns
+    /// it on and off, ticket 024).
     #[cfg(feature = "opencl")]
     fn tp_active(&self) -> bool {
-        self.decode_workspace.partition_ws.is_some()
+        self.decode_workspace.partition_ws.is_some() && self.tp_on_applied
+    }
+
+    /// Follow a `gpu.offload` switch (ticket 024) before this step runs, and tell the partition
+    /// runtime which decode step it is in. The dispatcher only fans the split out over the
+    /// layers; everything that lives in the partition workspace changes here.
+    #[cfg(feature = "opencl")]
+    fn sync_tp_switch(&mut self, ctx: &StepCtx) {
+        let Some(pw) = self.decode_workspace.partition_ws.clone() else {
+            return;
+        };
+        // SAFETY: between plan executions, on the dispatch thread.
+        let rt = unsafe { &mut (*pw.get()).tp };
+        rt.catch_up.step = ctx.decode_step as u64;
+        let on = self.model.layers[0].load_weights().partition_ctx.is_some();
+        if on == self.tp_on_applied {
+            return;
+        }
+        self.tp_on_applied = on;
+        // A plan of the other kind would fail its generation check (off) or silently keep the
+        // GPU-only path (on).
+        self.gpu_plan = None;
+        if on {
+            rt.reset_for_on();
+            eprintln!("[tp] offload on step={} pos={}", ctx.decode_step, ctx.pos);
+        } else {
+            let r = rt.release_for_off();
+            let kb = |v: Option<u64>| v.map_or_else(|| "na".to_string(), |v| v.to_string());
+            eprintln!(
+                "[tp] offload off step={} pos={} workers={}→{} host_kv_freed={} touched={} \
+                 pss_before={} pss_after={}",
+                ctx.decode_step,
+                ctx.pos,
+                r.workers.0,
+                r.workers.1,
+                r.host_kv_freed,
+                r.touched,
+                kb(r.pss_before),
+                kb(r.pss_after)
+            );
+        }
     }
 
     /// Install a resolved head-mask set (argus-cli `--mask-heads` / `--mask-heads-random` free-gen
@@ -788,6 +846,8 @@ impl Forward for ModelForward {
         // 5-F: fmt 가 유일 경로. plan path(execute_plan) 우선 시도 → build/invalidation 시
         // forward_into(trait object) 폴백. ensure_fmt_wrapped 가 prefill 시작에 wrap 완료.
         self.ensure_fmt_wrapped();
+        #[cfg(feature = "opencl")]
+        self.sync_tp_switch(ctx);
 
         // §5.9.2 Track B: hook 설치 여부 1회 read. 설치돼 있으면(IntraForward/LayerImmediate swap
         // 진행 중) plan path 를 우회한다 — plan path 는 layer loop 를 bypass 하므로 hook 의
@@ -911,7 +971,8 @@ impl Forward for ModelForward {
         }
 
         // A partitioned model never falls back: the dyn path runs it GPU-only, which would be a
-        // silent copy of the unpartitioned arm (ticket 021 §D6).
+        // silent copy of the unpartitioned arm (ticket 021 §D6). While `gpu.offload` has it off the
+        // model is GPU-only, and falls back like the unpartitioned arm.
         #[cfg(feature = "opencl")]
         if self.tp_active() {
             eprintln!("[tp] FATAL plan path unavailable");
